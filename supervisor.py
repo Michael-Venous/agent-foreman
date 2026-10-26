@@ -1428,7 +1428,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   if w['runtime']=='codex':self.set('native_history:'+wid,json.dumps(self.codex_prompt_ids(w)))
   self.db.execute('DELETE FROM settings WHERE key=?',('host:'+wid,))
   self.db.execute("UPDATE workers SET state='adopting',created=? WHERE id=?",(time.time(),wid))
-  try:subprocess.run(['systemd-run','--user','--unit='+unit,'--property=WorkingDirectory='+w['path'],'--setenv=PATH=/home/user/.local/bin:/usr/bin',*args],check=True,capture_output=True)
+  try:subprocess.run(['systemd-run','--user','--unit='+unit,'--property=WorkingDirectory='+w['path'],'--setenv=PATH='+str(Path.home()/'.local/bin')+':/usr/bin',*args],check=True,capture_output=True)
   except subprocess.CalledProcessError as e:
    if self.unit_state(unit).get('LoadState')!='not-found':raise ValueError('Adoption service start uncertain: inspect '+unit+'; do not retry blindly')
    self.db.execute("UPDATE workers SET state='registered' WHERE id=?",(wid,))

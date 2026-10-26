@@ -38,6 +38,6 @@ See [TOOLS.md](TOOLS.md) for the control API and [manager/NODES.md](manager/NODE
 
 ## Source and licensing
 
-This is a clean source-only publication. The original private operational history, runtime evidence, accounts and machine inventories are excluded; see [PUBLICATION.md](PUBLICATION.md). Future releases must preserve this boundary rather than merge private history.
+This is a clean source-only publication. The original private operational history, runtime evidence, accounts and machine inventories are excluded; see [PUBLICATION.md](PUBLICATION.md). Develop here and commit source changes normally; never merge private archive history. Local deployment values can be supplied through ignored `state/local-config.json` (`manager_session_id`, `public_url`), with environment overrides for builds/login output.
 
 HAPI is distributed under the GNU Affero General Public License v3; this distribution includes its modified-source patches and preserves that license in [LICENSE](LICENSE). Upstream source is fetched from the pinned HAPI release by the build scripts. No proprietary provider binaries, accounts or browser profiles are bundled.

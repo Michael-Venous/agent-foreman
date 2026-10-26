@@ -12,7 +12,9 @@ cmd=sys.argv[1]
 if cmd=='status':
  subprocess.run(['systemctl','--user','--no-pager','--lines=0','status',*SERVICES]);print(json.dumps(control({'op':'status'}),indent=2))
 elif cmd=='login':
- print('URL: https://your-host.example')
+ local_path=ROOT/'state/local-config.json'
+ local=json.loads(local_path.read_text()) if local_path.exists() else {}
+ print('URL: '+os.environ.get('HAPI_PUBLIC_URL',local.get('public_url','http://127.0.0.1:3006')))
  print('HAPI access token (keep private): '+json.loads((Path.home()/'.hapi/settings.json').read_text())['cliApiToken'])
 elif cmd=='backup':
  dest=ROOT/'state/backups'/time.strftime('%Y%m%d-%H%M%S');dest.mkdir(parents=True,mode=0o700)
