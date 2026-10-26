@@ -15,3 +15,10 @@ __pycache__/
 *.key
 node_modules/
 dist/
+
+# Runtime compatibility paths may be symlinks; directory-only rules do not cover them.
+/state
+/vendor
+/evidence
+/manager/control
+/manager/evidence
