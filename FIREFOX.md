@@ -2,6 +2,12 @@
 
 Use the installed Firefox binary with a separate profile/process, not the personal profile. Native Marionette serves loopback2829; Playwright is not required. Firefox supports one active Marionette controller per instance. Coordinate ownership and never replace a busy controller.
 
+## Default for already-configured agents
+
+Run `~/.local/bin/firefox-agent-browser start`, then explicitly `fx_connect {port:2829}`. For visible work, use `~/.local/bin/firefox-agent-browser gui` with the same isolated profile. Do not launch raw `firefox --marionette`, attach to personal2828, or use a fresh profile as an automatic fallback. If busy, coordinate; never replace its controller. Leave an existing legacy controller alone until its current task finishes. The clone persists: the setup steps below are not repeated for each task.
+
+## Initial setup
+
 1. Choose your normal profile from about:profiles. With Firefox closed, a complete profile copy is simplest; when it remains open, the supplied cloner uses per-database snapshots but cannot promise a transaction across all site files.
 2. Run `python3 deploy/firefox/clone-profile.py --source /path/to/your/profile`. The destination is `~/.local/share/agent-foreman/firefox/profile`; an existing destination is never overwritten. No password values are decoded. Encrypted logins, cookies, extensions and site storage are copied once; Firefox Sync/session restoration/runtime locks are omitted. Some sites and vaults require sign-in or unlocking again.
 3. Review and install with `python3 deploy/firefox/install-launcher.py`, then `systemctl --user daemon-reload`. Templates target Linux/systemd and may require platform-specific path adjustments. The service is on-demand, not enabled at boot.
