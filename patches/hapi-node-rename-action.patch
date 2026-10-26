@@ -1,0 +1,88 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -2,6 +2,8 @@
+ import { fitNodeFrame, framePoints, frameMemberIds, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
+ import { useNodeGrid } from '@/hooks/useNodeGrid'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
++import { useSessionActions } from '@/hooks/mutations/useSessionActions'
++import { RenameSessionDialog } from './RenameSessionDialog'
+ import * as Popover from '@radix-ui/react-popover'
+ import { createPortal } from 'react-dom'
+ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+@@ -106,12 +108,14 @@
+     useEffect(() => setGridSizeDraft(String(grid.size)), [grid.size])
+     const [objectMenu, setObjectMenu] = useState<{ id: string; x: number; y: number } | null>(null)
+     const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner'; x: number; y: number } | null>(null)
++    const [renamingSession, setRenamingSession] = useState<{ id: string; name: string } | null>(null)
++    const { renameSession, isPending: renamePending } = useSessionActions(api, renamingSession?.id ?? null)
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
+     const [addMenu, setAddMenu] = useState<{ x: number; y: number; point: GraphPoint; workspace: string } | null>(null)
+     const [addQuery, setAddQuery] = useState('')
+-    useEffect(() => { setAddMenu(null) }, [graph?.graph.workspaceId])
++    useEffect(() => { setAddMenu(null); setRenamingSession(null) }, [graph?.graph.workspaceId])
+     const [dropActive, setDropActive] = useState(false)
+     const dropInFlight = useRef<Promise<void> | null>(null)
+     const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null; movingChild?: string } | null>(null)
+@@ -920,6 +924,7 @@
+         }
+     }
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
++        {renamingSession && <RenameSessionDialog isOpen currentName={renamingSession.name} onClose={() => setRenamingSession(null)} onRename={renameSession} isPending={renamePending} />}
+         {headerTargets ? <>
+             {headerTargets.center && createPortal(workspaceControl, headerTargets.center)}
+             {headerTargets.actions && createPortal(gridControl, headerTargets.actions)}
+@@ -1101,6 +1106,7 @@
+                     {menu.mode === 'actions' ? <>
+                         <button type="button" autoFocus disabled={!menuSession} onClick={() => { const id = menu.id; closeMenu(); onOpenChat(id) }} className={menuItem}>Open chat</button>
+                         <button type="button" disabled={!menuSession} onClick={() => { if (openChatPopout(menu.id)) closeMenu(); else setError('Popout blocked. Allow popups for this site and try again.') }} className={menuItem}>Open in popout</button>
++                        <button type="button" disabled={!menuSession || !api} onClick={() => { setRenamingSession({ id: menu.id, name: title(menu.id) }); closeMenu() }} className={menuItem}>Rename</button>
+                         {menu.id !== overseer && <button type="button" onClick={() => { setMenu({ ...menu, mode: 'owner' }); setError(null) }} className={menuItem}>Set owner…</button>}
+                         {annotations.some(a => a.members?.includes(menu.id)) && <button type="button" disabled={pending !== null} onClick={() => removeFromFrame(menu.id)} className={menuItem}>Remove from frame</button>}
+                         {menuOwner && <button type="button" disabled={pending !== null} onClick={async () => { if (await changeOwner(menu.id, null) !== null) closeMenu() }} className={menuItem}>Detach from owner</button>}
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -111,6 +111,7 @@
+             return { ...copy(), stopped: ['A', 'B'], failed: [{ sessionId: 'C', error: 'offline' }] }
+         }),
+         abortSession: vi.fn(async () => {}),
++        renameSession: vi.fn(async (_sessionId: string, _name: string) => {}),
+     }
+     return api
+ }
+@@ -127,6 +128,34 @@
+     fireEvent.contextMenu(await screen.findByRole('button', { name: `Node ${name}` }), { clientX: 200, clientY: 150 })
+     return screen.findByRole('dialog', { name: `Actions for ${name}` })
+ }
++
++it.each([['Alpha', 'A'], ['Lone one', 'L']])('renames the exact node %s through the shared session action, preserving work and retrying failures', async (name, id) => {
++    const api = makeApi()
++    api.renameSession.mockRejectedValueOnce(new Error('Network error'))
++    const { client, onOpenChat } = setup(api)
++    const invalidate = vi.spyOn(client, 'invalidateQueries')
++    const before = (await api.getNodeGraph()).graph
++    const actions = await openNode(name)
++    fireEvent.click(within(actions).getByRole('button', { name: 'Rename' }))
++    expect(screen.queryByRole('dialog', { name: 'Actions for ' + name })).toBeNull()
++    const dialog = await screen.findByRole('dialog', { name: 'Rename Session' })
++    const input = within(dialog).getByRole('textbox')
++    expect(input).toHaveValue(name)
++    fireEvent.change(input, { target: { value: '  Revised node title  ' } })
++    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
++    await within(dialog).findByText('Failed to rename. Please try again.')
++    expect(input).toHaveValue('  Revised node title  ')
++    expect(api.renameSession).toHaveBeenLastCalledWith(id, 'Revised node title')
++    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
++    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Rename Session' })).toBeNull())
++    expect(api.renameSession).toHaveBeenCalledTimes(2)
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session', id] })
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['sessions'] })
++    expect((await api.getNodeGraph()).graph).toEqual(before)
++    expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled()
++    expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++})
++
+ /** Client coordinates of a node card's centre under the current pan/zoom. */
+ const nodeCentre = (id: string) => {
+     const card = document.querySelector<HTMLElement>(`[data-node-id="${id}"]`)!

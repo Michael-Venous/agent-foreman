@@ -1,0 +1,422 @@
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -9,7 +9,7 @@
+     sessionMatchesQuery,
+     sortSessionsBySearchRelevance,
+ } from '@/lib/sessionListSearch'
+-import { useLongPress } from '@/hooks/useLongPress'
++import { useLongPress, type TouchDragHandlers } from '@/hooks/useLongPress'
+ import { usePlatform } from '@/hooks/usePlatform'
+ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
+ import { SessionActionMenu } from '@/components/SessionActionMenu'
+@@ -908,6 +908,9 @@
+     lastSeenVersion: number
+     onMoveToFolder?: (session: SessionSummary) => void
+     managed?: boolean
++    touchDrag?: TouchDragHandlers
++    onNativeDragStart?: React.DragEventHandler<HTMLButtonElement>
++    onNativeDragEnd?: React.DragEventHandler<HTMLButtonElement>
+ }) {
+     const { t } = useTranslation()
+     const { addToast } = useToast()
+@@ -924,7 +927,7 @@
+         machineLabel,
+         lastSeenVersion
+     } = props
+-    const { haptic } = usePlatform()
++    const { haptic, isTouch } = usePlatform()
+     const [menuOpen, setMenuOpen] = useState(false)
+     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+     const [renameOpen, setRenameOpen] = useState(false)
+@@ -1006,7 +1009,9 @@
+                 onSelect(s.id)
+             }
+         },
+-        threshold: 500
++        threshold: 500,
++        touchDrag: menuOpen ? undefined : props.touchDrag,
++        disabled: menuOpen,
+     })
+ 
+     const sessionName = getSessionTitle(s)
+@@ -1030,6 +1035,14 @@
+             <button
+                 type="button"
+                 {...longPressHandlers}
++                draggable={Boolean(props.onNativeDragStart) && !isTouch && !menuOpen}
++                onDragStart={event => {
++                    if (menuOpen || isTouch) { event.preventDefault(); return }
++                    longPressHandlers.onMouseLeave(event)
++                    props.onNativeDragStart?.(event)
++                }}
++                onDragEnd={props.onNativeDragEnd}
++                onContextMenu={event => { event.preventDefault(); if (!menuOpen) longPressHandlers.onContextMenu(event) }}
+                 data-session-scroll-anchor
+                 className={`session-list-item group/session-row flex w-full flex-col gap-1 py-2 pl-2.5 pr-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] select-none rounded-lg ${selected ? 'bg-[var(--app-secondary-bg)]' : ''}`}
+                 style={{ WebkitTouchCallout: 'none' }}
+@@ -1573,9 +1586,7 @@
+     }
+ 
+     const renderChatRow = (s: SessionSummary, index: number, rows: SessionSummary[]) => (
+-        <div key={s.id} className="flex flex-col" draggable={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId))}
+-            onDragStart={event => { event.dataTransfer.setData('application/x-hapi-session', s.id); event.dataTransfer.effectAllowed = 'move'; setDraggedChat(s.id) }}
+-            onDragEnd={() => { setDraggedChat(null); setDropFolder(null) }}>
++        <div key={s.id} className={`flex flex-col ${draggedChat === s.id ? 'opacity-60' : ''}`}>
+             {shouldShowPinnedDivider(rows, index) ? (
+                 <div
+                     data-testid="session-pin-divider"
+@@ -1596,6 +1607,29 @@
+                 lastSeenVersion={lastSeenVersion}
+                 managed={Boolean(managedSessions[s.id])}
+                 onMoveToFolder={canMoveToFolder && ['codex', 'claude'].includes(getChatTab(s)) ? handleMoveToFolder : undefined}
++                onNativeDragStart={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId)) ? event => {
++                    event.dataTransfer.setData('application/x-hapi-session', s.id); event.dataTransfer.effectAllowed = 'move'; setDraggedChat(s.id)
++                } : undefined}
++                onNativeDragEnd={() => { setDraggedChat(null); setDropFolder(null) }}
++                touchDrag={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId)) ? {
++                    onStart: () => setDraggedChat(s.id),
++                    onMove: point => {
++                        const target = document.elementFromPoint(point.x, point.y)?.closest('[data-hapi-chat-folder]')
++                        setDropFolder(target ? target.getAttribute('data-hapi-chat-folder') || 'none' : null)
++                        const scroll = scrollContainerRef.current
++                        if (scroll) {
++                            const bounds = scroll.getBoundingClientRect()
++                            if (point.y < bounds.top + 40) scroll.scrollTop -= 14
++                            else if (point.y > bounds.bottom - 40) scroll.scrollTop += 14
++                        }
++                    },
++                    onEnd: point => {
++                        const target = document.elementFromPoint(point.x, point.y)?.closest('[data-hapi-chat-folder]')
++                        if (target) void moveDraggedChat(s.id, target.getAttribute('data-hapi-chat-folder') || null)
++                        setDraggedChat(null); setDropFolder(null)
++                    },
++                    onCancel: () => { setDraggedChat(null); setDropFolder(null) },
++                } : undefined}
+             />
+         </div>
+     )
+@@ -1655,7 +1689,7 @@
+                     ) : null}
+                     {moveError && <div role="alert" className="px-2 text-sm text-red-600">{moveError}</div>}
+                     {sections.map(({ folder, sessions }) => (
+-                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} className={`flex flex-col gap-0.5 ${dropFolder === (folder?.id ?? 'none') ? 'rounded ring-2 ring-[var(--app-link)]' : ''}`}
++                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} data-hapi-chat-folder={folder === undefined ? undefined : folder?.id ?? ''} className={`flex flex-col gap-0.5 ${dropFolder === (folder?.id ?? 'none') ? 'rounded ring-2 ring-[var(--app-link)]' : ''}`}
+                             onDragOver={event => { if (folder !== undefined && draggedChat) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropFolder(folder?.id ?? 'none') } }}
+                             onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }}
+                             onDrop={event => {
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -1,4 +1,4 @@
+-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import type { ApiClient, CodexFoldersResponse } from '@/api/client'
+@@ -236,3 +236,46 @@
+         expect(api.assignCodexFolder).not.toHaveBeenCalled()
+     })
+ })
++
++
++it('blocks desktop dragging while its action menu is open and restores it after dismissal', async () => {
++    const api = folderApi(); renderList({ api })
++    await screen.findByRole('button', { name: 'Blender folder' })
++    const row = screen.getByRole('button', { name: /Loose codex chat/ })
++    expect(row).toHaveAttribute('draggable', 'true')
++    fireEvent.contextMenu(row)
++    await screen.findByRole('menuitem', { name: /Move to folder/ })
++    expect(row).toHaveAttribute('draggable', 'false')
++    const transfer = { setData: vi.fn(), effectAllowed: '' }
++    expect(fireEvent.dragStart(row, { dataTransfer: transfer })).toBe(false)
++    expect(transfer.setData).not.toHaveBeenCalled()
++    fireEvent.keyDown(document, { key: 'Escape' })
++    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
++    expect(row).toHaveAttribute('draggable', 'true')
++})
++
++for (const provider of ['codex', 'claude'] as const) it(`moves ${provider} with a short touch hold and drag without opening its menu`, async () => {
++    const chat = provider === 'codex' ? codex('moving', 'Touch drag chat', 'native-thread') : claude('moving', 'Touch drag chat')
++    localStorage.setItem('hapi-chat-tab', provider)
++    const api = folderApi({ getCodexFolders: vi.fn().mockResolvedValue({ ...folders, assignments: {} }) })
++    renderList({ api, list: [chat] })
++    await screen.findByRole('button', { name: /No folder folder/ })
++    const row = screen.getByRole('button', { name: /Touch drag chat/ })
++    const original = document.elementFromPoint
++    document.elementFromPoint = () => row
++    const now = Date.now()
++    vi.useFakeTimers()
++    try {
++        vi.setSystemTime(now)
++        fireEvent.touchStart(row, { touches: [{ clientX: 20, clientY: 80 }] })
++        act(() => vi.advanceTimersByTime(200))
++        fireEvent.touchMove(row, { cancelable: true, touches: [{ clientX: 20, clientY: 110 }] })
++        const target = screen.getByRole('button', { name: 'Blender folder' }).closest('[data-hapi-chat-folder]')!
++        document.elementFromPoint = () => target
++        fireEvent.touchMove(row, { cancelable: true, touches: [{ clientX: 20, clientY: 140 }] })
++        act(() => vi.advanceTimersByTime(700))
++        expect(screen.queryByRole('menu')).toBeNull()
++        fireEvent.touchEnd(row, { changedTouches: [{ clientX: 20, clientY: 140 }] })
++    } finally { vi.useRealTimers(); document.elementFromPoint = original }
++    await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledExactlyOnceWith(provider === 'codex' ? 'native-thread' : 'moving', 'f-blender', provider))
++})
+--- a/web/src/hooks/useLongPress.ts
++++ b/web/src/hooks/useLongPress.ts
+@@ -1,5 +1,12 @@
+ import type React from 'react'
+ import { useCallback, useEffect, useRef } from 'react'
++
++export type TouchDragHandlers = {
++    onStart: (point: { x: number; y: number }) => void
++    onMove: (point: { x: number; y: number }) => void
++    onEnd: (point: { x: number; y: number }) => void
++    onCancel: () => void
++}
+ 
+ type UseLongPressOptions = {
+     onLongPress: (point: { x: number; y: number }) => void
+@@ -15,6 +22,8 @@
+     interaction?: 'legacy' | 'touch-only-native-click'
+     /** Disable just the long-press gesture while retaining the normal click. */
+     longPressEnabled?: boolean
++    /** Legacy list rows: move after a brief hold to drag, hold still for the menu. */
++    touchDrag?: TouchDragHandlers
+ }
+ 
+ // How long after a touch interaction to keep ignoring synthesized mouse
+@@ -29,6 +38,7 @@
+ const NATIVE_CLICK_SUPPRESSION_WINDOW_MS = GHOST_MOUSE_WINDOW_MS
+ 
+ type UseLongPressHandlers = {
++    ref?: React.RefCallback<HTMLElement>
+     onMouseDown: React.MouseEventHandler
+     onMouseUp: React.MouseEventHandler
+     onMouseLeave: React.MouseEventHandler
+@@ -49,6 +59,7 @@
+         disabled = false,
+         interaction = 'legacy',
+         longPressEnabled = true,
++        touchDrag,
+     } = options
+ 
+     const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+@@ -67,6 +78,25 @@
+     // time — on a persistent list (tablet sidebar) the second click lands on
+     // whatever row slid under the finger, navigating to the wrong session.
+     const lastTouchAtRef = useRef(0)
++    const touchGestureRef = useRef<{ started: number; dragging: boolean; scrolling: boolean; x: number; y: number } | null>(null)
++    const removeTouchMoveRef = useRef<(() => void) | null>(null)
++    const touchMoveHandlerRef = useRef<((event: TouchEvent) => void) | null>(null)
++    const lastTouchDraggedRef = useRef(false)
++    const dragCancelRef = useRef<(() => void) | null>(null)
++
++    const setTouchTarget = useCallback((target: HTMLElement | null) => {
++        removeTouchMoveRef.current?.()
++        touchMoveHandlerRef.current = null
++        if (!target) return
++        const move = (event: TouchEvent) => touchMoveHandlerRef.current?.(event)
++        // Must exist before touchstart: adding a blocking listener mid-gesture
++        // is too late for Chromium to deliver cancelable touchmove events.
++        target.addEventListener('touchmove', move, { passive: false })
++        removeTouchMoveRef.current = () => {
++            target.removeEventListener('touchmove', move)
++            removeTouchMoveRef.current = null
++        }
++    }, [])
+ 
+     const clearTimer = useCallback(() => {
+         if (timerRef.current) {
+@@ -95,6 +125,8 @@
+     useEffect(() => () => {
+         clearTimer()
+         clearNativeClickSuppression()
++        removeTouchMoveRef.current?.()
++        dragCancelRef.current?.()
+     }, [clearTimer, clearNativeClickSuppression])
+ 
+     const startTimer = useCallback((clientX: number, clientY: number) => {
+@@ -147,19 +179,68 @@
+ 
+     const onTouchStart = useCallback<React.TouchEventHandler>((e) => {
+         lastTouchAtRef.current = Date.now()
++        touchMoveHandlerRef.current = null
++        dragCancelRef.current?.()
++        dragCancelRef.current = null
++        touchGestureRef.current = null
++        lastTouchDraggedRef.current = false
++        if (e.touches.length !== 1) { clearTimer(); touchMoved.current = true; return }
+         const touch = e.touches[0]
+         startTimer(touch.clientX, touch.clientY)
+-    }, [startTimer])
++        if (!touchDrag || disabled) return
++        const gesture = { started: Date.now(), dragging: false, scrolling: false, x: touch.clientX, y: touch.clientY }
++        touchGestureRef.current = gesture
++        // Only an actual armed drag cancels scrolling. The mounted local
++        // listener owns touchmove; React's delegated listener stays passive.
++        const move = (event: TouchEvent) => {
++            if (event.touches.length !== 1) {
++                clearTimer(); touchMoved.current = true; gesture.scrolling = true
++                dragCancelRef.current?.(); dragCancelRef.current = null; gesture.dragging = false
++                return
++            }
++            const next = event.touches[0]
++            if (gesture.scrolling || isLongPressRef.current) return
++            if (!gesture.dragging && Math.hypot(next.clientX - gesture.x, next.clientY - gesture.y) < 8) return
++            touchMoved.current = true
++            clearTimer()
++            // Moving immediately is scrolling. Once chosen, it cannot turn into
++            // a drag partway through that same swipe. Holding still for 500ms
++            // chooses the menu instead; the two actions are mutually exclusive.
++            if (!gesture.dragging && (Date.now() - gesture.started < 180 || !event.cancelable)) {
++                gesture.scrolling = true
++                return
++            }
++            event.preventDefault()
++            if (!gesture.dragging) {
++                gesture.dragging = true
++                lastTouchDraggedRef.current = true
++                dragCancelRef.current = touchDrag.onCancel
++                touchDrag.onStart({ x: gesture.x, y: gesture.y })
++            }
++            gesture.x = next.clientX; gesture.y = next.clientY
++            touchDrag.onMove({ x: next.clientX, y: next.clientY })
++        }
++        touchMoveHandlerRef.current = move
++    }, [startTimer, clearTimer, touchDrag, disabled])
+ 
+     const onTouchEnd = useCallback<React.TouchEventHandler>((e) => {
+         lastTouchAtRef.current = Date.now()
+-        // Prevent the browser's compatibility mouse/click sequence from firing
+-        // on the row that ends up under the finger after navigation/reordering.
+-        e.preventDefault()
++        touchMoveHandlerRef.current = null
++        const gesture = touchGestureRef.current
++        touchGestureRef.current = null
++        dragCancelRef.current = null
++        if (gesture?.dragging) {
++            const touch = e.changedTouches[0]
++            touchDrag?.onEnd({ x: touch?.clientX ?? gesture.x, y: touch?.clientY ?? gesture.y })
++        }
++        // Prevent compatibility mouse events from selecting a row after a
++        // touch tap, menu or drag. Scrolling never emits an application click.
++        if (e.cancelable) e.preventDefault()
+         handleEnd(!isLongPressRef.current)
+-    }, [handleEnd])
++    }, [handleEnd, touchDrag])
+ 
+     const onTouchMove = useCallback<React.TouchEventHandler>(() => {
++        if (touchGestureRef.current) return
+         touchMoved.current = true
+         clearTimer()
+     }, [clearTimer])
+@@ -167,11 +248,14 @@
+     const onContextMenu = useCallback<React.MouseEventHandler>((e) => {
+         if (!disabled) {
+             e.preventDefault()
++            // Touch uses its own timer, including when a browser generates
++            // contextmenu early. Drag/scroll must never open a second action.
++            if (touchGestureRef.current || (lastTouchDraggedRef.current && isGhostMouseEvent()) || isLongPressRef.current) return
+             clearTimer()
+             isLongPressRef.current = true
+             onLongPress({ x: e.clientX, y: e.clientY })
+         }
+-    }, [disabled, clearTimer, onLongPress])
++    }, [disabled, clearTimer, isGhostMouseEvent, onLongPress])
+ 
+     const onKeyDown = useCallback<React.KeyboardEventHandler>((e) => {
+         if (disabled) return
+@@ -182,6 +266,11 @@
+     }, [disabled, onClick])
+ 
+     const onTouchCancel = useCallback<React.TouchEventHandler>(() => {
++        lastTouchAtRef.current = Date.now()
++        touchMoveHandlerRef.current = null
++        dragCancelRef.current?.()
++        dragCancelRef.current = null
++        touchGestureRef.current = null
+         clearTimer()
+         isLongPressRef.current = false
+         touchMoved.current = false
+@@ -253,6 +342,7 @@
+     }
+ 
+     return {
++        ...(touchDrag ? { ref: setTouchTarget } : {}),
+         onMouseDown,
+         onMouseUp,
+         onMouseLeave,
+--- a/web/src/hooks/useLongPress.test.tsx
++++ b/web/src/hooks/useLongPress.test.tsx
+@@ -324,3 +324,73 @@
+         expect(onClick).toHaveBeenCalledOnce()
+     })
+ })
++
++
++describe('exclusive touch drag and long press', () => {
++    beforeEach(() => { vi.restoreAllMocks(); vi.useFakeTimers(); vi.setSystemTime(10_000) })
++    afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks() })
++    function setup() {
++        const onClick = vi.fn(), onLongPress = vi.fn()
++        const touchDrag = { onStart: vi.fn(), onMove: vi.fn(), onEnd: vi.fn(), onCancel: vi.fn() }
++        function Row() {
++            return <button data-testid="gesture" {...useLongPress({ onClick, onLongPress, touchDrag })}>Chat</button>
++        }
++        const view = render(<Row />)
++        const row = view.getByTestId('gesture')
++        const start = () => fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] })
++        const move = (y: number) => fireEvent.touchMove(row, { cancelable: true, touches: [{ clientX: 10, clientY: y }] })
++        const end = () => fireEvent.touchEnd(row, { changedTouches: [{ clientX: 10, clientY: 90 }] })
++        const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms))
++        return { ...view, row, onClick, onLongPress, touchDrag, start, move, end, wait }
++    }
++    it('starts a brief-hold drag once, cancels the menu timer and suppresses synthetic menus/clicks', () => {
++        const g = setup(); g.start(); g.wait(200)
++        expect(g.move(40)).toBe(false)
++        g.wait(600); g.move(90); fireEvent.contextMenu(g.row); g.end()
++        fireEvent.contextMenu(g.row); fireEvent.mouseDown(g.row); fireEvent.mouseUp(g.row)
++        expect(g.touchDrag.onStart).toHaveBeenCalledOnce()
++        expect(g.touchDrag.onMove).toHaveBeenCalledTimes(2)
++        expect(g.touchDrag.onEnd).toHaveBeenCalledExactlyOnceWith({ x: 10, y: 90 })
++        expect(g.onLongPress).not.toHaveBeenCalled(); expect(g.onClick).not.toHaveBeenCalled()
++    })
++    it('opens a long-hold menu once and never turns that gesture into a drag', () => {
++        const g = setup(); g.start(); g.wait(500)
++        fireEvent.contextMenu(g.row); g.move(90); g.end()
++        expect(g.onLongPress).toHaveBeenCalledOnce()
++        expect(g.touchDrag.onStart).not.toHaveBeenCalled(); expect(g.touchDrag.onEnd).not.toHaveBeenCalled()
++        expect(g.onClick).not.toHaveBeenCalled()
++    })
++    it('keeps the hold timer when the browser emits contextmenu early', () => {
++        const g = setup(); g.start(); g.wait(250); fireEvent.contextMenu(g.row)
++        expect(g.onLongPress).not.toHaveBeenCalled()
++        g.wait(250); g.end()
++        expect(g.onLongPress).toHaveBeenCalledOnce(); expect(g.touchDrag.onStart).not.toHaveBeenCalled()
++    })
++    it('leaves an immediate swipe as scrolling even after enough time elapses to arm dragging', () => {
++        const g = setup(); g.start(); g.wait(50)
++        expect(g.move(40)).toBe(true)
++        g.wait(600); expect(g.move(90)).toBe(true); g.end()
++        expect(g.onLongPress).not.toHaveBeenCalled(); expect(g.touchDrag.onStart).not.toHaveBeenCalled(); expect(g.onClick).not.toHaveBeenCalled()
++    })
++    it('tolerates small finger jitter before a long-hold menu', () => {
++        const g = setup(); g.start(); g.wait(200); g.move(13); g.wait(300); g.end()
++        expect(g.onLongPress).toHaveBeenCalledOnce(); expect(g.touchDrag.onStart).not.toHaveBeenCalled()
++    })
++    it('still selects a tap exactly once', () => {
++        const g = setup(); g.start(); g.wait(80); g.end()
++        fireEvent.mouseDown(g.row); fireEvent.mouseUp(g.row)
++        expect(g.onClick).toHaveBeenCalledOnce(); expect(g.onLongPress).not.toHaveBeenCalled(); expect(g.touchDrag.onStart).not.toHaveBeenCalled()
++    })
++    it('cancels without dropping on touchcancel or unmount', () => {
++        const g = setup(); g.start(); g.wait(200); g.move(40); fireEvent.touchCancel(g.row)
++        g.wait(600); expect(g.touchDrag.onCancel).toHaveBeenCalledOnce()
++        expect(g.touchDrag.onEnd).not.toHaveBeenCalled(); expect(g.onLongPress).not.toHaveBeenCalled()
++        g.start(); g.wait(200); g.move(40); g.unmount()
++        expect(g.touchDrag.onCancel).toHaveBeenCalledTimes(2); expect(g.touchDrag.onEnd).not.toHaveBeenCalled()
++    })
++    it('cancels a drag if a second finger enters', () => {
++        const g = setup(); g.start(); g.wait(200); g.move(40)
++        fireEvent.touchMove(g.row, { touches: [{ clientX: 10, clientY: 50 }, { clientX: 25, clientY: 50 }] }); g.end()
++        expect(g.touchDrag.onCancel).toHaveBeenCalledOnce(); expect(g.touchDrag.onEnd).not.toHaveBeenCalled(); expect(g.onClick).not.toHaveBeenCalled()
++    })
++})

@@ -1,0 +1,373 @@
+--- a/shared/package.json
++++ b/shared/package.json
+@@ -23,6 +23,7 @@
+         "./voicePickerCatalog": "./src/voicePickerCatalog.ts",
+         "./voice-personality": "./src/voicePersonality.ts",
+         "./usage": "./src/usage.ts",
++        "./codexContextPreference": "./src/codexContextPreference.ts",
+         "./settingsFileLock": "./src/settingsFileLock.ts",
+         "./agentCliSpawnLease": "./src/agentCliSpawnLease.ts"
+     },
+--- a/cli/src/codex/codexAppServerClient.ts
++++ b/cli/src/codex/codexAppServerClient.ts
+@@ -1,3 +1,4 @@
++import { applyContextPreference } from '@hapi/protocol/codexContextPreference';
+ import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+ import { existsSync } from 'node:fs';
+ import WebSocket from 'ws';
+@@ -588,6 +589,7 @@
+             throw createAbortError();
+         }
+ 
++        params = applyContextPreference(method, params);
+         const id = this.nextId++;
+         const payload: JsonRpcLiteRequest = {
+             id,
+--- a/hub/src/web/routes/codexContext.ts
++++ b/hub/src/web/routes/codexContext.ts
+@@ -1,19 +1,12 @@
+ import { Hono } from 'hono'
+ import { readFileSync } from 'node:fs'
+ import { join } from 'node:path'
+-import { codexHome, createStdioAppServer, type CodexAppServer, type Rpc } from '../../codexFolders'
++import { codexHome } from '../../codexFolders'
++import { readContextPreference, writeContextPreference } from '@hapi/protocol/codexContextPreference'
+ import type { WebAppEnv } from '../middleware/auth'
++import type { SyncEngine } from '../../sync/syncEngine'
++import { requireSyncEngine, requireSessionFromParam } from './guards'
+ 
+-type Layer = { name: { type: string; file?: string; profile?: string | null }; version: string }
+-async function read(call: Rpc) {
+-    const result = await call('config/read', { includeLayers: true })
+-    const config = result.config as Record<string, unknown>
+-    const layer = (result.layers as Layer[]).find(l => l.name.type === 'user' && !l.name.profile)
+-    if (!layer?.name.file) throw new Error('Codex user configuration is unavailable')
+-    return { requestedWindow: typeof config.model_context_window === 'number' ? config.model_context_window : null,
+-        autoCompactLimit: typeof config.model_auto_compact_token_limit === 'number' ? config.model_auto_compact_token_limit : null,
+-        version: layer.version, file: layer.name.file }
+-}
+ function catalog() {
+     try {
+         const data = JSON.parse(readFileSync(join(codexHome(), 'models_cache.json'), 'utf8'))
+@@ -23,34 +16,35 @@
+         }))
+     } catch { return [] }
+ }
+-export function createCodexContextRoutes(server: CodexAppServer = createStdioAppServer()): Hono<WebAppEnv> {
++export function createCodexContextRoutes(getSyncEngine: () => SyncEngine | null, home?: string): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+-    app.use('/codex-context', async (c, next) => c.get('namespace') === 'default' ? next() : c.json({ error: 'Only the hub owner can change Codex context' }, 403))
+-    app.get('/codex-context', async c => {
++    // Old global endpoints intentionally removed; stale clients cannot mutate global config.
++    const path = '/sessions/:id/codex-context'
++    app.use(path, async (c, next) => c.get('namespace') === 'default' ? next() : c.json({ error: 'Only the hub owner can change Codex context' }, 403))
++    function thread(c: Parameters<typeof requireSyncEngine>[0]): string | Response {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const access = requireSessionFromParam(c, engine)
++        if (access instanceof Response) return access
++        const metadata = access.session.metadata
++        if (metadata?.flavor !== 'codex' || !metadata.codexSessionId) return c.json({ error: 'Start this Codex chat first' }, 409)
++        if (process.env.HAPI_LOCAL_CATALOG_MACHINE && metadata.machineId !== process.env.HAPI_LOCAL_CATALOG_MACHINE) return c.json({ error: 'Context preferences require a chat on this machine' }, 409)
++        return metadata.codexSessionId
++    }
++    app.get(path, c => {
+         c.header('Cache-Control', 'no-store')
+-        try {
+-            return c.json(await server(async call => { const { file, ...state } = await read(call); return { ...state, models: catalog() } }))
+-        } catch { return c.json({ error: 'Unable to read Codex context settings' }, 502) }
++        const id = thread(c)
++        if (id instanceof Response) return id
++        try { return c.json({ ...readContextPreference(id, home), models: catalog() }) }
++        catch { return c.json({ error: 'Unable to read this chat’s context preference' }, 502) }
+     })
+-    app.post('/codex-context', async c => {
++    app.post(path, async c => {
++        const id = thread(c)
++        if (id instanceof Response) return id
+         const body = await c.req.json().catch(() => null)
+         if (!body || typeof body.enabled !== 'boolean' || typeof body.version !== 'string') return c.json({ error: 'Invalid context setting' }, 400)
+-        try {
+-            return c.json(await server(async call => {
+-                const before = await read(call)
+-                if (before.version !== body.version) throw new Error('conflict')
+-                await call('config/batchWrite', {
+-                    edits: [{ keyPath: 'model_context_window', value: body.enabled ? 1_000_000 : null, mergeStrategy: 'replace' }],
+-                    expectedVersion: before.version, filePath: before.file, reloadUserConfig: false
+-                })
+-                const { file, ...state } = await read(call)
+-                if (state.requestedWindow !== (body.enabled ? 1_000_000 : null)) throw new Error('unconfirmed')
+-                return { ...state, models: catalog() }
+-            }))
+-        } catch (error) {
+-            return c.json({ error: error instanceof Error && error.message === 'conflict'
+-                ? 'Codex settings changed. Refresh and try again.' : 'Codex did not confirm the setting. Refresh before retrying.' }, 409)
+-        }
++        try { return c.json({ ...writeContextPreference(id, body.enabled, body.version, home), models: catalog() }) }
++        catch { return c.json({ error: 'Could not save this chat’s preference. Refresh and try again.' }, 409) }
+     })
+     return app
+ }
+--- a/hub/src/web/routes/codexContext.test.ts
++++ b/hub/src/web/routes/codexContext.test.ts
+@@ -1,37 +1,47 @@
+-import { describe, expect, it } from 'bun:test'
++import { afterEach, describe, expect, it } from 'bun:test'
+ import { Hono } from 'hono'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { applyContextPreference, readContextPreference } from '@hapi/protocol/codexContextPreference'
+ import { createCodexContextRoutes } from './codexContext'
++import type { SyncEngine } from '../../sync/syncEngine'
+ import type { WebAppEnv } from '../middleware/auth'
+-import type { CodexAppServer } from '../../codexFolders'
+-function setup(namespace = 'default') {
+-    let value: number | null = null
+-    const writes: unknown[] = []
+-    const server: CodexAppServer = async work => work(async (method, raw) => {
+-        if (method === 'config/read') return { config: { model_context_window: value }, layers: [{ name: { type: 'user', file: '/fake/config.toml' }, version: 'v1' }] }
+-        const p = raw as { edits: Array<{ value: number | null }> }
+-        writes.push(raw); value = p.edits[0].value; return {}
+-    })
++const dirs: string[] = []
++afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })))
++function setup(namespace = 'default', home = mkdtempSync(join(tmpdir(), 'hapi-context-'))) {
++    dirs.push(home)
++    const ids: Record<string, string> = { a: '11111111-1111-4111-8111-111111111111', b: '1d767691-b72a-5b31-ae89-b6f3a12c6a5d', resumed: '11111111-1111-4111-8111-111111111111' }
++    const engine = { resolveSessionAccess: (id: string) => ids[id] ? { ok: true, sessionId: id, session: { metadata: { flavor: 'codex', codexSessionId: ids[id], machineId: process.env.HAPI_LOCAL_CATALOG_MACHINE } } } : { ok: false, reason: 'not-found' } } as unknown as SyncEngine
+     const app = new Hono<WebAppEnv>()
+     app.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
+-    app.route('/api', createCodexContextRoutes(server))
+-    const post = (body: unknown) => app.request('/api/codex-context', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+-    return { app, post, writes }
++    app.route('/api', createCodexContextRoutes(() => engine, home))
++    const post = (id: string, body: unknown) => app.request(`/api/sessions/${id}/codex-context`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
++    const get = async (id: string) => (await app.request(`/api/sessions/${id}/codex-context`)).json() as Promise<{ enabled: boolean; version: string }>
++    return { app, post, get, ids, home }
+ }
+-describe('Codex context preference', () => {
+-    it('writes only context with version checking, then restores native default', async () => {
++describe('per-chat Codex context', () => {
++    it('isolates chats and persists through a new HAPI session ID for the same native thread', async () => {
+         const s = setup()
+-        expect(((await (await s.post({ enabled: true, version: 'v1' })).json()) as { requestedWindow: number | null }).requestedWindow).toBe(1000000)
+-        expect(s.writes[0]).toEqual({ edits: [{ keyPath: 'model_context_window', value: 1000000, mergeStrategy: 'replace' }], expectedVersion: 'v1', filePath: '/fake/config.toml', reloadUserConfig: false })
+-        expect(((await (await s.post({ enabled: false, version: 'v1' })).json()) as { requestedWindow: number | null }).requestedWindow).toBeNull()
++        expect((await s.post('a', { enabled: true, version: '0' })).status).toBe(200)
++        expect((await s.get('a')).enabled).toBe(true)
++        expect((await s.get('resumed')).enabled).toBe(true)
++        expect((await s.get('b')).enabled).toBe(false)
++        const request = { threadId: s.ids.a, config: { unrelated: 'keep' } }
++        expect(applyContextPreference('thread/resume', request, s.home)).toEqual({ ...request, config: { unrelated: 'keep', model_context_window: 1000000 } })
++        expect(applyContextPreference('thread/resume', { threadId: s.ids.b }, s.home)).toEqual({ threadId: s.ids.b })
++        expect(applyContextPreference('turn/start', request, s.home)).toBe(request)
++        expect((await s.post('a', { enabled: false, version: (await s.get('a')).version })).status).toBe(200)
++        expect(applyContextPreference('thread/resume', { ...request, config: { model_context_window: 1000000, unrelated: 'keep' } }, s.home)).toEqual(request)
++        expect(readContextPreference(s.ids.a, s.home).enabled).toBe(false)
+     })
+-    it('rejects other tenants and stale/invalid requests before mutation', async () => {
++    it('rejects unknown sessions, other tenants, stale versions and old global endpoint', async () => {
+         const s = setup()
+-        expect((await s.post({ enabled: true, version: 'old' })).status).toBe(409)
+-        expect((await s.post({ enabled: 'yes', version: 'v1' })).status).toBe(400)
+-        expect(s.writes).toHaveLength(0)
+-        const other = setup('tenant')
+-        expect((await other.post({ enabled: true, version: 'v1' })).status).toBe(403)
+-        expect((await other.app.request('/api/codex-context')).status).toBe(403)
+-        expect(other.writes).toHaveLength(0)
++        expect((await s.post('a', { enabled: true, version: 'old' })).status).toBe(409)
++        expect((await s.post('a', { enabled: 'yes', version: '0' })).status).toBe(400)
++        expect((await s.post('missing', { enabled: true, version: '0' })).status).toBe(404)
++        expect((await setup('tenant').post('a', { enabled: true, version: '0' })).status).toBe(403)
++        expect((await s.app.request('/api/codex-context', { method: 'POST' })).status).toBe(404)
++        expect((await s.get('a')).enabled).toBe(false)
+     })
+ })
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -297,7 +297,7 @@
+     app.route('/api', createCodexFoldersRoutes())
+     app.route('/api', createSessionGoalRoutes(options.getSyncEngine))
+     app.route('/api', createManagedSessionsRoutes())
+-    app.route('/api', createCodexContextRoutes())
++    app.route('/api', createCodexContextRoutes(options.getSyncEngine))
+     app.route('/api', createStorageRoutes(configuration.dbPath))
+     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+     app.route('/api', createUsageRoutes(options.store))
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -170,18 +170,17 @@
+ }
+ 
+ export type CodexContextState = {
+-    requestedWindow: number | null
+-    autoCompactLimit: number | null
++    enabled: boolean
+     version: string
+     models: Array<{ model: string; defaultWindow: number; maxWindow?: number; effectivePercent?: number }>
+ }
+ 
+ export class ApiClient {
+-    getCodexContext(): Promise<CodexContextState> {
+-        return this.request('/api/codex-context')
++    getCodexContext(sessionId: string): Promise<CodexContextState> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/codex-context`)
+     }
+-    setCodexContext(enabled: boolean, version: string): Promise<CodexContextState> {
+-        return this.request('/api/codex-context', { method: 'POST', body: JSON.stringify({ enabled, version }) })
++    setCodexContext(sessionId: string, enabled: boolean, version: string): Promise<CodexContextState> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/codex-context`, { method: 'POST', body: JSON.stringify({ enabled, version }) })
+     }
+ 
+     private token: string
+--- a/web/src/components/AssistantChat/CodexContextToggle.tsx
++++ b/web/src/components/AssistantChat/CodexContextToggle.tsx
+@@ -2,13 +2,13 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import { useAppContext } from '@/lib/app-context'
+ 
+-export function CodexContextToggle({ model }: { model: string | null }) {
++export function CodexContextToggle({ model, sessionId }: { model: string | null; sessionId: string }) {
+     const { api } = useAppContext()
+     const client = useQueryClient()
+     const [saving, setSaving] = useState(false)
+     const [error, setError] = useState<string | null>(null)
+     const [saved, setSaved] = useState(false)
+-    const query = useQuery({ queryKey: ['codex-context'], queryFn: () => api!.getCodexContext(), enabled: Boolean(api), staleTime: 0, retry: false })
++    const query = useQuery({ queryKey: ['codex-context', sessionId], queryFn: () => api!.getCodexContext(sessionId), enabled: Boolean(api), staleTime: 0, retry: false })
+     const data = query.data
+     const entry = data?.models.find(m => m.model === model)
+     const max = entry?.maxWindow
+@@ -17,23 +17,21 @@
+         if (!api || !data || saving) return
+         setSaving(true); setError(null); setSaved(false)
+         try {
+-            const next = await api.setCodexContext(enabled, data.version)
+-            client.setQueryData(['codex-context'], next); setSaved(true)
++            const next = await api.setCodexContext(sessionId, enabled, data.version)
++            client.setQueryData(['codex-context', sessionId], next); setSaved(true)
+         } catch (e) { setError(e instanceof Error ? e.message : 'Unable to save'); await query.refetch() }
+         finally { setSaving(false) }
+     }
+     return <div className="mt-3 border-t border-[var(--app-border)] pt-3 text-xs">
+         <label className="flex min-h-9 cursor-pointer items-center justify-between gap-2">
+             <span>Extended context · up to 1M</span>
+-            <input type="checkbox" role="switch" aria-label="Extended Codex context" checked={data?.requestedWindow === 1_000_000}
++            <input type="checkbox" role="switch" aria-label="Extended Codex context" checked={data?.enabled ?? false}
+                 disabled={!data || saving} onChange={e => void change(e.target.checked)} />
+         </label>
+-        <p className="text-[11px] text-[var(--app-hint)]">All Codex chats on this machine. Applies to new chats or after stopping and resuming a chat. Running turns continue unchanged.</p>
++        <p className="text-[11px] text-[var(--app-hint)]">This chat only. Stop and resume this chat to apply. Its choice is kept when resumed.</p>
+         {usable ? <p className="mt-1 text-[11px] text-[var(--app-hint)]">This model currently allows about {Math.round(usable / 1000)}k usable tokens with extended context.</p> : null}
+-        {data?.requestedWindow && data.requestedWindow !== 1_000_000 ? <p className="mt-1">Custom setting: {data.requestedWindow.toLocaleString()} tokens.</p> : null}
+-        {data?.autoCompactLimit ? <p className="mt-1">Existing auto-compaction setting: {data.autoCompactLimit.toLocaleString()} tokens.</p> : null}
+         <p className="mt-1 text-[11px] text-[var(--app-hint)]">Off restores the model default. Longer context can consume more usage.</p>
+-        {saved ? <p role="status" className="mt-1">Saved. Start a new chat or stop and resume this chat to apply.</p> : null}
++        {saved ? <p role="status" className="mt-1">Saved for this chat. Stop and resume it to apply.</p> : null}
+         {error || query.error ? <p role="alert" className="mt-1 text-red-500">{error ?? 'Could not read Codex context settings.'}</p> : null}
+     </div>
+ }
+--- a/web/src/components/AssistantChat/CodexContextToggle.test.tsx
++++ b/web/src/components/AssistantChat/CodexContextToggle.test.tsx
+@@ -5,18 +5,18 @@
+ const api = vi.hoisted(() => ({ getCodexContext: vi.fn(), setCodexContext: vi.fn() }))
+ vi.mock('@/lib/app-context', () => ({ useAppContext: () => ({ api }) }))
+ afterEach(() => { cleanup(); vi.resetAllMocks() })
+-const state = { requestedWindow: null, version: 'v1', models: [{ model: 'gpt-6-astra', maxWindow: 872000, effectivePercent: 95 }] }
+-function mount() { return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><CodexContextToggle model="gpt-6-astra" /></QueryClientProvider>) }
++const state = { enabled: false, version: 'v1', models: [{ model: 'gpt-6-astra', maxWindow: 872000, effectivePercent: 95 }] }
++function mount() { return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><CodexContextToggle sessionId="chat-a" model="gpt-6-astra" /></QueryClientProvider>) }
+ it('shows the real catalog ceiling and saves through the native setting API', async () => {
+     api.getCodexContext.mockResolvedValue(state)
+-    api.setCodexContext.mockResolvedValue({ ...state, requestedWindow: 1000000 })
++    api.setCodexContext.mockResolvedValue({ ...state, enabled: true })
+     mount()
+     await screen.findByText(/828k usable/)
+     fireEvent.click(screen.getByRole('switch'))
+     await screen.findByRole('status')
+-    expect(api.setCodexContext).toHaveBeenCalledWith(true, 'v1')
++    expect(api.setCodexContext).toHaveBeenCalledWith('chat-a', true, 'v1')
+     expect(screen.getByRole('switch')).toBeChecked()
+-    expect(screen.getByRole('status')).toHaveTextContent('stop and resume')
++    expect(screen.getByRole('status')).toHaveTextContent('Stop and resume')
+ })
+ it('keeps the observed setting after a failed save and reports the error', async () => {
+     api.getCodexContext.mockResolvedValue(state)
+--- a/web/src/components/AssistantChat/ChatModelMenu.tsx
++++ b/web/src/components/AssistantChat/ChatModelMenu.tsx
+@@ -4,6 +4,7 @@
+ type Option = { value: string | null; label: string }
+ export function ChatModelMenu(props: {
+     codex?: boolean
++    sessionId?: string
+     model: string | null
+     reasoning: string | null
+     models: Option[]
+@@ -41,7 +42,7 @@
+                         {props.efforts.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
+                     </select>
+                 </label>
+-                {props.codex ? <CodexContextToggle model={props.model} /> : null}
++                {props.codex && props.sessionId ? <CodexContextToggle sessionId={props.sessionId} model={props.model} /> : null}
+                 {props.running ? <p className="mt-2 text-[11px] text-[var(--app-hint)]">Running now: changes apply from the next turn.</p> : null}
+             </Popover.Content>
+         </Popover.Portal>
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -2348,6 +2348,7 @@
+                                 /> : null}
+                                 <ChatModelMenu
+                                     codex={agentFlavor === 'codex'}
++                                    sessionId={sessionId}
+                                     model={model === 'auto' || model === 'default' ? null : model}
+                                     reasoning={agentFlavor === 'codex' ? modelReasoningEffort : effort}
+                                     models={modelOptions}
+--- /dev/null
++++ b/shared/src/codexContextPreference.ts
+@@ -0,0 +1,45 @@
++/** Node-only per-native-thread preferences. Never writes Codex's global config. */
++import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
++import { join } from 'node:path'
++import { homedir } from 'node:os'
++import { randomUUID } from 'node:crypto'
++export type ContextPreference = { enabled: boolean; version: string }
++const validId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
++function file(id: string, home?: string) {
++    if (!validId.test(id)) throw new Error('Invalid native thread ID')
++    return join(home ?? process.env.HAPI_HOME?.replace(/^~/, homedir()) ?? join(homedir(), '.hapi'), 'codex-context', `${id}.json`)
++}
++export function readContextPreference(id: string, home?: string): ContextPreference {
++    const path = file(id, home)
++    try {
++        const value = JSON.parse(readFileSync(path, 'utf8'))
++        if (typeof value.enabled !== 'boolean' || typeof value.version !== 'string') throw new Error('Invalid context preference')
++        return value
++    } catch (e) {
++        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { enabled: false, version: '0' }
++        throw e
++    }
++}
++export function writeContextPreference(id: string, enabled: boolean, version: string, home?: string): ContextPreference {
++    const previous = readContextPreference(id, home)
++    if (previous.version !== version) throw new Error('Context preference changed. Refresh and try again.')
++    const path = file(id, home)
++    mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 })
++    const next = { enabled, version: randomUUID() }
++    const temp = `${path}.${next.version}.tmp`
++    writeFileSync(temp, JSON.stringify(next), { mode: 0o600 })
++    renameSync(temp, path)
++    return next
++}
++/** Called at the native resume boundary, including shared and dedicated runtimes. */
++export function applyContextPreference(method: string, raw: unknown, home?: string): unknown {
++    if (method !== 'thread/resume' || !raw || typeof raw !== 'object') return raw
++    const params = raw as Record<string, unknown>
++    if (typeof params.threadId !== 'string' || !validId.test(params.threadId)) return raw
++    const preference = readContextPreference(params.threadId, home)
++    if (preference.version === '0') return raw
++    const config = { ...(params.config as Record<string, unknown> ?? {}) }
++    if (preference.enabled) config.model_context_window = 1_000_000
++    else delete config.model_context_window
++    return { ...params, config }
++}

@@ -1,0 +1,120 @@
+--- a/hub/src/sync/localProcesses.ts
++++ b/hub/src/sync/localProcesses.ts
+@@ -40,14 +40,22 @@
+                 if (sessionIds.length !== 1 || threadIds.length !== 1) continue
+                 const target = bySession.get(sessionIds[0])
+                 if (!target || target.nativeId !== threadIds[0] || target.controllerPid === pid) continue
++                // Explicit opt-in for persistent browser/test infrastructure,
++                // never a basename, elapsed-time or CPU-usage inference. The
++                // marker is per process: real child jobs must unset it or set
++                // HAPI_PROCESS_ROLE=work. Unknown/ambiguous roles remain work.
++                const roles = environment.filter(value => value.startsWith('HAPI_PROCESS_ROLE='))
++                if (roles.length === 1 && roles[0] === 'HAPI_PROCESS_ROLE=helper') continue
+                 const argv = (await readFile(join(path, 'cmdline'))).toString().split('\0').filter(Boolean)
+                 if (!argv.length) continue
+                 const executable = basename(argv[0])
+                 // Infrastructure is not work even if a future runtime inherits these markers.
+                 if (/^codex(?:-|$)/.test(executable) && argv[1] === 'app-server') continue
+                 const comm = (await readFile(join(path, 'comm'), 'utf8')).trim().slice(0, 80)
+-                const script = ['bash', 'sh', 'zsh', 'python', 'python3'].includes(executable)
+-                    && argv[1] && !argv[1].startsWith('-') ? basename(argv[1]).slice(0, 100) : null
++                const scriptArgument = argv[1] && !argv[1].startsWith('-') ? argv[1] : null
++                const namesScript = ['bash', 'sh', 'zsh', 'python', 'python3'].includes(executable)
++                    || ['bun', 'node', 'nodejs'].includes(executable) && /\.(?:mjs|cjs|js|ts)$/i.test(scriptArgument ?? '')
++                const script = namesScript && scriptArgument ? basename(scriptArgument).slice(0, 100) : null
+                 const after = identity(await readFile(join(path, 'stat'), 'utf8'), pid)
+                 if (!after || before.start !== after.start || before.parent !== after.parent
+                     || (await stat(path)).uid !== uid) continue
+--- a/hub/src/sync/localProcesses.test.ts
++++ b/hub/src/sync/localProcesses.test.ts
+@@ -18,7 +18,7 @@
+     await writeFile(join(root, 'sys/kernel/random/boot_id'), boot + '\n')
+     const process = async (pid: number, options: {
+         session?: string; native?: string; parent?: number; state?: string;
+-        start?: number; argv?: string[]; comm?: string
++        start?: number; argv?: string[]; comm?: string; roles?: string[]
+     } = {}) => {
+         const dir = join(root, String(pid))
+         await mkdir(dir, { recursive: true })
+@@ -30,6 +30,7 @@
+         const env = ['PRIVATE_TEST_KEY=must-not-be-returned']
+         if (options.session !== undefined) env.push('HAPI_SESSION_ID=' + options.session)
+         if (options.native !== undefined) env.push('CODEX_THREAD_ID=' + options.native)
++        for (const role of options.roles ?? []) env.push('HAPI_PROCESS_ROLE=' + role)
+         await writeFile(join(dir, 'environ'), env.join('\0') + '\0')
+         await writeFile(join(dir, 'cmdline'), (options.argv ?? ['/usr/bin/bash', '/private/work/render-job.sh', '--secret-argument']).join('\0') + '\0')
+         await writeFile(join(dir, 'comm'), (options.comm ?? 'bash') + '\n')
+@@ -91,6 +92,73 @@
+         await f.process(103, { session: 'session-a', native: 'thread-a', argv: ['/private/project/codex', 'user-job'], comm: 'codex' })
+         const result = await scanLocalProcesses([{ sessionId: 'session-a', nativeId: 'thread-a', controllerPid: 100 }], { procRoot: f.root, uid: owned })
+         expect(jobs(result).map(job => job.pid)).toEqual([103])
++    })
++    it('excludes explicitly marked helpers while identical bun scripts and CPU jobs remain work', async () => {
++        const f = await fixture()
++        const browser = { session: 'session-a', native: 'thread-a', argv: ['/usr/bin/bun', '/tmp/hapi-graph-ports-browser.mjs'], comm: 'bun', state: 'R' }
++        await f.process(100, { ...browser, roles: ['helper'] })
++        // Same executable/script is work unless the process explicitly opts out.
++        await f.process(101, browser)
++        await f.process(102, { ...browser, argv: ['/usr/bin/bun', 'test', '/private/work/browser.test.ts'], roles: ['work'] })
++        await f.process(103, { ...browser, argv: ['/usr/bin/bun', '/private/work/cpu-render.mjs'], start: 1 })
++        const result = await f.scan()
++        expect(jobs(result).map(job => job.pid)).toEqual([101, 102, 103])
++        expect(jobs(result).map(job => job.command)).toEqual(['bun · hapi-graph-ports-browser.mjs', 'bun', 'bun · cpu-render.mjs'])
++        expect(JSON.stringify([...result])).not.toContain('HAPI_PROCESS_ROLE')
++    })
++    it('labels recognized Bun/Node script basenames without exposing paths, arguments or evaluation source', async () => {
++        const f = await fixture()
++        const cases: Array<{ executable: string; args: string[]; label: string }> = [
++            { executable: 'bun', args: ['/private/work/browser.mjs', '--secret-argument'], label: 'bun · browser.mjs' },
++            { executable: 'node', args: ['/private/work/test.js', '--secret-argument'], label: 'node · test.js' },
++            { executable: 'nodejs', args: ['/private/work/job.cjs'], label: 'nodejs · job.cjs' },
++            { executable: 'bun', args: ['/private/work/job.ts'], label: 'bun · job.ts' },
++            { executable: 'bun', args: ['run', '/private/work/job.ts'], label: 'bun' },
++            { executable: 'bun', args: ['test', '/private/work/job.test.ts'], label: 'bun' },
++            { executable: 'node', args: ['--eval', 'PRIVATE_EVALUATION_SOURCE'], label: 'node' },
++            { executable: 'bun', args: ['/private/work/unrecognized-script'], label: 'bun' }
++        ]
++        for (let i = 0; i < cases.length; i++) {
++            const item = cases[i]
++            await f.process(100 + i, { session: 'session-a', native: 'thread-a', argv: [`/usr/bin/${item.executable}`, ...item.args], comm: item.executable })
++        }
++        const result = await f.scan()
++        expect(jobs(result).map(job => job.command)).toEqual(cases.map(item => item.label))
++        const encoded = JSON.stringify([...result])
++        expect(encoded).not.toContain('/private/')
++        expect(encoded).not.toContain('--secret-argument')
++        expect(encoded).not.toContain('PRIVATE_EVALUATION_SOURCE')
++    })
++    it('counts real work below helper infrastructure when children override or unset the inherited role', async () => {
++        const f = await fixture()
++        const bound = { session: 'session-a', native: 'thread-a', comm: 'bun', argv: ['/usr/bin/bun', '/private/work/helper.mjs'] }
++        await f.process(100, { ...bound, roles: ['helper'] })
++        await f.process(101, { ...bound, parent: 100, roles: ['helper'] })
++        await f.process(102, { ...bound, parent: 101, roles: ['work'], state: 'R' })
++        await f.process(103, { ...bound, parent: 100 })
++        await f.process(104, { ...bound, parent: 100, roles: ['future-role'] })
++        await f.process(105, { ...bound, parent: 102, roles: ['work'] })
++        expect(jobs(await f.scan()).map(job => job.pid)).toEqual([102, 103, 104])
++    })
++    it('treats unknown, non-exact and ambiguous role markers as ordinary work', async () => {
++        const f = await fixture()
++        const roles = [['worker'], ['Helper'], ['helper '], ['helper-worker'], [''], ['helper', 'work'], ['helper', 'helper']]
++        for (let i = 0; i < roles.length; i++) {
++            await f.process(100 + i, { session: 'session-a', native: 'thread-a', roles: roles[i] })
++        }
++        expect(jobs(await f.scan()).map(job => job.pid)).toEqual(roles.map((_, i) => 100 + i))
++    })
++    it('keeps exact native/session, controller, UID and zombie guards for explicitly marked work', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a', roles: ['work'] })
++        await f.process(101, { session: 'session-a', native: 'wrong-thread', roles: ['work'] })
++        await f.process(102, { session: 'wrong-session', native: 'thread-a', roles: ['work'] })
++        await f.process(103, { session: 'session-a', roles: ['work'] })
++        await f.process(104, { session: 'session-a', native: 'thread-a', state: 'Z', roles: ['work'] })
++        await f.process(105, { session: 'session-a', native: 'thread-a', roles: ['work'] })
++        const targets = [{ sessionId: 'session-a', nativeId: 'thread-a', controllerPid: 100 }]
++        expect(jobs(await scanLocalProcesses(targets, { procRoot: f.root, uid: owned })).map(job => job.pid)).toEqual([105])
++        expect(jobs(await scanLocalProcesses(targets, { procRoot: f.root, uid: owned + 1 }))).toEqual([])
+     })
+     it('drops an exited or unreadable process on the next observation and leaves unrelated live jobs intact', async () => {
+         const f = await fixture()

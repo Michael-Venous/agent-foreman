@@ -1,0 +1,194 @@
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -9,9 +9,9 @@
+ export function fitNodeFrame(frame: NodeAnnotation, positions: Record<string, FramePoint>): NodeAnnotation {
+     const points = (frame.members ?? []).flatMap(id => positions[id] ? [positions[id]] : [])
+     if (frame.kind !== 'frame' || !points.length) return frame
+-    const x = Math.min(...points.map(p => p.x)) - 24, y = Math.min(...points.map(p => p.y)) - 36
+-    const width = Math.max(180, Math.max(...points.map(p => p.x + (p.width ?? NODE_SIZE.width))) + 24 - x)
+-    const height = Math.max(100, Math.max(...points.map(p => p.y + (p.height ?? NODE_SIZE.height))) + 24 - y)
++    const x = Math.min(...points.map(p => p.x)) - 12, y = Math.min(...points.map(p => p.y)) - 32
++    const width = Math.max(180, Math.max(...points.map(p => p.x + (p.width ?? NODE_SIZE.width))) + 12 - x)
++    const height = Math.max(100, Math.max(...points.map(p => p.y + (p.height ?? NODE_SIZE.height))) + 16 - y)
+     if (width > 8000 || height > 8000) throw new Error('Frame contents are too far apart. Keep them within 8000 canvas units.')
+     return { ...frame, x, y, width, height }
+ }
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -6,14 +6,14 @@
+     const initial = { A:{x:100,y:120}, B:{x:300,y:300} }
+     const first = placeInFrame([frame], 'A', initial)[0]
+     expect(first.members).toEqual(['A'])
+-    expect(first).toMatchObject({x:76,y:84,width:248,height:140})
++    expect(first).toMatchObject({x:88,y:88,width:224,height:128})
+     const expanded = fitNodeFrame({...first,members:['A','B']},initial)
+     const moved = placeInFrame([expanded], 'A', {...initial,A:{x:-200,y:-100}})[0]
+     expect(moved.members).toEqual(['B','A'])
+-    expect(moved.x).toBe(-224)
++    expect(moved.x).toBe(-212)
+     const released = placeInFrame([moved], 'A', initial, true)[0]
+     expect(released.members).toEqual(['B'])
+-    expect(released.x).toBe(276)
++    expect(released.x).toBe(288)
+ })
+ it('chooses the smallest containing frame and removes membership from the old one', () => {
+     const small = {...frame,id:'small',x:50,y:50,width:300,height:250}
+@@ -32,9 +32,9 @@
+     expect(moved.annotations.find(a=>a.id==='note')).toMatchObject({x:350,y:175})
+     expect(moved.routing?.junctions[0]).toMatchObject({x:300,y:225})
+     const bounds=moved.annotations.find(a=>a.id===parent.id)!
+-    expect(bounds.x).toBe(126)
+-    expect(bounds.x+bounds.width).toBe(654)
+-    expect(bounds.y+bounds.height).toBe(379)
++    expect(bounds.x).toBe(138)
++    expect(bounds.x+bounds.width).toBe(642)
++    expect(bounds.y+bounds.height).toBe(371)
+     const released=placeInFrame(moved.annotations,'text:note',framePoints(moved.positions,moved.annotations,moved.routing!.junctions),true)
+     expect(released[0].members).not.toContain('text:note')
+ })
+@@ -54,8 +54,8 @@
+     const points = { A: { x: 900, y: 300 }, B: { x: 1200, y: 300 }, 'text:note': { x: 100, y: 100, width: 100, height: 100 }, 'junction:dot': { x: 80, y: 80, width: 16, height: 16 } }
+     const result = placeSelectionInFrames([target], ['A', 'B'], points)[0]
+     expect(result.members).toEqual(target.members)
+-    expect(result.x).toBe(56)
+-    expect(result.x + result.width).toBe(1424)
++    expect(result.x).toBe(68)
++    expect(result.x + result.width).toBe(1412)
+ })
+ 
+ it('nests frames, moves all descendants exactly once, and refits ancestors around an inner change', () => {
+@@ -88,7 +88,7 @@
+     const points = framePoints({ A: { x: 100, y: 120 } }, [], junctions)
+     for (const id of ['A', 'junction:plain', 'junction:labelled']) {
+         const fitted = fitNodeFrame({ ...frame, members: [id] }, points)
+-        expect(points[id].y - fitted.y).toBe(36)
++        expect(points[id].y - fitted.y).toBe(32)
+         expect(fitted.y).toBeLessThan(points[id].y - 14)
+         expect(fitted.y + fitted.height).toBeGreaterThanOrEqual(points[id].y + (points[id].height ?? 80))
+     }
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -5,7 +5,7 @@
+ const COLORS = { slate: '#64748b', blue: '#3b82f6', violet: '#8b5cf6', green: '#16a34a', amber: '#d97706' } as const
+ const label = (a: NodeAnnotation) => a.kind === 'frame' ? a.text || 'Untitled frame' : a.text.split('\n')[0] || 'Text box'
+ 
+-/** Frame surfaces capture selection/move; nested frames and cards remain above them. */
++/** Frame interiors capture selection; margins capture movement; nested frames and cards remain above them. */
+ export function GraphAnnotationLayer({ annotations, selected, zoom, onSelect, onEdit, onAdjust, onContextMenu }: {
+     annotations: readonly NodeAnnotation[]; selected: string | null; zoom: number;
+     onSelect: (id: string) => void; onEdit: (annotation: NodeAnnotation) => void;
+@@ -26,13 +26,21 @@
+         style={{ left: a.x, top: a.y, width: a.width, height: a.height, zIndex: a.kind === 'frame' ? 'auto' : 3,
+             borderColor: COLORS[a.color], borderWidth: selected === a.id ? 2 : 1,
+             background: `color-mix(in srgb, ${COLORS[a.color]} ${a.kind === 'frame' ? 7 : 12}%, var(--app-bg))` }}>
+-        {a.kind === 'frame' && <button type="button" data-annotation-move={a.id} aria-label={`Select frame: ${label(a)}`} onClick={event => { if (event.detail === 0) onSelect(a.id) }}
++        {a.kind === 'frame' && <button type="button" data-annotation-select={a.id} style={{ cursor: 'default' }} aria-label={`Select frame: ${label(a)}`} onClick={event => { if (event.detail === 0) onSelect(a.id) }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
+-            className="pointer-events-auto absolute inset-0 h-full w-full cursor-move rounded-xl focus-visible:outline-2 focus-visible:outline-[var(--app-link)]" />}
++            className="pointer-events-auto absolute inset-0 h-full w-full cursor-default rounded-xl focus-visible:outline-2 focus-visible:outline-[var(--app-link)]" />}
++        {a.kind === 'frame' && <>{[
++            ['left', { left: 0, top: 0, bottom: 0, width: 12 }],
++            ['right', { right: 0, top: 0, bottom: 0, width: 12 }],
++            ['bottom', { left: 0, right: 0, bottom: 0, height: 16 }],
++            ['top', { left: 0, right: 0, top: 0, height: 32 }],
++        ].map(([side, style]) => <div key={side as string} data-frame-margin={side} data-annotation-move={a.id}
++            onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
++            className="pointer-events-auto absolute cursor-move" style={style as React.CSSProperties} />)}</>}
+         <button type="button" data-annotation-move={a.id} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+             style={{ zIndex: a.kind === 'frame' && selected === a.id ? 4 : undefined }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }} onClick={event => { if (event.detail === 0) onSelect(a.id) }} onKeyDown={event => keys(event, a)}
+-            className={`pointer-events-auto absolute inset-x-0 top-0 min-w-0 cursor-move rounded-t-xl px-3 text-left focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'min-h-6 py-1 text-xs font-semibold' : 'min-h-10 py-2 text-sm h-full overflow-hidden rounded-b-xl'}`}>
++            className={`pointer-events-auto absolute inset-x-0 top-0 min-w-0 cursor-move rounded-t-xl px-2 text-left focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'min-h-6 py-0.5 text-xs font-semibold' : 'min-h-10 py-1 text-sm h-full overflow-hidden rounded-b-xl'}`}>
+             {a.kind === 'frame' ? <span data-annotation-label={a.id} className="inline-block max-w-full truncate align-middle">{label(a)}</span> : <span data-annotation-label={a.id} className="block h-full whitespace-pre-wrap break-words leading-relaxed">{a.text || 'Text box'}</span>}
+         </button>
+         {selected === a.id && !(a.kind === 'frame' && a.members?.length) && <button type="button" data-annotation-resize={a.id} aria-label={`Resize ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -398,7 +398,7 @@
+         }
+         const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
+         const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
+-        if (!annotation) setSelectedAnnotation(null)
++        if (!annotation) setSelectedAnnotation(target.closest('[data-annotation-select]')?.getAttribute('data-annotation-select') ?? null)
+         const dotId = target.closest('[data-junction-id]')?.getAttribute('data-junction-id')
+         if (!dotId && !(boxSelection.current && selectedNodes.includes(target.closest('[data-node-id]')?.getAttribute('data-node-id') ?? ''))) { setSelectedJunction(null); setMovingJunction(null) }
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+@@ -498,7 +498,7 @@
+         }
+         if (g.kind === 'box') {
+             if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
+-            if (!g.moved) setAddMenu(null)
++            if (!g.moved) { setAddMenu(null); setSelectedAnnotation(null) }
+             g.moved = true
+             const end = toGraph(event.clientX, event.clientY)
+             const rect = { x: Math.min(g.origin.x, end.x), y: Math.min(g.origin.y, end.y), width: Math.abs(end.x - g.origin.x), height: Math.abs(end.y - g.origin.y) }
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1228,7 +1228,7 @@
+     await waitFor(()=>expect(api.editNodeVisual).toHaveBeenCalledOnce())
+     const first=api.editNodeVisual.mock.calls[0][1], beforePoint=first.positions.B
+     expect(first.annotations[0].members).toEqual(['B'])
+-    expect(first.annotations[0].x).toBe(beforePoint.x-24)
++    expect(first.annotations[0].x).toBe(beforePoint.x-12)
+     const handle=screen.getByRole('button',{name:'Move frame: Group'})
+     fireEvent.pointerDown(handle,{pointerId:2,button:0,clientX:100,clientY:100})
+     fireEvent.pointerMove(canvas,{pointerId:2,clientX:150,clientY:140})
+@@ -1360,7 +1360,7 @@
+         fireEvent.pointerUp(canvas, { pointerId: 4, clientX: 500 - 900 * k, clientY: 500 - 850 * k })
+         await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
+         const enrolled = (await api.getNodeGraph()).graph.annotations!.find(a => a.id === 'group')!
+-        expect(enrolled).toMatchObject({ x: 76, y: 114, width: 328, height: 240, members: ['text:note'] })
++        expect(enrolled).toMatchObject({ x: 88, y: 118, width: 304, height: 228, members: ['text:note'] })
+         fireEvent.click(screen.getByRole('button', { name: 'Junction 1' }))
+         openDotMenu('dot'); fireEvent.click(screen.getByRole('button', { name: 'Move junction' }))
+         const start = dotPoint('dot'), dot = screen.getByRole('button', { name: 'Junction 1' })
+@@ -1827,6 +1827,12 @@
+     const body = await screen.findByRole('button', { name: 'Select frame: Render group' }), canvas = screen.getByRole('application')
+     fireEvent.pointerDown(body, { pointerId: 2, button: 0, clientX: 250, clientY: 250 }); fireEvent.pointerUp(canvas, { pointerId: 2, clientX: 250, clientY: 250 })
+     expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
++    const callsBefore = api.editNodeAnnotation.mock.calls.length
++    fireEvent.pointerDown(body, { pointerId: 8, button: 0, clientX: 250, clientY: 250 })
++    fireEvent.pointerMove(canvas, { pointerId: 8, clientX: 350, clientY: 350 })
++    fireEvent.pointerUp(canvas, { pointerId: 8, clientX: 350, clientY: 350 })
++    expect(api.editNodeAnnotation).toHaveBeenCalledTimes(callsBefore)
++    expect(api.editNodeVisual).not.toHaveBeenCalled()
+     const title = body.parentElement!.querySelector('[data-annotation-label]')!
+     fireEvent.pointerDown(title, { pointerId: 3, button: 0, clientX: 250, clientY: 200 }); fireEvent.pointerMove(canvas, { pointerId: 3, clientX: 300, clientY: 220 }); fireEvent.pointerUp(canvas, { pointerId: 3, clientX: 300, clientY: 220 })
+     await waitFor(() => expect(api.editNodeAnnotation).toHaveBeenCalledTimes(2))
+@@ -1844,7 +1850,7 @@
+     graph.graph.annotations = fitFrames([outer, inner, note], framePoints({ A: { x: 100, y: 150 } }, [outer, inner, note], graph.graph.junctions))
+     const api = makeApi({ graph }); setup(api)
+     const body = await screen.findByRole('button', { name: 'Select frame: Outer' }), canvas = screen.getByRole('application')
+-    fireEvent.pointerDown(body, { pointerId: 9, button: 0, clientX: 150, clientY: 200 })
++    fireEvent.pointerDown(body.parentElement!.querySelector('[data-frame-margin="left"]')!, { pointerId: 9, button: 0, clientX: 150, clientY: 200 })
+     fireEvent.pointerMove(canvas, { pointerId: 9, clientX: 210, clientY: 230 }); fireEvent.pointerUp(canvas, { pointerId: 9, clientX: 210, clientY: 230 })
+     await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(1))
+     const next = (await api.getNodeGraph()).graph, a = next.nodes.find(n => n.sessionId === 'A')!, dx = a.x! - 100, dy = a.y! - 150
+@@ -2027,3 +2033,27 @@
+         expect(api.editNodeRouting).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled()
+     } finally { vi.useRealTimers() }
+ })
++
++
++it.each(['mouse', 'touch'])('box-selects cards and junctions from frame interior with %s without moving the frame', async pointerType => {
++    const graph = initial()
++    graph.graph.nodes = [{ sessionId: 'A', x: 100, y: 100, addedAt: 1 }, { sessionId: 'B', x: 800, y: 100, addedAt: 1 }]
++    graph.graph.junctions = [{ id: 'j', owner: null, x: 350, y: 150 }]
++    graph.graph.annotations = [{ id: 'f', kind: 'frame', text: 'Selection area', color: 'blue', x: 0, y: 0, width: 650, height: 400, members: ['A', 'junction:j'] }]
++    const { api, onOpenChat } = setup(makeApi({ graph }))
++    const body = await screen.findByRole('button', { name: 'Select frame: Selection area' })
++    const canvas = screen.getByRole('application'), bounds = boxBounds('A'), end = dotPoint('j')
++    vi.useFakeTimers()
++    try {
++        fireEvent.pointerDown(body, { pointerId: 92, pointerType, button: 0, clientX: bounds.left, clientY: bounds.top })
++        if (pointerType === 'touch') act(() => vi.advanceTimersByTime(550))
++        fireEvent.pointerMove(canvas, { pointerId: 92, pointerType, clientX: end.clientX + 20, clientY: end.clientY + 20 })
++        expect(screen.getByTestId('graph-selection-box')).toBeInTheDocument()
++        fireEvent.pointerUp(canvas, { pointerId: 92, pointerType, clientX: end.clientX + 20, clientY: end.clientY + 20 })
++    } finally { vi.useRealTimers() }
++    expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'true')
++    expect(screen.getByRole('button', { name: 'Junction 1' })).toHaveAttribute('aria-pressed', 'true')
++    expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-pressed', 'false')
++    expect(api.editNodeVisual).not.toHaveBeenCalled(); expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++    expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++})

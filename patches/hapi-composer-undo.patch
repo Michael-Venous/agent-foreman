@@ -1,0 +1,97 @@
+--- a/web/src/components/AssistantChat/RichComposerInput.tsx
++++ b/web/src/components/AssistantChat/RichComposerInput.tsx
+@@ -675,7 +675,7 @@
+         placeholder,
+         className,
+         autoFocus = false,
+-        onValueChange,
++        onValueChange: publishValue,
+         onMirrorChange,
+         onKeyDown,
+         onPaste,
+@@ -688,6 +688,18 @@
+     const rootRef = useRef<HTMLDivElement>(null)
+     // null until first sync/emit so mount-time `value` always paints into the DOM.
+     const lastEmittedRef = useRef<string | null>(null)
++    const historyRef = useRef([value])
++    const historyIndexRef = useRef(0)
++    const onValueChange = useCallback((next: string) => {
++        const history = historyRef.current
++        if (next !== history[historyIndexRef.current]) {
++            history.splice(historyIndexRef.current + 1)
++            history.push(next)
++            if (history.length > 200) history.shift()
++            historyIndexRef.current = history.length - 1
++        }
++        publishValue(next)
++    }, [publishValue])
+     const composingRef = useRef(false)
+     const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const hoveredChipRef = useRef<HTMLElement | null>(null)
+@@ -741,6 +753,9 @@
+ 
+     useLayoutEffect(() => {
+         if (value === lastEmittedRef.current) return
++        // A sent message or replacement draft starts a separate undo history.
++        historyRef.current = [value]
++        historyIndexRef.current = 0
+         syncFromValue(value)
+     }, [value, syncFromValue])
+ 
+@@ -1068,6 +1083,20 @@
+         if (e.nativeEvent.isComposing || composingRef.current) {
+             return
+         }
++        const undoKey = e.key.toLowerCase()
++        if ((e.ctrlKey || e.metaKey) && !e.altKey && (undoKey === 'z' || undoKey === 'y')) {
++            e.preventDefault()
++            const redo = undoKey === 'y' || e.shiftKey
++            const nextIndex = historyIndexRef.current + (redo ? 1 : -1)
++            const next = historyRef.current[nextIndex]
++            if (next !== undefined) {
++                historyIndexRef.current = nextIndex
++                syncFromValue(next)
++                onEdit?.()
++                publishValue(next)
++            }
++            return
++        }
+         if (e.key === 'Backspace' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+             const root = rootRef.current
+             if (root) {
+@@ -1103,6 +1132,8 @@
+         }
+     }, [
+         applyBackwardDelete,
++        syncFromValue,
++        publishValue,
+         emitFromDom,
+         onEdit,
+         onKeyDown,
+--- a/web/src/components/AssistantChat/RichComposerInput.test.tsx
++++ b/web/src/components/AssistantChat/RichComposerInput.test.tsx
+@@ -309,3 +309,24 @@
+         expect(serializeComposerSegments(segmentsFromEditor(editor))).toBe('hello')
+     })
+ })
++
++describe('composer undo history', () => {
++    it('undoes and redoes typing and custom newline edits', () => {
++        render(<SynchronousControlledHarness />)
++        const editor = screen.getByRole('textbox')
++        editor.focus()
++        editor.textContent = 'alpha beta'
++        placeCaret(editor.firstChild as Text, 10)
++        fireEvent.input(editor)
++        fireEvent.keyDown(editor, { key: 'Enter', ctrlKey: true })
++        expect(screen.getByTestId('controlled-value').textContent).toBe('alpha beta\n')
++        fireEvent.keyDown(editor, { key: 'z', ctrlKey: true })
++        expect(screen.getByTestId('controlled-value').textContent).toBe('alpha beta')
++        fireEvent.keyDown(editor, { key: 'z', ctrlKey: true })
++        expect(screen.getByTestId('controlled-value').textContent).toBe('alpha')
++        fireEvent.keyDown(editor, { key: 'z', ctrlKey: true, shiftKey: true })
++        expect(screen.getByTestId('controlled-value').textContent).toBe('alpha beta')
++        fireEvent.keyDown(editor, { key: 'y', ctrlKey: true })
++        expect(screen.getByTestId('controlled-value').textContent).toBe('alpha beta\n')
++    })
++})

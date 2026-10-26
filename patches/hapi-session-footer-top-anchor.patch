@@ -1,0 +1,270 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -66,12 +66,12 @@
+         setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => {
+             if (collapsed === Boolean(old?.collapsed)) return old
+             const bounds = fitSessionWindow(old?.bounds ?? initialBounds())
+-            // Keep the same center in both directions so repeated toggles don't
+-            // walk the window toward the top-left. Recover only at viewport edges.
+-            const centeredBubble = { x: bounds.x + (bounds.width - BUBBLE.width) / 2, y: bounds.y + (bounds.height - BUBBLE.height) / 2 }
+-            const bubble = fitSessionBubble(collapsed ? centeredBubble : old?.bubble ?? centeredBubble)
++            // Preserve the top-middle anchor in both directions; expansion grows
++            // down from the bubble instead of rising above it. Recover at edges.
++            const anchoredBubble = { x: bounds.x + (bounds.width - BUBBLE.width) / 2, y: bounds.y }
++            const bubble = fitSessionBubble(collapsed ? anchoredBubble : old?.bubble ?? anchoredBubble)
+             return { ...old, open: true, collapsed, bubble, bounds: collapsed ? bounds : recoverSessionWindow({
+-                ...bounds, x: bubble.x + (BUBBLE.width - bounds.width) / 2, y: bubble.y + (BUBBLE.height - bounds.height) / 2,
++                ...bounds, x: bubble.x + (BUBBLE.width - bounds.width) / 2, y: bubble.y,
+             }) }
+         }),
+         setPinnedCollapsed: (pinnedCollapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, pinnedCollapsed })),
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -1,5 +1,5 @@
+ import type { ApiClient, ManagedSession } from '@/api/client'
+-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import type { SessionSummary } from '@/types/api'
+@@ -367,13 +367,15 @@
+         dismissSessionManager: async (ids: string[]) => { for (const id of ids) records[id].dismissedAt = 2; return structuredClone(records) } }
+     const select = vi.fn()
+     render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={remote as unknown as ApiClient} sessions={chats} onSelect={select} /></I18nProvider></QueryClientProvider>)
+-    open(); fireEvent.click(await screen.findByRole('button', { name: '+ Add chats' }))
++    open(); fireEvent.click(await screen.findByRole('button', { name: 'Add chats' }))
+     fireEvent.change(screen.getByRole('searchbox', { name: 'Search chats to add' }), { target: { value: 'claude' } })
+     expect(screen.queryByRole('button', { name: 'Add Codex to Session Manager' })).toBeNull()
+     fireEvent.click(screen.getByRole('button', { name: 'Add Claude to Session Manager' }))
+     await screen.findByRole('button', { name: 'Open Claude' })
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Add Claude to Session Manager' })).toBeNull())
++    fireEvent.keyDown(screen.getByRole('searchbox', { name: 'Search chats to add' }), { key: 'Escape' })
+     fireEvent.click(screen.getByRole('button', { name: 'Dismiss Claude from Session Manager' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Add chats' }))
+     fireEvent.click(await screen.findByRole('button', { name: 'Add Claude to Session Manager' }))
+     await screen.findByRole('button', { name: 'Open Claude' })
+     expect(add).toHaveBeenCalledTimes(2)
+@@ -404,13 +406,17 @@
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
+ 
+-it('keeps the plain Session Manager title even when the hub has a named workspace', async () => {
++it('tracks the active workspace in the Session Manager title', async () => {
+     const graphApi = { ...controls, getNodeGraph: vi.fn(async () => ({ activeWorkspaceId: 'p1', overseer: null, graph: { workspaceId: 'p1', nodes: [], edges: [] },
+         workspaces: [{ id: 'default', name: 'Default', kind: 'default', createdAt: 1, updatedAt: 1 }, { id: 'p1', name: 'Research', kind: 'preset', createdAt: 2, updatedAt: 2 }] })) } as unknown as ApiClient
+-    render(<QueryClientProvider client={new QueryClient()}><I18nProvider><SessionManagerButton api={graphApi} sessions={[]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
++    const client = new QueryClient()
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={graphApi} sessions={[]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
+     open()
+-    expect(await screen.findByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
++    expect(await screen.findByText('Session Manager · Research')).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Move Session Manager' })).toBeInTheDocument()
++    const graph = await graphApi.getNodeGraph()
++    act(() => client.setQueryData(['node-graph'], { ...graph, activeWorkspaceId: 'default' }))
++    expect(await screen.findByText('Session Manager · Default')).toBeInTheDocument()
+ })
+ 
+ 
+@@ -466,7 +472,7 @@
+     expect(trigger).toHaveAttribute('aria-pressed', 'false')
+     expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
+     expect(screen.queryByRole('button', { name: 'Active' })).toBeNull()
+-    expect(screen.getByRole('separator', { name: 'Session list' })).toBeInTheDocument()
++    expect(screen.queryByRole('separator', { name: 'Session list' })).not.toBeInTheDocument()
+     openFilters()
+     const filters = screen.getByRole('group', { name: 'Session filters' })
+     expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBe(window)
+@@ -509,3 +515,45 @@
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++
++it.each([false, true])('keeps the compact footer outside list scrolling (embedded=%s)', async embedded => {
++    const client = new QueryClient(), add = vi.fn()
++    const localApi = { ...controls, addSessionManager: add } as unknown as ApiClient
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={localApi}
++        sessions={[session('Codex')]} onSelect={vi.fn()} embedded={embedded} hideTrigger={embedded} /></I18nProvider></QueryClientProvider>)
++    if (!embedded) open()
++    await screen.findByRole('button', { name: 'Open Codex' })
++    const list = screen.getByLabelText('Session Manager sessions')
++    expect(within(screen.getByRole('button', { name: 'Session Manager filters' }).closest('header')!).getByText('Session Manager')).toBeInTheDocument()
++    const footer = screen.getByTestId('session-manager-footer')
++    const palette = within(footer).getByRole('toolbar', { name: 'Session Manager actions' })
++    expect(list).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto')
++    expect(list.parentElement).toHaveClass('min-h-0', 'flex-1', 'overflow-hidden')
++    expect(list.nextElementSibling).toBe(footer)
++    expect(footer).toHaveClass('shrink-0', 'pr-7')
++    expect(palette).toHaveClass('w-fit', 'rounded-lg', 'border', 'p-1')
++    expect(palette).toHaveTextContent('1 active · 1 listed')
++    const addButton = within(palette).getByRole('button', { name: 'Add chats' })
++    const clearButton = within(palette).getByRole('button', { name: 'Clear finished' })
++    for (const button of [addButton, clearButton]) {
++        expect(button.textContent).toBe('')
++        expect(button).toHaveClass('h-8', 'w-8')
++        expect(button).toHaveAttribute('title', button.getAttribute('aria-label'))
++    }
++    fireEvent.click(addButton)
++    const picker = screen.getByRole('group', { name: 'Add chats to Session Manager' })
++    expect(footer).not.toContainElement(picker)
++    expect(screen.getByTestId('session-manager-footer')).toBe(footer)
++    expect(list.nextElementSibling).toBe(footer)
++    fireEvent.keyDown(within(picker).getByRole('searchbox'), { key: 'Escape' })
++    await waitFor(() => expect(screen.queryByRole('group', { name: 'Add chats to Session Manager' })).toBeNull())
++    expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++    expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
++    chooseFilter('Inactive')
++    expect(screen.getByText('No matching sessions.')).toBeInTheDocument()
++    expect(palette).toHaveTextContent('0 of 1 shown')
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++    expect(add).not.toHaveBeenCalled()
++})
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,3 +1,4 @@
++import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react'
+@@ -46,6 +47,9 @@
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+     const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+     const { open, collapsed, pinnedCollapsed = false, setPinnedCollapsed } = useSessionManagerWindow()
++    const { data: graph } = useNodeGraph(props.api, Boolean(props.embedded || (open && !collapsed)))
++    const workspaceName = activeWorkspaceName(graph)
++    const title = workspaceName ? `Session Manager · ${workspaceName}` : 'Session Manager'
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+     const [showAdd, setShowAdd] = useState(false)
+@@ -67,29 +71,9 @@
+     const Frame = props.embedded ? EmbeddedFrame : SessionManagerWindow
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+-        {(props.embedded || open) && <Frame count={rows.length} title="Session Manager" headerActions={<SessionManagerFilters activity={activityFilter} managed={managedOnly} onActivity={setActivityFilter} onManaged={setManagedOnly} />}>
+-            <div className="flex shrink-0 items-center gap-2 text-xs text-[var(--app-hint)]">
+-                <span className="min-w-0 flex-1 truncate">{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
+-                {props.api?.addSessionManager && <button type="button" aria-expanded={showAdd} onClick={() => setShowAdd(value => !value)} className="min-h-8 shrink-0 text-[var(--app-link)]">{showAdd ? 'Done' : '+ Add chats'}</button>}
+-                <button type="button" disabled={clearing || adding !== null || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-8 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+-            </div>
+-            <div role="separator" aria-label="Session list" className="h-px shrink-0 bg-[var(--app-border)]" />
+-            {showAdd && <div role="group" aria-label="Add chats to Session Manager" className="shrink-0 rounded-lg border border-[var(--app-border)] p-2">
+-                <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)}
+-                    className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
+-                <div className="max-h-48 overflow-y-auto overscroll-contain">
+-                    {addCandidates.map(session => <button key={session.id} type="button" disabled={adding !== null || clearing} aria-label={`Add ${getSessionTitle(session)} to Session Manager`}
+-                        onClick={async () => { if (await add(session.id)) { setActivityFilter('all'); setManagedOnly(false); setPinnedCollapsed(false) } }}
+-                        className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
+-                        <span className="min-w-0 flex-1"><span className="block truncate text-sm">{getSessionTitle(session)}</span>
+-                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{session.metadata?.flavor ?? 'claude'} · {session.metadata?.path ?? ''}</span></span>
+-                        <span aria-hidden="true" className="shrink-0 text-[var(--app-link)]">{adding === session.id ? '…' : '+'}</span>
+-                    </button>)}
+-                    {!addCandidates.length && <p className="p-2 text-xs text-[var(--app-hint)]">{props.sessions ? 'No chats to add.' : 'Loading chats…'}</p>}
+-                </div>
+-            </div>}
++        {(props.embedded || open) && <Frame count={rows.length} title={title} headerActions={<SessionManagerFilters activity={activityFilter} managed={managedOnly} onActivity={setActivityFilter} onManaged={setManagedOnly} />}>
+             {listError && <p role="alert" className="text-xs text-[var(--app-badge-error-text)]">{listError}</p>}
+-            <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
++            <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {pinnedCount > 0 && <button type="button" aria-label="Pinned sessions" aria-expanded={!pinnedCollapsed}
+                     onClick={() => setPinnedCollapsed(!pinnedCollapsed)} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-2 text-left text-xs font-medium text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">
+                     <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={`h-3.5 w-3.5 shrink-0 transition-transform ${pinnedCollapsed ? '-rotate-90' : ''}`}><path d="m4 6 4 4 4-4" /></svg>
+@@ -132,6 +116,37 @@
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+             </div>
++            <div className="shrink-0 pr-7 pt-1" data-testid="session-manager-footer">
++                <div role="toolbar" aria-label="Session Manager actions" className="flex w-fit max-w-full items-center gap-1 rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 text-xs text-[var(--app-hint)] shadow-sm">
++                    <span className="mx-1 min-w-0 truncate">{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
++                    {props.api?.addSessionManager && <Popover.Root open={showAdd} onOpenChange={setShowAdd}>
++                        <Popover.Trigger asChild><button type="button" aria-label="Add chats" title="Add chats" aria-expanded={showAdd} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">
++                            <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><path d="M10 4v12M4 10h12" /></svg>
++                        </button></Popover.Trigger>
++                        <Popover.Portal><Popover.Content side="top" align="start" sideOffset={8} collisionPadding={8} aria-label="Add chats" className="z-[60] max-h-[var(--radix-popover-content-available-height)] w-80 max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-xl rounded-lg"
++                            onEscapeKeyDown={event => { event.stopPropagation(); setShowAdd(false) }}
++                            onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setShowAdd(false) } }}>
++                            <div role="group" aria-label="Add chats to Session Manager" className="rounded-lg border border-[var(--app-border)] p-2">
++                                <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)}
++                                    className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                                <div className="max-h-48 overflow-y-auto overscroll-contain">
++                                    {addCandidates.map(session => <button key={session.id} type="button" disabled={adding !== null || clearing} aria-label={`Add ${getSessionTitle(session)} to Session Manager`}
++                                        onClick={async () => { if (await add(session.id)) { setActivityFilter('all'); setManagedOnly(false); setPinnedCollapsed(false) } }}
++                                        className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
++                                        <span className="min-w-0 flex-1"><span className="block truncate text-sm">{getSessionTitle(session)}</span>
++                                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{session.metadata?.flavor ?? 'claude'} · {session.metadata?.path ?? ''}</span></span>
++                                        <span aria-hidden="true" className="shrink-0 text-[var(--app-link)]">{adding === session.id ? '…' : '+'}</span>
++                                    </button>)}
++                                    {!addCandidates.length && <p className="p-2 text-xs text-[var(--app-hint)]">{props.sessions ? 'No chats to add.' : 'Loading chats…'}</p>}
++                                </div>
++                            </div>
++                        </Popover.Content></Popover.Portal>
++                    </Popover.Root>}
++                    <button type="button" aria-label="Clear finished" title="Clear finished" disabled={clearing || adding !== null || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">
++                        <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10M9 8v6M11 8v6" /></svg>
++                    </button>
++                </div>
++            </div>
+         </Frame>}
+     </>
+ }
+@@ -178,7 +193,7 @@
+ 
+ /** Popup-window page body: edge to edge, no window chrome of its own. */
+ function EmbeddedFrame({ children, title, headerActions }: { children: ReactNode; count?: number; title?: ReactNode; headerActions?: ReactNode }) {
+-    return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome text-sm font-semibold"><span className="min-w-0 flex-1 truncate">{title ?? 'Session Manager'}</span>{headerActions}</header><div className="flex min-h-0 flex-1 flex-col gap-1 overflow-auto px-3 py-1">{children}</div></div>
++    return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome text-sm font-semibold"><span className="min-w-0 flex-1 truncate">{title ?? 'Session Manager'}</span>{headerActions}</header><div className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-1">{children}</div></div>
+ }
+ 
+ export function SessionManagerLauncher({ count }: { count: number }) {
+diff --git a/web/src/components/SessionManagerWindow.test.tsx b/web/src/components/SessionManagerWindow.test.tsx
+--- a/web/src/components/SessionManagerWindow.test.tsx
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -88,7 +88,7 @@
+ it('collapses, drags without expanding, expands on tap and closes from the bubble', async () => {
+     setup(); await open(); const original = geometry(); await collapse()
+     expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+-    expect(bubblePosition()).toEqual({ x: original.x + (original.width - 96) / 2, y: original.y + (original.height - 44) / 2 })
++    expect(bubblePosition()).toEqual({ x: original.x + (original.width - 96) / 2, y: original.y })
+     const handle = screen.getByRole('button', { name: 'Expand Session Manager' }), before = bubblePosition()
+     fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 1100, clientY: 750 })
+     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 900, clientY: 650 })
+@@ -98,7 +98,7 @@
+     fireEvent.pointerDown(handle, { pointerId: 2, button: 0, clientX: 900, clientY: 650 })
+     fireEvent.pointerUp(handle, { pointerId: 2 }); fireEvent.click(handle, { detail: 1 })
+     await screen.findByRole('dialog', { name: 'Session Manager' }); expect(geometry()).toEqual({ ...original, x: original.x - 200, y: 8 })
+-    await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: 8 + (original.height - 44) / 2 })
++    await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: 8 })
+     fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+     await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
+     await open(); expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+@@ -106,7 +106,7 @@
+ it.each([
+     { viewportWidth: 1200, bounds: { x: 220, y: 200, width: 480, height: 400 } },
+     { viewportWidth: 390, bounds: { x: 40, y: 160, width: 300, height: 300 } },
+-])('expands around the bubble center without cumulative drift at viewport width $viewportWidth', async ({ viewportWidth, bounds }) => {
++])('expands from the bubble top middle without cumulative drift at viewport width $viewportWidth', async ({ viewportWidth, bounds }) => {
+     vi.stubGlobal('innerWidth', viewportWidth)
+     const client = new QueryClient()
+     client.setQueryData(['session-manager-window'], { open: true, collapsed: false, bounds })
+@@ -115,7 +115,7 @@
+     await collapse()
+     const bubble = bubblePosition()
+     expect(bubble.x + 48).toBe(bounds.x + bounds.width / 2)
+-    expect(bubble.y + 22).toBe(bounds.y + bounds.height / 2)
++    expect(bubble.y).toBe(bounds.y)
+     fireEvent.keyDown(screen.getByRole('button', { name: 'Expand Session Manager' }), { key: 'ArrowRight' })
+     fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
+     await screen.findByRole('dialog', { name: 'Session Manager' })
+diff --git a/web/src/components/SessionManagerWindow.tsx b/web/src/components/SessionManagerWindow.tsx
+--- a/web/src/components/SessionManagerWindow.tsx
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -13,5 +13,5 @@
+ }
+ 
+ export function SessionManagerWindow({ children, count = 0, title, headerActions }: { children: ReactNode; count?: number; title?: ReactNode; headerActions?: ReactNode }) {
+-    return <FloatingWindow config={SESSION_MANAGER_WINDOW} title={title} count={count} headerActions={headerActions} bodyClassName="flex min-h-0 flex-1 flex-col gap-1 overflow-auto px-3 pt-1 pb-7">{children}</FloatingWindow>
++    return <FloatingWindow config={SESSION_MANAGER_WINDOW} title={title} count={count} headerActions={headerActions} bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-1">{children}</FloatingWindow>
+ }

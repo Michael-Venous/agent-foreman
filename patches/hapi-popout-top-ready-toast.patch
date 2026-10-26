@@ -1,0 +1,77 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -23,11 +23,11 @@
+     // Used for returning to the selected chat with a compact bubble on mobile.
+     return narrow || mobileDevice()
+ }
+-// Leave 5% visible at each edge. The launcher remains available to close it.
++// Allow 95% offscreen at the sides/bottom, but never hide the header above the viewport.
+ function fitPosition(position: Position, size: { width: number; height: number }, view = viewport()): Position {
+     return {
+         x: Math.max(view.x - size.width * .95, Math.min(position.x, view.x + view.width - size.width * .05)),
+-        y: Math.max(view.y - size.height * .95, Math.min(position.y, view.y + view.height - size.height * .05)),
++        y: Math.max(view.y, Math.min(position.y, view.y + view.height - size.height * .05)),
+     }
+ }
+ export function fitSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
+@@ -40,7 +40,7 @@
+     return fitPosition(position, BUBBLE, view)
+ }
+ // Automatic recovery is separate from manual placement: drag/resize still permits
+-// 95% offscreen. Explicit reopen/expand and a changed viewport restore the controls.
++// 95% offscreen at the sides/bottom. Reopen/expand and viewport changes restore controls.
+ export function recoverSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
+     const fitted = fitSessionWindow(bounds, view)
+     return { ...fitted,
+diff --git a/web/src/components/SessionManagerWindow.test.tsx b/web/src/components/SessionManagerWindow.test.tsx
+--- a/web/src/components/SessionManagerWindow.test.tsx
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -69,7 +69,7 @@
+     expect(geometry().width).toBe(before.width)
+ 
+ })
+-it('allows 95% offscreen while retaining a visible edge on narrow and keyboard-sized viewports', () => {
++it('keeps the top reachable while allowing 95% offscreen at the sides and bottom', () => {
+     for (const view of [{ x: 0, y: 0, width: 390, height: 844 }, { x: 5, y: 100, width: 230, height: 180 }]) {
+         const fitted = fitSessionWindow({ x: -999, y: 9999, width: 2000, height: 1500 }, view)
+         expect(fitted.width).toBeLessThanOrEqual(view.width - 16)
+@@ -78,7 +78,8 @@
+         expect(fitted.y).toBeCloseTo(view.y + view.height - fitted.height * .05)
+         const opposite = fitSessionWindow({ ...fitted, x: 9999, y: -9999 }, view)
+         expect(opposite.x).toBeCloseTo(view.x + view.width - fitted.width * .05)
+-        expect(opposite.y).toBeCloseTo(view.y - fitted.height * .95)
++        expect(opposite.y).toBe(view.y)
++        expect(fitSessionBubble({ x: 20, y: -9999 }, view).y).toBe(view.y)
+     }
+ })
+ 
+@@ -92,7 +93,7 @@
+     const handle = screen.getByRole('button', { name: 'Expand Session Manager' }), before = bubblePosition()
+     fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 1100, clientY: 750 })
+     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 900, clientY: 650 })
+-    await waitFor(() => expect(bubblePosition()).toEqual({ x: before.x - 200, y: before.y - 100 }))
++    await waitFor(() => expect(bubblePosition()).toEqual({ x: before.x - 200, y: Math.max(0, before.y - 100) }))
+     fireEvent.pointerUp(handle, { pointerId: 1 }); fireEvent.click(handle, { detail: 1 })
+     expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+     fireEvent.pointerDown(handle, { pointerId: 2, button: 0, clientX: 900, clientY: 650 })
+@@ -163,7 +164,7 @@
+     fireEvent.pointerMove(title, { pointerId: 1, clientX: -1000, clientY: -1000 })
+     fireEvent.pointerUp(title, { pointerId: 1 })
+     await waitFor(() => expect(geometry().x).toBe(-456))
+-    expect(geometry().y).toBe(-532)
++    expect(geometry().y).toBe(0)
+     await collapse()
+     fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+     await open()
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -388,6 +388,7 @@
+     }, [t])
+ 
+     const handleToast = useCallback((event: ToastEvent) => {
++        if (event.data.title.trim() === 'Ready for input') return
+         const localized = translateIncomingToast(event.data.title, event.data.body)
+         addToast({
+             title: localized.title,

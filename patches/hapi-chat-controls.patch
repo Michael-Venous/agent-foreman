@@ -1,0 +1,283 @@
+diff --git a/web/src/components/AssistantChat/ChatModelMenu.tsx b/web/src/components/AssistantChat/ChatModelMenu.tsx
+index 31dbdf1..02fc037 100644
+--- a/web/src/components/AssistantChat/ChatModelMenu.tsx
++++ b/web/src/components/AssistantChat/ChatModelMenu.tsx
+@@ -7,6 +7,8 @@ export function ChatModelMenu(props: {
+     models: Option[]
+     efforts: Option[]
+     disabled: boolean
++    /** A turn is running: changes are accepted and take effect from the next turn. */
++    running?: boolean
+     onModel: (value: string | null) => void
+     onReasoning: (value: string | null) => void
+ }) {
+@@ -37,6 +39,7 @@ export function ChatModelMenu(props: {
+                         {props.efforts.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
+                     </select>
+                 </label>
++                {props.running ? <p className="mt-2 text-[11px] text-[var(--app-hint)]">Running now: changes apply from the next turn.</p> : null}
+             </Popover.Content>
+         </Popover.Portal>
+     </Popover.Root>
+diff --git a/web/src/components/AssistantChat/ChatPermissionMenu.tsx b/web/src/components/AssistantChat/ChatPermissionMenu.tsx
+new file mode 100644
+index 0000000..f338ada
+--- /dev/null
++++ b/web/src/components/AssistantChat/ChatPermissionMenu.tsx
+@@ -0,0 +1,61 @@
++import * as Popover from '@radix-ui/react-popover'
++import type { PermissionMode, PermissionModeOption } from '@hapi/protocol'
++
++const DESCRIPTIONS: Partial<Record<PermissionMode, string>> = {
++    default: 'Asks before commands and edits',
++    acceptEdits: 'Edits files without asking; asks for commands',
++    plan: 'Plans only; makes no changes',
++    'read-only': 'Reads files only; asks to change anything',
++    bypassPermissions: 'Full access, never asks',
++    yolo: 'Full access, never asks',
++}
++const TONE_CLASS: Record<PermissionModeOption['tone'], string> = {
++    neutral: 'text-[var(--app-fg)]',
++    info: 'text-[var(--app-link)]',
++    warning: 'text-[var(--app-badge-warning-text)]',
++    danger: 'text-red-600',
++}
++
++/** Per-chat permission mode, always visible in the composer; works mid-turn. */
++export function ChatPermissionMenu(props: {
++    mode: PermissionMode
++    options: PermissionModeOption[]
++    disabled: boolean
++    running: boolean
++    onChange: (mode: PermissionMode) => void
++}) {
++    const current = props.options.find(option => option.mode === props.mode)
++    const label = current?.label ?? props.mode
++    return <Popover.Root>
++        <Popover.Trigger asChild>
++            <button type="button" aria-label={`Permissions: ${label}`} disabled={props.disabled}
++                className={`flex h-11 max-w-[5.5rem] shrink-0 items-center gap-1 rounded-lg px-1.5 text-xs font-medium hover:bg-[var(--app-subtle-bg)] disabled:opacity-50 ${TONE_CLASS[current?.tone ?? 'neutral']}`}>
++                <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
++                    <path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z" />
++                </svg>
++                <span className="truncate">{label}</span>
++            </button>
++        </Popover.Trigger>
++        <Popover.Portal>
++            <Popover.Content side="top" align="start" sideOffset={8} collisionPadding={12} aria-label="Permissions"
++                className="z-[100] w-72 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-2 shadow-xl">
++                <div className="px-2 pb-1 pt-1 text-xs font-medium text-[var(--app-hint)]">Permissions for this chat</div>
++                <div role="radiogroup" aria-label="Permission mode" className="flex flex-col">
++                    {props.options.map(option => (
++                        <Popover.Close asChild key={option.mode}>
++                            <button type="button" role="radio" aria-checked={option.mode === props.mode}
++                                onClick={() => { if (option.mode !== props.mode) props.onChange(option.mode) }}
++                                className="flex min-h-11 w-full flex-col justify-center rounded-lg px-2 py-1.5 text-left hover:bg-[var(--app-subtle-bg)]">
++                                <span className={`flex items-center gap-2 text-sm ${option.mode === props.mode ? 'font-semibold' : ''} ${TONE_CLASS[option.tone]}`}>
++                                    {option.label}{option.mode === props.mode ? <span aria-hidden="true">✓</span> : null}
++                                </span>
++                                {DESCRIPTIONS[option.mode] ? <span className="text-[11px] text-[var(--app-hint)]">{DESCRIPTIONS[option.mode]}</span> : null}
++                            </button>
++                        </Popover.Close>
++                    ))}
++                </div>
++                {props.running ? <p className="px-2 pt-2 text-[11px] text-[var(--app-hint)]">Running now: the new mode applies to the agent's next actions.</p> : null}
++            </Popover.Content>
++        </Popover.Portal>
++    </Popover.Root>
++}
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index 767ca58..a0892be 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -472,8 +472,41 @@ describe('compact chat model menu', () => {
+         fireEvent.change(screen.getByRole('combobox', {name:'Reasoning'}), {target:{value:'high'}})
+         expect(onModelReasoningEffortChange).toHaveBeenCalledWith('high')
+     })
+-    it('disables the compact control during a running turn', () => {
+-        renderComposer('claude', {compactModelControls:true, thinking:true})
++    it('keeps model controls usable during a running turn and says they apply next turn', () => {
++        const onModelChange = vi.fn()
++        renderComposer('claude', {compactModelControls:true, thinking:true, onModelChange,
++            availableModelOptions:[{value:'claude-opus-5-5',label:'Opus 5.5'}, {value:'claude-sonnet-5-5',label:'Sonnet 5.5'}]})
++        const trigger = screen.getByRole('button', {name:/Model and reasoning:/})
++        expect(trigger).toBeEnabled()
++        fireEvent.click(trigger)
++        expect(screen.getByText(/changes apply from the next turn/)).toBeInTheDocument()
++        fireEvent.change(screen.getByRole('combobox', {name:'Model'}), {target:{value:'claude-sonnet-5-5'}})
++        expect(onModelChange).toHaveBeenCalledWith('claude-sonnet-5-5')
++    })
++    it('still disables model controls for an inactive chat', () => {
++        renderComposer('claude', {compactModelControls:true, active:false})
+         expect(screen.getByRole('button', {name:/Model and reasoning:/})).toBeDisabled()
++        expect(screen.getByRole('button', {name:/Permissions:/})).toBeDisabled()
++    })
++    it('shows per-chat permissions beside the model and changes them, even mid-turn', () => {
++        const onPermissionModeChange = vi.fn()
++        renderComposer('claude', {compactModelControls:true, thinking:true, permissionMode:'bypassPermissions', onPermissionModeChange})
++        const trigger = screen.getByRole('button', {name:'Permissions: Yolo'})
++        expect(trigger).toBeEnabled()
++        expect(trigger.compareDocumentPosition(screen.getByRole('button', {name:/Model and reasoning:/})) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++        fireEvent.click(trigger)
++        expect(screen.getByRole('radio', {name:/Yolo/})).toHaveAttribute('aria-checked', 'true')
++        expect(screen.getByText(/applies to the agent's next actions/)).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('radio', {name:/^Default/}))
++        expect(onPermissionModeChange).toHaveBeenCalledWith('default')
++    })
++    it('offers Codex native permission modes without Safe Yolo for shared sessions', () => {
++        const onPermissionModeChange = vi.fn()
++        renderComposer('codex', {compactModelControls:true, permissionMode:'yolo', onPermissionModeChange, concurrentClients:true})
++        fireEvent.click(screen.getByRole('button', {name:'Permissions: Yolo'}))
++        const modes = screen.getAllByRole('radio').map(r => r.textContent)
++        expect(modes.some(m => /Safe Yolo/.test(m ?? ''))).toBe(false)
++        fireEvent.click(screen.getByRole('radio', {name:/Read Only/}))
++        expect(onPermissionModeChange).toHaveBeenCalledWith('read-only')
+     })
+ })
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index c151fdd..5ebec83 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -1,4 +1,5 @@
+ import { ChatModelMenu } from './ChatModelMenu'
++import { ChatPermissionMenu } from './ChatPermissionMenu'
+ import {
+     getCodexCollaborationModeOptions,
+     getCopilotAgentModeOptions,
+@@ -2337,15 +2338,26 @@ export function HappyComposer(props: {
+                         ) : null}
+ 
+                         <ComposerButtons
+-                            modelMenu={props.compactModelControls && (agentFlavor === 'claude' || agentFlavor === 'codex') ? <ChatModelMenu
+-                                model={model === 'auto' || model === 'default' ? null : model}
+-                                reasoning={agentFlavor === 'codex' ? modelReasoningEffort : effort}
+-                                models={modelOptions}
+-                                efforts={agentFlavor === 'codex' ? codexReasoningEffortOptions : claudeEffortOptions}
+-                                disabled={thinking || modelEffortControlsDisabled}
+-                                onModel={handleModelChange}
+-                                onReasoning={agentFlavor === 'codex' ? handleModelReasoningEffortChange : handleEffortChange}
+-                            /> : undefined}
++                            modelMenu={props.compactModelControls && (agentFlavor === 'claude' || agentFlavor === 'codex') ? <>
++                                {showPermissionSettings ? <ChatPermissionMenu
++                                    mode={permissionMode}
++                                    options={permissionModeOptions}
++                                    disabled={controlsDisabled}
++                                    running={Boolean(thinking)}
++                                    onChange={handlePermissionChange}
++                                /> : null}
++                                <ChatModelMenu
++                                    model={model === 'auto' || model === 'default' ? null : model}
++                                    reasoning={agentFlavor === 'codex' ? modelReasoningEffort : effort}
++                                    models={modelOptions}
++                                    efforts={agentFlavor === 'codex' ? codexReasoningEffortOptions : claudeEffortOptions}
++                                    // Runtimes accept changes mid-turn and apply them from the next turn.
++                                    disabled={modelEffortControlsDisabled}
++                                    running={Boolean(thinking)}
++                                    onModel={handleModelChange}
++                                    onReasoning={agentFlavor === 'codex' ? handleModelReasoningEffortChange : handleEffortChange}
++                                />
++                            </> : undefined}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
+                             showSettingsButton={showSettingsButton}
+diff --git a/web/src/components/AssistantChat/messages/UserMessage.tsx b/web/src/components/AssistantChat/messages/UserMessage.tsx
+index 537b54b..79ebc03 100644
+--- a/web/src/components/AssistantChat/messages/UserMessage.tsx
++++ b/web/src/components/AssistantChat/messages/UserMessage.tsx
+@@ -8,6 +8,32 @@ import { CliOutputBlock } from '@/components/CliOutputBlock'
+ import { getConversationMessageAnchorId } from '@/chat/outline'
+ import { MessageActions } from '@/components/AssistantChat/messages/MessageActions'
+ import { useTranslation } from '@/lib/use-translation'
++import { useState } from 'react'
++import { parseSupervisorBatch, type SupervisorBatch } from '@/components/AssistantChat/messages/supervisorBatch'
++
++function SupervisorBatchMessage(props: { batch: SupervisorBatch; text: string; elementId: string }) {
++    const [open, setOpen] = useState(false)
++    const { count, kinds } = props.batch
++    const summary = `Supervisor update${count === null ? '' : ` · ${count} event${count === 1 ? '' : 's'}`}${kinds.length ? ` · ${kinds.slice(0, 3).join(', ')}${kinds.length > 3 ? '…' : ''}` : ''}`
++    return (
++        <MessagePrimitive.Root id={props.elementId} data-hapi-message-role="user" data-supervisor-batch className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full">
++            <button
++                type="button"
++                aria-expanded={open}
++                onClick={() => setOpen(value => !value)}
++                className="flex max-w-full items-center gap-1.5 rounded-md py-1 text-xs text-[var(--app-hint)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
++            >
++                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={open ? 'rotate-90 transition-transform' : 'transition-transform'}>
++                    <polyline points="9 18 15 12 9 6" />
++                </svg>
++                <span className="truncate">{summary}</span>
++            </button>
++            {open ? (
++                <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-[var(--app-border)] bg-[var(--app-subtle-bg)] p-2 text-[11px] text-[var(--app-hint)]">{props.text}</pre>
++            ) : null}
++        </MessagePrimitive.Root>
++    )
++}
+ 
+ export function HappyUserMessage() {
+     const ctx = useHappyChatContext()
+@@ -92,6 +118,9 @@ export function HappyUserMessage() {
+         )
+     }
+ 
++    const supervisorBatch = parseSupervisorBatch(text)
++    if (supervisorBatch) return <SupervisorBatchMessage batch={supervisorBatch} text={text} elementId={elementId} />
++
+     const hasText = text.length > 0
+     const hasAttachments = attachments && attachments.length > 0
+ 
+diff --git a/web/src/components/AssistantChat/messages/supervisorBatch.test.ts b/web/src/components/AssistantChat/messages/supervisorBatch.test.ts
+new file mode 100644
+index 0000000..e92c41b
+--- /dev/null
++++ b/web/src/components/AssistantChat/messages/supervisorBatch.test.ts
+@@ -0,0 +1,22 @@
++import { describe, expect, it } from 'vitest'
++import { parseSupervisorBatch } from './supervisorBatch'
++
++describe('parseSupervisorBatch', () => {
++    it('recognizes the legacy JSON batch and summarizes event kinds', () => {
++        const text = '[Supervisor event batch; not a new user instruction]\n' + JSON.stringify([
++            { id: 1, kind: 'finished' }, { id: 2, kind: 'manual-hold' }, { id: 3, kind: 'finished' },
++        ]) + '\nInspect status/results, honor pauses and manual holds.'
++        expect(parseSupervisorBatch(text)).toEqual({ count: 3, kinds: ['finished', 'manual-hold'] })
++    })
++    it('recognizes the compact batch format', () => {
++        const text = '[supervisor update; not a user instruction] 2 events; ack 101,102\n#101 finished · SampleFluid · claude:be24 · task=x\n#102 input-required · SampleSpace · codex:475e'
++        expect(parseSupervisorBatch(text)).toEqual({ count: 2, kinds: ['finished', 'input-required'] })
++    })
++    it('leaves real user messages alone, including ones that mention the supervisor', () => {
++        expect(parseSupervisorBatch('Continue progress on SampleFluid')).toBeNull()
++        expect(parseSupervisorBatch('Why does the [Supervisor event batch] repeat?')).toBeNull()
++    })
++    it('still collapses a recognized batch whose body cannot be parsed', () => {
++        expect(parseSupervisorBatch('[Supervisor event batch; not a new user instruction]\nnot json')).toEqual({ count: null, kinds: [] })
++    })
++})
+diff --git a/web/src/components/AssistantChat/messages/supervisorBatch.ts b/web/src/components/AssistantChat/messages/supervisorBatch.ts
+new file mode 100644
+index 0000000..0e58884
+--- /dev/null
++++ b/web/src/components/AssistantChat/messages/supervisorBatch.ts
+@@ -0,0 +1,20 @@
++/** Manager supervisor wake-ups: machine batches shown collapsed, not as user bubbles. */
++const PREFIXES = ['[Supervisor event batch', '[supervisor update']
++
++export type SupervisorBatch = { count: number | null; kinds: string[] }
++
++export function parseSupervisorBatch(text: string): SupervisorBatch | null {
++    const trimmed = text.trimStart()
++    if (!PREFIXES.some(prefix => trimmed.startsWith(prefix))) return null
++    // Compact format: one "#id kind · ..." line per event.
++    const lines = trimmed.split('\n').filter(line => /^#\d+\s/.test(line))
++    if (lines.length > 0) {
++        return { count: lines.length, kinds: [...new Set(lines.map(line => line.split(/\s+/)[1] ?? ''))].filter(Boolean) }
++    }
++    // Legacy format: a JSON array of event rows on the second line.
++    try {
++        const rows = JSON.parse(trimmed.split('\n')[1] ?? '') as Array<{ kind?: string }>
++        if (Array.isArray(rows)) return { count: rows.length, kinds: [...new Set(rows.map(row => row.kind ?? ''))].filter(Boolean) }
++    } catch { /* fall through */ }
++    return { count: null, kinds: [] }
++}

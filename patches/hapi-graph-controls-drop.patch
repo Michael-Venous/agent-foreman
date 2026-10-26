@@ -1,0 +1,473 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
++import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { createsCycle, edgeAsleep, nodeIsIdle, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+@@ -7,6 +7,7 @@
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { clampZoom, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
+ import { getSessionTitle } from '@/lib/sessionTitle'
++import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Paused' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+@@ -35,8 +36,8 @@
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+ /** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
+-export function NodeGraphView({ api, sessions, onOpenChat, onOpenChats, visible = true }: {
+-    api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; onOpenChats?: () => void; visible?: boolean
++export function NodeGraphView({ api, sessions, onOpenChat, visible = true }: {
++    api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; visible?: boolean
+ }) {
+     const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
+     const mobile = useFloatingWindowMobile()
+@@ -48,8 +49,8 @@
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
+-    const [showAdd, setShowAdd] = useState(false)
+-    const [addQuery, setAddQuery] = useState('')
++    const [dropActive, setDropActive] = useState(false)
++    const dropInFlight = useRef<Promise<void> | null>(null)
+     const [link, setLink] = useState<{ from: string; to: GraphPoint; target: string | null } | null>(null)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
+@@ -199,7 +200,7 @@
+         }
+     }
+ 
+-    const openMenu = (id: string) => { setMenu({ id, mode: 'actions' }); setError(null); setShowAdd(false) }
++    const openMenu = (id: string) => { setMenu({ id, mode: 'actions' }); setError(null) }
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
+         setPending(key); setError(null)
+         try { return await mutate(run, graphOf) }
+@@ -208,10 +209,30 @@
+     }
+ 
+     if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
+-    const nodeIds = new Set(ids)
+-    const addCandidates = (sessions ?? []).filter(session => !nodeIds.has(session.id))
+-        .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? 'claude'}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
+-        .sort((a, b) => b.updatedAt - a.updatedAt)
++    const dragOver = (event: DragEvent<HTMLDivElement>) => {
++        if (!hasSessionDrag(event.dataTransfer)) return
++        event.preventDefault()
++        if (!graph || pending || dropInFlight.current) { event.dataTransfer.dropEffect = 'none'; return }
++        event.dataTransfer.dropEffect = 'copy'
++        setDropActive(true)
++    }
++    const drop = (event: DragEvent<HTMLDivElement>) => {
++        event.preventDefault()
++        setDropActive(false)
++        const id = readSessionDrag(event.dataTransfer)
++        if (!graph || pending || dropInFlight.current || !id || !sessionsById.has(id) || id === overseer) return
++        const at = toGraph(event.clientX, event.clientY)
++        const point = round({ x: at.x - NODE_SIZE.width / 2, y: at.y - NODE_SIZE.height / 2 })
++        setMenu(null); setPending(`drop:${id}`); setError(null)
++        dropInFlight.current = (async () => {
++            try {
++                await flushSave()
++                if (!ids.includes(id)) await mutate(client => client.addNode(id))
++                await mutate(client => client.saveNodeLayout({ [id]: point }))
++            } catch (cause) { setError(errorText(cause, 'Could not add chat to workspace')) }
++            finally { setPending(null); dropInFlight.current = null }
++        })()
++    }
+     const menuSession = menu ? sessionsById.get(menu.id) : undefined
+     const menuOwner = menu ? layout?.parent[menu.id] : undefined
+     const menuBusy = menu ? !nodeIsIdle(menuSession) && !stopped[menu.id] : false
+@@ -219,30 +240,15 @@
+     const menuKeys = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu() } }
+ 
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
+-        <div className="relative z-20 flex shrink-0 flex-wrap items-center gap-2 border-b border-[var(--app-divider)] px-2 py-1">
+-            {/* The chat list link the old header back arrow provided. */}
+-            {onOpenChats && <button type="button" onClick={onOpenChats} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">Chats</button>}
+-            {graph && <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={flushSave} />}
+-            <button type="button" aria-expanded={showAdd} onClick={() => { setShowAdd(value => !value); setMenu(null) }} className="ml-auto min-h-10 shrink-0 rounded-lg px-3 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">{showAdd ? 'Done' : '+ Add chats'}</button>
+-            {showAdd && <div role="group" aria-label="Add chats to workspace" className="absolute right-2 top-full mt-1 w-[min(22rem,calc(100%-1rem))] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
+-                <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)} className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
+-                <div className="max-h-64 overflow-y-auto overscroll-contain">
+-                    {addCandidates.map(session => <button key={session.id} type="button" disabled={pending !== null} aria-label={`Add ${getSessionTitle(session)} to workspace`}
+-                        onClick={() => void act(`add:${session.id}`, client => client.addNode(session.id))}
+-                        className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
+-                        <span className="min-w-0 flex-1"><span className="block truncate text-sm">{getSessionTitle(session)}</span>
+-                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{session.metadata?.flavor ?? 'claude'} · {session.metadata?.path ?? ''}</span></span>
+-                        <span aria-hidden="true" className="shrink-0 text-[var(--app-link)]">{pending === `add:${session.id}` ? '…' : '+'}</span>
+-                    </button>)}
+-                    {!addCandidates.length && <p className="p-2 text-xs text-[var(--app-hint)]">{sessions ? 'No chats to add.' : 'Loading chats…'}</p>}
+-                </div>
+-                {error && !menu && <p role="alert" className="p-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
+-            </div>}
+-        </div>
+-        {(loadError || (error && !menu && !showAdd)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
++        {(loadError || (error && !menu)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+         <div ref={canvas} aria-label="Node graph" role="application" onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
++            onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
++            onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab active:cursor-grabbing">
++            {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
++                <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} />
++            </div>}
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+                 <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width="1" height="1" aria-hidden="true">
+@@ -280,7 +286,10 @@
+                     </div>
+                 })}
+             </div>}
+-            {graph && ids.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-6 text-center text-sm text-[var(--app-hint)]">No nodes. Use + Add chats.</p>}
++            {graph && ids.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-20 text-center text-sm text-[var(--app-hint)]">Drag chats here from the sidebar.</p>}
++            {dropActive && <div aria-hidden="true" className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--app-link)] bg-[var(--app-bg)]/70">
++                <span className="rounded-lg bg-[var(--app-dialog-bg)] px-3 py-2 text-sm text-[var(--app-link)]">Drop chat here</span>
++            </div>}
+             <div data-graph-ui className="absolute bottom-2 left-2 z-10 flex gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                 <button type="button" aria-label="Zoom out" onClick={() => zoomAt(1 / 1.25)} className={iconButton}>−</button>
+                 <button type="button" aria-label="Zoom in" onClick={() => zoomAt(1.25)} className={iconButton}>+</button>
+@@ -356,10 +365,10 @@
+     const closeSwitch = () => { if (!pending) { setTarget(null); setResult(null); setError(null) } }
+     return <div className="relative min-w-0">
+         <button type="button" aria-label="Workspaces" aria-expanded={open} onClick={() => { setOpen(value => !value); setError(null) }}
+-            className="flex min-h-10 min-w-0 max-w-[16rem] items-center gap-1.5 rounded-lg px-2 text-sm hover:bg-[var(--app-subtle-bg)]">
+-            <span className="text-xs text-[var(--app-hint)]">Workspace</span><span className="truncate font-medium">{current}</span><span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
++            className="pointer-events-auto flex min-h-12 min-w-0 max-w-full items-center gap-1.5 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] px-3 text-sm shadow hover:bg-[var(--app-subtle-bg)]">
++            <span className="truncate font-medium">{current}</span><span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
+         </button>
+-        {open && <div role="group" aria-label="Workspace slots" className="absolute left-0 top-full z-30 mt-1 w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
++        {open && <div role="group" aria-label="Workspace slots" className="pointer-events-auto absolute left-0 top-full z-30 mt-1 w-[min(22rem,100%)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
+             <ul className="max-h-72 overflow-y-auto overscroll-contain">
+                 {sortWorkspaces(graph.workspaces).map(workspace => {
+                     const active = workspace.id === graph.activeWorkspaceId, editable = workspace.kind === 'preset' && !active
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -6,9 +6,14 @@
+ import type { SessionSummary } from '@/types/api'
+ import { I18nProvider } from '@/lib/i18n-context'
+ import { NODE_SIZE } from '@/lib/nodeGraphLayout'
++import { SESSION_DRAG_TYPE } from '@/lib/sessionDrag'
+ import { NodeGraphView, nodeStatus } from './NodeGraphView'
+ 
+ beforeEach(() => {
++    vi.stubGlobal('DragEvent', class extends MouseEvent {
++        dataTransfer: DataTransfer | null
++        constructor(type: string, init: DragEventInit = {}) { super(type, init); this.dataTransfer = init.dataTransfer ?? null }
++    })
+     vi.stubGlobal('PointerEvent', class extends MouseEvent {
+         pointerId: number
+         pointerType: string
+@@ -95,6 +100,10 @@
+     const [, x, y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
+     return { clientX: x! + (parseFloat(card.style.left) + NODE_SIZE.width / 2) * k!, clientY: y! + (parseFloat(card.style.top) + NODE_SIZE.height / 2) * k! }
+ }
++const transfer = (values: Record<string, string>) => ({ types: Object.keys(values), getData: (type: string) => values[type] ?? '', dropEffect: '' })
++const dropChat = (id: string, clientX = 300, clientY = 250) => fireEvent.drop(screen.getByRole('application', { name: 'Node graph' }), {
++    dataTransfer: transfer({ [SESSION_DRAG_TYPE]: id }), clientX, clientY,
++})
+ 
+ describe('nodeStatus', () => {
+     it('maps live summary state to node labels', () => {
+@@ -183,15 +192,83 @@
+         await waitFor(() => expect(screen.queryByRole('button', { name: 'Node Lone one' })).toBeNull())
+     })
+ 
+-    it('adds an existing chat as a lone node', async () => {
+-        const { api } = setup()
+-        await screen.findByRole('button', { name: 'Node Alpha' })
+-        fireEvent.click(screen.getByRole('button', { name: '+ Add chats' }))
+-        expect(screen.queryByRole('button', { name: 'Add Alpha to workspace' })).toBeNull()
+-        fireEvent.change(screen.getByRole('searchbox', { name: 'Search chats to add' }), { target: { value: 'new' } })
+-        fireEvent.click(screen.getByRole('button', { name: 'Add New chat to workspace' }))
++    it('accepts serialized sidebar data in another window and persists a lone node at the drop point', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        const start = nodeCentre('B'), card = document.querySelector<HTMLElement>('[data-node-id="B"]')!
++        const canvas = screen.getByRole('application', { name: 'Node graph' })
++        const data = transfer({ [SESSION_DRAG_TYPE]: 'N' })
++        expect(fireEvent.dragOver(canvas, { dataTransfer: data })).toBe(false)
++        expect(data.dropEffect).toBe('copy')
++        expect(screen.getByText('Drop chat here')).toBeInTheDocument()
++        dropChat('N', start.clientX, start.clientY)
+         await waitFor(() => expect(api.addNode).toHaveBeenCalledWith('N'))
+         await screen.findByRole('button', { name: 'Node New chat' })
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledWith({ N: { x: parseFloat(card.style.left), y: parseFloat(card.style.top) } }))
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.abortSession).not.toHaveBeenCalled()
++        expect(document.querySelector('[data-edge$="->N"]')).toBeNull()
++        expect(screen.queryByText('Drop chat here')).toBeNull()
++    })
++
++    it('repositions an existing node without duplicating it or changing its owner', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dropChat('B')
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledTimes(1))
++        expect(api.addNode).not.toHaveBeenCalled()
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(document.querySelector('[data-edge="O->B"]')).toBeInTheDocument()
++        expect(screen.getAllByRole('button', { name: 'Node Bravo' })).toHaveLength(1)
++    })
++
++    it('ignores unknown chats, unrelated text, foreign links and the overseer', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dropChat('unknown'); dropChat('O')
++        const canvas = screen.getByRole('application', { name: 'Node graph' })
++        for (const text of ['N', 'https://elsewhere.invalid/sessions/N']) fireEvent.drop(canvas, { dataTransfer: transfer({ 'text/plain': text }) })
++        expect(api.addNode).not.toHaveBeenCalled()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
++
++    it('accepts a same-origin chat link when only standard drag formats survive', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.drop(screen.getByRole('application', { name: 'Node graph' }), {
++            dataTransfer: transfer({ 'text/uri-list': `${location.origin}/sessions/N` }), clientX: 300, clientY: 200,
++        })
++        await waitFor(() => expect(api.addNode).toHaveBeenCalledWith('N'))
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledTimes(1))
++    })
++
++    it('refuses overlapping drops and reports a failed add without saving a phantom node', async () => {
++        const api = makeApi()
++        let reject!: (error: Error) => void
++        api.addNode.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail }))
++        setup(api)
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dropChat('N'); dropChat('N')
++        await waitFor(() => expect(api.addNode).toHaveBeenCalledTimes(1))
++        reject(new Error('Hub unavailable'))
++        expect(await screen.findByRole('alert')).toHaveTextContent('Hub unavailable')
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++        expect(screen.queryByRole('button', { name: 'Node New chat' })).toBeNull()
++        dropChat('N')
++        await screen.findByRole('button', { name: 'Node New chat' })
++    })
++
++    it('retains a successfully added node if only the layout save fails', async () => {
++        const api = makeApi()
++        api.saveNodeLayout.mockRejectedValueOnce(new Error('Layout unavailable'))
++        setup(api)
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dropChat('N')
++        expect(await screen.findByRole('alert')).toHaveTextContent('Layout unavailable')
++        expect(screen.getByRole('button', { name: 'Node New chat' })).toBeInTheDocument()
++        dropChat('N')
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledTimes(2))
++        expect(api.addNode).toHaveBeenCalledTimes(1)
+     })
+ 
+     it('drags a node and saves the layout once, debounced', async () => {
+@@ -304,14 +381,14 @@
+     })
+ })
+ 
+-describe('chat list link', () => {
+-    it('offers Chats (the old back arrow) only when the host provides it', async () => {
+-        const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+-        const onOpenChats = vi.fn()
+-        render(<QueryClientProvider client={client}><I18nProvider>
+-            <NodeGraphView api={makeApi() as unknown as ApiClient} sessions={sessions} onOpenChat={vi.fn()} onOpenChats={onOpenChats} />
+-        </I18nProvider></QueryClientProvider>)
+-        fireEvent.click(await screen.findByRole('button', { name: 'Chats' }))
+-        expect(onOpenChats).toHaveBeenCalledOnce()
+-    })
+-})
++describe('compact graph controls', () => {
++    it('floats the workspace name inside the canvas without the old toolbar buttons or label', async () => {
++        setup()
++        const workspace = await screen.findByRole('button', { name: 'Workspaces' })
++        expect(workspace.textContent).toBe('Default▾')
++        expect(screen.getByRole('application', { name: 'Node graph' })).toContainElement(workspace)
++        expect(screen.queryByRole('button', { name: 'Chats' })).toBeNull()
++        expect(screen.queryByRole('button', { name: '+ Add chats' })).toBeNull()
++        expect(screen.queryByText('Workspace', { exact: true })).toBeNull()
++    })
++})
+diff --git a/web/src/components/NodeGraphHost.tsx b/web/src/components/NodeGraphHost.tsx
+--- a/web/src/components/NodeGraphHost.tsx
++++ b/web/src/components/NodeGraphHost.tsx
+@@ -23,7 +23,6 @@
+     const name = activeWorkspaceName(data)
+     return <FloatingWindow config={NODE_GRAPH_WINDOW} title={name ? `Nodes · ${name}` : 'Nodes'} count={data?.graph.nodes.length ?? 0} bodyClassName="flex min-h-0 flex-1 flex-col">
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions} visible={!collapsed}
+-            onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)); if (mobile) setCollapsed(true) }}
+-            onOpenChats={() => { void navigate({ to: '/sessions' }); if (mobile) setCollapsed(true) }} />
++            onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)); if (mobile) setCollapsed(true) }} />
+     </FloatingWindow>
+ }
+diff --git a/web/src/routes/popout.tsx b/web/src/routes/popout.tsx
+--- a/web/src/routes/popout.tsx
++++ b/web/src/routes/popout.tsx
+@@ -35,7 +35,6 @@
+     usePopoutWindow('nodes', workspace ? `Nodes · ${workspace}` : 'Nodes')
+     return <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions}
+-            onOpenChat={sessionId => sendToMain({ action: 'open-session', sessionId })}
+-            onOpenChats={() => sendToMain({ action: 'open-chats' })} />
++            onOpenChat={sessionId => sendToMain({ action: 'open-session', sessionId })} />
+     </div>
+ }
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -34,6 +34,7 @@
+ import { useSessionListStatusMode } from '@/hooks/useSessionListStatusMode'
+ import { useShowActiveSessionsOnly } from '@/hooks/useShowActiveSessionsOnly'
+ import { usePinInProgressSessions } from '@/hooks/usePinInProgressSessions'
++import { SESSION_DRAG_TYPE, writeSessionDrag } from '@/lib/sessionDrag'
+ import { classifySessionAttention, sessionIsUnread } from '@/lib/sessionAttention'
+ import {
+     getSessionLastSeenAt,
+@@ -1037,10 +1038,11 @@
+             <button
+                 type="button"
+                 {...longPressHandlers}
+-                draggable={Boolean(props.onNativeDragStart) && !isTouch && !menuOpen}
++                draggable={!isTouch && !menuOpen}
+                 onDragStart={event => {
+                     if (menuOpen || isTouch) { event.preventDefault(); return }
+                     longPressHandlers.onMouseLeave(event)
++                    writeSessionDrag(event.dataTransfer, s.id)
+                     props.onNativeDragStart?.(event)
+                 }}
+                 onDragEnd={props.onNativeDragEnd}
+@@ -1610,9 +1612,7 @@
+                 lastSeenVersion={lastSeenVersion}
+                 managed={Boolean(managedSessions[s.id])}
+                 onMoveToFolder={canMoveToFolder && ['codex', 'claude'].includes(getChatTab(s)) ? handleMoveToFolder : undefined}
+-                onNativeDragStart={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId)) ? event => {
+-                    event.dataTransfer.setData('application/x-hapi-session', s.id); event.dataTransfer.effectAllowed = 'move'; setDraggedChat(s.id)
+-                } : undefined}
++                onNativeDragStart={() => setDraggedChat(s.id)}
+                 onNativeDragEnd={() => { setDraggedChat(null); setDropFolder(null) }}
+                 touchDrag={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId)) ? {
+                     onStart: () => setDraggedChat(s.id),
+@@ -1697,7 +1697,7 @@
+                             onDrop={event => {
+                                 if (folder === undefined || !draggedChat) return
+                                 event.preventDefault(); event.stopPropagation()
+-                                const id = event.dataTransfer.getData('application/x-hapi-session')
++                                const id = event.dataTransfer.getData(SESSION_DRAG_TYPE)
+                                 if (id === draggedChat) void moveDraggedChat(id, folder?.id ?? null)
+                                 setDraggedChat(null); setDropFolder(null)
+                             }}>
+diff --git a/web/src/components/SessionList.chat-tabs.test.tsx b/web/src/components/SessionList.chat-tabs.test.tsx
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -226,6 +226,9 @@
+         const row = screen.getByRole('button', { name: /Drag this chat/ }).closest('[draggable]')!
+         const values = new Map<string, string>(); const transfer = { setData: (key: string, value: string) => values.set(key, value), getData: (key: string) => values.get(key) ?? '', effectAllowed: '', dropEffect: '' }
+         fireEvent.dragStart(row, { dataTransfer: transfer })
++        expect(values.get('application/x-hapi-session')).toBe('moving')
++        expect(values.get('text/uri-list')).toBe(`${location.origin}/sessions/moving`)
++        expect(transfer.effectAllowed).toBe('copyMove')
+         const folder = screen.getByRole('button', { name: 'Blender folder' }).closest('[data-testid="chat-folder"]')!
+         fireEvent.dragOver(folder, { dataTransfer: transfer }); fireEvent.drop(folder, { dataTransfer: transfer })
+         await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith(provider === 'codex' ? 'native-thread' : 'moving', 'f-blender', provider))
+@@ -237,6 +240,28 @@
+         fireEvent.drop(folder, { dataTransfer: { getData: () => 'cx-school' } })
+         expect(api.assignCodexFolder).not.toHaveBeenCalled()
+     })
++})
++
++it('exports sidebar drags even when folders and native identity are not available', () => {
++    renderList({ list: [makeSession({ id: 'fresh', metadata: { name: 'Fresh chat', flavor: 'codex', path: '/work' } })] })
++    const row = screen.getByRole('button', { name: /Fresh chat/ })
++    expect(row).toHaveAttribute('draggable', 'true')
++    const values = new Map<string, string>()
++    fireEvent.dragStart(row, { dataTransfer: { setData: (key: string, value: string) => values.set(key, value), effectAllowed: '' } })
++    expect(values.get('application/x-hapi-session')).toBe('fresh')
++    expect(values.get('text/uri-list')).toBe(`${location.origin}/sessions/fresh`)
++})
++
++for (const section of ['pinned', 'running'] as const) it(`exports ${section} sidebar rows to graph popups`, () => {
++    localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
++    renderList({ list: [makeSession({ id: 'special', active: true, thinking: section === 'running', globalPinned: section === 'pinned',
++        metadata: { name: 'Special chat', flavor: 'codex', path: '/work' } })] })
++    const row = screen.getByRole('button', { name: /Special chat/ })
++    expect(row).toHaveAttribute('draggable', 'true')
++    const values = new Map<string, string>()
++    fireEvent.dragStart(row, { dataTransfer: { setData: (key: string, value: string) => values.set(key, value), effectAllowed: '' } })
++    expect(values.get('application/x-hapi-session')).toBe('special')
++    expect(values.get('text/uri-list')).toBe(`${location.origin}/sessions/special`)
+ })
+ 
+ 
+diff --git a/web/src/lib/sessionDrag.ts b/web/src/lib/sessionDrag.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/sessionDrag.ts
+@@ -0,0 +1,30 @@
++/** Native drag data survives crossing browser windows; React state does not. */
++export const SESSION_DRAG_TYPE = 'application/x-hapi-session'
++
++export function writeSessionDrag(transfer: DataTransfer, sessionId: string): void {
++    const url = new URL(`/sessions/${encodeURIComponent(sessionId)}`, window.location.origin).href
++    transfer.setData(SESSION_DRAG_TYPE, sessionId)
++    transfer.setData('text/uri-list', url)
++    transfer.setData('text/plain', url)
++    // Folder drops move a chat; graph drops only copy its reference.
++    transfer.effectAllowed = 'copyMove'
++}
++
++export function hasSessionDrag(transfer: DataTransfer): boolean {
++    return Array.from(transfer.types).some(type => type === SESSION_DRAG_TYPE || type === 'text/uri-list' || type === 'text/plain')
++}
++
++/** Callers must also check that the ID belongs to their current session list. */
++export function readSessionDrag(transfer: DataTransfer): string | null {
++    const id = transfer.getData(SESSION_DRAG_TYPE)
++    if (id) return id
++    // Some browsers expose only the standard link formats across windows.
++    const link = transfer.getData('text/uri-list') || transfer.getData('text/plain')
++    const urls = link.split(/\r?\n/).filter(line => line.trim() && !line.startsWith('#'))
++    if (urls.length !== 1) return null
++    try {
++        const url = new URL(urls[0]!)
++        const match = /^\/sessions\/([^/]+)$/.exec(url.pathname)
++        return url.origin === window.location.origin && !url.search && !url.hash && match ? decodeURIComponent(match[1]!) : null
++    } catch { return null }
++}
+diff --git a/web/src/lib/sessionDrag.test.ts b/web/src/lib/sessionDrag.test.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/sessionDrag.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it } from 'vitest'
++import { hasSessionDrag, readSessionDrag, SESSION_DRAG_TYPE, writeSessionDrag } from './sessionDrag'
++
++function transfer(values: Record<string, string> = {}) {
++    return { types: Object.keys(values), getData: (type: string) => values[type] ?? '', setData: (type: string, value: string) => { values[type] = value }, effectAllowed: '' } as unknown as DataTransfer
++}
++
++describe('cross-window session references', () => {
++    it('writes both native and standard link formats with copy and move support', () => {
++        const data = transfer()
++        writeSessionDrag(data, 'chat-id')
++        expect(readSessionDrag(data)).toBe('chat-id')
++        expect(data.getData('text/uri-list')).toBe(`${location.origin}/sessions/chat-id`)
++        expect(data.getData('text/plain')).toBe(`${location.origin}/sessions/chat-id`)
++        expect(data.effectAllowed).toBe('copyMove')
++    })
++
++    it('recognizes protected drag types without needing to read their data', () => {
++        expect(hasSessionDrag(transfer({ [SESSION_DRAG_TYPE]: '' }))).toBe(true)
++        expect(hasSessionDrag(transfer({ Files: '' }))).toBe(false)
++    })
++
++    it('accepts a single same-origin chat link, including URI-list comments', () => {
++        expect(readSessionDrag(transfer({ 'text/uri-list': `# chat\r\n${location.origin}/sessions/chat-id\r\n` }))).toBe('chat-id')
++        expect(readSessionDrag(transfer({ 'text/plain': `${location.origin}/sessions/chat-id` }))).toBe('chat-id')
++    })
++
++    it.each(['chat-id', 'https://elsewhere.invalid/sessions/chat-id', '/sessions/chat-id', `${location.origin}/sessions/chat-id?token=bad`, `${location.origin}/sessions/chat-id#part`, `${location.origin}/sessions/chat-id/extra`, `${location.origin}/sessions/a\n${location.origin}/sessions/b`, 'file:///tmp/file', 'javascript:alert(1)'])('ignores unrelated or unsafe link data: %s', value => {
++        expect(readSessionDrag(transfer({ 'text/plain': value }))).toBeNull()
++    })
++})

@@ -1,0 +1,27 @@
+--- a/cli/src/runner/run.ts
++++ b/cli/src/runner/run.ts
+@@ -1604,7 +1604,7 @@
+       || agent === 'opencode'
+       || agent === 'agy'
+       || agent === 'dsh'
+-      || (agentCommand === 'claude' && options.forkSession)) {
++      || (agentCommand === 'claude' && (options.forkSession || options.existingSessionId))) {
+     const existingSessionId = options.existingSessionId ?? options.sessionId;
+     if (existingSessionId) {
+       args.push('--existing-session-id', existingSessionId);
+--- a/cli/src/runner/buildCliArgs.test.ts
++++ b/cli/src/runner/buildCliArgs.test.ts
+@@ -6,6 +6,13 @@
+ import { buildCliArgs, classifyRecoveredProcessGeneration, createSpawnDeduplicator, releaseRecoveredSpawnDedupe } from './run'
+ 
+ describe('buildCliArgs', () => {
++    it('binds a fresh Claude temporary session to the hub-reserved identity', () => {
++        const args = buildCliArgs('claude', { directory: '/tmp', existingSessionId: 'temporary-reserved-id' })
++        expect(args[args.indexOf('--existing-session-id') + 1]).toBe('temporary-reserved-id')
++        expect(args).not.toContain('--resume')
++        expect(args).not.toContain('--fork-session')
++    })
++
+     it('adds --permission-mode for valid permission mode', () => {
+         const args = buildCliArgs('claude', {
+             directory: '/tmp',

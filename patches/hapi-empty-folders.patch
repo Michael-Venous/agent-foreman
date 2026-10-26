@@ -1,0 +1,118 @@
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -303,11 +303,12 @@
+     return flavor === 'codex' ? 'codex' : flavor === 'claude' || !flavor ? 'claude' : 'other'
+ }
+ 
+-/** Folder sections for the Codex tab in ChatGPT order; chats without a folder last. */
++/** Shared folder order for both providers, including empty destinations; unfiled chats last. */
+ export function groupChatsByFolder(
+     sessions: SessionSummary[],
+     folders: CodexFolder[],
+-    folderOf: (session: SessionSummary) => string | null
++    folderOf: (session: SessionSummary) => string | null,
++    includeEmptyUnfiled = false
+ ): Array<{ folder: CodexFolder | null; sessions: SessionSummary[] }> {
+     const byFolder = new Map<string | null, SessionSummary[]>()
+     const known = new Set(folders.map(folder => folder.id))
+@@ -317,8 +318,8 @@
+         byFolder.set(key, [...(byFolder.get(key) ?? []), session])
+     }
+     return [
+-        ...folders.filter(folder => byFolder.has(folder.id)).map(folder => ({ folder, sessions: byFolder.get(folder.id)! })),
+-        ...(byFolder.has(null) ? [{ folder: null, sessions: byFolder.get(null)! }] : []),
++        ...folders.map(folder => ({ folder, sessions: byFolder.get(folder.id) ?? [] })),
++        ...(byFolder.has(null) || includeEmptyUnfiled ? [{ folder: null, sessions: byFolder.get(null) ?? [] }] : []),
+     ]
+ }
+ 
+@@ -1637,14 +1638,12 @@
+     )
+ 
+     const renderChatList = () => {
+-        if (chatSessions.length === 0) {
++        if (chatSessions.length === 0 && !api) {
+             return null
+         }
+         const tabSessions = chatSessions.filter(session => getChatTab(session) === activeTab)
+         const sections = ['codex', 'claude'].includes(activeTab) && codexFolders.data
+-            ? (draggedChat
+-                ? [...codexFolders.data.folders.map(folder => ({ folder, sessions: tabSessions.filter(s => folderOf(s) === folder.id) })), { folder: null, sessions: tabSessions.filter(s => !folderOf(s)) }]
+-                : groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf))
++            ? groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf, Boolean(draggedChat))
+             : [{ folder: undefined, sessions: tabSessions }]
+         return (
+             <div key="chats-section" data-testid="session-chat-list">
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -123,9 +123,11 @@
+         expect(within(school!).getByRole('button', { name: /Internship outreach/ })).toBeInTheDocument()
+         expect(within(none!).getByText('No folder')).toBeInTheDocument()
+         expect(within(none!).getByRole('button', { name: /Loose codex chat/ })).toBeInTheDocument()
+-        // Claude chats are never sent to the Codex folder service.
++        // Claude uses its own membership lookup against the shared folder catalog.
+         fireEvent.click(screen.getByRole('tab', { name: /Claude/ }))
+-        expect(screen.queryAllByTestId('chat-folder')).toHaveLength(0)
++        await screen.findByRole('button', { name: 'Blender folder' })
++        expect(api.getCodexFolders).toHaveBeenCalledWith([], 'claude')
++        expect(screen.getAllByTestId('chat-folder')).toHaveLength(3)
+     })
+ 
+     it('moves a Codex chat to another ChatGPT folder from the row menu', async () => {
+@@ -181,13 +183,13 @@
+ })
+ 
+ describe('groupChatsByFolder', () => {
+-    it('drops unknown folder IDs into No folder and omits empty folders', () => {
++    it('drops unknown folder IDs into No folder and preserves empty folders', () => {
+         const groups = groupChatsByFolder(
+             [codex('a', 'A', 't-a'), codex('b', 'B', 't-b')],
+             [{ id: 'f1', name: 'One', position: 1 }, { id: 'f2', name: 'Two', position: 2 }],
+             session => session.id === 'a' ? 'f2' : 'deleted-folder'
+         )
+-        expect(groups.map(g => [g.folder?.name ?? null, g.sessions.map(s => s.id)])).toEqual([['Two', ['a']], [null, ['b']]])
++        expect(groups.map(g => [g.folder?.name ?? null, g.sessions.map(s => s.id)])).toEqual([['One', []], ['Two', ['a']], [null, ['b']]])
+     })
+ })
+ 
+@@ -279,3 +281,40 @@
+     } finally { vi.useRealTimers(); document.elementFromPoint = original }
+     await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledExactlyOnceWith(provider === 'codex' ? 'native-thread' : 'moving', 'f-blender', provider))
+ })
++
++
++describe('empty folder visibility', () => {
++    for (const provider of ['codex', 'claude'] as const) {
++        it(`shows and collapses empty ${provider} folders even with no chats`, async () => {
++            localStorage.setItem('hapi-chat-tab', provider)
++            const api = folderApi({ getCodexFolders: vi.fn().mockResolvedValue({ folders: folders.folders, assignments: {} }) })
++            renderList({ api, list: [] })
++            const folder = await screen.findByRole('button', { name: 'Blender folder' })
++            expect(screen.getAllByTestId('chat-folder')).toHaveLength(2)
++            expect(api.getCodexFolders).toHaveBeenCalledWith([], provider)
++            fireEvent.click(folder)
++            expect(folder).toHaveAttribute('aria-expanded', 'false')
++            expect(screen.getByRole('button', { name: 'Rename folder Blender' })).toBeInTheDocument()
++            expect(screen.getByRole('button', { name: /New folder/ })).toBeInTheDocument()
++        })
++
++        it(`keeps a newly created empty folder visible in ${provider}`, async () => {
++            localStorage.setItem('hapi-chat-tab', provider)
++            const catalog = [...folders.folders]
++            const api = folderApi({
++                getCodexFolders: vi.fn(async () => ({ folders: [...catalog], assignments: {} })),
++                createCodexFolder: vi.fn(async (name, id) => {
++                    const folder = { id, name, position: 7 }
++                    catalog.push(folder)
++                    return folder
++                }),
++            })
++            renderList({ api, list: [] })
++            fireEvent.click(await screen.findByRole('button', { name: /New folder/ }))
++            fireEvent.change(await screen.findByLabelText('Folder name'), { target: { value: 'Empty project' } })
++            fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Create' }))
++            expect(await screen.findByRole('button', { name: 'Empty project folder' })).toBeInTheDocument()
++            expect(api.assignCodexFolder).not.toHaveBeenCalled()
++        })
++    }
++})

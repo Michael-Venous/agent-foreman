@@ -1,0 +1,7 @@
+[Unit]
+Description=Firefox native agent control (isolated cloned profile, headless)
+[Service]
+ExecStart=/usr/bin/firefox --headless --marionette --no-remote -profile "%h/.local/share/agent-foreman/firefox/profile" about:blank
+Restart=no
+TimeoutStopSec=20
+UMask=0077

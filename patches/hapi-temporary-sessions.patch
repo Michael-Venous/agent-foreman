@@ -1,0 +1,997 @@
+diff --git a/cli/src/codex/shared/runtime.integration.test.ts b/cli/src/codex/shared/runtime.integration.test.ts
+index 1b2a958..d0a4372 100644
+--- a/cli/src/codex/shared/runtime.integration.test.ts
++++ b/cli/src/codex/shared/runtime.integration.test.ts
+@@ -12,13 +12,13 @@ import { isProcessAlive } from '@/utils/process';
+ 
+ const state = vi.hoisted(() => ({ home: '', sessions: new Map<string, MockSession>(), beforeBootstrap: undefined as (() => Promise<void>) | undefined }));
+ class MockSession {
+-    readonly sessionId = randomUUID();
++    readonly sessionId: string;
+     state: AgentState = { requests: { 'old-worker': { tool: 'request_user_input', arguments: {}, createdAt: 0 } } }; metadata: Metadata;
+     messages: unknown[] = []; consumed: string[] = []; dead = false;
+     user?: (message: { content: { text: string } }, id?: string) => void;
+     rpc = new Map<string, (params: unknown) => Promise<unknown>>();
+     rpcHandlerManager = { registerHandler: (name: string, fn: (params: unknown) => Promise<unknown>) => { this.rpc.set(name, fn); } };
+-    constructor(cwd: string) { this.metadata = { path: cwd, host: 'test', hostPid: process.pid, machineId: 'test', flavor: 'codex', capabilities: { concurrentClients: true } }; }
++    constructor(cwd: string, sessionId: string = randomUUID()) { this.sessionId = sessionId; this.metadata = { path: cwd, host: 'test', hostPid: process.pid, machineId: 'test', flavor: 'codex', capabilities: { concurrentClients: true } }; }
+     getMetadata() { return this.metadata; }
+     updateMetadata(fn: (m: Metadata) => Metadata) { this.metadata = fn(this.metadata); }
+     updateAgentState(fn: (s: AgentState) => AgentState) { this.state = fn(this.state); }
+@@ -41,13 +41,33 @@ vi.mock('@/agent/sessionFactory', () => ({ bootstrapSession: async (options: { w
+     state.sessions.set(session.sessionId, session);
+     return { session: session as unknown as ApiSessionClient, sessionInfo: { id: session.sessionId, namespace: 'test' }, metadata: session.metadata,
+         workingDirectory: options.workingDirectory, machineId: 'test', startedBy: 'terminal', api: {} };
+-}, bootstrapExistingSession: vi.fn() }));
++}, bootstrapExistingSession: vi.fn(async (options: { workingDirectory: string; sessionId: string }) => {
++    const session = new MockSession(options.workingDirectory, options.sessionId);
++    state.sessions.set(session.sessionId, session);
++    return { session: session as unknown as ApiSessionClient, sessionInfo: { id: session.sessionId, namespace: 'test' }, metadata: session.metadata,
++        workingDirectory: options.workingDirectory, machineId: 'test', startedBy: 'runner', api: {} };
++}) }));
+ vi.mock('@/runner/controlClient', () => ({ notifyRunnerSessionStarted: vi.fn(async () => ({})) }));
+ vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: async () => ({ server: { url: 'http://unused', stop() {} }, mcpServers: {} }) }));
+ 
+ // Explicit opt-in: installed official binary, entirely isolated CODEX_HOME, mock Responses API only.
+ describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Codex shared runtime', () => {
+     afterEach(() => { vi.unstubAllEnvs(); state.sessions.clear(); state.beforeBootstrap = undefined; });
++    it('binds a fresh thread to a preallocated HAPI session without a model turn', async () => {
++        const home = await mkdtemp('/tmp/hapi-shared-preallocated-'); state.home = home;
++        const ch = join(home, 'codex'); await mkdir(ch);
++        await writeFile(join(ch, 'config.toml'), 'model = "mock-model"\nmodel_provider = "mock"\n[model_providers.mock]\nname = "No model calls"\nbase_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[analytics]\nenabled = false\n[feedback]\nenabled = false\n');
++        vi.stubEnv('CODEX_HOME', ch); vi.stubEnv('HOME', home);
++        const abort = new AbortController();
++        const ready = vi.fn(() => abort.abort());
++        try {
++            const { runSharedRuntime } = await import('./runtime');
++            await runSharedRuntime({ workingDirectory: home, existingSessionId: 'preallocated-temporary' }, ready, abort.signal);
++            expect(ready).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'preallocated-temporary' }));
++            expect([...state.sessions.keys()]).toEqual(['preallocated-temporary']);
++            expect(state.sessions.get('preallocated-temporary')?.consumed).toEqual([]);
++        } finally { abort.abort(); await rm(home, { recursive: true, force: true }); }
++    }, 30_000);
+     it('rejects a child ID before creating a HAPI binding or calling native resume', async () => {
+         const home = await mkdtemp('/tmp/hapi-shared-child-'); state.home = home;
+         const ch = join(home, 'codex'); await mkdir(ch);
+diff --git a/cli/src/codex/shared/runtime.ts b/cli/src/codex/shared/runtime.ts
+index 3a054ce..e6f2413 100644
+--- a/cli/src/codex/shared/runtime.ts
++++ b/cli/src/codex/shared/runtime.ts
+@@ -212,7 +212,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
+         await notifyRunnerSessionStarted(root.session.sessionId, root.session.getMetadata() ?? root.bootstrap.metadata);
+     };
+     const create = (method: 'thread/start' | 'thread/fork', params: Record<string, unknown>, parent?: SharedCodexRoot, initialOptions?: SharedLaunchOptions): Promise<SharedCodexRoot> => operation(async () => {
+-        const root = await prepare(string(params.cwd) ?? launch.cwd, undefined, parent);
++        const root = await prepare(string(params.cwd) ?? launch.cwd, initialOptions?.existingSessionId, parent);
+         let nativeSucceeded = false;
+         try {
+             runtime.pendingCreations = [...runtime.pendingCreations ?? [], root.session.sessionId]; await persist();
+diff --git a/hub/src/socket/handlers/cli/sessionHandlers.test.ts b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+index cec001d..8e49432 100644
+--- a/hub/src/socket/handlers/cli/sessionHandlers.test.ts
++++ b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+@@ -438,7 +438,7 @@ describe('cli session handlers', () => {
+         expect(uuids).toEqual(['msg-1', 'msg-2'])
+     })
+ 
+-    it.each(['supersededBySessionId', 'opencodeClearOperation'] as const)(
++    it.each(['supersededBySessionId', 'opencodeClearOperation', 'temporary'] as const)(
+         'ignores a forged hub-owned %s addition from CLI metadata',
+         (field) => {
+             const store = new Store(':memory:')
+@@ -467,7 +467,7 @@ describe('cli session handlers', () => {
+         const store = new Store(':memory:')
+         const operation = { replacementSessionId: 'owned-target', state: 'completed', updatedAt: Date.now() }
+         const session = store.sessions.getOrCreateSession('preserve-clear-link', {
+-            supersededBySessionId: 'owned-target', opencodeClearOperation: operation
++            temporary: true, supersededBySessionId: 'owned-target', opencodeClearOperation: operation
+         }, null, 'default')
+         const socket = new FakeSocket()
+         registerSessionHandlers(socket as unknown as CliSocketWithData, {
+@@ -485,7 +485,7 @@ describe('cli session handlers', () => {
+             }
+         }, () => {})
+         expect(store.sessions.getSessionByNamespace(session.id, 'default')?.metadata).toMatchObject({
+-            supersededBySessionId: 'owned-target', opencodeClearOperation: operation, lifecycleState: 'archived'
++            temporary: true, supersededBySessionId: 'owned-target', opencodeClearOperation: operation, lifecycleState: 'archived'
+         })
+     })
+ })
+diff --git a/hub/src/socket/handlers/cli/sessionHandlers.ts b/hub/src/socket/handlers/cli/sessionHandlers.ts
+index b15e5f3..b70b0de 100644
+--- a/hub/src/socket/handlers/cli/sessionHandlers.ts
++++ b/hub/src/socket/handlers/cli/sessionHandlers.ts
+@@ -68,7 +68,7 @@ const updateStateSchema = z.object({
+     agentState: z.unknown().nullable()
+ })
+ 
+-const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation'] as const
++const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation', 'temporary'] as const
+ 
+ function preserveHubOwnedMetadata(incoming: unknown, current: unknown): unknown {
+     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return incoming
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+index 07787cc..7a6b6d6 100644
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -1580,7 +1580,7 @@ export class SessionCache {
+ 
+     async deduplicateByAgentSessionId(sessionId: string): Promise<void> {
+         const session = this.sessions.get(sessionId)
+-        if (!session?.metadata) return
++        if (!session?.metadata || session.metadata.temporary) return
+ 
+         const agentId = this.extractAgentSessionId(session.metadata)
+         if (!agentId) return
+@@ -1610,7 +1610,7 @@ export class SessionCache {
+                 for (const [existingId, existing] of this.sessions) {
+                     if (existingId === sessionId) continue
+                     if (existing.namespace !== session.namespace) continue
+-                    if (!existing.metadata) continue
++                    if (!existing.metadata || existing.metadata.temporary) continue
+                     if (existing.metadata[agentId.field] !== agentId.value) continue
+                     if (agentId.field === 'piSessionId' && existing.metadata.machineId !== agentId.machineId) continue
+                     candidates.push({ id: existingId, session: existing })
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index 25b10a9..8553a4c 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1745,6 +1745,7 @@ export class SyncEngine {
+     }
+ 
+     async archiveSession(sessionId: string): Promise<void> {
++        const temporary = this.getSession(sessionId)?.metadata?.temporary === true
+         // tiann/hapi#916: when the CLI is already gone (e.g. after a
+         // hub-restart cascade SIGTERMed the runner but the in-memory
+         // `active` flag has not been reconciled yet) the kill-RPC throws
+@@ -1764,6 +1765,7 @@ export class SyncEngine {
+             }
+         }
+         this.handleSessionEnd({ sid: sessionId, time: Date.now() })
++        if (temporary && this.getSession(sessionId)) await this.deleteSession(sessionId)
+     }
+ 
+     /**
+@@ -2068,9 +2070,26 @@ export class SyncEngine {
+         existingSessionId?: string,
+         collaborationMode?: CodexCollaborationMode,
+         copilotAgentMode?: CopilotAgentMode,
+-        startingMode?: 'remote' | 'pty'
++        startingMode?: 'remote' | 'pty',
++        temporary?: boolean
+     ): ReturnType<RpcGateway['spawnSession']> {
+-        return await this.rpcGateway.spawnSession(
++        // Reserve a fresh identity before starting the controller. Inheritance,
++        // imports and resumes can never turn an existing transcript temporary.
++        let temporaryId: string | undefined
++        if (temporary) {
++            if (existingSessionId || resumeSessionId) {
++                return { type: 'error', message: 'Temporary chats must start a fresh session' }
++            }
++            const machine = this.getMachine(machineId)
++            if (!machine) return { type: 'error', message: 'Machine not found' }
++            temporaryId = randomUUID()
++            this.sessionCache.getOrCreateSession(`temporary:${temporaryId}`, {
++                path: directory, host: machine.metadata?.host ?? machineId,
++                machineId, flavor: agent, temporary: true,
++            }, {}, machine.namespace, model, effort, modelReasoningEffort, temporaryId)
++            existingSessionId = temporaryId
++        }
++        const result = await this.rpcGateway.spawnSession(
+             machineId,
+             directory,
+             agent,
+@@ -2088,6 +2107,16 @@ export class SyncEngine {
+             copilotAgentMode,
+             startingMode
+         )
++        if (temporaryId && result.type === 'success' && result.sessionId !== temporaryId) {
++            // Never label a different (possibly pre-existing) session temporary.
++            return { type: 'error', message: 'Runner did not attach to the temporary session' }
++        }
++        if (temporaryId && result.type === 'error'
++            && (result.code === 'agent_unavailable' || result.code === 'outside_workspace_roots')) {
++            const session = this.getSession(temporaryId)
++            if (session && !session.active) await this.deleteSession(temporaryId)
++        }
++        return result
+     }
+ 
+     /**
+diff --git a/hub/src/sync/temporarySession.test.ts b/hub/src/sync/temporarySession.test.ts
+new file mode 100644
+index 0000000..2f7780a
+--- /dev/null
++++ b/hub/src/sync/temporarySession.test.ts
+@@ -0,0 +1,112 @@
++import { describe, expect, it, mock } from 'bun:test'
++import { Store } from '../store'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { SyncEngine } from './syncEngine'
++
++function setup() {
++    const store = new Store(':memory:')
++    const engine = new SyncEngine(store, {
++        of: () => ({ to: () => ({ emit() {} }) })
++    } as never, new RpcRegistry(), { broadcast() {} } as never)
++    engine.getOrCreateMachine('machine', { host: 'host', platform: 'linux', happyCliVersion: 'test' }, null, 'ns')
++    const gateway = (engine as unknown as { rpcGateway: {
++        spawnSession: (...args: unknown[]) => Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string; code?: 'agent_unavailable' }>
++        killSession: (id: string) => Promise<void>
++    } }).rpcGateway
++    return { store, engine, gateway }
++}
++
++function spawnTemporary(engine: SyncEngine) {
++    return engine.spawnSession('machine', '/tmp/project', 'claude', 'claude-opus-5-5', 'high', undefined,
++        'simple', undefined, undefined, 'high', undefined, undefined, undefined, undefined, undefined, undefined, true)
++}
++
++describe('temporary HAPI sessions', () => {
++    it('persists the fresh identity and temporary marker before starting the controller', async () => {
++        const { store, engine, gateway } = setup()
++        try {
++            gateway.spawnSession = mock(async (...args) => {
++                const id = args[12] as string
++                expect(store.sessions.getSessionByNamespace(id, 'ns')?.metadata).toMatchObject({ temporary: true, machineId: 'machine' })
++                expect(engine.getSession(id)?.model).toBe('claude-opus-5-5')
++                expect(args[8]).toBeUndefined() // no native resume
++                return { type: 'success' as const, sessionId: id }
++            })
++            const result = await spawnTemporary(engine)
++            expect(result.type).toBe('success')
++            expect(gateway.spawnSession).toHaveBeenCalledTimes(1)
++        } finally { engine.stop() }
++    })
++    it.each([true, false])('explicit end removes only temporary chats (temporary=%s)', async temporary => {
++        const { store, engine, gateway } = setup()
++        try {
++            const session = engine.getOrCreateSession('test', { path: '/tmp', host: 'host', temporary }, {}, 'ns')
++            store.messages.addMessage(session.id, { text: 'history' }, 'local')
++            gateway.killSession = mock(async () => {})
++            await engine.archiveSession(session.id)
++            expect(Boolean(store.sessions.getSession(session.id))).toBe(!temporary)
++            if (temporary) expect(store.messages.getMessages(session.id, 10)).toHaveLength(0)
++        } finally { engine.stop() }
++    })
++    it('retains a temporary chat across ordinary session end and unexpected disconnect', () => {
++        const { store, engine } = setup()
++        try {
++            const session = engine.getOrCreateSession('recoverable', { path: '/tmp', host: 'host', temporary: true }, {}, 'ns')
++            engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++            engine.handleSessionEnd({ sid: session.id, time: Date.now(), reason: 'error' })
++            expect(store.sessions.getSession(session.id)?.metadata).toMatchObject({ temporary: true })
++        } finally { engine.stop() }
++    })
++    it('does not delete when stopping the controller fails', async () => {
++        const { store, engine, gateway } = setup()
++        try {
++            const session = engine.getOrCreateSession('failure', { path: '/tmp', host: 'host', temporary: true }, {}, 'ns')
++            gateway.killSession = async () => { throw new Error('timeout') }
++            await expect(engine.archiveSession(session.id)).rejects.toThrow('timeout')
++            expect(store.sessions.getSession(session.id)).toBeTruthy()
++        } finally { engine.stop() }
++    })
++    it('does not convert an existing session into a temporary one', async () => {
++        const { engine, gateway } = setup()
++        try {
++            gateway.spawnSession = mock(async () => ({ type: 'success' as const, sessionId: 'existing' }))
++            const result = await engine.spawnSession('machine', '/tmp', 'claude', undefined, undefined, undefined,
++                undefined, undefined, 'native-existing', undefined, undefined, undefined, undefined, undefined, undefined, undefined, true)
++            expect(result.type).toBe('error')
++            expect(gateway.spawnSession).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++    it('retains the reserved identity after an uncertain spawn acknowledgement', async () => {
++        const { engine, gateway } = setup()
++        try {
++            gateway.spawnSession = async () => ({ type: 'error', message: 'RPC timeout' })
++            await spawnTemporary(engine)
++            expect(engine.getSessions().filter(s => s.metadata?.temporary)).toHaveLength(1)
++        } finally { engine.stop() }
++    })
++    it('cleans an unused reservation after a known pre-start rejection', async () => {
++        const { engine, gateway } = setup()
++        try {
++            gateway.spawnSession = async () => ({ type: 'error', message: 'unavailable', code: 'agent_unavailable' })
++            await spawnTemporary(engine)
++            expect(engine.getSessions()).toHaveLength(0)
++        } finally { engine.stop() }
++    })
++    it('never merges temporary history with a durable native-history import', async () => {
++        const { store, engine } = setup()
++        try {
++            const cache = (engine as unknown as { sessionCache: { deduplicateByAgentSessionId(id: string): Promise<void> } }).sessionCache
++            const metadata = { path: '/tmp', host: 'host', claudeSessionId: 'same-native-id', flavor: 'claude' }
++            const durable = engine.getOrCreateSession('durable', metadata, {}, 'ns')
++            const temporary = engine.getOrCreateSession('temporary', { ...metadata, temporary: true }, {}, 'ns')
++            store.messages.addMessage(durable.id, { text: 'durable' }, 'one')
++            store.messages.addMessage(temporary.id, { text: 'temporary' }, 'two')
++            await cache.deduplicateByAgentSessionId(durable.id)
++            await cache.deduplicateByAgentSessionId(temporary.id)
++            expect(store.sessions.getSession(durable.id)).toBeTruthy()
++            expect(store.sessions.getSession(temporary.id)).toBeTruthy()
++            expect(store.messages.getMessages(durable.id, 10)).toHaveLength(1)
++            expect(store.messages.getMessages(temporary.id, 10)).toHaveLength(1)
++        } finally { engine.stop() }
++    })
++})
+diff --git a/hub/src/web/routes/machines.test.ts b/hub/src/web/routes/machines.test.ts
+index e4ee2fd..7e196b5 100644
+--- a/hub/src/web/routes/machines.test.ts
++++ b/hub/src/web/routes/machines.test.ts
+@@ -356,14 +356,15 @@ describe('machines routes', () => {
+         const response = await app.request('/api/machines/machine-1/spawn', {
+             method: 'POST',
+             headers: { 'content-type': 'application/json' },
+-            body: JSON.stringify({ directory: '/tmp/x', startingMode: 'pty' })
++            body: JSON.stringify({ directory: '/tmp/x', startingMode: 'pty', temporary: true })
+         })
+ 
+         expect(response.status).toBe(200)
+         expect(captured).not.toBeNull()
+-        // startingMode is the last positional argument, after collaborationMode
+-        // and copilotAgentMode.
++        // startingMode follows collaborationMode and copilotAgentMode.
++        // The hub-only temporary flag follows it.
+         expect(captured![15]).toBe('pty')
++        expect(captured![16]).toBe(true)
+         expect(captured![12]).toBeUndefined()
+     })
+ 
+diff --git a/hub/src/web/routes/machines.ts b/hub/src/web/routes/machines.ts
+index 29a22e3..491b290 100644
+--- a/hub/src/web/routes/machines.ts
++++ b/hub/src/web/routes/machines.ts
+@@ -138,7 +138,8 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
+             undefined,
+             parsed.data.collaborationMode,
+             parsed.data.copilotAgentMode,
+-            startingMode
++            startingMode,
++            parsed.data.temporary
+         )
+         return c.json(result)
+     })
+diff --git a/shared/src/apiTypes.ts b/shared/src/apiTypes.ts
+index c0eba1a..8414c90 100644
+--- a/shared/src/apiTypes.ts
++++ b/shared/src/apiTypes.ts
+@@ -627,6 +627,7 @@ export type QueuedStateResponse = {
+ }
+ 
+ export const SpawnSessionRequestSchema = z.object({
++    temporary: z.boolean().optional(),
+     directory: z.string().min(1),
+     agent: AgentFlavorSchema.optional(),
+     model: z.string().optional(),
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+index d26c0ad..42d7ed1 100644
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -55,6 +55,8 @@ export const WorktreeMetadataSchema = z.object({
+ export type WorktreeMetadata = z.infer<typeof WorktreeMetadataSchema>
+ 
+ export const MetadataSchema = z.object({
++    // Hub-owned: delete the HAPI transcript only when explicitly ended.
++    temporary: z.boolean().optional(),
+     path: z.string(),
+     host: z.string(),
+     version: z.string().optional(),
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 459ab11..7729831 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -926,7 +926,8 @@ export class ApiClient {
+         serviceTier?: 'fast' | 'standard',
+         collaborationMode?: CodexCollaborationMode,
+         copilotAgentMode?: CopilotAgentMode,
+-        startingMode?: 'remote' | 'pty'
++        startingMode?: 'remote' | 'pty',
++        temporary?: boolean
+     ): Promise<SpawnResponse> {
+         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
+             method: 'POST',
+@@ -943,7 +944,8 @@ export class ApiClient {
+                 serviceTier,
+                 collaborationMode,
+                 copilotAgentMode,
+-                startingMode
++                startingMode,
++                temporary
+             })
+         })
+     }
+diff --git a/web/src/components/AssistantChat/ChatModelMenu.tsx b/web/src/components/AssistantChat/ChatModelMenu.tsx
+index 91a7e24..8678adb 100644
+--- a/web/src/components/AssistantChat/ChatModelMenu.tsx
++++ b/web/src/components/AssistantChat/ChatModelMenu.tsx
+@@ -1,8 +1,11 @@
++import { resolvedChoices } from '@/lib/resolvedChoices'
+ import { CodexContextToggle } from './CodexContextToggle'
+ import * as Popover from '@radix-ui/react-popover'
+ 
+ type Option = { value: string | null; label: string }
+ export function ChatModelMenu(props: {
++    defaultModel?: string | null
++    defaultReasoning?: string | null
+     codex?: boolean
+     sessionId?: string
+     model: string | null
+@@ -15,31 +18,35 @@ export function ChatModelMenu(props: {
+     onModel: (value: string | null) => void
+     onReasoning: (value: string | null) => void
+ }) {
+-    const model = props.models.find(o => o.value === props.model)?.label ?? props.model ?? 'Default'
+-    const reasoning = props.efforts.find(o => o.value === props.reasoning)?.label ?? props.reasoning ?? 'Auto'
++    const models = resolvedChoices(props.models, props.model, props.defaultModel)
++    const efforts = resolvedChoices(props.efforts, props.reasoning, props.defaultReasoning)
++    const model = models.options.find(option => option.value === models.selected)?.label ?? 'Model'
++    const reasoning = efforts.options.find(option => option.value === efforts.selected)?.label ?? null
+     return <Popover.Root>
+         <Popover.Trigger asChild>
+-            <button type="button" aria-label={`Model and reasoning: ${model}, ${reasoning}`} disabled={props.disabled}
++            <button type="button" aria-label={`Model and reasoning: ${model}${reasoning ? `, ${reasoning}` : ''}`} disabled={props.disabled}
+                 className="flex h-11 max-w-[9rem] shrink-0 flex-col justify-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
+                 <span className="w-full truncate text-xs font-medium">{model}</span>
+-                <span className="w-full truncate text-[11px] text-[var(--app-hint)]">{reasoning} ▾</span>
++                <span className="w-full truncate text-[11px] text-[var(--app-hint)]">{reasoning ? `${reasoning} ▾` : '▾'}</span>
+             </button>
+         </Popover.Trigger>
+         <Popover.Portal>
+             <Popover.Content side="top" align="end" sideOffset={8} collisionPadding={12} aria-label="Model and reasoning"
+                 className="z-[100] w-72 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-3 shadow-xl">
+                 <label className="mb-3 flex flex-col gap-1 text-xs">Model
+-                    <select aria-label="Model" value={props.model ?? ''} disabled={props.disabled}
++                    <select aria-label="Model" value={models.selected} disabled={props.disabled}
+                         onChange={e => props.onModel(e.target.value || null)}
+                         className="min-h-11 w-full rounded-lg border bg-[var(--app-bg)] px-2 text-sm">
+-                        {props.models.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
++                        {!models.selected ? <option value="" disabled hidden>Choose model</option> : null}
++                        {models.options.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
+                     </select>
+                 </label>
+                 <label className="flex flex-col gap-1 text-xs">Reasoning
+-                    <select aria-label="Reasoning" value={props.reasoning ?? ''} disabled={props.disabled || props.efforts.length === 0}
++                    <select aria-label="Reasoning" value={efforts.selected} disabled={props.disabled || efforts.options.length === 0}
+                         onChange={e => props.onReasoning(e.target.value || null)}
+                         className="min-h-11 w-full rounded-lg border bg-[var(--app-bg)] px-2 text-sm">
+-                        {props.efforts.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
++                        {!efforts.selected ? <option value="" disabled hidden>Choose reasoning</option> : null}
++                        {efforts.options.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
+                     </select>
+                 </label>
+                 {props.codex && props.sessionId ? <CodexContextToggle sessionId={props.sessionId} model={props.model} /> : null}
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index 1214b54..5f8e6c7 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -287,6 +287,8 @@ export function HappyComposer(props: {
+     sendWhenReady?: boolean
+     readyToInterrupt?: boolean
+     onInterruptReady?: () => void
++    defaultModel?: string | null
++    defaultReasoning?: string | null
+     supportsNativePriority?: boolean
+     statisticsButton?: ReactNode
+     sessionId?: string
+@@ -2353,6 +2355,8 @@ export function HappyComposer(props: {
+                                     onChange={handlePermissionChange}
+                                 /> : null}
+                                 <ChatModelMenu
++                                    defaultModel={props.defaultModel}
++                                    defaultReasoning={props.defaultReasoning}
+                                     codex={agentFlavor === 'codex'}
+                                     sessionId={sessionId}
+                                     model={model === 'auto' || model === 'default' ? null : model}
+diff --git a/web/src/components/NewSession/ActionButtons.test.tsx b/web/src/components/NewSession/ActionButtons.test.tsx
+new file mode 100644
+index 0000000..df3cdd1
+--- /dev/null
++++ b/web/src/components/NewSession/ActionButtons.test.tsx
+@@ -0,0 +1,25 @@
++import { describe, expect, it, vi } from 'vitest'
++import { fireEvent, render, screen } from '@testing-library/react'
++import { I18nProvider } from '@/lib/i18n-context'
++import { ActionButtons } from './ActionButtons'
++
++describe('new chat actions', () => {
++    it('places the purple temporary action immediately left of Create and invokes it once', () => {
++        const temporary = vi.fn(), create = vi.fn()
++        render(<I18nProvider><ActionButtons isPending={false} canCreate isDisabled={false}
++            onCancel={() => {}} onCreateTemporary={temporary} onCreate={create} /></I18nProvider>)
++        const button = screen.getByRole('button', { name: 'Create temporary' })
++        expect(button.nextElementSibling).toHaveTextContent('Create')
++        expect(button.className).toContain('bg-violet-600')
++        expect(button.title).toContain('Project files and provider history remain')
++        fireEvent.click(button)
++        expect(temporary).toHaveBeenCalledTimes(1)
++        expect(create).not.toHaveBeenCalled()
++    })
++    it('disables both create actions while a creation is pending', () => {
++        render(<I18nProvider><ActionButtons isPending canCreate isDisabled={false}
++            onCancel={() => {}} onCreateTemporary={() => {}} onCreate={() => {}} /></I18nProvider>)
++        expect(screen.getByRole('button', { name: 'Create temporary' })).toBeDisabled()
++        expect(screen.getAllByRole('button').every(button => (button as HTMLButtonElement).disabled)).toBe(true)
++    })
++})
+diff --git a/web/src/components/NewSession/ActionButtons.tsx b/web/src/components/NewSession/ActionButtons.tsx
+index 44728fa..cf7a3fb 100644
+--- a/web/src/components/NewSession/ActionButtons.tsx
++++ b/web/src/components/NewSession/ActionButtons.tsx
+@@ -8,22 +8,30 @@ export function ActionButtons(props: {
+     isDisabled: boolean
+     createLabel?: string
+     onCancel: () => void
++    onCreateTemporary?: () => void
+     onCreate: () => void
+ }) {
+     const { t } = useTranslation()
+ 
+     return (
+-        <div className="flex w-full justify-end gap-2 px-3 pt-3 pb-[calc(env(safe-area-inset-bottom)+1rem)]">
++        <div className="grid w-full grid-cols-[1fr_auto] sm:flex sm:justify-end gap-2 px-3 pt-3 pb-[calc(env(safe-area-inset-bottom)+1rem)]">
+             <Button
+                 variant="secondary"
++                className="col-span-2 mr-auto justify-self-start"
+                 onClick={props.onCancel}
+-                disabled={props.isDisabled}
++                disabled={props.isDisabled || props.isPending}
+             >
+                 {t('button.cancel')}
+             </Button>
++            {props.onCreateTemporary ? <Button
++                onClick={props.onCreateTemporary}
++                disabled={!props.canCreate || props.isDisabled || props.isPending}
++                title="Deletes this HAPI chat when you choose Archive. Project files and provider history remain."
++                className="gap-2 bg-violet-600 text-white hover:bg-violet-700"
++            >Create temporary</Button> : null}
+             <Button
+                 onClick={props.onCreate}
+-                disabled={!props.canCreate}
++                disabled={!props.canCreate || props.isDisabled || props.isPending}
+                 aria-busy={props.isPending}
+                 className="gap-2"
+             >
+diff --git a/web/src/components/NewSession/EffortField.test.tsx b/web/src/components/NewSession/EffortField.test.tsx
+index e9fca81..a894b4a 100644
+--- a/web/src/components/NewSession/EffortField.test.tsx
++++ b/web/src/components/NewSession/EffortField.test.tsx
+@@ -49,7 +49,9 @@ describe('EffortField', () => {
+         )
+         const select = container.querySelector('select') as HTMLSelectElement
+         const values = Array.from(select.options).map((option) => option.value)
+-        expect(values[0]).toBe('auto')
++        expect(values).not.toContain('auto')
++        expect(select.value).toBe('')
++        expect(select.selectedOptions[0]?.hidden).toBe(true)
+         expect(values).toContain('low')
+         expect(values).toContain('high')
+     })
+@@ -99,7 +101,7 @@ describe('EffortField', () => {
+         )
+         const select = container.querySelector('select') as HTMLSelectElement
+         const values = Array.from(select.options).map((option) => option.value)
+-        expect(values).toContain('default')
++        expect(values).not.toContain('default')
+         expect(values).toContain('high')
+         // Codex static fallback excludes max (reserved for model-dependent lists).
+         expect(values).not.toContain('max')
+@@ -139,3 +141,12 @@ describe('EffortField', () => {
+         ])
+     })
+ })
++
++it('shows the known Codex default as its concrete effort without changing inheritance', () => {
++    const onChange = vi.fn()
++    const { container } = render(<EffortField {...baseProps} agent="codex" defaultEffort="high" onReasoningEffortChange={onChange} />)
++    const select = container.querySelector('select')!
++    expect(select.value).toBe('high')
++    expect(Array.from(select.options).some(option => /default/i.test(option.text))).toBe(false)
++    expect(onChange).not.toHaveBeenCalled()
++})
+diff --git a/web/src/components/NewSession/EffortField.tsx b/web/src/components/NewSession/EffortField.tsx
+index f684fac..d5e751f 100644
+--- a/web/src/components/NewSession/EffortField.tsx
++++ b/web/src/components/NewSession/EffortField.tsx
+@@ -1,3 +1,4 @@
++import { resolvedChoices } from '@/lib/resolvedChoices'
+ import { getAgentConfigDescriptor, type PiThinkingLevelMap } from '@hapi/protocol'
+ import { getPiThinkingLevelOptions } from '@/components/AssistantChat/piThinkingLevelOptions'
+ import { getCodexComposerReasoningEffortOptions } from '@/components/AssistantChat/codexReasoningEffortOptions'
+@@ -7,6 +8,7 @@ import type { AgentType, CodexReasoningEffort, LaunchEffort } from './types'
+ import { CLAUDE_EFFORT_OPTIONS, CODEX_REASONING_EFFORT_OPTIONS, GROK_EFFORT_OPTIONS } from './types'
+ 
+ export type EffortFieldProps = {
++    defaultEffort?: string | null
+     agent: AgentType
+     /** Launch-effort state (Claude / Grok / Pi). */
+     effort: LaunchEffort
+@@ -88,21 +90,24 @@ export function EffortField(props: EffortFieldProps) {
+     }
+ 
+     const value = isReasoningEffort ? props.reasoningEffort : props.effort
++    const resolved = props.agent === 'claude' || props.agent === 'codex'
++        ? resolvedChoices(options, value, props.defaultEffort) : null
+     const onChange = isReasoningEffort ? props.onReasoningEffortChange : props.onEffortChange
+ 
+     return (
+         <div className="flex flex-col gap-1.5 px-3 py-3">
+             <label className="text-xs font-medium text-[var(--app-hint)]">
+                 {isReasoningEffort ? t('newSession.reasoningEffort') : t('newSession.effort')}{' '}
+-                <span className="font-normal">({t('newSession.model.optional')})</span>
++                {!resolved ? <span className="font-normal">({t('newSession.model.optional')})</span> : null}
+             </label>
+             <SelectControl
+-                value={value}
++                value={resolved?.selected ?? value}
+                 onChange={(e) => onChange(e.target.value)}
+                 disabled={props.isDisabled}
+                 className="py-2 pl-3 text-sm rounded-lg border border-[var(--app-divider)] bg-[var(--app-bg)] text-[var(--app-text)] focus:outline-none focus:ring-2 focus:ring-[var(--app-link)] disabled:opacity-50"
+             >
+-                {options.map((option) => (
++                {resolved && !resolved.selected ? <option value="" disabled hidden>Choose reasoning</option> : null}
++                {(resolved?.options ?? options).map((option) => (
+                     <option key={option.value} value={option.value}>
+                         {option.label}
+                     </option>
+diff --git a/web/src/components/NewSession/ModelSelector.test.tsx b/web/src/components/NewSession/ModelSelector.test.tsx
+index d21b5bd..f09ae4b 100644
+--- a/web/src/components/NewSession/ModelSelector.test.tsx
++++ b/web/src/components/NewSession/ModelSelector.test.tsx
+@@ -53,3 +53,14 @@ describe('ModelSelector', () => {
+         expect(container.querySelector('select')).toBeNull()
+     })
+ })
++
++it('shows the resolved model once without a Default alias', () => {
++    const { container } = render(<ModelSelector {...baseProps} agent="claude" defaultModel="claude-opus-5-5" options={[
++        { value: 'auto', label: 'Default (Opus 5.5)' },
++        { value: 'claude-opus-5-5', label: 'Opus 5.5' },
++        { value: 'claude-opus-5-5', label: 'Opus 5.5' },
++    ]} />)
++    const select = container.querySelector('select')!
++    expect(select.value).toBe('claude-opus-5-5')
++    expect(Array.from(select.options).map(option => option.textContent)).toEqual(['Opus 5.5'])
++})
+diff --git a/web/src/components/NewSession/ModelSelector.tsx b/web/src/components/NewSession/ModelSelector.tsx
+index 0946b11..76910e7 100644
+--- a/web/src/components/NewSession/ModelSelector.tsx
++++ b/web/src/components/NewSession/ModelSelector.tsx
+@@ -1,9 +1,11 @@
++import { resolvedChoices } from '@/lib/resolvedChoices'
+ import type { AgentType } from './types'
+ import { MODEL_OPTIONS } from './types'
+ import { useTranslation } from '@/lib/use-translation'
+ import { SelectControl } from '@/components/ui/select-control'
+ 
+ export function ModelSelector(props: {
++    defaultModel?: string | null
+     agent: AgentType
+     model: string
+     label?: string
+@@ -14,7 +16,10 @@ export function ModelSelector(props: {
+     onModelChange: (value: string) => void
+ }) {
+     const { t } = useTranslation()
+-    const options: Array<{ value: string; label: string; group?: string }> = props.options ?? MODEL_OPTIONS[props.agent]
++    const raw: Array<{ value: string; label: string; group?: string }> = props.options ?? MODEL_OPTIONS[props.agent]
++    const resolved = props.agent === 'claude' || props.agent === 'codex'
++        ? resolvedChoices(raw, props.model, props.defaultModel) : null
++    const options = resolved?.options ?? raw
+     if (options.length === 0) {
+         return null
+     }
+@@ -33,11 +38,12 @@ export function ModelSelector(props: {
+                 {props.label ?? t('newSession.model')}
+             </label>
+             <SelectControl
+-                value={props.model}
++                value={resolved?.selected ?? props.model}
+                 onChange={(e) => props.onModelChange(e.target.value)}
+                 disabled={props.isDisabled || props.isLoading}
+                 className="py-2 pl-3 text-sm rounded-lg border border-[var(--app-divider)] bg-[var(--app-bg)] text-[var(--app-text)] focus:outline-none focus:ring-2 focus:ring-[var(--app-link)] disabled:opacity-50"
+             >
++                {resolved && !resolved.selected ? <option value="" disabled hidden>Choose model</option> : null}
+                 {Object.entries(groupedOptions).map(([group, grouped]) => group ? (
+                     <optgroup key={group} label={group}>
+                         {grouped.map((option) => (
+diff --git a/web/src/components/NewSession/index.test.tsx b/web/src/components/NewSession/index.test.tsx
+index b5cce30..10195c4 100644
+--- a/web/src/components/NewSession/index.test.tsx
++++ b/web/src/components/NewSession/index.test.tsx
+@@ -1,3 +1,4 @@
++vi.mock('@/hooks/queries/useClaudeModels', () => ({ useClaudeModels: () => ({ models: [{value:'default',resolvedModel:'claude-opus-5-5',displayName:'Default (recommended)'},{value:'opus',resolvedModel:'claude-opus-5-5',displayName:'Opus 5.5'}],isLoading:false,error:null }) }))
+ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import type { ApiClient } from '@/api/client'
+@@ -264,8 +265,9 @@ vi.mock('./ModelSelector', () => ({
+     )
+ }))
+ vi.mock('./ActionButtons', () => ({
+-    ActionButtons: (props: { onCreate: () => void; onChooseFolder?: () => void; canCreate: boolean }) => (
++    ActionButtons: (props: { onCreate: () => void; onChooseFolder?: () => void; onCreateTemporary?: () => void; canCreate: boolean }) => (
+         <>
++            {props.onCreateTemporary ? <button type="button" data-testid="create-temporary" disabled={!props.canCreate} onClick={props.onCreateTemporary}>temporary</button> : null}
+             <button type="button" data-testid="create" disabled={!props.canCreate} onClick={props.onCreate}>create</button>
+             {props.onChooseFolder ? <button type="button" data-testid="browse" onClick={props.onChooseFolder}>browse</button> : null}
+         </>
+@@ -340,6 +342,17 @@ describe('NewSession launch preferences', () => {
+         expect(screen.queryByDisplayValue('claude')).not.toBeInTheDocument()
+     })
+ 
++    it('sends the temporary flag only for the separate temporary creation action', async () => {
++        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'temporary-chat' })
++        render(<NewSession api={api} machines={[machine]} initialMachineId="machine-1"
++            initialDirectory="C:\\repo" onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        await waitFor(() => expect(screen.getByTestId('create-temporary')).toBeEnabled())
++        fireEvent.click(screen.getByTestId('create-temporary'))
++        await waitFor(() => expect(mocks.onSuccess).toHaveBeenCalledWith('temporary-chat'))
++        expect(mocks.spawnSession).toHaveBeenCalledTimes(1)
++        expect(mocks.spawnSession).toHaveBeenCalledWith(expect.objectContaining({ temporary: true }))
++    })
++
+     it('refuses a directory rejected by workspace-root validation', async () => {
+         mocks.checkPathsExists.mockImplementation(async ([path]: string[]) => ({
+             exists: { [path]: false },
+diff --git a/web/src/components/NewSession/index.tsx b/web/src/components/NewSession/index.tsx
+index 934f6bb..03854c9 100644
+--- a/web/src/components/NewSession/index.tsx
++++ b/web/src/components/NewSession/index.tsx
+@@ -20,7 +20,9 @@ import { useActiveSuggestions, type Suggestion } from '@/hooks/useActiveSuggesti
+ import { useDirectorySuggestions } from '@/hooks/useDirectorySuggestions'
+ import { useRecentPaths } from '@/hooks/useRecentPaths'
+ import { useTranslation } from '@/lib/use-translation'
+-import { getCodexModelReasoningEfforts } from '@/lib/codexModelCapabilities'
++import { claudeCatalogChoices } from '@/lib/claudeCatalogChoices'
++import { useClaudeModels } from '@/hooks/queries/useClaudeModels'
++import { getCodexModelReasoningEfforts, resolveCodexModel } from '@/lib/codexModelCapabilities'
+ import {
+     buildNewSessionCursorModelCatalog,
+     buildNewSessionCursorPickerState,
+@@ -310,6 +312,12 @@ export function NewSession(props: {
+         machineId,
+         enabled: agent === 'codex' && Boolean(machineId)
+     })
++    const claudeCatalog = useClaudeModels({ api: props.api, machineId, enabled: agent === 'claude' })
++    const claudeDefaultModel = claudeCatalog.models.find(candidate => candidate.value === 'default')?.resolvedModel
++    const claudeModelOptions = claudeCatalog.models.length ? claudeCatalogChoices(claudeCatalog.models) : undefined
++    const defaultReasoning = agent === 'codex'
++        ? resolveCodexModel(codexModelsState.models, model)?.defaultReasoningEffort
++        : undefined
+     const [agySelectedModel, setAgySelectedModel] = useState<string | null>(null)
+     // Whether the AGY model on screen is one the user picked here, as opposed to
+     // one restored from a draft or a saved preference. A restored model that the
+@@ -1487,7 +1495,7 @@ export function NewSession(props: {
+         }
+     }, [suggestions, selectedIndex, moveUp, moveDown, clearSuggestions, handleSuggestionSelect])
+ 
+-    async function handleCreate() {
++    async function handleCreate(temporary = false) {
+         if (!machineId || !trimmedDirectory || createInFlightRef.current) return
+ 
+         createInFlightRef.current = true
+@@ -1625,6 +1633,7 @@ export function NewSession(props: {
+             }
+ 
+             const result = await spawnSession({
++                temporary: temporary || undefined,
+                 machineId,
+                 directory: trimmedDirectory,
+                 agent,
+@@ -1879,9 +1888,11 @@ export function NewSession(props: {
+                     <ModelSelector
+                         agent={agent}
+                         model={model}
++                        defaultModel={agent === 'claude' ? claudeDefaultModel : resolveCodexModel(codexModelsState.models, null)?.id}
+                         options={
+                             agent === 'codex'
+                                 ? codexModelOptions
++                                : agent === 'claude' ? claudeModelOptions
+                                 : agent === 'grok'
+                                     ? grokModelOptions
+                                     : agent === 'copilot'
+@@ -1897,7 +1908,7 @@ export function NewSession(props: {
+                             || (agent === 'copilot' && Boolean(copilotModelsState.error))
+                             || (agent === 'pi' && Boolean(piModelsState.error))
+                         }
+-                        isLoading={(agent === 'codex' && codexModelsState.isLoading)
++                        isLoading={(agent === 'claude' && claudeCatalog.isLoading) || (agent === 'codex' && codexModelsState.isLoading)
+                             || (agent === 'grok' && grokModelsState.isLoading)
+                             || (agent === 'copilot' && copilotModelsState.isLoading)
+                             || (agent === 'pi' && piModelsState.isLoading)}
+@@ -1920,6 +1931,7 @@ export function NewSession(props: {
+                     effort={effort}
+                     onEffortChange={setEffort}
+                     reasoningEffort={modelReasoningEffort}
++                    defaultEffort={defaultReasoning}
+                     onReasoningEffortChange={setModelReasoningEffort}
+                     isDisabled={isFormDisabled || (agent === 'codex' && codexModelsState.isLoading)}
+                     grokOptions={agent === 'grok' ? grokEffortOptions : undefined}
+@@ -1974,7 +1986,8 @@ export function NewSession(props: {
+                 isDisabled={isFormDisabled}
+                 createLabel={createLabel}
+                 onCancel={props.onCancel}
+-                onCreate={handleCreate}
++                onCreate={() => handleCreate()}
++                onCreateTemporary={!selectedCodexImportSession && !selectedPiImportSession ? () => handleCreate(true) : undefined}
+             />
+             <CodexSessionSyncDialog
+                 isOpen={isCodexImportDialogOpen}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index b60e8e6..018561a 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,4 +1,6 @@
+ import { NativeReadyMessages } from './AssistantChat/NativeReadyMessages'
++import { resolveCodexModel } from '@/lib/codexModelCapabilities'
++import { claudeCatalogChoices } from '@/lib/claudeCatalogChoices'
+ import { useSteerQueuedMessage } from '@/hooks/mutations/useSteerQueuedMessage'
+ import { QuickApproval } from './QuickApproval'
+ import { GoalBanner } from './GoalBanner'
+@@ -992,10 +994,7 @@ function SessionChatInner(props: SessionChatProps) {
+         retry: false,
+     })
+     const claudeModels = claudeCatalog.data?.models
+-    const claudeModelOptions = claudeModels?.map(m => ({
+-        value: m.value === 'default' ? null : (m.resolvedModel ?? m.value),
+-        label: m.value === 'default' ? `Default (${m.resolvedModel ?? m.displayName})` : m.displayName,
+-    }))
++    const claudeModelOptions = claudeModels ? claudeCatalogChoices(claudeModels) : undefined
+     const currentClaudeModel = claudeModels?.find(m => m.value === (props.session.model ?? 'default') || m.resolvedModel === props.session.model)
+     const claudeEfforts = currentClaudeModel?.supportedEffortLevels?.map(value => ({ value, name: value })) ?? []
+     const codexModelsState = useCodexModels({
+@@ -2079,6 +2078,9 @@ function SessionChatInner(props: SessionChatProps) {
+                         permissionMode={props.session.permissionMode}
+                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
+                         copilotAgentMode={agentFlavor === 'copilot' ? props.session.copilotAgentMode : undefined}
++                        defaultModel={agentFlavor === 'claude' ? claudeModels?.find(model => model.value === 'default')?.resolvedModel ?? reduced.latestUsage?.model ?? props.session.model
++                            : agentFlavor === 'codex' ? resolveCodexModel(codexModelsState.models, null)?.id : null}
++                        defaultReasoning={agentFlavor === 'codex' ? resolveCodexModel(codexModelsState.models, props.session.model)?.defaultReasoningEffort : null}
+                         compactModelControls
+                         model={props.session.model}
+                         modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+index 3d3436a..a39044a 100644
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -388,6 +388,7 @@ export function SessionHeader(props: {
+                     <div className="min-w-0 flex-1">
+                         <div className="truncate font-semibold">
+                             {title}
++                            {session.metadata?.temporary ? <span title="Deleted from HAPI when you choose Archive" className="ml-2 rounded bg-violet-500/15 px-1.5 py-0.5 text-xs font-normal text-violet-500">Temporary</span> : null}
+                         </div>
+                         {showMobileMetadata ? (
+                             <div className="flex min-w-0 flex-nowrap items-center gap-2 overflow-hidden text-xs text-[var(--app-hint)] sm:hidden">
+diff --git a/web/src/hooks/mutations/useSpawnSession.ts b/web/src/hooks/mutations/useSpawnSession.ts
+index c9e2d59..ed3a10c 100644
+--- a/web/src/hooks/mutations/useSpawnSession.ts
++++ b/web/src/hooks/mutations/useSpawnSession.ts
+@@ -19,6 +19,7 @@ type SpawnInput = {
+     collaborationMode?: CodexCollaborationMode
+     copilotAgentMode?: CopilotAgentMode
+     startingMode?: 'remote' | 'pty'
++    temporary?: boolean
+ }
+ 
+ export function useSpawnSession(api: ApiClient | null): {
+@@ -47,7 +48,8 @@ export function useSpawnSession(api: ApiClient | null): {
+                 input.serviceTier,
+                 input.collaborationMode,
+                 input.copilotAgentMode,
+-                input.startingMode
++                input.startingMode,
++                input.temporary
+             )
+         },
+         onSuccess: () => {
+diff --git a/web/src/hooks/queries/useClaudeModels.ts b/web/src/hooks/queries/useClaudeModels.ts
+new file mode 100644
+index 0000000..8d49421
+--- /dev/null
++++ b/web/src/hooks/queries/useClaudeModels.ts
+@@ -0,0 +1,14 @@
++import { useQuery } from '@tanstack/react-query'
++import type { ApiClient } from '@/api/client'
++
++export function useClaudeModels(args: { api: ApiClient | null; machineId?: string | null; enabled: boolean }) {
++    const query = useQuery({
++        queryKey: ['local-claude-models', args.machineId],
++        queryFn: () => args.api!.getMachineClaudeModels(args.machineId!),
++        enabled: args.enabled && Boolean(args.api && args.machineId),
++        staleTime: 60_000,
++        retry: false,
++    })
++    return { models: query.data?.models ?? [], isLoading: query.isLoading,
++        error: query.error instanceof Error ? query.error.message : null }
++}
+diff --git a/web/src/lib/claudeCatalogChoices.test.ts b/web/src/lib/claudeCatalogChoices.test.ts
+new file mode 100644
+index 0000000..9aeb3d3
+--- /dev/null
++++ b/web/src/lib/claudeCatalogChoices.test.ts
+@@ -0,0 +1,14 @@
++import { expect, it } from 'vitest'
++import { claudeCatalogChoices } from './claudeCatalogChoices'
++import { resolvedChoices } from './resolvedChoices'
++it('shows Opus 5.5 once even when Default (recommended) is the first native catalog entry', () => {
++    const choices = claudeCatalogChoices([
++        {value:'default',resolvedModel:'claude-opus-5-5',displayName:'Default (recommended)'},
++        {value:'opus',resolvedModel:'claude-opus-5-5',displayName:'Opus 5.5'},
++    ])
++    expect(resolvedChoices(choices, 'auto', 'claude-opus-5-5')).toEqual({selected:'claude-opus-5-5', options:[{value:'claude-opus-5-5',label:'Opus 5.5'}]})
++})
++it('can label a resolved default even if its concrete alias is absent', () => {
++    expect(claudeCatalogChoices([{value:'default',resolvedModel:'claude-opus-5-5',displayName:'Default (recommended)'}]))
++        .toEqual([{value:'claude-opus-5-5',label:'Opus 5.5'}])
++})
+diff --git a/web/src/lib/claudeCatalogChoices.ts b/web/src/lib/claudeCatalogChoices.ts
+new file mode 100644
+index 0000000..aa8e2d9
+--- /dev/null
++++ b/web/src/lib/claudeCatalogChoices.ts
+@@ -0,0 +1,14 @@
++import { getClaudeModelLabel } from '@hapi/protocol'
++
++type ClaudeModel = { value: string; resolvedModel?: string; displayName: string }
++/** Prefer the concrete catalog entry over the native Default (recommended) alias. */
++export function claudeCatalogChoices(models: readonly ClaudeModel[]) {
++    return models.map(candidate => {
++        const id = candidate.resolvedModel ?? candidate.value
++        const concrete = models.find(model => model.value !== 'default' && (model.resolvedModel ?? model.value) === id)
++        const version = id.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)(?:$|[-\[])/i)
++        const label = concrete?.displayName ?? getClaudeModelLabel(id)
++            ?? (version ? `${version[1]![0]!.toUpperCase()}${version[1]!.slice(1)} ${version[2]}.${version[3]}${id.includes('[1m]') ? ' 1M' : ''}` : id)
++        return { value: id, label }
++    }).filter(model => model.value !== 'default')
++}
+diff --git a/web/src/lib/resolvedChoices.test.ts b/web/src/lib/resolvedChoices.test.ts
+new file mode 100644
+index 0000000..9d68c0b
+--- /dev/null
++++ b/web/src/lib/resolvedChoices.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from 'vitest'
++import { resolvedChoices } from './resolvedChoices'
++
++describe('resolved choices', () => {
++    it('merges inheritance and duplicate concrete options into one actual choice', () => {
++        expect(resolvedChoices([{value:null,label:'Default (Opus 5.5)'},{value:'opus-5-5',label:'Opus 5.5'},
++            {value:'opus-5-5',label:'Opus 5.5'}], 'auto', 'opus-5-5')).toEqual({
++            selected:'opus-5-5', options:[{value:'opus-5-5',label:'Opus 5.5'}]
++        })
++    })
++    it('preserves an explicit custom model instead of resetting it to the default', () => {
++        expect(resolvedChoices([{value:'default',label:'Default'},{value:'opus',label:'Opus'}], 'custom', 'opus').selected).toBe('custom')
++    })
++    it('does not invent an effort when the provider does not report its default', () => {
++        const result = resolvedChoices([{value:null,label:'Auto'},{value:'high',label:'High'}], null)
++        expect(result).toEqual({selected:'',options:[{value:'high',label:'High'}]})
++    })
++})
+diff --git a/web/src/lib/resolvedChoices.ts b/web/src/lib/resolvedChoices.ts
+new file mode 100644
+index 0000000..a54ee56
+--- /dev/null
++++ b/web/src/lib/resolvedChoices.ts
+@@ -0,0 +1,20 @@
++export type Choice = { value: string | null; label: string; group?: string }
++export function isInheritedChoice(value: string | null | undefined): boolean {
++    return value == null || value === '' || value === 'auto' || value === 'default'
++}
++/** Show a resolved default once, without exposing the transport's inheritance sentinel. */
++export function resolvedChoices(options: readonly Choice[], current: string | null | undefined, resolvedDefault?: string | null) {
++    const concrete = options.filter((option): option is Choice & { value: string } => !isInheritedChoice(option.value))
++    const selected = isInheritedChoice(current) ? resolvedDefault ?? '' : current!
++    const seen = new Set<string>()
++    const choices = concrete.filter(option => {
++        if (seen.has(option.value!)) return false
++        seen.add(option.value!); return true
++    })
++    if (selected && !choices.some(option => option.value === selected)) {
++        const inherited = options.find(option => isInheritedChoice(option.value))
++        const resolvedLabel = inherited?.label.match(/^Default\s*\((.+)\)$/i)?.[1]
++        choices.unshift({ value: selected, label: resolvedLabel ?? selected })
++    }
++    return { options: choices, selected }
++}

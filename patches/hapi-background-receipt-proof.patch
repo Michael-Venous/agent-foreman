@@ -1,0 +1,284 @@
+--- a/shared/src/index.ts
++++ b/shared/src/index.ts
+@@ -26,3 +26,4 @@
+ export * from './usage'
+ export * from './version'
+ export type * from './types'
++export * from './backgroundTaskReceipt'
+--- /dev/null
++++ b/shared/src/backgroundTaskReceipt.ts
+@@ -0,0 +1,15 @@
++/** Match the runtime receipt at the start of a result, never a substring in code, logs or diffs. */
++export function claudeBackgroundTaskReceipt(output: string): { id: string; outputPath: string } | null {
++    const line = output.split(/\r?\n/, 1)[0]
++    const match = line.match(/^Command running in background with ID: ([\w-]+)\. Output is being written to: (\/[^\r\n]+?\.output)\.?(?: You will be notified when it completes\.(?: To check interim output, use Read on that file path\.)?)?$/)
++    return match ? { id: match[1], outputPath: match[2] } : null
++}
++
++/** exec output may have transport headers before its process receipt; arbitrary prose is not a header. */
++export function codexBackgroundTaskReceipt(output: string): string | null {
++    const lines = output.split(/\r?\n/)
++    let index = 0
++    if (/^Chunk ID: [\w-]+$/.test(lines[index] ?? '')) index++
++    if (/^Wall time: [\d.]+ seconds$/.test(lines[index] ?? '')) index++
++    return lines[index]?.match(/^Process running with session ID (\d+)$/)?.[1] ?? null
++}
+--- /dev/null
++++ b/shared/src/backgroundTaskReceipt.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from 'bun:test'
++import { claudeBackgroundTaskReceipt, codexBackgroundTaskReceipt } from './backgroundTaskReceipt'
++const receipt = 'Command running in background with ID: real-job. Output is being written to: /tmp/project/real-job.output.'
++describe('background launch receipts', () => {
++    it('accepts complete native receipts, cwd hints and CRLF', () => {
++        for (const suffix of ['', '\nSession cwd remains /project.', ' You will be notified when it completes. To check interim output, use Read on that file path.\r\nSession cwd remains /project.']) {
++            expect(claudeBackgroundTaskReceipt(receipt + suffix)).toEqual({ id: 'real-job', outputPath: '/tmp/project/real-job.output' })
++        }
++    })
++    it('rejects fixture strings, source files, diffs, grep results, prose and incomplete receipts', () => {
++        for (const output of [`const start = '${receipt}'`, `--- a/test.ts\n+++ b/test.ts\n+const start = '${receipt}'`, `import { test } from 'vitest'\n${receipt}`, `file.ts:42:${receipt}`, `Example: ${receipt}`, `\`${receipt}\``, 'Command running in background with ID: real-job', receipt + "',", receipt.replace('/tmp/project/real-job.output', 'not-a-path')]) expect(claudeBackgroundTaskReceipt(output)).toBeNull()
++    })
++    it('accepts Codex receipts only at the beginning or after known transport headers', () => {
++        expect(codexBackgroundTaskReceipt('Process running with session ID 42\nOutput:')).toBe('42')
++        expect(codexBackgroundTaskReceipt('Chunk ID: abc123\nWall time: 1.002 seconds\nProcess running with session ID 42\nFinal output:')).toBe('42')
++        for (const output of ["const output = 'Process running with session ID 42'", 'source:\nProcess running with session ID 42', '+Process running with session ID 42']) expect(codexBackgroundTaskReceipt(output)).toBeNull()
++    })
++})
+--- a/hub/src/sync/backgroundTasks.ts
++++ b/hub/src/sync/backgroundTasks.ts
+@@ -1,4 +1,4 @@
+-import { isObject } from '@hapi/protocol'
++import { claudeBackgroundTaskReceipt, isObject } from '@hapi/protocol'
+ import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+ 
+ export type BackgroundTaskDelta = {
+@@ -34,7 +34,8 @@
+         if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) return
+         const stopped = stoppedTaskId(textOf(block.content))
+         if (stopped) completedIds.add(stopped)
+-        for (const match of textOf(block.content).matchAll(/Command running in background with ID:\s*([\w-]+)/g)) startedIds.add(match[1])
++        const receipt = claudeBackgroundTaskReceipt(textOf(block.content))
++        if (receipt) startedIds.add(receipt.id)
+     }
+     if (data.type === 'tool_result') start(data)
+     if ((data.type === 'user' || data.type === 'assistant') && isObject(data.message) && Array.isArray(data.message.content)) {
+--- a/hub/src/sync/backgroundTasks.test.ts
++++ b/hub/src/sync/backgroundTasks.test.ts
+@@ -63,3 +63,12 @@
+         expect(extractBackgroundTaskDelta(taskEnd('a', 'running'))).toBeNull()
+     })
+ })
++
++it('does not count fixture strings from source files or diffs as launches (Dev2 regression)', () => {
++    const event = taskStart('job')
++    const receipt = event.content.data.message.content[0].content
++    for (const output of [`--- a/test.ts\n+++ b/test.ts\n+const start = '${receipt}',`, `import { test } from 'vitest'\nconst start = '${receipt}'`, `42:${receipt}`]) {
++        event.content.data.message.content[0].content = output
++        expect(extractBackgroundTaskDelta(event)).toBeNull()
++    }
++})
+--- a/hub/src/backgroundTaskOutput.ts
++++ b/hub/src/backgroundTaskOutput.ts
+@@ -2,7 +2,7 @@
+ import { open, realpath, stat } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { basename, join, resolve, sep } from 'node:path'
+-import { isObject } from '@hapi/protocol'
++import { claudeBackgroundTaskReceipt, isObject } from '@hapi/protocol'
+ import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+ 
+ export function backgroundOutputPath(content: unknown, taskId: string): string | null {
+@@ -16,9 +16,8 @@
+         if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) continue
+         const text = typeof block.content === 'string' ? block.content : Array.isArray(block.content)
+             ? block.content.map(p => isObject(p) && typeof p.text === 'string' ? p.text : '').join('\n') : ''
+-        if (text.match(/Command running in background with ID:\s*([\w-]+)/)?.[1] !== taskId) continue
+-        const path = text.match(/Output is being written to:\s*(\/[^\r\n]+?\.output)(?:[\s.]|$)/)?.[1]
+-        if (path) return path
++        const receipt = claudeBackgroundTaskReceipt(text)
++        if (receipt?.id === taskId) return receipt.outputPath
+     }
+     return null
+ }
+--- a/hub/src/backgroundTaskOutput.test.ts
++++ b/hub/src/backgroundTaskOutput.test.ts
+@@ -12,7 +12,7 @@
+     return { root, dir }
+ }
+ export function proof(id: string, path: string) {
+-    return { role: 'agent', content: { type: 'output', data: { type: 'user', message: { content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified.` }] } } } }
++    return { role: 'agent', content: { type: 'output', data: { type: 'user', message: { content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.` }] } } } }
+ }
+ describe('background task output', () => {
+     it('requires native tool-result proof for the exact task, never arbitrary user text', () => {
+@@ -40,3 +40,10 @@
+         await expect(readBackgroundTail(join(dir, 'missing.output'), native, 'missing', root)).rejects.toThrow()
+     })
+ })
++
++it('does not authorize output reads using a quoted receipt in source code', () => {
++    const event = proof('job', `/tmp/project/${native}/tasks/job.output`)
++    const block = event.content.data.message.content[0]
++    block.content = `--- a/test.ts\n+const receipt = '${block.content}'`
++    expect(backgroundOutputPath(event, 'job')).toBeNull()
++})
+--- a/hub/src/sync/sessionCache.backgroundTasks.test.ts
++++ b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+@@ -89,3 +89,24 @@
+     })
+ 
+ })
++
++it('rebuilds false historical starts as zero while preserving real unfinished work', () => {
++    const store = new Store(':memory:')
++    try {
++        const publisher = { emit: () => {} } as unknown as EventPublisher
++        const cache = new SessionCache(store, publisher)
++        const session = cache.getOrCreateSession('dev2-fixture-read', { path: '/tmp', host: 'test' }, null, 'default')
++        const quoted = taskStart('job')
++        quoted.content.data.message.content[0].content = `--- a/test.ts\n+++ b/test.ts\n+const start = '${quoted.content.data.message.content[0].content}'`
++        store.messages.addMessage(session.id, quoted)
++        const restarted = new SessionCache(store, publisher)
++        restarted.reloadAll()
++        restarted.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++        expect(restarted.getSession(session.id)).toMatchObject({ active: true, thinking: false, backgroundTaskCount: 0 })
++        store.messages.addMessage(session.id, taskStart('real-render'))
++        const withRealTask = new SessionCache(store, publisher)
++        withRealTask.reloadAll()
++        withRealTask.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++        expect(withRealTask.getSession(session.id)?.backgroundTaskCount).toBe(1)
++    } finally { store.close() }
++})
+--- a/web/src/chat/backgroundTaskViews.ts
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -1,4 +1,4 @@
+-import { isObject } from '@hapi/protocol'
++import { claudeBackgroundTaskReceipt, codexBackgroundTaskReceipt, isObject } from '@hapi/protocol'
+ import type { ChatBlock, NormalizedMessage, ToolCallBlock } from './types'
+ import { getInputStringAny } from '@/lib/toolInputUtils'
+ 
+@@ -24,9 +24,9 @@
+ }
+ export function backgroundTaskReceipt(result: unknown): { id: string; provider: 'claude' | 'codex' } | null {
+     const output = text(result)
+-    const claude = output.match(/Command running in background with ID:\s*([\w-]+)/)?.[1]
++    const claude = claudeBackgroundTaskReceipt(output)?.id
+     if (claude) return { id: claude, provider: 'claude' }
+-    const codex = output.match(/Process running with session ID\s+(\d+)/i)?.[1]
++    const codex = codexBackgroundTaskReceipt(output)
+     return codex ? { id: `codex:${codex}`, provider: 'codex' } : null
+ }
+ function tools(blocks: readonly ChatBlock[]): ToolCallBlock[] {
+--- a/web/src/chat/backgroundTaskViews.test.ts
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -56,3 +56,8 @@
+     expect(collectBackgroundTasks([block('spawn', { command: 'render' }, start), poll], [], true, 1)[0].state).toBe('running')
+     expect(collectBackgroundTasks([block('spawn', { command: 'render' }, start), poll], [], false, 0)[0].state).toBe('unknown')
+ })
++
++it('does not invent tasks from fixture strings read in files, diffs or grep output', () => {
++    const outputs = [`--- a/test.ts\n+++ b/test.ts\n+const start = '${start}'`, `import { test } from 'vitest'\nconst start = '${start}'`, `file.ts:42:${start}`, "const output = 'Process running with session ID 42'", 'source:\nProcess running with session ID 42']
++    for (const output of outputs) expect(collectBackgroundTasks([block('read-source', { command: 'cat test.ts' }, output)], [], true, 0)).toEqual([])
++})
+--- a/web/src/chat/sessionStatus.ts
++++ b/web/src/chat/sessionStatus.ts
+@@ -1,4 +1,4 @@
+-import { isObject } from '@hapi/protocol'
++import { claudeBackgroundTaskReceipt, isObject } from '@hapi/protocol'
+ import type { ThreadGoal, TodoItem } from '@/types/api'
+ import type { ChatBlock, NormalizedMessage, ToolCallBlock } from '@/chat/types'
+ import { isSubagentToolName } from '@/chat/subagentTool'
+@@ -30,11 +30,10 @@
+     possibleTerminalCommands: string[]
+ }
+ 
+-const BACKGROUND_START_RE = /Command running in background with ID:\s*([^\s<]+)/
+ const TASK_ID_RE = /<task-id>\s*([^<]+?)\s*<\/task-id>/
+ 
+ function findBackgroundTaskId(value: unknown): string | null {
+-    if (typeof value === 'string') return value.match(BACKGROUND_START_RE)?.[1] ?? null
++    if (typeof value === 'string') return claudeBackgroundTaskReceipt(value)?.id ?? null
+     const values = Array.isArray(value) ? value : isObject(value) ? Object.values(value) : []
+     for (const item of values) {
+         const taskId = findBackgroundTaskId(item)
+--- a/web/src/chat/sessionStatus.test.ts
++++ b/web/src/chat/sessionStatus.test.ts
+@@ -103,7 +103,7 @@
+                         id: 'bash-1',
+                         state: 'completed',
+                         input: { command: 'bun run dev', cwd: '/repo/web' },
+-                        result: 'Command running in background with ID: bg-1',
++                        result: 'Command running in background with ID: bg-1. Output is being written to: /tmp/bg-1.output.',
+                         startedAt: 123
+                     }
+                 }),
+@@ -113,7 +113,7 @@
+                         id: 'bash-2',
+                         state: 'completed',
+                         input: { command: 'bun test --watch' },
+-                        result: [{ type: 'text', text: 'Command running in background with ID: bg-2' }]
++                        result: [{ type: 'text', text: 'Command running in background with ID: bg-2. Output is being written to: /tmp/bg-2.output.' }]
+                     }
+                 }),
+                 toolBlock({
+@@ -153,3 +153,10 @@
+         })
+     })
+ })
++
++it('does not expose a background terminal from code/diff fixture strings', () => {
++    const receipt = 'Command running in background with ID: job. Output is being written to: /tmp/job.output.'
++    for (const output of [`--- a/test.ts\n+const receipt = '${receipt}'`, `import { test } from 'vitest'\n${receipt}`]) {
++        expect(buildSessionStatusData({ goal: null, tasks: [], blocks: [toolBlock({ name: 'Bash', tool: { result: output } })], messages: [] })).toBeNull()
++    }
++})
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -7,6 +7,7 @@
+ import { SyncEngine } from './syncEngine'
+ import { RpcRegistry } from '../socket/rpcRegistry'
+ import { createNodeGraphRoutes } from '../web/routes/nodeGraph'
++import { taskStart } from './backgroundTasks.test'
+ import { createSessionsRoutes } from '../web/routes/sessions'
+ import type { WebAppEnv } from '../web/middleware/auth'
+ import type { NodeGraphResponse, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
+@@ -167,3 +168,24 @@
+         } finally { store.close() }
+     })
+ })
++
++
++it('allows removing a stopped node whose apparent tasks came from code fixtures, preserving real work guards', async () => {
++    const f = fixture()
++    try {
++        for (const real of [false, true]) {
++            const session = f.create(real ? 'Actual render' : 'Dev2 source read')
++            const message = taskStart('job')
++            if (!real) message.content.data.message.content[0].content = `--- a/test.ts\n+const receipt = '${message.content.data.message.content[0].content}'`
++            f.store.messages.addMessage(session.id, message)
++            f.engine.pauseSession(session.id)
++            f.alive(session.id, false)
++            const pause = f.store.getManualPause(session.id)
++            const result = (await f.call<NodeGraphResponse & { skippedIds: string[] }>('/node-graph/nodes/remove', { ids: [session.id] })).json
++            expect(result.skippedIds).toEqual(real ? [session.id] : [])
++            expect(f.engine.getSession(session.id)?.backgroundTaskCount).toBe(real ? 1 : 0)
++            expect(f.store.getManualPause(session.id)).toEqual(pause)
++            expect(f.engine.getSession(session.id)?.active).toBe(true)
++        }
++    } finally { f.close() }
++})
+--- a/hub/src/sync/sessionManager.test.ts
++++ b/hub/src/sync/sessionManager.test.ts
+@@ -213,8 +213,11 @@
+         }
+         expect(f.store.sessionManager.list('default')[s.id].activityAt).toBe(record.activityAt)
+         const publisher = (f.engine as unknown as { eventPublisher: { emit: (event: unknown) => void } }).eventPublisher
++        publisher.emit({ type: 'message-received', sessionId: s.id, message: { id: 'read-fixture', seq: 1, localId: null, createdAt: record.dismissedAt! + 1,
++            content: { role: 'agent', content: { type: 'output', data: { type: 'tool_result', content: "const start = 'Command running in background with ID: job. Output is being written to: /tmp/job.output.'" } } } } })
++        expect(f.engine.getSessionManager('default')[s.id].activityAt).toBe(record.activityAt)
+         publisher.emit({ type: 'message-received', sessionId: s.id, message: { id: 'new-task', seq: 1, localId: null, createdAt: record.dismissedAt! + 1,
+-            content: { role: 'agent', content: { type: 'output', data: { type: 'tool_result', content: 'Command running in background with ID: new-job' } } } } })
++            content: { role: 'agent', content: { type: 'output', data: { type: 'tool_result', content: 'Command running in background with ID: new-job. Output is being written to: /tmp/new-job.output.' } } } } })
+         expect(f.engine.getSessionManager('default')[s.id].activityAt).toBeGreaterThan(record.dismissedAt!)
+     } finally { f.close() }
+ })

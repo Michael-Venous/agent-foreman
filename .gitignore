@@ -1,0 +1,17 @@
+state/
+vendor/
+evidence/
+manager/control/
+manager/evidence/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db*
+*.log
+*.pem
+*.key
+node_modules/
+dist/

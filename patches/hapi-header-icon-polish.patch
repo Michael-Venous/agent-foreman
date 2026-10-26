@@ -1,0 +1,63 @@
+diff --git a/web/src/components/SideChatButton.tsx b/web/src/components/SideChatButton.tsx
+--- a/web/src/components/SideChatButton.tsx
++++ b/web/src/components/SideChatButton.tsx
+@@ -43,9 +43,8 @@
+     }
+     return <>
+         <button type="button" disabled={!api} onClick={() => { setError(null); setOpen(true) }} title="Ask a side question" aria-label="Open side chat"
+-            className="flex h-8 w-8 shrink-0 flex-col items-center justify-center gap-0 rounded-lg text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]">
+-            <span className="text-[9px] font-medium leading-[10px]">Side</span>
+-            <svg aria-hidden="true" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z" /></svg>
++            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]">
++            <svg aria-hidden="true" className="h-5 w-5" style={{ transform: 'scaleX(-1)' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z" /></svg>
+         </button>
+         <Dialog open={open} onOpenChange={setOpen}>
+             <DialogContent className="flex max-h-[85dvh] flex-col gap-3">
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -204,7 +204,7 @@
+             if (canPopout() && openPopout('session-manager')) return
+             setOpen(true)
+         }} aria-label="Session Manager" title={count === undefined ? 'Session Manager' : `Session Manager (${count})`} aria-expanded={open && !collapsed}
+-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--app-border)] text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-5 w-5"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+         </button>)
+ }
+diff --git a/web/src/components/NodeGraphWindow.tsx b/web/src/components/NodeGraphWindow.tsx
+--- a/web/src/components/NodeGraphWindow.tsx
++++ b/web/src/components/NodeGraphWindow.tsx
+@@ -25,7 +25,7 @@
+             if (!open && canPopout() && openPopout('nodes')) return
+             if (!open) setOpen(true); else setCollapsed(!collapsed)
+         }}
+-        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-fg)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
++        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--app-border)] text-[var(--app-fg)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+         <NodesIcon className="h-5 w-5" />
+     </button>
+ }
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -444,7 +444,7 @@
+                     </div>
+                     </Popover.Root>
+                     </div>
+-                    <div className="flex items-center justify-center" aria-label="Session tools">
++                    <div className="flex items-center justify-center gap-2" aria-label="Session tools">
+                         <SessionManagerLauncher />
+                         <NodesButton />
+                     </div>
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -409,7 +409,7 @@
+         expect(tools).toContainElement(screen.getByRole('button', { name: 'Nodes' }))
+         expect(tools).toContainElement(screen.getByRole('button', { name: 'Session Manager' }))
+         expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent(/^$/)
+-        expect(screen.getByRole('button', { name: 'Open side chat' })).toHaveTextContent('Side')
++        expect(screen.getByRole('button', { name: 'Open side chat' })).toHaveTextContent(/^$/)
+     })
+ })
+ 

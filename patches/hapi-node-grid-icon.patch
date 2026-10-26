@@ -1,0 +1,12 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -779,7 +779,7 @@
+ 
+     const workspaceControl = graph ? <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /> : null
+     const gridControl = graph ? <div data-graph-ui className="flex shrink-0 items-center">
+-        <Popover.Root><Popover.Trigger asChild><button type="button" aria-label="Grid settings" title="Grid and snapping" aria-pressed={grid.enabled} className={`${iconButton} ${grid.enabled ? 'text-[var(--app-link)]' : ''}`}>#</button></Popover.Trigger>
++        <Popover.Root><Popover.Trigger asChild><button type="button" aria-label="Grid settings" title="Grid and snapping" aria-pressed={grid.enabled} className={`${iconButton} ${grid.enabled ? 'text-[var(--app-link)]' : ''}`}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="1.5" /><path d="M9 3v18M15 3v18M3 9h18M3 15h18" /></svg></button></Popover.Trigger>
+             <Popover.Portal><Popover.Content data-graph-ui aria-label="Grid settings" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="end" collisionPadding={8} className="z-[110] w-60 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-sm shadow-xl">
+                 <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.enabled} onChange={e => setGrid({ ...grid, enabled: e.target.checked })} />Snap to grid</label>
+                 <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.visible} onChange={e => setGrid({ ...grid, visible: e.target.checked })} />Show grid</label>

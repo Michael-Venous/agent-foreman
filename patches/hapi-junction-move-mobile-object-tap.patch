@@ -1,0 +1,126 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -119,6 +119,7 @@
+     const setSelectedJunction = (id: string | null) => setSelectedJunctions(id ? [id] : [])
+     const boxSelection = useRef(false)
+     const [movingJunction, setMovingJunction] = useState<string | null>(null)
++    useEffect(() => { if (movingJunction && !selectedJunctions.includes(movingJunction)) setMovingJunction(null) }, [movingJunction, selectedJunctions])
+     const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
+     const [selectedAnnotation, setSelectedAnnotation] = useState<string | null>(null)
+     const [editingAnnotation, setEditingAnnotation] = useState<{ workspace: string; before: NodeAnnotation | null; value: NodeAnnotation } | null>(null)
+@@ -149,6 +150,8 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
++    const objectPress = useRef<{ pointer: number; id: string; at: number; x: number; y: number; workspace: string } | null>(null)
++    const lastObjectTap = useRef<{ id: string; at: number; x: number; y: number; workspace: string } | null>(null)
+     const lastCanvasTap = useRef<{ at: number; x: number; y: number; workspace: string } | null>(null)
+     const cancelSelectionGesture = () => {
+         lastCanvasTap.current = null
+@@ -402,7 +405,7 @@
+         event.currentTarget.focus({ preventScroll: true })
+         cancelTouchMenu()
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+-        if (pointers.current.size >= 2) { pinchStart(); return }
++        if (pointers.current.size >= 2) { objectPress.current = null; lastObjectTap.current = null; pinchStart(); return }
+         if (previewing) {
+             const node = target.closest('[data-node-id]')?.getAttribute('data-node-id') ?? undefined
+             const annotation = target.closest('[data-annotation-id]')?.getAttribute('data-annotation-id') ?? null
+@@ -411,6 +414,12 @@
+             if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
+             return
+         }
++        const object = target.closest('[data-node-id]')?.getAttribute('data-node-id')
++            ?? (target.closest('[data-junction-id]') ? 'junction:' + target.closest('[data-junction-id]')!.getAttribute('data-junction-id') : null)
++            ?? (target.closest('[data-annotation-move]') ? (target.closest('[data-annotation-kind]')?.getAttribute('data-annotation-kind') ?? 'text') + ':' + target.closest('[data-annotation-move]')!.getAttribute('data-annotation-move') : null)
++        objectPress.current = event.pointerType === 'touch' && object && graph && !target.closest('[data-input-handle],[data-link-handle],[data-annotation-resize]')
++            ? { pointer: event.pointerId, id: object, at: performance.now(), x: event.clientX, y: event.clientY, workspace: graph.graph.workspaceId } : null
++        if (!objectPress.current) lastObjectTap.current = null
+         const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
+         const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
+         if (!annotation) setSelectedAnnotation(target.closest('[data-annotation-select]')?.getAttribute('data-annotation-select') ?? null)
+@@ -609,6 +618,20 @@
+         if (g.pointer !== event.pointerId) return
+         gesture.current = null
+         const cancelled = event.type === 'pointercancel'
++        const press = objectPress.current; objectPress.current = null
++        if (event.pointerType === 'touch' && press?.pointer === event.pointerId) {
++            const previous = lastObjectTap.current; lastObjectTap.current = null
++            if (!cancelled && performance.now() - press.at <= DOUBLE_TAP_MS && Math.hypot(event.clientX - press.x, event.clientY - press.y) < 6) {
++                const tap = { id: press.id, at: performance.now(), x: event.clientX, y: event.clientY, workspace: press.workspace }
++                if (previous?.id === tap.id && previous.workspace === tap.workspace && tap.at - previous.at <= DOUBLE_TAP_MS && Math.hypot(tap.x - previous.x, tap.y - previous.y) <= DOUBLE_TAP_SLOP) {
++                    setLink(null)
++                    if (tap.id.startsWith('junction:') || tap.id.startsWith('frame:') || tap.id.startsWith('text:')) openObjectMenu(tap.id, tap.x, tap.y)
++                    else openMenu(tap.id, { x: tap.x, y: tap.y })
++                    return
++                }
++                lastObjectTap.current = tap
++            }
++        }
+         if (g.kind === 'pan' && g.tapStartedAt !== undefined && !g.moved && !cancelled && graph && performance.now() - g.tapStartedAt <= DOUBLE_TAP_MS && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) {
+             lastCanvasTap.current = { at: performance.now(), x: event.clientX, y: event.clientY, workspace: graph.graph.workspaceId }
+         }
+@@ -618,7 +641,7 @@
+                 const current = routing.junctions.find(j => j.id === g.id)
+                 if (!current || current.x !== g.origin.x || current.y !== g.origin.y) throw new Error('The junction moved elsewhere. Try again.')
+                 return { ...routing, junctions: routing.junctions.map(j => j.id === g.id ? { ...j, ...g.last } : j) }
+-            }).finally(() => { setJunctionDrafts({}); setMovingJunction(null) })
++            }).finally(() => { setJunctionDrafts({}) })
+             else { setJunctionDrafts({}); if (!cancelled && g.editLabel) { const dot = graph?.graph.junctions?.find(j => j.id === g.id); if (dot && graph) setEditingJunction({ workspace: graph.graph.workspaceId, before: dot, label: dot.label ?? '' }) } }
+         } else if (g.kind === 'annotation') {
+             const clear = () => {
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -2143,3 +2143,52 @@
+     expect(api.editNodeRouting.mock.calls[0]![1].edges).toContainEqual({ owner: 'A', child: 'L' })
+     expect(api.abortSession).not.toHaveBeenCalled()
+ })
++
++it.each(['mouse', 'touch'])('keeps junction Move mode across drags until deselection with %s', async pointerType => {
++    const { api } = setup(), id = await addDot(), canvas = screen.getByRole('application')
++    openDotMenu(id); fireEvent.click(screen.getByRole('button', { name: 'Move junction' }))
++    for (let i = 0; i < 2; i++) {
++        const start = dotPoint(id), dot = screen.getByRole('button', { name: 'Junction 1' })
++        fireEvent.pointerDown(dot, { pointerId: 60, pointerType, button: 0, ...start })
++        fireEvent.pointerMove(canvas, { pointerId: 60, pointerType, clientX: start.clientX + 40, clientY: start.clientY + 30 })
++        fireEvent.pointerUp(canvas, { pointerId: 60, pointerType, clientX: start.clientX + 40, clientY: start.clientY + 30 })
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(i + 2))
++        expect(screen.getByRole('button', { name: 'Junction 1' })).toHaveAttribute('title', 'Drag to move junction')
++    }
++    fireEvent.pointerDown(canvas, { pointerId: 61, pointerType, button: 0, clientX: -1000, clientY: -1000 })
++    fireEvent.pointerUp(canvas, { pointerId: 61, pointerType, clientX: -1000, clientY: -1000 })
++    const dot = screen.getByRole('button', { name: 'Junction 1' }), at = dotPoint(id)
++    fireEvent.pointerDown(dot, { pointerId: 62, pointerType, button: 0, ...at })
++    fireEvent.pointerUp(canvas, { pointerId: 62, pointerType, ...at })
++    expect(dot).toHaveAttribute('title', 'Drag to branch. Right-click or hold for actions.')
++})
++it.each(['Node Alpha', 'Junction 1', 'Move frame: Group', 'Move text box: Note'])('opens %s actions on mobile double tap without mutation', async name => {
++    const graph = initial()
++    graph.graph.junctions = [{ id: 'j', owner: null, x: 500, y: 300 }]
++    graph.graph.annotations = [
++        { id: 'f', kind: 'frame', text: 'Group', color: 'blue', x: 700, y: 200, width: 300, height: 200 },
++        { id: 't', kind: 'text', text: 'Note', color: 'blue', x: 700, y: 500, width: 200, height: 100 },
++    ]
++    const { api } = setup(makeApi({ graph })), object = await screen.findByRole('button', { name }), canvas = screen.getByRole('application')
++    for (let i = 0; i < 2; i++) {
++        fireEvent.pointerDown(object, { pointerId: 70, pointerType: 'touch', button: 0, clientX: 300, clientY: 200 })
++        fireEvent.pointerUp(canvas, { pointerId: 70, pointerType: 'touch', clientX: 300, clientY: 200 })
++    }
++    expect(screen.getByRole('dialog', { name: name === 'Node Alpha' ? 'Actions for Alpha' : 'Object actions' })).toBeInTheDocument()
++    expect(api.editNodeVisual).not.toHaveBeenCalled(); expect(api.editNodeRouting).not.toHaveBeenCalled(); expect(api.saveNodeLayout).not.toHaveBeenCalled()
++})
++
++it('does not turn desktop double clicks or mobile drags into object menus', async () => {
++    setup(); const node = await screen.findByRole('button', { name: 'Node Alpha' }), canvas = screen.getByRole('application')
++    for (let i = 0; i < 2; i++) {
++        fireEvent.pointerDown(node, { pointerId: 71, pointerType: 'mouse', button: 0, clientX: 300, clientY: 200 })
++        fireEvent.pointerUp(canvas, { pointerId: 71, pointerType: 'mouse', clientX: 300, clientY: 200 })
++    }
++    expect(screen.queryByRole('dialog', { name: 'Actions for Alpha' })).toBeNull()
++    fireEvent.pointerDown(node, { pointerId: 72, pointerType: 'touch', button: 0, clientX: 300, clientY: 200 })
++    fireEvent.pointerUp(canvas, { pointerId: 72, pointerType: 'touch', clientX: 300, clientY: 200 })
++    fireEvent.pointerDown(node, { pointerId: 73, pointerType: 'touch', button: 0, clientX: 300, clientY: 200 })
++    fireEvent.pointerMove(canvas, { pointerId: 73, pointerType: 'touch', clientX: 400, clientY: 250 })
++    fireEvent.pointerUp(canvas, { pointerId: 73, pointerType: 'touch', clientX: 400, clientY: 250 })
++    expect(screen.queryByRole('dialog', { name: 'Actions for Alpha' })).toBeNull()
++})

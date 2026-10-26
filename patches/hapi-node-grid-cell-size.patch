@@ -1,0 +1,79 @@
+diff --git a/web/src/lib/nodeGraphLayout.ts b/web/src/lib/nodeGraphLayout.ts
+--- a/web/src/lib/nodeGraphLayout.ts
++++ b/web/src/lib/nodeGraphLayout.ts
+@@ -1,7 +1,8 @@
+ import { createsCycle, type NodeGraphEdge, type NodeGraphNode } from '@hapi/protocol/nodeGraph'
+ 
+-/** Node card size in graph units; positions are card top-left corners. */
+-export const NODE_SIZE = { width: 184, height: 76 } as const
++export const DEFAULT_NODE_GRID_SIZE = 20
++/** Whole default grid cells, with the centered ports also on grid lines. */
++export const NODE_SIZE = { width: DEFAULT_NODE_GRID_SIZE * 10, height: DEFAULT_NODE_GRID_SIZE * 4 } as const
+ const GAP_X = 28, GAP_Y = 72, TREE_GAP = 56, LONE_GAP = 88, LONE_LABEL = 28
+ 
+ export type GraphPoint = { x: number; y: number }
+diff --git a/web/src/hooks/useNodeGrid.ts b/web/src/hooks/useNodeGrid.ts
+--- a/web/src/hooks/useNodeGrid.ts
++++ b/web/src/hooks/useNodeGrid.ts
+@@ -1,8 +1,8 @@
+ import { useEffect, useState } from 'react'
+-import type { GraphPoint } from '@/lib/nodeGraphLayout'
++import { DEFAULT_NODE_GRID_SIZE, type GraphPoint } from '@/lib/nodeGraphLayout'
+ export const NODE_GRID_KEY = 'hapi-node-grid-v1'
+ export type NodeGrid = { enabled: boolean; visible: boolean; size: number }
+-const defaults: NodeGrid = { enabled: false, visible: false, size: 20 }
++const defaults: NodeGrid = { enabled: false, visible: false, size: DEFAULT_NODE_GRID_SIZE }
+ export function readNodeGrid(): NodeGrid {
+     try { const v = JSON.parse(localStorage.getItem(NODE_GRID_KEY) ?? 'null'); return v && typeof v.enabled === 'boolean' && typeof v.visible === 'boolean' && Number.isFinite(v.size) ? { enabled: v.enabled, visible: v.visible, size: Math.max(4, Math.min(200, Math.round(v.size))) } : defaults } catch { return defaults }
+ }
+@@ -18,7 +18,7 @@
+         return () => { window.removeEventListener('storage', update); window.removeEventListener(NODE_GRID_KEY, update) }
+     }, [])
+     const setGrid = (next: NodeGrid) => {
+-        const value = { ...next, size: Math.max(4, Math.min(200, Math.round(next.size) || 20)) }
++        const value = { ...next, size: Math.max(4, Math.min(200, Math.round(next.size) || DEFAULT_NODE_GRID_SIZE)) }
+         setState(value)
+         try { localStorage.setItem(NODE_GRID_KEY, JSON.stringify(value)); window.dispatchEvent(new Event(NODE_GRID_KEY)) } catch { /* Local control still works. */ }
+     }
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -10,7 +10,7 @@
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+-import { clampZoom, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
++import { clampZoom, DEFAULT_NODE_GRID_SIZE, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+ import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
+@@ -707,7 +707,7 @@
+             <Popover.Portal><Popover.Content data-graph-ui aria-label="Grid settings" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="end" collisionPadding={8} className="z-[110] w-60 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-sm shadow-xl">
+                 <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.enabled} onChange={e => setGrid({ ...grid, enabled: e.target.checked })} />Snap to grid</label>
+                 <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.visible} onChange={e => setGrid({ ...grid, visible: e.target.checked })} />Show grid</label>
+-                <label className="flex min-h-9 items-center gap-2">Grid size<input aria-label="Grid size" type="number" min="4" max="200" value={gridSizeDraft} onChange={e => { const raw = e.target.value; setGridSizeDraft(raw); const size = Number(raw); if (raw && size >= 4 && size <= 200) setGrid({ ...grid, size }) }} onBlur={() => { const size = Math.max(4, Math.min(200, Number(gridSizeDraft) || 20)); setGrid({ ...grid, size }); setGridSizeDraft(String(size)) }} onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') { setGrid({ ...grid, size: Number(gridSizeDraft) }); if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } } }} className="w-20 rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1" /></label>
++                <label className="flex min-h-9 items-center gap-2">Grid size<input aria-label="Grid size" type="number" min="4" max="200" value={gridSizeDraft} onChange={e => { const raw = e.target.value; setGridSizeDraft(raw); const size = Number(raw); if (raw && size >= 4 && size <= 200) setGrid({ ...grid, size }) }} onBlur={() => { const size = Math.max(4, Math.min(200, Number(gridSizeDraft) || DEFAULT_NODE_GRID_SIZE)); setGrid({ ...grid, size }); setGridSizeDraft(String(size)) }} onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') { setGrid({ ...grid, size: Number(gridSizeDraft) }); if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } } }} className="w-20 rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1" /></label>
+             </Popover.Content></Popover.Portal>
+         </Popover.Root>
+     </div> : null
+@@ -767,7 +767,7 @@
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
+-            style={grid.visible ? { backgroundImage: 'radial-gradient(circle, var(--app-hint) 0.7px, transparent 0.8px)', backgroundSize: `${grid.size * view.k}px ${grid.size * view.k}px`, backgroundPosition: `${view.x}px ${view.y}px` } : undefined}
++            style={grid.visible ? { backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--app-hint) 35%, transparent) 0.5px, transparent 0.65px)', backgroundSize: `${grid.size * view.k}px ${grid.size * view.k}px`, backgroundPosition: `${view.x}px ${view.y}px` } : undefined}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-default outline-none">
+             <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
+diff --git a/web/src/lib/nodeFrames.test.ts b/web/src/lib/nodeFrames.test.ts
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -6,7 +6,7 @@
+     const initial = { A:{x:100,y:120}, B:{x:300,y:300} }
+     const first = placeInFrame([frame], 'A', initial)[0]
+     expect(first.members).toEqual(['A'])
+-    expect(first).toMatchObject({x:76,y:68,width:232,height:152})
++    expect(first).toMatchObject({x:76,y:68,width:248,height:156})
+     const expanded = fitNodeFrame({...first,members:['A','B']},initial)
+     const moved = placeInFrame([expanded], 'A', {...initial,A:{x:-200,y:-100}})[0]
+     expect(moved.members).toEqual(['B','A'])

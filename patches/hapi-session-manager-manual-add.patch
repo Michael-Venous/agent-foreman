@@ -1,0 +1,250 @@
+--- a/hub/src/store/sessionManager.ts
++++ b/hub/src/store/sessionManager.ts
+@@ -32,6 +32,12 @@
+             ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, activity_at=excluded.activity_at,
+             busy=excluded.busy, thinking=excluded.thinking WHERE session_manager_entries.namespace=excluded.namespace`).run(session.id, namespace, summary, activityAt, old?.dismissed_at ?? null, busy, thinking)
+     }
++    add(session: SessionSummary, namespace: string): void {
++        this.db.transaction(() => {
++            this.observe(session, namespace, 0, true)
++            this.db.query('UPDATE session_manager_entries SET dismissed_at = NULL WHERE session_id = ? AND namespace = ?').run(session.id, namespace)
++        })()
++    }
+     list(namespace: string): SessionManagerRecords {
+         const rows = this.db.query('SELECT * FROM session_manager_entries WHERE namespace = ?').all(namespace) as Row[]
+         return Object.fromEntries(rows.map(row => [row.session_id, {
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -305,6 +305,13 @@
+         const access = this.resolveSessionAccess(sessionId, namespace)
+         if (!access.ok) return false
+         this.store.sessionManager.observe(toSessionSummary(access.session), namespace, 0, true)
++        return true
++    }
++
++    addSessionManagerEntry(sessionId: string, namespace: string): boolean {
++        const access = this.resolveSessionAccess(sessionId, namespace)
++        if (!access.ok) return false
++        this.store.sessionManager.add(toSessionSummary(access.session), namespace)
+         return true
+     }
+ 
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -91,6 +91,13 @@
+         engine.dismissSessionManagerEntries(namespace, body.ids)
+         return c.json({ entries: engine.getSessionManager(namespace) })
+     })
++    app.post('/session-manager/:id/add', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace')
++        if (!engine.addSessionManagerEntry(c.req.param('id'), namespace)) return c.json({ error: 'Session not found' }, 404)
++        return c.json({ entries: engine.getSessionManager(namespace) })
++    })
+     app.post('/session-manager/:id/retain', (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+         if (engine instanceof Response) return engine
+--- a/hub/src/sync/sessionManager.test.ts
++++ b/hub/src/sync/sessionManager.test.ts
+@@ -146,3 +146,38 @@
+         } finally { f.close() }
+     })
+ })
++
++it('manually adds both providers without changing paused sessions; rejects other namespaces', async () => {
++    const f = fixture()
++    try {
++        for (const tag of ['Codex', 'Claude']) {
++            const s = f.create(tag)
++            f.store.setManualPause(s.id, true)
++            const before = JSON.stringify(f.engine.getSession(s.id)), pause = f.store.getManualPause(s.id)
++            expect((await f.app().request(`/session-manager/${s.id}/add`, { method: 'POST' })).status).toBe(200)
++            expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
++            expect(JSON.stringify(f.engine.getSession(s.id))).toBe(before)
++            expect(f.store.getManualPause(s.id)).toEqual(pause)
++            expect((await f.app('other').request(`/session-manager/${s.id}/add`, { method: 'POST' })).status).toBe(404)
++        }
++        expect((await f.app().request('/session-manager/missing/add', { method: 'POST' })).status).toBe(404)
++        expect(f.engine.getSessionManager('other')).toEqual({})
++    } finally { f.close() }
++})
++
++it('explicit Add restores dismissal, is idempotent, and survives a hub restart', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'hapi-add-')), path = join(dir, 'hub.db')
++    let f = fixture(path)
++    try {
++        const s = f.create('Codex')
++        f.engine.addSessionManagerEntry(s.id, 'default')
++        f.engine.dismissSessionManagerEntries('default', [s.id])
++        expect(f.engine.getSessionManager('default')[s.id].dismissedAt).not.toBeNull()
++        f.engine.addSessionManagerEntry(s.id, 'default')
++        const added = f.engine.getSessionManager('default')[s.id]
++        f.engine.addSessionManagerEntry(s.id, 'default')
++        expect(f.engine.getSessionManager('default')[s.id]).toEqual(added)
++        f.close(); f = fixture(path)
++        expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
++    } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -848,6 +848,10 @@
+         return (await this.request<{ entries: SessionManagerRecords }>('/api/session-manager')).entries
+     }
+ 
++    async addSessionManager(sessionId: string): Promise<SessionManagerRecords> {
++        return (await this.request<{ entries: SessionManagerRecords }>(`/api/session-manager/${encodeURIComponent(sessionId)}/add`, { method: 'POST' })).entries
++    }
++
+     async dismissSessionManager(ids: readonly string[]): Promise<SessionManagerRecords> {
+         return (await this.request<{ entries: SessionManagerRecords }>('/api/session-manager/dismiss', {
+             method: 'POST', body: JSON.stringify({ ids })
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -1,4 +1,4 @@
+-import { useEffect, useState } from 'react'
++import { useEffect, useRef, useState } from 'react'
+ import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient } from '@/api/client'
+@@ -11,6 +11,8 @@
+ export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>, api?: ApiClient | null) {
+     const client = useQueryClient()
+     const [clearError, setClearError] = useState<string | null>(null)
++    const [adding, setAdding] = useState<string | null>(null)
++    const addInFlight = useRef(false)
+     const [clearing, setClearing] = useState(false)
+     const remoteEnabled = typeof api?.getSessionManager === 'function'
+     const remote = useQuery<SessionManagerRecords>({
+@@ -30,10 +32,24 @@
+         else if (!remoteEnabled) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity))
+     }, [client, sessions, managed, activity, remote.data, remoteEnabled])
+     return {
+-        entries, clearing, error: clearError ?? (remote.error instanceof Error ? remote.error.message : null),
++        entries, clearing, adding, error: clearError ?? (remote.error instanceof Error ? remote.error.message : null),
+         markStopped: (id: string) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => markSessionStopped(old ?? {}, id)),
++        add: async (id: string): Promise<boolean> => {
++            if (addInFlight.current || clearing || !api?.addSessionManager) return false
++            addInFlight.current = true; setAdding(id); setClearError(null)
++            try {
++                await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
++                const records = await api.addSessionManager(id)
++                await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
++                client.setQueryData(SESSION_MANAGER_REMOTE_KEY, records)
++                return true
++            } catch (error) {
++                setClearError(error instanceof Error ? error.message : 'Could not add chat')
++                return false
++            } finally { addInFlight.current = false; setAdding(null) }
++        },
+         dismiss: async (ids: readonly string[]) => {
+-            if (clearing) return
++            if (clearing || addInFlight.current) return
+             const clearable = ids.filter(id => client.getQueryData<SessionManagerState>(SESSION_MANAGER_KEY)?.[id]?.stopped)
+             if (!remoteEnabled) {
+                 client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => dismissSessions(old ?? {}, clearable))
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -44,7 +44,9 @@
+     const mobile = useSessionManagerMobile()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+-    const { entries, dismiss, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api)
++    const [showAdd, setShowAdd] = useState(false)
++    const [addQuery, setAddQuery] = useState('')
++    const { entries, dismiss, add, adding, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -54,6 +56,9 @@
+     const filtered = managedOnly || activityFilter !== 'all'
+     const clearable = displayedRows.filter(e => e.stopped && !(isManaged(e.session.id)
+         && (!e.observedWork || currentManaged[e.session.id]?.projectStatus === 'paused' || currentManaged[e.session.id]?.manualHold)))
++    const addCandidates = (props.sessions ?? []).filter(session => !entries[session.id] || entries[session.id].dismissed)
++        .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? ''}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
++        .sort((a, b) => b.updatedAt - a.updatedAt)
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+@@ -70,8 +75,23 @@
+             </div>
+             <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+                 <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
+-                <button type="button" disabled={clearing || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
++                {props.api?.addSessionManager && <button type="button" aria-expanded={showAdd} onClick={() => setShowAdd(value => !value)} className="min-h-9 shrink-0 text-[var(--app-link)]">{showAdd ? 'Done' : '+ Add chats'}</button>}
++                <button type="button" disabled={clearing || adding !== null || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+             </div>
++            {showAdd && <div role="group" aria-label="Add chats to Session Manager" className="shrink-0 rounded-lg border border-[var(--app-border)] p-2">
++                <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)}
++                    className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                <div className="max-h-48 overflow-y-auto overscroll-contain">
++                    {addCandidates.map(session => <button key={session.id} type="button" disabled={adding !== null || clearing} aria-label={`Add ${getSessionTitle(session)} to Session Manager`}
++                        onClick={async () => { if (await add(session.id)) { setActivityFilter('all'); setManagedOnly(false); setPinnedCollapsed(false) } }}
++                        className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
++                        <span className="min-w-0 flex-1"><span className="block truncate text-sm">{getSessionTitle(session)}</span>
++                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{session.metadata?.flavor ?? 'claude'} · {session.metadata?.path ?? ''}</span></span>
++                        <span aria-hidden="true" className="shrink-0 text-[var(--app-link)]">{adding === session.id ? '…' : '+'}</span>
++                    </button>)}
++                    {!addCandidates.length && <p className="p-2 text-xs text-[var(--app-hint)]">{props.sessions ? 'No chats to add.' : 'Loading chats…'}</p>}
++                </div>
++            </div>}
+             {listError && <p role="alert" className="text-xs text-[var(--app-badge-error-text)]">{listError}</p>}
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {pinnedCount > 0 && <button type="button" aria-label="Pinned sessions" aria-expanded={!pinnedCollapsed}
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -328,3 +328,30 @@
+     expect(await screen.findByRole('button', { name: 'Open Pinned task' })).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++it('searches and adds existing or cleared chats without controlling work', async () => {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++    const chats = [session('Codex', false, false), session('Claude', false, false)]
++    const records: import('@hapi/protocol/sessionManager').SessionManagerRecords = {}
++    const add = vi.fn(async (id: string) => {
++        records[id] = { session: chats.find(chat => chat.id === id)!, activityAt: 1, dismissedAt: null }
++        return structuredClone(records)
++    })
++    const remote = { ...controls, getSessionManager: async () => structuredClone(records), addSessionManager: add,
++        dismissSessionManager: async (ids: string[]) => { for (const id of ids) records[id].dismissedAt = 2; return structuredClone(records) } }
++    const select = vi.fn()
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={remote as unknown as ApiClient} sessions={chats} onSelect={select} /></I18nProvider></QueryClientProvider>)
++    open(); fireEvent.click(await screen.findByRole('button', { name: '+ Add chats' }))
++    fireEvent.change(screen.getByRole('searchbox', { name: 'Search chats to add' }), { target: { value: 'claude' } })
++    expect(screen.queryByRole('button', { name: 'Add Codex to Session Manager' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Add Claude to Session Manager' }))
++    await screen.findByRole('button', { name: 'Open Claude' })
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Add Claude to Session Manager' })).toBeNull())
++    fireEvent.click(screen.getByRole('button', { name: 'Dismiss Claude from Session Manager' }))
++    fireEvent.click(await screen.findByRole('button', { name: 'Add Claude to Session Manager' }))
++    await screen.findByRole('button', { name: 'Open Claude' })
++    expect(add).toHaveBeenCalledTimes(2)
++    expect(select).not.toHaveBeenCalled()
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
+--- a/web/src/hooks/useSessionManager.test.tsx
++++ b/web/src/hooks/useSessionManager.test.tsx
+@@ -56,3 +56,21 @@
+         hook.unmount(); hook.client.clear()
+     })
+ })
++
++it('failed Add preserves dismissal and duplicate pending Add is ignored', async () => {
++    const f = setup(); f.records.s.dismissedAt = 200
++    let reject!: (reason: Error) => void
++    const add = vi.fn(() => new Promise<SessionManagerRecords>((_resolve, no) => { reject = no }))
++    Object.assign(f.controls, { addSessionManager: add })
++    const hook = f.mount()
++    await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(true))
++    let pending!: Promise<boolean>
++    act(() => { pending = hook.result.current.add('s') })
++    await waitFor(() => expect(add).toHaveBeenCalledTimes(1))
++    expect(await hook.result.current.add('s')).toBe(false)
++    await act(async () => { reject(new Error('offline')); expect(await pending).toBe(false) })
++    expect(add).toHaveBeenCalledTimes(1)
++    expect(hook.result.current.entries.s.dismissed).toBe(true)
++    expect(hook.result.current.error).toBe('offline')
++    hook.unmount(); hook.client.clear()
++})

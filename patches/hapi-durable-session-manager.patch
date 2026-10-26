@@ -1,0 +1,722 @@
+--- a/hub/src/store/index.ts
++++ b/hub/src/store/index.ts
+@@ -1,3 +1,4 @@
++import { SessionManagerStore } from './sessionManager'
+ import { Database } from 'bun:sqlite'
+ import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs'
+ import { dirname } from 'node:path'
+@@ -63,6 +64,7 @@
+     private readonly _dbPath: string
+     private closed: boolean = false
+ 
++    readonly sessionManager: SessionManagerStore
+     readonly sessions: SessionStore
+     readonly machines: MachineStore
+     readonly messages: MessageStore
+@@ -127,6 +129,7 @@
+             }
+         }
+ 
++        this.sessionManager = new SessionManagerStore(this.db)
+         this.sessions = new SessionStore(this.db)
+         this.machines = new MachineStore(this.db)
+         this.messages = new MessageStore(this.db)
+--- /dev/null
++++ b/hub/src/store/sessionManager.ts
+@@ -0,0 +1,47 @@
++import type { Database } from 'bun:sqlite'
++import type { SessionSummary } from '@hapi/protocol'
++import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
++
++type Row = { session_id: string; namespace: string; summary: string; activity_at: number; dismissed_at: number | null; busy: number; thinking: number }
++
++/** Durable UI list only. No controller, management, message or goal mutations. */
++export class SessionManagerStore {
++    constructor(private db: Database) {
++        db.exec(`CREATE TABLE IF NOT EXISTS session_manager_entries (
++            session_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, summary TEXT NOT NULL,
++            activity_at INTEGER NOT NULL, dismissed_at INTEGER, busy INTEGER NOT NULL, thinking INTEGER NOT NULL
++        )`)
++        db.exec('CREATE INDEX IF NOT EXISTS session_manager_namespace ON session_manager_entries(namespace)')
++    }
++    observe(session: SessionSummary, namespace: string, invokedAt = 0, retain = false, completionAt = 0, allowStart = true): void {
++        const old = this.db.query('SELECT * FROM session_manager_entries WHERE session_id = ? AND namespace = ?').get(session.id, namespace) as Row | null
++        const busy = Number(session.active && (session.thinking || session.backgroundTaskCount > 0 || session.pendingRequestsCount > 0))
++        const thinking = Number(session.active && session.thinking)
++        if (!old && !busy && !invokedAt && !retain && !completionAt) return
++        // Startup/reconnect snapshots can briefly restore stale background
++        // counters. They are not proof of a new run after a manual dismissal.
++        const wasConnected = old ? (JSON.parse(old.summary) as SessionSummary).active : false
++        const started = (!old || allowStart) && Boolean(
++            thinking && !old?.thinking || busy && !old?.busy && (!old || wasConnected)
++        )
++        const activityAt = Math.max(old?.activity_at ?? 0, invokedAt, !old ? completionAt : 0,
++            started ? Math.max(Date.now(), (old?.dismissed_at ?? 0) + 1) : 0)
++        const summary = JSON.stringify({ ...session, pendingRequests: [] })
++        if (old && old.activity_at === activityAt && old.busy === busy && old.thinking === thinking && old.summary === summary) return
++        this.db.query(`INSERT INTO session_manager_entries VALUES (?, ?, ?, ?, ?, ?, ?)
++            ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, activity_at=excluded.activity_at,
++            busy=excluded.busy, thinking=excluded.thinking WHERE session_manager_entries.namespace=excluded.namespace`).run(session.id, namespace, summary, activityAt, old?.dismissed_at ?? null, busy, thinking)
++    }
++    list(namespace: string): SessionManagerRecords {
++        const rows = this.db.query('SELECT * FROM session_manager_entries WHERE namespace = ?').all(namespace) as Row[]
++        return Object.fromEntries(rows.map(row => [row.session_id, {
++            session: JSON.parse(row.summary), activityAt: row.activity_at, dismissedAt: row.dismissed_at
++        }]))
++    }
++    dismiss(namespace: string, ids: readonly string[]): void {
++        this.db.transaction(() => {
++            for (const id of ids) this.db.query(`UPDATE session_manager_entries SET dismissed_at = MAX(?, activity_at)
++                WHERE session_id = ? AND namespace = ?`).run(Date.now(), id, namespace)
++        })()
++    }
++}
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1,3 +1,5 @@
++import { toSessionSummary } from '@hapi/protocol'
++import { sessionManagerActivityTime, type SessionManagerRecords } from '@hapi/protocol/sessionManager'
+ /**
+  * Sync Engine for HAPI Telegram Bot (Direct Connect)
+  *
+@@ -215,8 +217,30 @@
+     ) {
+         this.eventPublisher = new EventPublisher(sseManager, (event) => this.resolveNamespace(event))
+         this.sessionCache = new SessionCache(store, this.eventPublisher)
++        const membershipStartedAt = Date.now()
+         this.eventPublisher.subscribe((event) => {
++            if ('sessionId' in event && (event.type === 'session-added' || event.type === 'session-updated' || event.type === 'messages-consumed')) {
++                const session = this.sessionCache.getSession(event.sessionId)
++                if (session) {
++                    // CLI reconnect replays ACKs with a fresh receipt timestamp.
++                    // Only persisted first-invocation times identify new work.
++                    const invokedAt = event.type === 'messages-consumed' ? event.localIds.reduce((latest, id) => {
++                        const result = this.store.messages.lookupQueuedMessage(event.sessionId, id)
++                        return result.status === 'invoked' ? Math.max(latest, result.message.invokedAt ?? 0) : latest
++                    }, 0) : 0
++                    this.store.sessionManager.observe(toSessionSummary(session), session.namespace, invokedAt, false, 0, event.type !== 'session-added')
++                }
++            }
++
+             if (event.type === 'message-received') {
++                const completedAt = sessionManagerActivityTime(event)
++                const current = this.sessionCache.getSession(event.sessionId)
++                if (current && completedAt !== null && completedAt >= membershipStartedAt) {
++                    // Catch a short completed turn even if no busy heartbeat arrived.
++                    // A late/replayed result must never undo an existing dismissal.
++                    this.store.sessionManager.observe(toSessionSummary(current), current.namespace, 0, false, completedAt)
++                }
++
+                 if (!this.sessionCache.getSession(event.sessionId)?.hasConversationContent
+                     && hasConversationMessageContent(event.message.content)) {
+                     this.sessionCache.refreshConversationContent(event.sessionId)
+@@ -264,6 +288,28 @@
+             return this.machineCache.getMachine(event.machineId)?.namespace
+         }
+         return undefined
++    }
++
++    getSessionManager(namespace: string): SessionManagerRecords {
++        const records = this.store.sessionManager.list(namespace)
++        for (const [id, record] of Object.entries(records)) {
++            const current = this.sessionCache.getSession(id)
++            record.missing = !current || current.namespace !== namespace
++            if (!record.missing && current) record.session = toSessionSummary(current)
++            else record.session = { ...record.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0, pendingRequests: [] }
++        }
++        return records
++    }
++
++    retainSessionManagerEntry(sessionId: string, namespace: string): boolean {
++        const access = this.resolveSessionAccess(sessionId, namespace)
++        if (!access.ok) return false
++        this.store.sessionManager.observe(toSessionSummary(access.session), namespace, 0, true)
++        return true
++    }
++
++    dismissSessionManagerEntries(namespace: string, ids: readonly string[]): void {
++        this.store.sessionManager.dismiss(namespace, ids)
+     }
+ 
+     getSessions(): Session[] {
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -1,3 +1,4 @@
++import { readManagedSessions } from './managedSessions'
+ import {
+     CursorMigrateToAcpRequestSchema,
+     DeleteUploadRequestSchema,
+@@ -71,6 +72,33 @@
+ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+ 
++    app.get('/session-manager', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace')
++        // Current managed idle/paused rows remain discoverable too. Enrollment
++        // never reverses an explicit dismissal and release never removes it.
++        if (namespace === 'default') for (const id of Object.keys(readManagedSessions())) engine.retainSessionManagerEntry(id, namespace)
++        c.header('Cache-Control', 'no-store')
++        return c.json({ entries: engine.getSessionManager(namespace) })
++    })
++    app.post('/session-manager/dismiss', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const body = await c.req.json().catch(() => null)
++        if (!Array.isArray(body?.ids) || body.ids.length > 1000 || !body.ids.every((id: unknown) => typeof id === 'string')) return c.json({ error: 'Expected session ids' }, 400)
++        const namespace = c.get('namespace')
++        engine.dismissSessionManagerEntries(namespace, body.ids)
++        return c.json({ entries: engine.getSessionManager(namespace) })
++    })
++    app.post('/session-manager/:id/retain', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace')
++        if (!engine.retainSessionManagerEntry(c.req.param('id'), namespace)) return c.json({ error: 'Session not found' }, 404)
++        return c.json({ entries: engine.getSessionManager(namespace) })
++    })
++
+     app.get('/sessions', (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+         if (engine instanceof Response) {
+--- /dev/null
++++ b/hub/src/sync/sessionManager.test.ts
+@@ -0,0 +1,148 @@
++import { describe, expect, it } from 'bun:test'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Hono } from 'hono'
++import { Store } from '../store'
++import { SyncEngine } from './syncEngine'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { createSessionsRoutes } from '../web/routes/sessions'
++import type { WebAppEnv } from '../web/middleware/auth'
++
++function fixture(path = ':memory:') {
++    const store = new Store(path)
++    const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++    const create = (tag: string, namespace = 'default') => engine.getOrCreateSession(tag, { path: '/tmp/work', host: 'test', flavor: tag === 'Claude' ? 'claude' : 'codex' }, {}, namespace)
++    const alive = (id: string, thinking: boolean) => engine.handleSessionAlive({ sid: id, time: Date.now(), thinking })
++    const app = (namespace = 'default') => {
++        const app = new Hono<WebAppEnv>()
++        app.use('*', async (c, next) => { c.set('namespace', namespace); return next() })
++        app.route('/', createSessionsRoutes(() => engine)); return app
++    }
++    return { store, engine, create, alive, app, close: () => { engine.stop(); store.close() } }
++}
++
++describe('durable Session Manager membership', () => {
++    it('enrolls manual and managed work without a browser, retaining completion and disconnect', () => {
++        const f = fixture()
++        try {
++            const manual = f.create('Codex'), managed = f.create('Claude'), never = f.create('Never ran')
++            expect(Object.keys(f.engine.getSessionManager('default'))).toEqual([])
++            f.alive(manual.id, true); f.alive(managed.id, true)
++            f.alive(manual.id, false); f.alive(managed.id, false)
++            const entries = f.engine.getSessionManager('default')
++            expect(Object.keys(entries).sort()).toEqual([manual.id, managed.id].sort())
++            expect(entries[never.id]).toBeUndefined()
++            expect(entries[manual.id].session.thinking).toBe(false)
++            expect(entries[managed.id].dismissedAt).toBeNull()
++        } finally { f.close() }
++    })
++    it('Unmanage is independent of membership, even without a captured run', () => {
++        const f = fixture()
++        try {
++            const s = f.create('Paused managed')
++            f.engine.retainSessionManagerEntry(s.id, 'default')
++            // Roster is no longer supplied; status updates cannot remove it.
++            f.alive(s.id, false)
++            expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
++            f.engine.dismissSessionManagerEntries('default', [s.id])
++            f.engine.retainSessionManagerEntry(s.id, 'default')
++            expect(f.engine.getSessionManager('default')[s.id].dismissedAt).not.toBeNull()
++        } finally { f.close() }
++    })
++    it('retains membership and manual dismissal across a full store/hub restart', () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-membership-')), path = join(dir, 'hub.db')
++        let f = fixture(path)
++        try {
++            const kept = f.create('Kept'), cleared = f.create('Cleared')
++            for (const s of [kept, cleared]) { f.alive(s.id, true); f.alive(s.id, false) }
++            f.engine.dismissSessionManagerEntries('default', [cleared.id]); f.close()
++            f = fixture(path)
++            const entries = f.engine.getSessionManager('default')
++            expect(entries[kept.id].dismissedAt).toBeNull()
++            expect(entries[cleared.id].dismissedAt).not.toBeNull()
++            f.alive(cleared.id, false)
++            expect(f.engine.getSessionManager('default')[cleared.id].dismissedAt).not.toBeNull()
++            f.alive(cleared.id, true)
++            const renewed = f.engine.getSessionManager('default')[cleared.id]
++            expect(renewed.activityAt).toBeGreaterThan(renewed.dismissedAt!)
++        } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++    it('clear is list-only; ordinary updates cannot undo it', async () => {
++        const f = fixture()
++        try {
++            const s = f.create('Codex'); f.alive(s.id, true)
++            const before = JSON.stringify(f.engine.getSession(s.id))
++            const response = await f.app().request('/session-manager/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [s.id] }) })
++            expect(response.status).toBe(200)
++            expect(JSON.stringify(f.engine.getSession(s.id))).toBe(before)
++            f.alive(s.id, true); f.alive(s.id, false)
++            const result = await (await f.app().request('/session-manager')).json() as { entries: import('@hapi/protocol/sessionManager').SessionManagerRecords }
++            const entry = result.entries[s.id]
++            expect(entry.dismissedAt).toBeGreaterThanOrEqual(entry.activityAt)
++            expect(f.store.getManualPause(s.id)).toBeNull()
++        } finally { f.close() }
++    })
++    it('captures a short public completion and ignores late results after Clear', () => {
++        const f = fixture()
++        try {
++            const s = f.create('Fast turn')
++            const publisher = (f.engine as unknown as { eventPublisher: { emit: (event: unknown) => void } }).eventPublisher
++            const completion = () => publisher.emit({ type: 'message-received', sessionId: s.id, message: {
++                id: 'done', seq: 1, localId: null, createdAt: Date.now(),
++                content: { role: 'agent', content: { type: 'output', data: { type: 'task_complete' } } }
++            } })
++            completion()
++            expect(f.engine.getSessionManager('default')[s.id].activityAt).toBeGreaterThan(0)
++            f.engine.dismissSessionManagerEntries('default', [s.id]); completion()
++            const row = f.engine.getSessionManager('default')[s.id]
++            expect(row.dismissedAt).toBeGreaterThanOrEqual(row.activityAt)
++        } finally { f.close() }
++    })
++
++    it('uses original invocation timestamps, never reconnect ACK receipt time', () => {
++        const f = fixture()
++        try {
++            const s = f.create('Replay')
++            const publisher = (f.engine as unknown as { eventPublisher: { emit: (event: unknown) => void } }).eventPublisher
++            f.store.messages.addMessage(s.id, { role: 'user', content: { text: 'Original work' } }, 'prompt')
++            f.store.recordMessagesConsumed(s.id, ['prompt'], 100, 'default')
++            const ack = (ids: string[]) => publisher.emit({ type: 'messages-consumed', sessionId: s.id, localIds: ids, invokedAt: Date.now() + 1000 })
++            ack(['prompt']); expect(f.engine.getSessionManager('default')[s.id].activityAt).toBe(100)
++            f.engine.dismissSessionManagerEntries('default', [s.id]); ack(['prompt', 'unknown'])
++            const cleared = f.engine.getSessionManager('default')[s.id]
++            expect(cleared.activityAt).toBe(100); expect(cleared.dismissedAt).toBeGreaterThanOrEqual(100)
++            f.store.messages.addMessage(s.id, { role: 'user', content: { text: 'New work' } }, 'new')
++            f.store.recordMessagesConsumed(s.id, ['new'], cleared.dismissedAt! + 1, 'default'); ack(['new'])
++            expect(f.engine.getSessionManager('default')[s.id].activityAt).toBeGreaterThan(cleared.dismissedAt!)
++        } finally { f.close() }
++    })
++
++    it('does not undo Clear on startup or an idle reconnect with restored background counts', () => {
++        const f = fixture()
++        try {
++            const s = f.create('Background replay'); f.alive(s.id, true); f.alive(s.id, false)
++            f.engine.dismissSessionManagerEntries('default', [s.id])
++            const record = f.engine.getSessionManager('default')[s.id]
++            f.store.sessionManager.observe({ ...record.session, backgroundTaskCount: 1 }, 'default', 0, false, 0, false)
++            let row = f.store.sessionManager.list('default')[s.id]
++            expect(row.activityAt).toBe(record.activityAt)
++            f.store.sessionManager.observe({ ...record.session, active: false, backgroundTaskCount: 0 }, 'default')
++            f.store.sessionManager.observe({ ...record.session, active: true, backgroundTaskCount: 1 }, 'default')
++            row = f.store.sessionManager.list('default')[s.id]
++            expect(row.activityAt).toBe(record.activityAt)
++        } finally { f.close() }
++    })
++
++    it('scopes reads, enrollment and dismissal to the authenticated namespace', async () => {
++        const f = fixture()
++        try {
++            const s = f.create('Private'); f.alive(s.id, true)
++            expect(await (await f.app('other').request('/session-manager')).json()).toEqual({ entries: {} })
++            expect((await f.app('other').request(`/session-manager/${s.id}/retain`, { method: 'POST' })).status).toBe(404)
++            await f.app('other').request('/session-manager/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [s.id] }) })
++            expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
++            expect((await f.app().request('/session-manager/dismiss', { method: 'POST', body: 'invalid' })).status).toBe(400)
++        } finally { f.close() }
++    })
++})
+--- /dev/null
++++ b/shared/src/sessionManager.ts
+@@ -0,0 +1,33 @@
++import type { SyncEvent } from './types'
++import type { SessionSummary } from './sessionSummary'
++
++/** List membership is independent of manager oversight and controller lifetime. */
++export type SessionManagerRecord = {
++    session: SessionSummary
++    activityAt: number
++    dismissedAt: number | null
++    missing?: boolean
++}
++export type SessionManagerRecords = Record<string, SessionManagerRecord>
++
++const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
++
++/** Activity evidence only; no chat actions and no transcript content retained. */
++export function sessionManagerActivityTime(event: SyncEvent): number | null {
++    if (event.type === 'messages-consumed') return event.localIds.length ? event.invokedAt : null
++    if (event.type !== 'message-received') return null
++    const content = object(event.message.content)
++    if (content?.role !== 'agent') return null
++    const inner = object(content.content)
++    const data = object(inner?.data)
++    if (data?.isSidechain) return null
++    const kind = data?.type
++    const terminal = ['task_complete', 'task_failed', 'turn_aborted'].includes(String(kind))
++        || (inner?.type === 'event' && ['ready', 'error', 'abort-restore'].includes(String(kind)))
++        || (kind === 'system' && data?.subtype === 'turn_duration')
++    // Public output covers a final reply even when its busy heartbeat was missed.
++    const reply = (inner?.type === 'text' && typeof inner.text === 'string')
++        || (kind === 'assistant' && object(data?.message)?.role !== 'user')
++    return terminal || reply ? event.message.createdAt : null
++}
++
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,3 +1,4 @@
++import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+ import type {
+     AttachmentMetadata,
+     AuthResponse,
+@@ -843,6 +844,16 @@
+         })
+     }
+ 
++    async getSessionManager(): Promise<SessionManagerRecords> {
++        return (await this.request<{ entries: SessionManagerRecords }>('/api/session-manager')).entries
++    }
++
++    async dismissSessionManager(ids: readonly string[]): Promise<SessionManagerRecords> {
++        return (await this.request<{ entries: SessionManagerRecords }>('/api/session-manager/dismiss', {
++            method: 'POST', body: JSON.stringify({ ids })
++        })).entries
++    }
++
+     async unmanageSession(sessionId: string): Promise<void> {
+         await this.request(`/api/managed-sessions/${encodeURIComponent(sessionId)}/unmanage`, { method: 'POST' })
+     }
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -1,3 +1,4 @@
++import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+ import type { SessionSummary } from '@/types/api'
+ 
+ export const SESSION_MANAGER_ACTIVITY_KEY = ['session-manager-activity'] as const
+@@ -10,9 +11,7 @@
+     return session.active && (session.thinking || (session.backgroundTaskCount ?? 0) > 0 || session.pendingRequestsCount > 0)
+ }
+ 
+-/** UI-only retention. Undefined managedIds means this observer has no roster
+- * knowledge; only an explicit roster snapshot may remove roster-only rows.
+- * Never writes to a session, controller, goal or history. */
++/** UI projection/fallback. Oversight and filtering never remove membership. */
+ export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[], managedIds?: ReadonlySet<string>, activity: SessionManagerActivity = {}): SessionManagerState {
+     let next = previous
+     const set = (id: string, entry: ManagedListEntry) => {
+@@ -25,13 +24,6 @@
+         const activityAt = Math.max(old?.activityAt ?? 0, activity[session.id] ?? 0)
+         if (!old && !activityAt && !sessionHasWork(session) && !managedIds?.has(session.id)) continue
+         const observedWork = activityAt > 0 || old?.observedWork || sessionHasWork(old?.session ?? session) || sessionHasWork(session)
+-        // A chat admitted solely by the current managed roster must leave when
+-        // oversight is released. Actual observed work keeps normal retention.
+-        if (old && !observedWork && managedIds !== undefined && !managedIds.has(session.id) && !old.dismissed) {
+-            if (next === previous) next = { ...previous }
+-            delete next[session.id]
+-            continue
+-        }
+         const newWork = old && ((activityAt > (old.activityAt ?? 0) && activityAt > (old.dismissedAt ?? 0)) || (sessionHasWork(session) && (!sessionHasWork(old.session) || (!old.session.thinking && session.thinking))))
+         const dismissed = old?.dismissed === true && !newWork
+         const stopped = !sessionHasWork(session) || (newWork ? false : old?.stopped)
+@@ -41,10 +33,7 @@
+     }
+     for (const [id, old] of Object.entries(previous)) {
+         if (!present.has(id)) {
+-            if (!old.observedWork && !sessionHasWork(old.session) && managedIds !== undefined && !managedIds.has(id) && !old.dismissed) {
+-                if (next === previous) next = { ...previous }
+-                delete next[id]
+-            } else if (!old.missing) set(id, { ...old, missing: true, stopped: true, session: { ...old.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } })
++            if (!old.missing) set(id, { ...old, missing: true, stopped: true, session: { ...old.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } })
+         }
+     }
+     return next
+@@ -60,3 +49,23 @@
+     if (!previous[id]) return previous
+     return { ...previous, [id]: { ...previous[id], stopped: true } }
+ }
++
++
++/** Server membership survives refresh, reconnect, browser/hub restart and other
++ * clients. Fresh session snapshots supply status; they never decide membership. */
++export function reconcileSessionManager(previous: SessionManagerState, records: SessionManagerRecords, sessions: readonly SessionSummary[]): SessionManagerState {
++    const live = new Map(sessions.map(session => [session.id, session]))
++    return Object.fromEntries(Object.entries(records).map(([id, record]) => {
++        const session = live.get(id) ?? record.session
++        const old = previous[id]
++        const newWork = record.activityAt > (old?.activityAt ?? 0)
++        return [id, {
++            session, activityAt: record.activityAt,
++            dismissed: record.dismissedAt !== null && record.dismissedAt >= record.activityAt,
++            dismissedAt: record.dismissedAt ?? undefined,
++            missing: record.missing ?? false,
++            stopped: !sessionHasWork(session) || Boolean(old?.stopped && !newWork),
++            observedWork: record.activityAt > 0
++        }]
++    }))
++}
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -79,12 +79,12 @@
+ })
+ 
+ 
+-it('removes roster-only rows on unmanage but retains actual recently observed work', () => {
++it('retains roster-only and observed-work rows after Unmanage', () => {
+     const idle = session({ id: 'idle', thinking: false }), running = session({ id: 'running' })
+     const before = observeSessions({}, [idle, running], new Set(['idle', 'running']))
+     const idleRunning = { ...running, thinking: false }
+     const after = observeSessions(before, [idle, idleRunning], new Set())
+-    expect(after.idle).toBeUndefined()
++    expect(after.idle?.dismissed).toBe(false)
+     expect(after.running?.observedWork).toBe(true)
+     expect(after.running?.stopped).toBe(true)
+     expect(dismissSessions(after, ['running']).running?.dismissed).toBe(true)
+@@ -102,10 +102,10 @@
+ })
+ 
+ 
+-it('removes a missing roster-only row once supervision ends', () => {
++it('retains a missing roster-only row after supervision ends', () => {
+     const idle = session({ thinking: false })
+     const seeded = observeSessions({}, [idle], new Set(['s']))
+-    expect(observeSessions(seeded, [], new Set())).toEqual({})
++    expect(observeSessions(seeded, [], new Set()).s?.missing).toBe(true)
+ })
+ 
+ 
+@@ -118,9 +118,9 @@
+     expect(updated.s?.dismissed).toBe(false)
+     const missing = observeSessions(updated, [])
+     expect(missing.s?.missing).toBe(true)
+-    // A loaded, explicitly empty roster still removes released roster-only rows.
+-    expect(observeSessions(updated, [idle], new Set())).toEqual({})
+-    expect(observeSessions(missing, [], new Set())).toEqual({})
++    // Even an explicitly empty roster cannot remove list membership.
++    expect(observeSessions(updated, [idle], new Set()).s?.dismissed).toBe(false)
++    expect(observeSessions(missing, [], new Set()).s?.missing).toBe(true)
+ })
+ 
+ it('retains a completed turn missed between runtime snapshots, including after automatic unmanage', () => {
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -1,11 +1,23 @@
+-import { useEffect } from 'react'
++import { useEffect, useState } from 'react'
+ import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+ import type { SessionSummary } from '@/types/api'
+-import { dismissSessions, markSessionStopped, observeSessions, SESSION_MANAGER_KEY, SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity, type SessionManagerState } from '@/lib/sessionManager'
++import type { ApiClient } from '@/api/client'
++import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
++import { dismissSessions, markSessionStopped, observeSessions, reconcileSessionManager, SESSION_MANAGER_KEY, SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity, type SessionManagerState } from '@/lib/sessionManager'
+ 
+-/** Query-cache lifetime: survives navigation, cleared on reload/hub cache reset. */
+-export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>) {
++export const SESSION_MANAGER_REMOTE_KEY = ['session-manager-membership'] as const
++
++/** Hub owns durable membership; query cache is only the current UI projection. */
++export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>, api?: ApiClient | null) {
+     const client = useQueryClient()
++    const [clearError, setClearError] = useState<string | null>(null)
++    const [clearing, setClearing] = useState(false)
++    const remoteEnabled = typeof api?.getSessionManager === 'function'
++    const remote = useQuery<SessionManagerRecords>({
++        queryKey: SESSION_MANAGER_REMOTE_KEY,
++        queryFn: remoteEnabled ? () => api!.getSessionManager() : skipToken,
++        enabled: remoteEnabled, refetchInterval: remoteEnabled ? 5000 : false, retry: false,
++    })
+     const { data: entries = {} } = useQuery<SessionManagerState>({
+         queryKey: SESSION_MANAGER_KEY, queryFn: skipToken, initialData: {}, enabled: false, gcTime: Infinity,
+     })
+@@ -13,12 +25,27 @@
+         queryKey: SESSION_MANAGER_ACTIVITY_KEY, queryFn: skipToken, initialData: {}, enabled: false, gcTime: Infinity,
+     })
+     useEffect(() => {
+-        // Undefined means data not loaded; do not mistake loading for disconnect.
+-        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity))
+-    }, [client, sessions, managed, activity])
++        if (!sessions) return
++        if (remote.data) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => reconcileSessionManager(old ?? {}, remote.data, sessions))
++        else if (!remoteEnabled) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity))
++    }, [client, sessions, managed, activity, remote.data, remoteEnabled])
+     return {
+-        entries,
++        entries, clearing, error: clearError ?? (remote.error instanceof Error ? remote.error.message : null),
+         markStopped: (id: string) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => markSessionStopped(old ?? {}, id)),
+-        dismiss: (ids: readonly string[]) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => dismissSessions(old ?? {}, ids)),
++        dismiss: async (ids: readonly string[]) => {
++            if (clearing) return
++            const clearable = ids.filter(id => client.getQueryData<SessionManagerState>(SESSION_MANAGER_KEY)?.[id]?.stopped)
++            if (!remoteEnabled) {
++                client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => dismissSessions(old ?? {}, clearable))
++                return
++            }
++            setClearing(true); setClearError(null)
++            try {
++                await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
++                const records = await api!.dismissSessionManager(clearable)
++                client.setQueryData(SESSION_MANAGER_REMOTE_KEY, records)
++            } catch (error) { setClearError(error instanceof Error ? error.message : 'Clear failed') }
++            finally { setClearing(false) }
++        },
+     }
+ }
+--- /dev/null
++++ b/web/src/hooks/useSessionManager.test.tsx
+@@ -0,0 +1,58 @@
++import { act, renderHook, waitFor } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import type { PropsWithChildren } from 'react'
++import { describe, expect, it, vi } from 'vitest'
++import type { SessionSummary } from '@/types/api'
++import type { ApiClient } from '@/api/client'
++import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
++import { useSessionManager, SESSION_MANAGER_REMOTE_KEY } from './useSessionManager'
++
++const session = { id: 's', active: true, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } as SessionSummary
++function setup() {
++    let records: SessionManagerRecords = { s: { session, activityAt: 100, dismissedAt: null } }
++    const controls = { getSessionManager: vi.fn(async () => structuredClone(records)), dismissSessionManager: vi.fn(async (ids: string[]) => {
++        for (const id of ids) records[id].dismissedAt = 200
++        return structuredClone(records)
++    }) }
++    const mount = () => {
++        const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++        const wrapper = ({ children }: PropsWithChildren) => <QueryClientProvider client={client}>{children}</QueryClientProvider>
++        const hook = renderHook(() => useSessionManager([session], {}, controls as unknown as ApiClient), { wrapper })
++        return { ...hook, client }
++    }
++    return { controls, mount, get records() { return records }, set records(value) { records = value } }
++}
++
++describe('durable membership projection', () => {
++    it('retains a finished unmanaged row after refresh and persists Clear across refresh', async () => {
++        const f = setup(); let hook = f.mount()
++        await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(false))
++        hook.unmount(); hook.client.clear(); hook = f.mount()
++        await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(false))
++        await act(() => hook.result.current.dismiss(['s']))
++        await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(true))
++        hook.unmount(); hook.client.clear(); hook = f.mount()
++        await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(true))
++        expect(f.controls.dismissSessionManager).toHaveBeenCalledExactlyOnceWith(['s'])
++        hook.unmount(); hook.client.clear()
++    })
++    it('returns a manually cleared chat when the hub observes a new run, not an unchanged poll', async () => {
++        const f = setup(); const hook = f.mount()
++        await waitFor(() => expect(hook.result.current.entries.s).toBeDefined())
++        await act(() => hook.result.current.dismiss(['s']))
++        await act(() => hook.client.invalidateQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY }))
++        await waitFor(() => expect(hook.result.current.entries.s.dismissed).toBe(true))
++        f.records = { s: { session, activityAt: 300, dismissedAt: 200 } }
++        await act(() => hook.client.invalidateQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY }))
++        await waitFor(() => expect(hook.result.current.entries.s.dismissed).toBe(false))
++        hook.unmount(); hook.client.clear()
++    })
++    it('does not remove the row when Clear fails', async () => {
++        const f = setup(); f.controls.dismissSessionManager.mockRejectedValueOnce(new Error('offline'))
++        const hook = f.mount(); await waitFor(() => expect(hook.result.current.entries.s).toBeDefined())
++        await act(() => hook.result.current.dismiss(['s']))
++        expect(hook.result.current.entries.s.dismissed).toBe(false)
++        expect(hook.result.current.error).toBe('offline')
++        hook.unmount(); hook.client.clear()
++    })
++})
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -44,7 +44,7 @@
+     const mobile = useSessionManagerMobile()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+-    const { entries, dismiss, markStopped } = useSessionManager(props.sessions, currentManaged)
++    const { entries, dismiss, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -68,8 +68,9 @@
+             </div>
+             <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+                 <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
+-                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
++                <button type="button" disabled={clearing || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+             </div>
++            {listError && <p role="alert" className="text-xs text-[var(--app-badge-error-text)]">{listError}</p>}
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {visibleRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+                     {index > 0 && isPinned(visibleRows[index - 1]!.session) && !isPinned(session) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+@@ -91,7 +92,7 @@
+                                 } catch (error) { setErrors(old => ({ ...old, [session.id]: error instanceof Error ? error.message : 'Unmanage failed' })) }
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+                             }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Unmanage</button>}
+-                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" onClick={() => dismiss([session.id])} className="h-10 w-10 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing} onClick={() => dismiss([session.id])} className="h-10 w-10 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                         : <button type="button" aria-label={`Stop ${getSessionTitle(session)}`} disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -165,12 +165,17 @@
+ })
+ 
+ 
+-it('immediately removes a roster-only idle row after Unmanage without aborting it', async () => {
++it('keeps a roster-only idle row after Unmanage without aborting it', async () => {
+     const client = new QueryClient()
+     render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={[session('Idle roster', true, false)]} managed={{ 'Idle roster': { role: 'worker', worker: 'w' } }} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>)
+     open(); await screen.findByRole('button', { name: 'Open Idle roster' })
+     fireEvent.click(screen.getByRole('button', { name: 'Unmanage' }))
+-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Idle roster' })).toBeNull())
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Unmanage' })).toBeNull())
++    expect(screen.getByRole('button', { name: 'Open Idle roster' })).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(screen.queryByRole('button', { name: 'Open Idle roster' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(screen.getByRole('button', { name: 'Open Idle roster' })).toBeInTheDocument()
+     expect(controls.unmanageSession).toHaveBeenCalledExactlyOnceWith('Idle roster')
+     expect(controls.abortSession).not.toHaveBeenCalled()
+ })
+--- a/shared/package.json
++++ b/shared/package.json
+@@ -7,6 +7,7 @@
+     "types": "./src/index.ts",
+     "exports": {
+         ".": "./src/index.ts",
++        "./sessionManager": "./src/sessionManager.ts",
+         "./apiTypes": "./src/apiTypes.ts",
+         "./messages": "./src/messages.ts",
+         "./slashCommands": "./src/slashCommands.ts",
+--- a/web/src/lib/sessionManagerActivity.ts
++++ b/web/src/lib/sessionManagerActivity.ts
+@@ -2,26 +2,8 @@
+ import type { SyncEvent } from '@/types/api'
+ import { SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity } from './sessionManager'
+ 
+-const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+-
+-/** Activity evidence only; no chat actions and no transcript content retained. */
+-export function sessionManagerActivityTime(event: SyncEvent): number | null {
+-    if (event.type === 'messages-consumed') return event.localIds.length ? event.invokedAt : null
+-    if (event.type !== 'message-received') return null
+-    const content = object(event.message.content)
+-    if (content?.role !== 'agent') return null
+-    const inner = object(content.content)
+-    const data = object(inner?.data)
+-    if (data?.isSidechain) return null
+-    const kind = data?.type
+-    const terminal = ['task_complete', 'task_failed', 'turn_aborted'].includes(String(kind))
+-        || (inner?.type === 'event' && ['ready', 'error', 'abort-restore'].includes(String(kind)))
+-        || (kind === 'system' && data?.subtype === 'turn_duration')
+-    // Public output covers a final reply even when its busy heartbeat was missed.
+-    const reply = (inner?.type === 'text' && typeof inner.text === 'string')
+-        || (kind === 'assistant' && object(data?.message)?.role !== 'user')
+-    return terminal || reply ? event.message.createdAt : null
+-}
++import { sessionManagerActivityTime } from '@hapi/protocol/sessionManager'
++export { sessionManagerActivityTime } from '@hapi/protocol/sessionManager'
+ 
+ export function observeSessionManagerEvent(client: QueryClient, event: SyncEvent): void {
+     const at = sessionManagerActivityTime(event)

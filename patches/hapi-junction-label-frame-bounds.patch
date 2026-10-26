@@ -1,0 +1,33 @@
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -3,7 +3,7 @@
+ export type FramePoint = GraphPoint & { width?: number; height?: number }
+ export type NodeVisualState = { positions: Record<string, FramePoint>; annotations: NodeAnnotation[]; routing?: NodeRouting }
+ export function framePoints(positions: Record<string, FramePoint>, annotations: readonly NodeAnnotation[], junctions: NodeRouting['junctions']): Record<string, FramePoint> {
+-    return { ...positions, ...Object.fromEntries(annotations.map(a => [a.kind + ':' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - (j.label ? 90 : 8), y: j.y - (j.label ? 36 : 8), width: j.label ? 180 : 16, height: j.label ? 52 : 16 }])) }
++    return { ...positions, ...Object.fromEntries(annotations.map(a => [a.kind + ':' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - 8, y: j.y - 8, width: 16, height: 16 }])) }
+ }
+ /** Tight bounds around members, reserving space for the frame title and ports. */
+ export function fitNodeFrame(frame: NodeAnnotation, positions: Record<string, FramePoint>): NodeAnnotation {
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -93,3 +93,19 @@
+         expect(fitted.y + fitted.height).toBeGreaterThanOrEqual(points[id].y + (points[id].height ?? 80))
+     }
+ })
++
++it('ignores junction labels when fitting frames, including nested frames and moved groups', () => {
++    const group = { ...frame, members: ['junction:dot'] }
++    const dot = { id: 'dot', owner: null, x: 100, y: 120 }
++    const plain = framePoints({}, [], [dot])
++    for (const label of ['Short', 'A much longer cable label that must not enlarge its frame']) {
++        const labelled = framePoints({}, [], [{ ...dot, label }])
++        expect(labelled).toEqual(plain)
++        expect(fitNodeFrame(group, labelled)).toEqual(fitNodeFrame(group, plain))
++        const outer = { ...frame, id: 'outer', members: ['frame:f'] }
++        const before = translateFrame(outer, [outer, group], framePoints({}, [outer, group], [dot]), { junctions: [dot], edges: [] }, { x: 20, y: 30 })
++        const after = translateFrame(outer, [outer, group], framePoints({}, [outer, group], [{ ...dot, label }]), { junctions: [{ ...dot, label }], edges: [] }, { x: 20, y: 30 })
++        expect(after.annotations).toEqual(before.annotations)
++        expect(after.routing?.junctions[0]).toMatchObject({ x: 120, y: 150, label })
++    }
++})

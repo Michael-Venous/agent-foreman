@@ -1,0 +1,117 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -125,20 +125,21 @@
+         // Cache setters use the latest state; viewport handlers read refs.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [open, collapsed])
+-    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize' | 'bubble') => {
++    const start = (event: PointerEvent<HTMLElement>, kind: 'move' | 'resize' | 'bubble') => {
+         if (event.button !== 0 || gesture.current) return
+         // Touch already has implicit capture; touch-action:none handles dragging.
+         // Preserve native taps instead of cancelling/focusing touch pointerdown.
+         if (event.pointerType !== 'touch') {
+             event.preventDefault()
+-            event.currentTarget.focus({ preventScroll: true })
++            const focus = kind === 'move' ? focusTarget.current : event.currentTarget
++            focus?.focus({ preventScroll: true })
+             event.currentTarget.setPointerCapture(event.pointerId)
+         }
+         suppressBubbleClick.current = false
+         const rect = kind === 'bubble' ? { ...fitSessionBubble(current.current.bubble ?? initialBubble()), ...BUBBLE } : fitSessionWindow(current.current.bounds ?? initialBounds())
+         gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: rect }
+     }
+-    const move = (event: PointerEvent<HTMLButtonElement>) => {
++    const move = (event: PointerEvent<HTMLElement>) => {
+         const start = gesture.current
+         if (!start || start.pointer !== event.pointerId) return
+         const dx = event.clientX - start.x, dy = event.clientY - start.y
+@@ -157,7 +158,7 @@
+         if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
+         setBounds(fitSessionWindow(next))
+     }
+-    const end = (event: PointerEvent<HTMLButtonElement>) => {
++    const end = (event: PointerEvent<HTMLElement>) => {
+         if (gesture.current?.pointer !== event.pointerId) return
+         if (event.type === 'pointercancel') suppressBubbleClick.current = true
+         gesture.current = null
+@@ -201,8 +202,18 @@
+         onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="app-section-header app-window-chrome" style={headerCenter ? { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr)' } : undefined}>
+-            <button ref={focusTarget} type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
++        <header className="app-section-header app-window-chrome touch-none select-none cursor-move [&_button:not([data-window-drag-handle])]:cursor-pointer"
++            onPointerDown={event => {
++                const target = event.target
++                // Portal controls belong to their own interaction surface. All
++                // remaining header space, including grid gaps/padding, is a handle.
++                if (event.defaultPrevented || !(target instanceof Element) || !event.currentTarget.contains(target)) return
++                const control = target.closest('button,a,input,select,textarea,[contenteditable="true"],[role="button"],[role="combobox"],[data-window-no-drag]')
++                if (control && control !== focusTarget.current) return
++                start(event, 'move')
++            }} {...pointerEvents}
++            style={headerCenter ? { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr)' } : undefined}>
++            <button ref={focusTarget} data-window-drag-handle type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move"
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
+             </button>
+diff --git a/web/src/components/NodeGraphHost.test.tsx b/web/src/components/NodeGraphHost.test.tsx
+--- a/web/src/components/NodeGraphHost.test.tsx
++++ b/web/src/components/NodeGraphHost.test.tsx
+@@ -38,6 +38,14 @@
+     vi.stubGlobal('innerWidth', 1200)
+     vi.stubGlobal('innerHeight', 900)
+     vi.stubGlobal('matchMedia', () => ({ matches: window.innerWidth <= 640, addEventListener() {}, removeEventListener() {} }))
++    vi.stubGlobal('PointerEvent', class extends MouseEvent {
++        pointerId: number
++        pointerType: string
++        constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1; this.pointerType = init.pointerType ?? 'mouse' }
++    })
++    HTMLElement.prototype.setPointerCapture = vi.fn()
++    HTMLElement.prototype.hasPointerCapture = vi.fn(() => false)
++    HTMLElement.prototype.releasePointerCapture = vi.fn()
+ })
+ afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+ 
+@@ -50,6 +58,40 @@
+ }
+ 
+ describe('Nodes floating window integration', () => {
++    it.each(['mouse', 'touch'])('drags from header padding and both empty control slots using $0', async pointerType => {
++        if (pointerType === 'touch') vi.stubGlobal('innerWidth', 390)
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const targets = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
++        expect(header).toHaveClass('touch-none', 'cursor-move')
++        for (const target of [header, targets.center!, targets.actions!.parentElement!]) {
++            const before = { x: parseFloat(panel.style.left), y: parseFloat(panel.style.top) }
++            fireEvent.pointerDown(target, { pointerId: 1, pointerType, button: 0, clientX: 200, clientY: 100 })
++            fireEvent.pointerMove(header, { pointerId: 1, pointerType, clientX: 240, clientY: 130 })
++            fireEvent.pointerUp(header, { pointerId: 1, pointerType })
++            await waitFor(() => expect(parseFloat(panel.style.left)).toBe(before.x + 40))
++            expect(parseFloat(panel.style.top)).toBe(before.y + 30)
++        }
++    })
++
++    it('does not capture or drag workspace, grid or minimize controls', async () => {
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const controls = [await within(header).findByRole('combobox', { name: 'Workspace' }), within(header).getByRole('button', { name: 'Graph options' }), within(header).getByRole('button', { name: 'Collapse Nodes' })]
++        const before = { left: panel.style.left, top: panel.style.top }
++        for (const control of controls) {
++            expect(fireEvent.pointerDown(control, { pointerId: 1, button: 0, clientX: 200, clientY: 100 })).toBe(true)
++            fireEvent.pointerMove(header, { pointerId: 1, clientX: 240, clientY: 130 })
++            fireEvent.pointerUp(header, { pointerId: 1 })
++            expect({ left: panel.style.left, top: panel.style.top }).toEqual(before)
++        }
++        expect(HTMLElement.prototype.setPointerCapture).not.toHaveBeenCalled()
++        fireEvent.click(controls[2]!)
++        await screen.findByLabelText('Nodes bubble')
++    })
++
+     it('places graph controls in the real top header under a plain Nodes title', async () => {
+         const view = setup()
+         const panel = await screen.findByRole('dialog', { name: 'Nodes' })

@@ -1,0 +1,13 @@
+[Unit]
+Description=Durable single-agent project supervisor
+After=hapi-hub.service hapi-runner.service
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/code/agent-foreman
+Environment=PATH=%h/.local/bin:/usr/bin
+ExecStart=/usr/bin/python3 %h/Documents/code/agent-foreman/supervisor.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+[Install]
+WantedBy=default.target

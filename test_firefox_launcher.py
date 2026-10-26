@@ -1,0 +1,152 @@
+"""Isolated-profile launcher regression coverage; never runs real Firefox/systemctl."""
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SCRIPT = Path(__file__).parent/'deploy/firefox/firefox-agent-browser'
+loader = importlib.machinery.SourceFileLoader('firefox_launcher', str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+launcher = importlib.util.module_from_spec(spec)
+loader.exec_module(launcher)
+
+
+class FirefoxLauncherTests(unittest.TestCase):
+    def setUp(self):
+        self.profile_guard = patch.object(launcher, 'require_profile')
+        self.profile_guard.start()
+        self.addCleanup(self.profile_guard.stop)
+
+    def test_normal_desktop_passes_urls_and_private_flags_without_automation(self):
+        with patch.object(launcher, 'unit_state', return_value=('inactive', 0)), patch.object(launcher.subprocess, 'run') as run:
+            args = ['--private-window', 'https://example.test/?a=1&b=2']
+            self.assertEqual(launcher.execute('desktop', args), ['/usr/bin/firefox', *args])
+            run.assert_not_called()
+
+    def test_cleanup_never_stops_graphical_firefox_outside_headless_unit(self):
+        with patch.object(launcher, 'unit_state', return_value=('inactive', 0)), patch.object(launcher.subprocess, 'run') as run:
+            self.assertIsNone(launcher.execute('finish', []));run.assert_not_called()
+
+    def test_idle_agent_service_stops_before_agent_gui_and_waits_for_exit(self):
+        with patch.object(launcher, 'unit_state', side_effect=[('active', 123), ('active', 123), ('inactive', 0)]), \
+             patch.object(launcher, 'identity', side_effect=['boot-start', 'boot-start', None]), \
+             patch.object(launcher, 'socket_states', return_value=['0A', '06']), patch.object(launcher.subprocess, 'run') as run:
+            self.assertEqual(launcher.execute('gui', ['--new-window']), ['/usr/bin/firefox', '--marionette', '--no-remote', '-profile', str(launcher.PROFILE), '--new-window'])
+            run.assert_called_once_with(['systemctl', '--user', 'stop', launcher.UNIT], check=True, timeout=30)
+
+    def test_connected_controller_refuses_desktop_gui_and_cleanup(self):
+        for command in ('gui', 'finish', 'stop'):
+            with self.subTest(command=command), patch.object(launcher, 'unit_state', return_value=('active', 123)), \
+                 patch.object(launcher, 'identity', return_value='boot-start'), \
+                 patch.object(launcher, 'socket_states', return_value=['0A', '01']), patch.object(launcher.subprocess, 'run') as run:
+                with self.assertRaisesRegex(launcher.Busy, 'agent is controlling'):
+                    launcher.execute(command, [])
+                run.assert_not_called()
+
+    def test_late_controller_pid_replacement_and_service_change_do_not_stop(self):
+        for states, identities, sockets in [
+            ([('active', 123)]*2, ['a', 'a'], [['0A'], ['0A', '01']]),
+            ([('active', 123)]*2, ['a', 'b'], [['0A']]),
+            ([('active', 123), ('active', 999)], ['a'], [['0A']]),
+        ]:
+            with self.subTest(states=states, identities=identities), \
+                 patch.object(launcher, 'unit_state', side_effect=states), patch.object(launcher, 'identity', side_effect=identities), \
+                 patch.object(launcher, 'socket_states', side_effect=sockets), patch.object(launcher.subprocess, 'run') as run:
+                with self.assertRaisesRegex(launcher.Busy, 'changed during handoff'):
+                    launcher.execute('gui', [])
+                run.assert_not_called()
+
+    def test_stop_failure_or_surviving_profile_owner_prevents_second_launch(self):
+        with patch.object(launcher, 'unit_state', return_value=('active', 123)), \
+             patch.object(launcher, 'identity', return_value='a'), patch.object(launcher, 'socket_states', return_value=['0A']), \
+             patch.object(launcher.subprocess, 'run', side_effect=subprocess.TimeoutExpired('stop', 30)):
+            with self.assertRaises(subprocess.TimeoutExpired):launcher.execute('gui', [])
+        with patch.object(launcher, 'unit_state', side_effect=[('active', 123)]*2+[('inactive', 0)]), \
+             patch.object(launcher, 'identity', return_value='a'), patch.object(launcher, 'socket_states', return_value=['0A']), \
+             patch.object(launcher.subprocess, 'run'):
+            with self.assertRaisesRegex(launcher.Busy, 'not exited'):launcher.execute('gui', [])
+
+    def test_start_reuses_listener_without_connecting_or_starting(self):
+        with patch.object(launcher, 'socket_states', return_value=['0A', '01']), patch.object(launcher, 'endpoint_isolated', return_value=True), patch.object(launcher.subprocess, 'run') as run:
+            self.assertIsNone(launcher.execute('start', []));run.assert_not_called()
+
+    def test_start_refuses_normal_locked_profile_instead_of_hidden_conflicting_browser(self):
+        with patch.object(launcher, 'socket_states', return_value=[]), patch.object(launcher, 'unit_state', return_value=('inactive', 0)), \
+             patch.object(launcher, 'agent_profile_open', return_value=True), patch.object(launcher.subprocess, 'run') as run:
+            with self.assertRaisesRegex(launcher.Busy, 'already open or locked'):launcher.execute('start', [])
+            run.assert_not_called()
+
+    def test_start_still_supports_explicit_headless_work_after_profile_is_closed(self):
+        with patch.object(launcher, 'socket_states', return_value=[]), patch.object(launcher, 'unit_state', return_value=('inactive', 0)), \
+             patch.object(launcher, 'agent_profile_open', return_value=False), patch.object(launcher.subprocess, 'run') as run:
+            self.assertIsNone(launcher.execute('start', []))
+            run.assert_called_once_with(['systemctl', '--user', 'start', launcher.UNIT], check=True, timeout=30)
+
+    def test_passive_socket_inspection_handles_ipv4_ipv6_and_only_local_port(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);(root/'net').mkdir()
+            (root/'net/tcp').write_text('header\n0: 0100007F:0B0D 00000000:0000 0A\n1: 0100007F:AAAA 0100007F:0B0D 01\n')
+            (root/'net/tcp6').write_text('header\n2: 00000000000000000000000001000000:0B0D 00000000000000000000000001000000:AAAA 01\n')
+            self.assertEqual(launcher.socket_states(root), ['0A', '01'])
+            (root/'net/tcp6').unlink();self.assertEqual(launcher.socket_states(root), ['0A'])
+            (root/'net/tcp').unlink()
+            with self.assertRaises(FileNotFoundError):launcher.socket_states(root)
+
+    def test_profile_identity_verifies_mode_profile_uid_and_pid_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);folder=root/'123';folder.mkdir()
+            # comm may contain spaces/parentheses; starttime is field22.
+            (folder/'stat').write_text('123 (firefox (headless)) S '+' '.join(['0']*18+['456']))
+            (folder/'cmdline').write_bytes(b'/usr/bin/firefox\0--headless\0--marionette\0-profile\0'+str(launcher.PROFILE).encode()+b'\0')
+            self.assertEqual(launcher.identity(123,root), '456')
+            (folder/'cmdline').write_bytes(b'/usr/bin/firefox\0--marionette\0')
+            with self.assertRaisesRegex(launcher.Busy, 'expected isolated headless'):launcher.identity(123,root)
+            self.assertIsNone(launcher.identity(999,root))
+
+    def test_shutdown_lockfile_presence_alone_does_not_block_future_headless_tasks(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher,'PROFILE',Path(td)):
+            (Path(td)/'.parentlock').touch()
+            self.assertFalse(launcher.agent_profile_open())
+            (Path(td)/'lock').symlink_to('stale-profile-lock')
+            self.assertTrue(launcher.agent_profile_open())
+
+    def test_control_shortcut_remains_explicitly_opt_in(self):
+        with patch.object(launcher, 'unit_state', return_value=('inactive', 0)):
+            self.assertEqual(launcher.execute('gui', ['https://example.test/']), ['/usr/bin/firefox', '--marionette', '--no-remote', '-profile', str(launcher.PROFILE), 'https://example.test/'])
+
+
+    def test_desktop_launch_does_not_touch_busy_agent_browser(self):
+        with patch.object(launcher, 'unit_state', side_effect=AssertionError('desktop must be independent')), patch.object(launcher, 'socket_states', side_effect=AssertionError('must not inspect agent endpoint')):
+            self.assertEqual(launcher.execute('desktop', ['https://example.test/']), ['/usr/bin/firefox', 'https://example.test/'])
+
+    def test_agent_gui_cannot_override_profile_with_extra_arguments(self):
+        for args in [['-P','daily'],['--profile=/daily'],['-profile','/daily']]:
+            with self.subTest(args=args), patch.object(launcher,'stop_headless') as stop:
+                with self.assertRaisesRegex(launcher.Busy,'profile overrides'):launcher.execute('gui',args)
+                stop.assert_not_called()
+
+    def test_listener_owner_requires_isolated_profile_not_daily_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);(root/'net').mkdir();(root/'net/tcp').write_text('header\n0: 0100007F:0B0D 00000000:0000 0A 0:0 0:0 0 1000 0 42\n')
+            folder=root/'123';folder.mkdir();(folder/'fd').mkdir();(folder/'fd/4').symlink_to('socket:[42]')
+            (folder/'cmdline').write_bytes(b'firefox\0--marionette\0-profile\0'+str(launcher.PROFILE).encode()+b'\0')
+            self.assertTrue(launcher.endpoint_isolated(root))
+            (folder/'cmdline').write_bytes(b'firefox\0--marionette\0-profile\0/daily\0')
+            self.assertFalse(launcher.endpoint_isolated(root))
+
+    def test_unknown_endpoint_is_never_reused(self):
+        with patch.object(launcher, 'socket_states', return_value=['0A']), patch.object(launcher, 'endpoint_isolated', return_value=False), patch.object(launcher.subprocess, 'run') as run:
+            with self.assertRaisesRegex(launcher.Busy, 'unverified browser'):launcher.execute('start', [])
+            run.assert_not_called()
+
+    def test_missing_profile_never_falls_back_to_daily(self):
+        self.profile_guard.stop()
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher.subprocess, 'run') as run:
+            with self.assertRaisesRegex(launcher.Busy, 'never fall back'):
+                launcher.execute('start', [])
+            run.assert_not_called()
+
+if __name__ == '__main__':unittest.main()

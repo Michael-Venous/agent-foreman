@@ -1,0 +1,607 @@
+--- a/web/src/components/assistant-ui/reasoning.tsx
++++ b/web/src/components/assistant-ui/reasoning.tsx
+@@ -1,4 +1,4 @@
+-import { useState, useCallback, useEffect, useLayoutEffect, useRef, type FC, type KeyboardEvent, type PropsWithChildren, type UIEvent } from 'react'
++import { useId, useState, useCallback, useEffect, useLayoutEffect, useRef, type FC, type KeyboardEvent, type PropsWithChildren, type UIEvent } from 'react'
+ import {
+     useAuiState,
+     type ReasoningGroupProps,
+@@ -78,7 +78,7 @@
+                 components={defaultComponents}
+                 componentsByLanguage={MARKDOWN_COMPONENTS_BY_LANGUAGE}
+                 urlTransform={denyOnlyTransform}
+-                className={cn(MARKDOWN_CLASSNAME, 'aui-reasoning-content text-[13.5px] text-[var(--app-hint)]')}
++                className={cn(MARKDOWN_CLASSNAME, 'aui-reasoning-content')}
+             />
+         </UriConfirmProvider>
+     )
+@@ -93,7 +93,9 @@
+     startIndex = 0,
+     endIndex,
+ }) => {
+-    const [isOpen, setIsOpen] = useState(false)
++    const { reasoningCollapsed } = useReasoningCollapse()
++    const [isOpen, setIsOpen] = useState(() => !reasoningCollapsed)
++    const contentId = useId()
+     const scrollRef = useRef<HTMLDivElement | null>(null)
+     const followLatestRef = useRef(true)
+     const pointerActiveRef = useRef(false)
+@@ -104,17 +106,15 @@
+         const parts = state.message.parts.slice(startIndex, endIndex === undefined ? undefined : endIndex + 1)
+         return parts.some((part) => part.type === 'reasoning' && part.status.type === 'running')
+     })
+-    const { reasoningCollapsed } = useReasoningCollapse()
+     const chatContext = useOptionalHappyChatContext()
+ 
+     useEffect(() => {
+-        if (!isStreaming) return
+         const nextOpen = !reasoningCollapsed
+         if (nextOpen) {
+             followLatestRef.current = true
+         }
+         setIsOpen(nextOpen)
+-    }, [isStreaming, reasoningCollapsed])
++    }, [reasoningCollapsed])
+ 
+     useEffect(() => {
+         if (isOpen || followLatestRef.current) return
+@@ -203,12 +203,14 @@
+     }, [])
+ 
+     return (
+-        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-3 overflow-hidden rounded-2xl bg-[var(--app-reasoning-bg)]">
++        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-1.5 overflow-hidden rounded-lg border-l-2 border-[var(--app-divider)]">
+             <button
+                 type="button"
+                 onClick={handleToggle}
++                aria-expanded={isOpen}
++                aria-controls={contentId}
+                 className={cn(
+-                    'flex w-full items-center gap-1.5 px-3.5 py-2.5 text-left text-xs font-medium',
++                    'flex w-full items-center gap-1.5 min-h-8 px-2 py-1 text-left text-xs font-medium',
+                     'text-[var(--app-hint)] hover:text-[var(--app-fg)]',
+                     'transition-colors cursor-pointer select-none'
+                 )}
+@@ -222,7 +224,7 @@
+                 )}
+             </button>
+ 
+-            <div
++            <div id={contentId} aria-hidden={!isOpen} inert={!isOpen}
+                 className={cn(
+                     'overflow-hidden transition-all duration-200 ease-in-out',
+                     isOpen ? 'max-h-[5000px] opacity-100' : 'max-h-0 opacity-0'
+@@ -242,7 +244,7 @@
+                     // (onNestedScrollFollowChange) already pauses the outer
+                     // auto-follow while the user scrolls inside this panel, so
+                     // contain is not needed to stop the two from fighting.
+-                    className="aui-reasoning-scroll max-h-[60vh] overflow-y-auto border-t border-[var(--app-divider)] px-3.5 py-3"
++                    className="aui-reasoning-scroll max-h-[min(35dvh,14rem)] overflow-y-auto px-2 pb-2"
+                 >
+                     {children}
+                 </div>
+--- a/web/src/components/assistant-ui/reasoning.test.tsx
++++ b/web/src/components/assistant-ui/reasoning.test.tsx
+@@ -91,20 +91,33 @@
+         vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+     })
+ 
+-    it('is collapsed by default', () => {
++    it('shows available reasoning by default', () => {
+         const { container } = renderGroup()
+-        expect(isCollapsed(container)).toBe(true)
++        expect(isCollapsed(container)).toBe(false)
+     })
+ 
+-    it('expands on click', () => {
++    it('collapses and expands on click', () => {
+         const { container } = renderGroup()
+         const scroll = container.querySelector('.aui-reasoning-scroll') as HTMLDivElement
++        expect(scroll.tabIndex).toBe(0)
++        fireEvent.click(container.querySelector('button')!)
++        expect(isCollapsed(container)).toBe(true)
+         expect(scroll.tabIndex).toBe(-1)
++        expect(container.querySelector('[inert]')).toBeTruthy()
+         fireEvent.click(container.querySelector('button')!)
+         expect(isCollapsed(container)).toBe(false)
+         expect(scroll.tabIndex).toBe(0)
+     })
+ 
++    it('keeps a user-collapsed group closed when new streaming begins', () => {
++        const { container, rerender } = renderGroup()
++        fireEvent.click(container.querySelector('button')!)
++        setStreaming()
++        rerender(<ReasoningGroup><div>public runtime update</div></ReasoningGroup>)
++        expect(isCollapsed(container)).toBe(true)
++        expect(container.querySelector('button')).toHaveAttribute('aria-expanded', 'false')
++    })
++
+     it('auto-expands while streaming', () => {
+         const { container, rerender } = renderGroup()
+         setStreaming()
+@@ -290,7 +303,7 @@
+         const { container } = renderGroup()
+ 
+         expect(container.querySelector('.animate-pulse')).toBeNull()
+-        expect(isCollapsed(container)).toBe(true)
++        expect(isCollapsed(container)).toBe(false)
+     })
+ 
+     it('uses the reasoning part status for the running indicator', () => {
+--- a/web/src/components/ToolCard/ToolCard.tsx
++++ b/web/src/components/ToolCard/ToolCard.tsx
+@@ -89,9 +89,10 @@
+     startedAt: number | null
+     completedAt: number | null
+     durationMs: number | null
+-    typography?: 'detail' | 'group'
++    typography?: 'detail' | 'group' | 'compact'
+ }) {
+     const { t } = useTranslation()
++    if (props.typography === 'compact') return props.durationMs == null ? null : <span className="shrink-0 text-[11px] tabular-nums text-[var(--app-hint)]" title={t('tool.duration')}>{formatDuration(props.durationMs)}</span>
+     const items = [
+         props.startedAt != null ? { label: t('tool.startedAt'), value: formatCompactToolTimestamp(props.startedAt) } : null,
+         props.completedAt != null ? { label: t('tool.completedAt'), value: formatCompactToolTimestamp(props.completedAt) } : null,
+@@ -123,7 +124,7 @@
+         return () => clearInterval(id)
+     }, [active, props.tool.startedAt, props.tool.createdAt])
+ 
+-    return <ToolTimingSummary {...getToolTimingDetails(props.tool, now)} />
++    return <ToolTimingSummary {...getToolTimingDetails(props.tool, now)} typography="compact" />
+ }
+ 
+ function ToolTimingDetails(props: { block: ToolCallBlock }) {
+@@ -414,6 +415,7 @@
+ function ToolCardInner(props: ToolCardProps) {
+     const { t } = useTranslation()
+     const [detailsOpen, setDetailsOpen] = useState(false)
++    const [bodyOpen, setBodyOpen] = useState(props.terminalToolDisplayMode === 'detailed')
+     const presentation = useMemo(() => getToolPresentation({
+         toolName: props.block.tool.name,
+         input: props.block.tool.input,
+@@ -479,21 +481,21 @@
+     }
+ 
+     const header = (
+-        <div className="flex items-center justify-between gap-3">
+-            <div className="min-w-0 flex flex-1 flex-col gap-1">
++        <div className="flex min-w-0 items-center justify-between gap-2">
++            <div className="min-w-0 flex flex-1 flex-col">
+                 <div className="min-w-0 flex items-center gap-2">
+                     <div className="shrink-0 flex h-3.5 w-3.5 items-center justify-center text-[var(--app-tool-card-accent)] leading-none">
+                         {presentation.icon}
+                     </div>
+                     <CardTitle className={cn(
+                         'min-w-0 text-sm font-medium leading-tight text-[var(--app-fg)]',
+-                        isCodexAgentCard ? 'truncate whitespace-nowrap' : 'break-words'
++                        'truncate whitespace-nowrap'
+                     )}>
+                         {toolTitle}
+                     </CardTitle>
+                 </div>
+ 
+-                {subtitle ? (
++                {subtitle && props.terminalToolDisplayMode === 'detailed' ? (
+                     <CardDescription className={cn(
+                         'font-mono text-xs text-[var(--app-tool-card-subtitle)]',
+                         isCodexAgentCard || useCompactTerminalCard ? 'truncate whitespace-nowrap' : 'break-all'
+@@ -501,13 +503,13 @@
+                         {truncate(subtitle, 160)}
+                     </CardDescription>
+                 ) : null}
+-                <ToolCardTimingSummary tool={props.block.tool} />
+             </div>
+ 
+             <div className={cn(
+                 'flex shrink-0 items-center gap-2 self-center text-[var(--app-hint)]',
+                 subtitle ? '-translate-y-0.5' : null
+             )}>
++                <ToolCardTimingSummary tool={props.block.tool} />
+                 {subagentModel ? (
+                     <span
+                         className="inline-block max-w-28 truncate rounded-full bg-[var(--app-subtle-bg)] px-1.5 py-px font-mono text-[10px] leading-tight text-[var(--app-hint)] sm:max-w-40"
+@@ -516,7 +518,7 @@
+                         {subagentModel}
+                     </span>
+                 ) : null}
+-                {backgroundLaunch ? <span className="text-[10px] text-[var(--app-hint)]" title="Launch returned; inspect the task in Activity for its status">Background</span> : <span className={stateColor}>
++                {backgroundLaunch ? <span className="text-[10px] text-[var(--app-hint)]" title="Launch returned; inspect the task in Activity for its status">Background</span> : <span className={stateColor} aria-label={props.block.tool.state}>
+                     <ToolStatusIcon state={props.block.tool.state} />
+                 </span>}
+                 <span className="text-[var(--app-hint)]">
+@@ -527,8 +529,8 @@
+     )
+ 
+     return (
+-        <Card className="overflow-hidden rounded-[20px] bg-[var(--app-tool-card-bg)] shadow-none">
+-            <CardHeader className={cn('space-y-0 p-3', subtitle ? 'pb-2' : null)}>
++        <Card className="aui-tool-card overflow-hidden rounded-lg bg-[var(--app-tool-card-bg)] shadow-none">
++            <CardHeader className="space-y-0 px-2.5 py-2">
+                 <Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
+                     <DialogTrigger asChild>
+                         <button
+@@ -564,7 +566,10 @@
+                 </Dialog>
+             </CardHeader>
+ 
+-            {hasBody ? (
++            {hasBody && permission?.status !== 'pending' && !(toolName === 'ExitPlanMode' || toolName === 'exit_plan_mode') ? <button type="button" aria-expanded={bodyOpen} onClick={() => setBodyOpen(value => !value)} className="flex min-h-8 w-full items-center gap-1 px-2.5 text-left text-xs text-[var(--app-hint)] hover:text-[var(--app-fg)]">
++                <span aria-hidden="true">{bodyOpen ? '▾' : '▸'}</span>Output
++            </button> : null}
++            {hasBody && (bodyOpen || permission?.status === 'pending' || toolName === 'ExitPlanMode' || toolName === 'exit_plan_mode') ? (
+                 <CardContent className="px-3 pb-3 pt-1">
+                     {taskSummary ? (
+                         <div className="mt-2">
+--- a/web/src/components/ToolCard/ToolGroupCard.tsx
++++ b/web/src/components/ToolCard/ToolGroupCard.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useMemo, useRef, useState } from 'react'
++import { useId, useEffect, useMemo, useRef, useState } from 'react'
+ import type { ToolGroupBlock } from '@/chat/toolGroups'
+ import type { ToolCallBlock } from '@/chat/types'
+ import { getCodexCommandActions, type CodexCommandAction } from '@/chat/codexCommandPresentation'
+@@ -192,6 +192,7 @@
+ }) {
+     const { t } = useTranslation()
+     const ctx = useHappyChatContext()
++    const contentId = useId()
+     const [open, setOpen] = useState(props.block.defaultOpen)
+     const [selectedToolId, setSelectedToolId] = useState<string | null>(null)
+     const [isHydratingHistory, setIsHydratingHistory] = useState(false)
+@@ -295,13 +296,14 @@
+     const fileCount = props.block.summary.fileTargets.length
+ 
+     return (
+-        <Card className="overflow-hidden rounded-[20px] bg-[var(--app-tool-group-bg)] shadow-none">
+-            <CardHeader className={cn('space-y-0 p-3', subtitle ? 'pb-2' : null)}>
++        <Card className="aui-tool-group overflow-hidden rounded-lg bg-[var(--app-tool-group-bg)] shadow-none">
++            <CardHeader className="space-y-0 px-2.5 py-2">
+                 <button
+                     type="button"
+                     onClick={() => setOpen((value) => !value)}
+-                    className="w-full text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                     aria-expanded={open}
++                    aria-controls={contentId}
++                    className="w-full text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                 >
+                     <div className="flex items-center justify-between gap-3">
+                         <div className="min-w-0 flex flex-1 flex-col gap-1">
+@@ -313,21 +315,19 @@
+                                     {primaryTitle}
+                                 </CardTitle>
+                             </div>
+-                            <ToolTimingSummary
+-                                startedAt={groupTiming.startedAt}
+-                                completedAt={groupTiming.completedAt}
+-                                durationMs={groupTiming.durationMs}
+-                                typography="group"
+-                            />
++
+                         </div>
+ 
+                         <div className="flex shrink-0 items-center gap-2 self-center text-[var(--app-hint)]">
++                            <ToolTimingSummary {...groupTiming} typography="compact" />
++                            {!open ? <span className="text-[11px] tabular-nums" title={`${props.block.tools.length} tool calls`} aria-label={`${props.block.tools.length} tool calls`}>{props.block.tools.length}</span> : null}
++                            {!groupTiming.running && props.block.summary.pendingCount === 0 && props.block.summary.errorCount === 0 ? <span className={toolStatusColorClass('completed')} aria-label="Completed tool calls"><ToolStatusIcon state="completed" /></span> : null}
+                             {groupTiming.running ? (
+                                 <span className={toolStatusColorClass('running')} aria-label={t('toolGroup.rowStatus.running')}>
+                                     <ToolStatusIcon state="running" />
+                                 </span>
+                             ) : null}
+-                            {summaryBadgeText ? (
++                            {open && summaryBadgeText ? (
+                                 <SummaryBadge
+                                     className="bg-[var(--app-subtle-bg)] text-xs font-normal text-[var(--app-hint)]"
+                                     text={summaryBadgeText}
+@@ -351,7 +351,7 @@
+                                     text={t('toolGroup.badge.error', { n: props.block.summary.errorCount })}
+                                 />
+                             ) : null}
+-                            {fileCount > 0 ? (
++                            {open && fileCount > 0 ? (
+                                 <SummaryBadge
+                                     className="bg-[var(--app-subtle-bg)] text-[var(--app-hint)]"
+                                     text={t('toolGroup.badge.fileTargets', { n: fileCount })}
+@@ -363,7 +363,8 @@
+             </CardHeader>
+ 
+             {open ? (
+-                <CardContent className="px-3 pb-3 pt-1">
++                <CardContent id={contentId} className="px-2.5 pb-2.5 pt-1">
++                    <div className="mb-2"><ToolTimingSummary {...groupTiming} typography="group" /></div>
+                     <div className="flex flex-col gap-2">
+                         {props.block.presentationMode === 'codex-exploration' ? (
+                             <CodexExplorationRows tools={props.block.tools} onSelect={setSelectedToolId} />
+--- a/web/src/components/ToolCard/ToolGroupCard.test.tsx
++++ b/web/src/components/ToolCard/ToolGroupCard.test.tsx
+@@ -112,9 +112,9 @@
+         const view = renderCard(makeGroup())
+ 
+         expect(screen.getByRole('button', { name: /inspect a\.ts/i })).toHaveAttribute('aria-expanded', 'false')
+-        expect(screen.getByText('Run 1 · Read 1')).toBeInTheDocument()
++        expect(screen.queryByText('Run 1 · Read 1')).not.toBeInTheDocument()
++        expect(screen.getByTitle('2 tool calls')).toHaveTextContent('2')
+         expect(screen.queryByText('2 actions')).not.toBeInTheDocument()
+-        expect(screen.getByText('Run 1 · Read 1')).toHaveClass('text-xs', 'font-normal', 'text-[var(--app-hint)]')
+         expect(screen.queryByText('src/a.ts')).not.toBeInTheDocument()
+         expect(screen.queryByText('bun test')).not.toBeInTheDocument()
+ 
+@@ -137,7 +137,7 @@
+         })
+     })
+ 
+-    it('shows group start, live duration, and a spinner while collapsed and running', () => {
++    it('shows duration and running status compactly; reveals full timing on expansion', () => {
+         const startedAt = Date.now() - 5_000
+         const completed = makeToolBlock('read-1', 'Read')
+         completed.tool.startedAt = startedAt
+@@ -156,13 +156,15 @@
+         })
+         const view = renderCard(group)
+ 
++        expect(screen.queryByText('Started')).not.toBeInTheDocument()
++        expect(screen.queryByText('Duration')).not.toBeInTheDocument()
++        fireEvent.click(within(view.container).getByRole('button', { expanded: false }))
+         expect(screen.getByText('Started')).toBeInTheDocument()
+-        expect(screen.getByText('Duration')).toBeInTheDocument()
+         expect(screen.queryByText('Finished')).not.toBeInTheDocument()
+         expect(within(view.container).getByLabelText('Running')).toBeInTheDocument()
+     })
+ 
+-    it('shows final timing in the collapsed header after every tool finishes', () => {
++    it('shows final duration compactly and keeps full timing accessible', () => {
+         const startedAt = Date.now() - 4_000
+         const first = makeToolBlock('read-1', 'Read')
+         first.tool.startedAt = startedAt
+@@ -171,12 +173,14 @@
+         second.tool.startedAt = startedAt + 1_000
+         second.tool.completedAt = startedAt + 4_000
+ 
+-        renderCard(makeGroup({ tools: [first, second] }))
+-
++        const view = renderCard(makeGroup({ tools: [first, second] }))
++        expect(screen.queryByText('Started')).not.toBeInTheDocument()
++        expect(screen.getByText('4.0s')).toBeInTheDocument()
++        fireEvent.click(within(view.container).getByRole('button', { expanded: false }))
+         expect(screen.getByText('Started')).toBeInTheDocument()
+         expect(screen.getByText('Finished')).toBeInTheDocument()
+         expect(screen.getByText('Duration')).toBeInTheDocument()
+-        expect(screen.getByText('4.0s')).toBeInTheDocument()
++        expect(screen.getAllByText('4.0s').length).toBeGreaterThan(0)
+     })
+ 
+     it('expands to show compact rows and opens a detail dialog per row', async () => {
+@@ -283,7 +287,7 @@
+         }))
+ 
+         expect(screen.getByRole('button', { name: /tool activity/i })).toBeInTheDocument()
+-        expect(screen.getByText('25 actions')).toBeInTheDocument()
++        expect(screen.getByTitle('25 tool calls')).toHaveTextContent('25')
+         expect(screen.queryByText('Use tool +24')).not.toBeInTheDocument()
+         expect(screen.queryByText('Tool 25')).not.toBeInTheDocument()
+ 
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -748,3 +748,15 @@
+     .aui-md :where(.aui-md-ul, .aui-md-ol) { padding-left: 1.25rem; }
+     .aui-md :where(.aui-md-blockquote) { padding: 0.65rem 0.8rem; }
+ }
++
++/* Public runtime reasoning stays readable without competing with the answer. */
++.aui-reasoning-content {
++    font-size: 0.8125rem;
++    line-height: 1.55;
++    color: var(--app-hint);
++}
++.aui-reasoning-content :where(.aui-md-p, .aui-md-li) {
++    line-height: inherit;
++    margin-block: 0.35rem;
++}
++.aui-reasoning-content :where(.aui-md-strong, .aui-md-em) { color: inherit; }
+--- a/web/src/components/AssistantChat/messages/ToolMessage.tsx
++++ b/web/src/components/AssistantChat/messages/ToolMessage.tsx
+@@ -198,7 +198,7 @@
+ }
+ 
+ function isPendingPermissionBlock(block: ChatBlock): boolean {
+-    return block.kind === 'tool-call' && block.tool.permission?.status === 'pending'
++    return block.kind === 'tool-call' && (block.tool.permission?.status === 'pending' || block.children.some(isPendingPermissionBlock))
+ }
+ 
+ function splitTaskChildren(block: ToolCallBlock): { pending: ChatBlock[]; rest: ChatBlock[] } {
+@@ -216,6 +216,18 @@
+     return { pending, rest }
+ }
+ 
++function NestedToolActivity({ block }: { block: ToolCallBlock }) {
++    if (block.tool.name === 'CodexAgent' || !block.children.length) return null
++    const { pending, rest } = splitTaskChildren(block)
++    return <>
++        {pending.length > 0 ? <div className="mt-2 pl-3"><HappyNestedBlockList blocks={pending} /></div> : null}
++        {rest.length > 0 ? <details className="mt-1">
++            <summary className="cursor-pointer text-xs text-[var(--app-hint)]">{isSubagentToolName(block.tool.name) ? 'Task details' : 'Tool activity'} ({rest.length})</summary>
++            <div className="mt-2 pl-3"><HappyNestedBlockList blocks={rest} /></div>
++        </details> : null}
++    </>
++}
++
+ function HappyNestedBlockList(props: {
+     blocks: ChatBlock[]
+ }) {
+@@ -288,9 +300,6 @@
+                 }
+ 
+                 if (block.kind === 'tool-call') {
+-                    const isTask = isSubagentToolName(block.tool.name)
+-                    const hideChildren = block.tool.name === 'CodexAgent'
+-                    const taskChildren = isTask ? splitTaskChildren(block) : null
+ 
+                     return (
+                         <div key={`tool:${block.id}`} data-hapi-share-exclude="true" className="py-1">
+@@ -303,31 +312,7 @@
+                                 onDone={ctx.onRefresh}
+                                 block={block}
+                             />
+-                            {!hideChildren && block.children.length > 0 ? (
+-                                isTask ? (
+-                                    <>
+-                                        {taskChildren && taskChildren.pending.length > 0 ? (
+-                                            <div className="mt-2 pl-3">
+-                                                <HappyNestedBlockList blocks={taskChildren.pending} />
+-                                            </div>
+-                                        ) : null}
+-                                        {taskChildren && taskChildren.rest.length > 0 ? (
+-                                            <details className="mt-2">
+-                                                <summary className="cursor-pointer text-xs text-[var(--app-hint)]">
+-                                                    Task details ({taskChildren.rest.length})
+-                                                </summary>
+-                                                <div className="mt-2 pl-3">
+-                                                    <HappyNestedBlockList blocks={taskChildren.rest} />
+-                                                </div>
+-                                            </details>
+-                                        ) : null}
+-                                    </>
+-                                ) : (
+-                                    <div className="mt-2 pl-3">
+-                                        <HappyNestedBlockList blocks={block.children} />
+-                                    </div>
+-                                )
+-                            ) : null}
++                            <NestedToolActivity block={block} />
+                         </div>
+                     )
+                 }
+@@ -369,9 +354,10 @@
+ 
+         return (
+             <div data-hapi-share-exclude="true" className="py-1 min-w-0 max-w-full overflow-x-hidden">
+-                <div className="overflow-hidden rounded-[20px] bg-[var(--app-tool-card-bg)] p-3 shadow-none">
+-                    <div className="flex items-center gap-2 text-xs">
+-                        <div className="font-mono text-[var(--app-tool-card-accent)]">
++                <details className="group/fallback overflow-hidden rounded-lg bg-[var(--app-tool-card-bg)] p-2.5 shadow-none">
++                    <summary className="flex cursor-pointer list-none items-center gap-2 text-xs">
++                        <span aria-hidden="true" className="text-[var(--app-hint)] group-open/fallback:rotate-90">▸</span>
++                        <div className="min-w-0 truncate font-mono text-[var(--app-tool-card-accent)]">
+                             Tool: {props.toolName}
+                         </div>
+                         {props.isError ? (
+@@ -380,7 +366,7 @@
+                         {props.status.type === 'running' && !hasResult ? (
+                             <span className="text-[var(--app-hint)]">Running…</span>
+                         ) : null}
+-                    </div>
++                    </summary>
+ 
+                     {hasArgsText ? (
+                         <div className="mt-2">
+@@ -393,15 +379,12 @@
+                             <CodeBlock code={resultText} language={typeof props.result === 'string' ? 'text' : 'json'} title="Output" />
+                         </div>
+                     ) : null}
+-                </div>
++                </details>
+             </div>
+         )
+     }
+ 
+     const block = artifact
+-    const isTask = isSubagentToolName(block.tool.name)
+-    const hideChildren = block.tool.name === 'CodexAgent'
+-    const taskChildren = isTask ? splitTaskChildren(block) : null
+ 
+     return (
+         <div data-hapi-share-exclude="true" className="py-1 min-w-0 max-w-full overflow-x-hidden">
+@@ -414,31 +397,7 @@
+                 onDone={ctx.onRefresh}
+                 block={block}
+             />
+-            {!hideChildren && block.children.length > 0 ? (
+-                isTask ? (
+-                    <>
+-                        {taskChildren && taskChildren.pending.length > 0 ? (
+-                            <div className="mt-2 pl-3">
+-                                <HappyNestedBlockList blocks={taskChildren.pending} />
+-                            </div>
+-                        ) : null}
+-                        {taskChildren && taskChildren.rest.length > 0 ? (
+-                            <details className="mt-2">
+-                                <summary className="cursor-pointer text-xs text-[var(--app-hint)]">
+-                                    Task details ({taskChildren.rest.length})
+-                                </summary>
+-                                <div className="mt-2 pl-3">
+-                                    <HappyNestedBlockList blocks={taskChildren.rest} />
+-                                </div>
+-                            </details>
+-                        ) : null}
+-                    </>
+-                ) : (
+-                    <div className="mt-2 pl-3">
+-                        <HappyNestedBlockList blocks={block.children} />
+-                    </div>
+-                )
+-            ) : null}
++            <NestedToolActivity block={block} />
+         </div>
+     )
+ }
+--- /dev/null
++++ b/web/src/components/ToolCard/compactActivity.test.tsx
+@@ -0,0 +1,58 @@
++import type { ComponentProps } from 'react'
++import { afterEach, expect, it } from 'vitest'
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import type { ToolCallBlock } from '@/chat/types'
++import type { ApiClient } from '@/api/client'
++import { I18nProvider } from '@/lib/i18n-context'
++import { ToolCard } from './ToolCard'
++import { HappyToolMessage } from '@/components/AssistantChat/messages/ToolMessage'
++import { HappyChatProvider, type HappyChatContextValue } from '@/components/AssistantChat/context'
++afterEach(cleanup)
++const context: HappyChatContextValue = { api: {} as ApiClient, sessionId: 's', metadata: null, terminalToolDisplayMode: 'compact', showSessionSummaryInChat: false, disabled: false, onRefresh() {}, hasMoreMessages: false, isSyncingTail: false, isLoadingMoreMessages: false, loadOlderMessagesPreservingScroll: async () => 'loaded' }
++const block = (name = 'Tool'): ToolCallBlock => ({ kind: 'tool-call', id: 'tool', localId: null, createdAt: 1000, children: [], tool: { id: 'tool', name, state: 'completed', input: { command: 'echo command-details' }, result: 'output-details', createdAt: 1000, startedAt: 1000, completedAt: 2500, execStartedAt: null, execCompletedAt: null, description: null } })
++const card = (item: ToolCallBlock) => <I18nProvider><ToolCard api={context.api} sessionId="s" metadata={null} terminalToolDisplayMode="compact" disabled={false} onDone={() => {}} block={item} /></I18nProvider>
++it('keeps compact terminal timing and full input/output available in details', () => {
++    render(card(block('Bash')))
++    expect(screen.queryByText('Started')).toBeNull()
++    expect(screen.queryByText('Input')).toBeNull()
++    expect(screen.getByText('1.5s')).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button'))
++    expect(screen.getByRole('dialog')).toHaveTextContent('command-details')
++    expect(screen.getByRole('dialog')).toHaveTextContent('output-details')
++    expect(screen.getByText('Started')).toBeInTheDocument()
++})
++it('collapses an ordinary output preview but keeps approvals immediately available', () => {
++    const { rerender } = render(card(block('NotebookEdit')))
++    expect(screen.queryByText('Input')).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /Output/ }))
++    expect(screen.getAllByText('Input').length).toBeGreaterThan(0)
++    fireEvent.click(screen.getByRole('button', { name: /Output/ }))
++    expect(screen.queryByText('Input')).toBeNull()
++    const pending = block('Bash'); pending.tool.state = 'pending'; pending.tool.permission = { id: 'request', status: 'pending' }
++    rerender(card(pending))
++    expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: /^Output$/ })).toBeNull()
++    expect(screen.getByRole('button', { name: 'Allow' })).toBeVisible()
++})
++it('fallback tool traces use a native disclosure instead of dumping JSON into the thread', () => {
++    const { container } = render(<I18nProvider><HappyChatProvider value={context}><HappyToolMessage {...({ toolName: 'New connector', argsText: '{"example":1}', result: 'public tool output', status: { type: 'complete' } } as unknown as ComponentProps<typeof HappyToolMessage>)} /></HappyChatProvider></I18nProvider>)
++    const details = container.querySelector('details')!
++    expect(details.open).toBe(false)
++    fireEvent.click(container.querySelector('summary')!)
++    expect(details.open).toBe(true)
++    expect(details).toHaveTextContent('public tool output')
++})
++
++it('folds nested tool activity while leaving pending approval children visible', () => {
++    const parent = block('Read')
++    const child = block('Bash'); child.id = 'pending-child'; child.tool.id = 'pending-child'; child.tool.state = 'pending'; child.tool.permission = { id: 'child-request', status: 'pending' }
++    parent.children = [child, { kind: 'agent-text', id: 'note', localId: null, createdAt: 1, text: 'Nested public note', model: null }]
++    const props = { toolName: 'Read', argsText: '{}', artifact: parent, status: { type: 'complete' } } as unknown as ComponentProps<typeof HappyToolMessage>
++    const { container } = render(<I18nProvider><HappyChatProvider value={context}><HappyToolMessage {...props}/></HappyChatProvider></I18nProvider>)
++    expect(screen.getByRole('button', { name: 'Allow' })).toBeVisible()
++    const details = container.querySelector('details')!
++    expect(details.open).toBe(false)
++    expect(screen.getByText('Nested public note')).not.toBeVisible()
++    fireEvent.click(container.querySelector('summary')!)
++    expect(screen.getByText('Nested public note')).toBeVisible()
++})

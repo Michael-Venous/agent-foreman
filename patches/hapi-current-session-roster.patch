@@ -1,0 +1,175 @@
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -1,7 +1,7 @@
+ import type { SessionSummary } from '@/types/api'
+ 
+ export const SESSION_MANAGER_KEY = ['session-manager-retained'] as const
+-export type ManagedListEntry = { session: SessionSummary; dismissed: boolean; missing: boolean; stopped?: boolean }
++export type ManagedListEntry = { session: SessionSummary; dismissed: boolean; missing: boolean; stopped?: boolean; observedWork?: boolean }
+ export type SessionManagerState = Record<string, ManagedListEntry>
+ 
+ export function sessionHasWork(session: SessionSummary): boolean {
+@@ -19,12 +19,28 @@
+     for (const session of sessions) {
+         const old = previous[session.id]
+         if (!old && !sessionHasWork(session) && !managedIds?.has(session.id)) continue
++        const observedWork = old?.observedWork || sessionHasWork(old?.session ?? session) || sessionHasWork(session)
++        // A chat admitted solely by the current managed roster must leave when
++        // oversight is released. Actual observed work keeps normal retention.
++        if (old && !observedWork && !managedIds?.has(session.id) && !old.dismissed) {
++            if (next === previous) next = { ...previous }
++            delete next[session.id]
++            continue
++        }
+         const newWork = old && sessionHasWork(session) && (!sessionHasWork(old.session) || (!old.session.thinking && session.thinking))
+         const dismissed = old?.dismissed === true && !newWork
+-        if (!old || old.session !== session || old.missing || old.dismissed !== dismissed) set(session.id, { session, dismissed, missing: false, stopped: newWork ? false : old?.stopped })
++        const stopped = !sessionHasWork(session) || (newWork ? false : old?.stopped)
++        if (!old || old.session !== session || old.missing || old.dismissed !== dismissed || old.stopped !== stopped || old.observedWork !== observedWork) {
++            set(session.id, { session, dismissed, missing: false, stopped, observedWork })
++        }
+     }
+     for (const [id, old] of Object.entries(previous)) {
+-        if (!present.has(id) && !old.missing) set(id, { ...old, missing: true, session: { ...old.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } })
++        if (!present.has(id)) {
++            if (!old.observedWork && !sessionHasWork(old.session) && !managedIds?.has(id) && !old.dismissed) {
++                if (next === previous) next = { ...previous }
++                delete next[id]
++            } else if (!old.missing) set(id, { ...old, missing: true, stopped: true, session: { ...old.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } })
++        }
+     }
+     return next
+ }
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -62,7 +62,7 @@
+     const managed = new Set([idle.id, offline.id, 'missing-record'])
+     const entries = observeSessions(initial, [idle, offline, ordinary], managed)
+     expect(Object.keys(entries)).toEqual([idle.id, offline.id])
+-    expect(entries[idle.id]?.stopped).not.toBe(true)
++    expect(entries[idle.id]?.stopped).toBe(true)
+     expect(observeSessions(entries, [idle, offline, ordinary], managed)).toBe(entries)
+ })
+ 
+@@ -77,3 +77,33 @@
+     // Reload drops the old dismissal but includes still-managed idle chats.
+     expect(observeSessions({}, [s], managed).s?.dismissed).toBe(false)
+ })
++
++
++it('removes roster-only rows on unmanage but retains actual recently observed work', () => {
++    const idle = session({ id: 'idle', thinking: false }), running = session({ id: 'running' })
++    const before = observeSessions({}, [idle, running], new Set(['idle', 'running']))
++    const idleRunning = { ...running, thinking: false }
++    const after = observeSessions(before, [idle, idleRunning], new Set())
++    expect(after.idle).toBeUndefined()
++    expect(after.running?.observedWork).toBe(true)
++    expect(after.running?.stopped).toBe(true)
++    expect(dismissSessions(after, ['running']).running?.dismissed).toBe(true)
++})
++
++it('natural completion and disconnect allow clearing without an abort; ongoing work still requires Stop', () => {
++    const work = observeSessions({}, [session()])
++    expect(dismissSessions(work, ['s']).s?.dismissed).toBe(false)
++    const idle = observeSessions(work, [session({ thinking: false })])
++    expect(idle.s?.stopped).toBe(true)
++    expect(dismissSessions(idle, ['s']).s?.dismissed).toBe(true)
++    const gone = observeSessions(work, [])
++    expect(gone.s?.stopped).toBe(true)
++    expect(dismissSessions(gone, ['s']).s?.dismissed).toBe(true)
++})
++
++
++it('removes a missing roster-only row once supervision ends', () => {
++    const idle = session({ thinking: false })
++    const seeded = observeSessions({}, [idle], new Set(['s']))
++    expect(observeSessions(seeded, [], new Set())).toEqual({})
++})
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,5 +1,5 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useEffect, useState } from 'react'
++import { useEffect, useMemo, useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+@@ -34,11 +34,12 @@
+     const [errors, setErrors] = useState<Record<string, string>>({})
+     const [locallyUnmanaged, setLocallyUnmanaged] = useState<Record<string, boolean>>({})
+     useEffect(() => { setLocallyUnmanaged(old => Object.fromEntries(Object.entries(old).filter(([id]) => props.managed?.[id]))) }, [props.managed])
+-    const isManaged = (id: string) => Boolean(props.managed?.[id] && !locallyUnmanaged[id])
++    const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
++    const isManaged = (id: string) => Boolean(currentManaged[id])
+     const [open, setOpen] = useState(false)
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+-    const { entries, dismiss, markStopped } = useSessionManager(props.sessions, props.managed)
++    const { entries, dismiss, markStopped } = useSessionManager(props.sessions, currentManaged)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -66,7 +67,7 @@
+             </div>
+             <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+                 <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
+-                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear stopped</button>
++                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+             </div>
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {visibleRows.map(({ session, missing, stopped }) => <div key={session.id} className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -25,9 +25,8 @@
+         await screen.findByRole('button', { name: 'Open Codex' }); expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+         rerender(fixture(client, [session('Codex', false, false), session('Claude')], select))
+         await screen.findByText('Inactive', { selector: 'p' })
+-        fireEvent.click(screen.getByRole('button', { name: 'Stop Codex' }))
+         await screen.findByRole('button', { name: 'Dismiss Codex from Session Manager' })
+-        fireEvent.click(screen.getByRole('button', { name: 'Clear stopped' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+         await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull())
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument(); expect(select).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: 'Stop Claude' }))
+@@ -84,9 +83,8 @@
+         rerender(view([session('Codex', false, false), session('Claude', true, false)]))
+         await screen.findByText('Inactive', { selector: 'p' })
+         fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+-        fireEvent.click(screen.getByRole('button', { name: 'Stop Codex' }))
+         await screen.findByRole('button', { name: 'Dismiss Codex from Session Manager' })
+-        fireEvent.click(screen.getByRole('button', { name: 'Clear stopped' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+         await screen.findByText(/No matching sessions/)
+         fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+         expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
+@@ -136,11 +134,10 @@
+     expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Open Offline' })).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled(); expect(select).not.toHaveBeenCalled()
+-    // Stop-before-clear remains required even when the project is already paused.
+-    expect(screen.getByRole('button', { name: 'Stop Terrain' })).toBeInTheDocument()
+-    expect(screen.queryByRole('button', { name: 'Dismiss Terrain from Session Manager' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Stop Terrain' }))
+-    fireEvent.click(await screen.findByRole('button', { name: 'Dismiss Terrain from Session Manager' }))
++    // Already idle: clearing must not abort, resume or unmanage the paused chat.
++    expect(screen.queryByRole('button', { name: 'Stop Terrain' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Dismiss Terrain from Session Manager' }))
++    expect(controls.abortSession).not.toHaveBeenCalled()
+     rerender(view({ ...managed }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull())
+     fireEvent.click(screen.getByRole('button', { name: 'All' })); fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+@@ -161,3 +158,14 @@
+     expect(screen.queryByRole('button', { name: 'Open Stopped' })).toBeNull()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++
++it('immediately removes a roster-only idle row after Unmanage without aborting it', async () => {
++    const client = new QueryClient()
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={[session('Idle roster', true, false)]} managed={{ 'Idle roster': { role: 'worker', worker: 'w' } }} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>)
++    open(); await screen.findByRole('button', { name: 'Open Idle roster' })
++    fireEvent.click(screen.getByRole('button', { name: 'Unmanage' }))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Idle roster' })).toBeNull())
++    expect(controls.unmanageSession).toHaveBeenCalledExactlyOnceWith('Idle roster')
++    expect(controls.abortSession).not.toHaveBeenCalled()
++})

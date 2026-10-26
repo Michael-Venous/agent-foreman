@@ -1,0 +1,62 @@
+--- a/hub/src/sync/turnFailure.ts
++++ b/hub/src/sync/turnFailure.ts
+@@ -13,7 +13,8 @@
+ 
+ /** undefined = no terminal evidence; null = trusted new turn/success/explicit abort.
+  * Codex raw task_failed may trigger recovery, so the launcher's final Task failed
+- * event is authoritative. A failed tool/subagent is not a failed parent turn. */
++ * event or shared projection's typed task_failed identity is authoritative.
++ * A failed tool/subagent is not a failed parent turn. */
+ export function runtimeTurnOutcome(content: unknown, at: number): Failure | null | undefined {
+     const record = unwrapRoleWrappedRecordEnvelope(content)
+     if (record?.role !== 'agent' || !isObject(record.content)) return undefined
+@@ -32,6 +33,10 @@
+         return failed(message, at)
+     }
+     if (inner.type === 'codex') {
++        // Shared projection gives terminal failures a stable typed event identity.
++        // Assistant prose has :agent_message identity even when quoting this text.
++        if (data.type === 'message' && typeof data.id === 'string'
++            && data.id.startsWith('codex:') && data.id.endsWith(':task_failed')) return failed(text(data.message), at)
+         if (data.type === 'error' && data.willRetry !== true && data.will_retry !== true && data.retryable !== true) return failed(text(data.message ?? data.error), at)
+         return undefined
+     }
+--- a/hub/src/sync/turnFailure.test.ts
++++ b/hub/src/sync/turnFailure.test.ts
+@@ -30,6 +30,13 @@
+         expect(runtimeTurnOutcome(output({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['Service unavailable'] }), 7)?.message).toBe('Service unavailable')
+         expect(runtimeTurnOutcome(output({ type: 'result', subtype: 'success', is_error: false }), 8)).toBeNull()
+     })
++    it('recognizes shared Codex terminal identity without trusting quoted assistant text', () => {
++        const shared = (data: unknown) => ({ role: 'agent', content: { type: 'codex', data } })
++        const message = 'Codex error: Selected model is at capacity'
++        expect(runtimeTurnOutcome(shared({ type: 'message', message, id: 'codex:thread:turn:hash:task_failed' }), 10)?.kind).toBe('capacity')
++        expect(runtimeTurnOutcome(shared({ type: 'message', message, id: 'codex:thread:turn:item:agent_message' }), 10)).toBeUndefined()
++        expect(runtimeTurnOutcome(shared({ type: 'message', message, id: 'codex:thread:turn:hash:task_failed', scope_role: 'child' }), 10)).toBeUndefined()
++    })
+     it('does not infer terminal failure from prose, tools, children or retry attempts', () => {
+         const quoted = 'Task failed: capacity'
+         expect(runtimeTurnOutcome({ role: 'user', content: { type: 'text', text: quoted } }, 1)).toBeUndefined()
+@@ -56,7 +63,7 @@
+         let f = fixture(path, clock)
+         try {
+             f.alive(true)
+-            f.send(event('Task failed: Selected model is at capacity'))
++            f.send({ role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'Codex error: Selected model is at capacity', id: 'codex:thread:turn:hash:task_failed' } } })
+             f.send(event('', 'ready')); f.alive(false)
+             expect(f.engine.getSession(f.session.id)?.lastFailure?.kind).toBe('capacity')
+             f.engine.handleSessionEnd({ sid: f.session.id, time: Date.now() })
+--- a/web/src/components/NodeGraphFailureStatus.test.ts
++++ b/web/src/components/NodeGraphFailureStatus.test.ts
+@@ -18,9 +18,9 @@
+ 
+ 
+ it('shows aggregate verified background work without overriding Stop or a new inference turn', () => {
+-    const process = { id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }
++    const process = { id: 'boot:123:456', pid: 123, command: 'render', checkedAt: Date.now() }
+     const session = { ...failed, lastFailure: null, backgroundTaskCount: 1, backgroundProcesses: [process] }
+-    expect(nodeStatus(session)).toBe('Background')
++    expect(nodeStatus(session)).toBe('Processes')
+     expect(nodeStatus({ ...session, thinking: true })).toBe('Running')
+     expect(nodeStatus({ ...session, manualPausedAt: 12 } as SessionSummary)).toBe('Stopped')
+ })

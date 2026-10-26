@@ -1,0 +1,537 @@
+diff --git a/hub/src/web/routes/machines.test.ts b/hub/src/web/routes/machines.test.ts
+index d010928..e4ee2fd 100644
+--- a/hub/src/web/routes/machines.test.ts
++++ b/hub/src/web/routes/machines.test.ts
+@@ -812,3 +812,23 @@ describe('machines routes', () => {
+         expect(calls).toEqual([{ refresh: false }, { refresh: true }])
+     })
+ })
++
++
++describe('local Claude catalog guard', () => {
++    it('does not run local discovery for an unconfigured or another machine', async () => {
++        const engine = {getMachine: () => createMachine()} as unknown as SyncEngine
++        const app = new Hono<WebAppEnv>()
++        app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++        app.route('/api', createMachinesRoutes(() => engine))
++        const response = await app.request('/api/machines/machine-1/claude-models')
++        expect(response.status).toBe(404)
++    })
++    it('requires the namespace-owned machine before discovery', async () => {
++        const engine = {getMachine: () => createMachine()} as unknown as SyncEngine
++        const app = new Hono<WebAppEnv>()
++        app.use('*', async (c, next) => { c.set('namespace', 'other'); await next() })
++        app.route('/api', createMachinesRoutes(() => engine))
++        const response = await app.request('/api/machines/machine-1/claude-models')
++        expect(response.status).toBe(403)
++    })
++})
+diff --git a/hub/src/web/routes/machines.ts b/hub/src/web/routes/machines.ts
+index 5a98356..29a22e3 100644
+--- a/hub/src/web/routes/machines.ts
++++ b/hub/src/web/routes/machines.ts
+@@ -1,3 +1,5 @@
++import { execFile } from 'node:child_process'
++import { promisify } from 'node:util'
+ import {
+     MACHINE_DISPLAY_NAME_MAX_LENGTH,
+     MACHINE_CAPABILITIES,
+@@ -16,6 +18,28 @@ import { requireMachine } from './guards'
+ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+ 
++    // Local deployment adapter: only this hub's configured development machine.
++    let claudeCatalog: { fetchedAt: number; models: unknown[]; version?: string } | undefined
++    let claudeDiscovery: Promise<typeof claudeCatalog> | undefined
++    app.get('/machines/:id/claude-models', async (c) => {
++        const engine = getSyncEngine()
++        if (!engine) return c.json({ error: 'Not connected' }, 503)
++        const machine = requireMachine(c, engine, c.req.param('id'))
++        if (machine instanceof Response) return machine
++        if (c.req.param('id') !== process.env.HAPI_LOCAL_CATALOG_MACHINE || !process.env.HAPI_CLAUDE_CATALOG_SCRIPT) {
++            return c.json({ error: 'Local Claude catalog not configured' }, 404)
++        }
++        try {
++            if (!claudeCatalog || Date.now() / 1000 - claudeCatalog.fetchedAt > 60) {
++                claudeDiscovery ??= promisify(execFile)('python3', [process.env.HAPI_CLAUDE_CATALOG_SCRIPT], { timeout: 25000, maxBuffer: 1024 * 1024 })
++                    .then(({ stdout }) => { claudeCatalog = JSON.parse(stdout); return claudeCatalog })
++                    .finally(() => { claudeDiscovery = undefined })
++                await claudeDiscovery
++            }
++            return c.json(claudeCatalog)
++        } catch { return c.json({ error: 'Claude catalog unavailable; check hub logs and CLI authentication' }, 503) }
++    })
++
+     app.get('/machines', (c) => {
+         const engine = getSyncEngine()
+         if (!engine) {
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 625aec7..44d105a 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -885,6 +885,10 @@ export class ApiClient {
+         )
+     }
+ 
++    async getMachineClaudeModels(machineId: string): Promise<{models: Array<{value: string; resolvedModel?: string; displayName: string; supportedEffortLevels?: string[]}>}> {
++        return await this.request(`/api/machines/${encodeURIComponent(machineId)}/claude-models`)
++    }
++
+     async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
+         return await this.request<CodexModelsResponse>(
+             `/api/machines/${encodeURIComponent(machineId)}/codex-models`
+diff --git a/web/src/components/AssistantChat/ChatModelMenu.tsx b/web/src/components/AssistantChat/ChatModelMenu.tsx
+new file mode 100644
+index 0000000..31dbdf1
+--- /dev/null
++++ b/web/src/components/AssistantChat/ChatModelMenu.tsx
+@@ -0,0 +1,43 @@
++import * as Popover from '@radix-ui/react-popover'
++
++type Option = { value: string | null; label: string }
++export function ChatModelMenu(props: {
++    model: string | null
++    reasoning: string | null
++    models: Option[]
++    efforts: Option[]
++    disabled: boolean
++    onModel: (value: string | null) => void
++    onReasoning: (value: string | null) => void
++}) {
++    const model = props.models.find(o => o.value === props.model)?.label ?? props.model ?? 'Default'
++    const reasoning = props.efforts.find(o => o.value === props.reasoning)?.label ?? props.reasoning ?? 'Auto'
++    return <Popover.Root>
++        <Popover.Trigger asChild>
++            <button type="button" aria-label={`Model and reasoning: ${model}, ${reasoning}`} disabled={props.disabled}
++                className="flex h-11 max-w-[9rem] shrink-0 flex-col justify-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
++                <span className="w-full truncate text-xs font-medium">{model}</span>
++                <span className="w-full truncate text-[11px] text-[var(--app-hint)]">{reasoning} ▾</span>
++            </button>
++        </Popover.Trigger>
++        <Popover.Portal>
++            <Popover.Content side="top" align="end" sideOffset={8} collisionPadding={12} aria-label="Model and reasoning"
++                className="z-[100] w-72 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-3 shadow-xl">
++                <label className="mb-3 flex flex-col gap-1 text-xs">Model
++                    <select aria-label="Model" value={props.model ?? ''} disabled={props.disabled}
++                        onChange={e => props.onModel(e.target.value || null)}
++                        className="min-h-11 w-full rounded-lg border bg-[var(--app-bg)] px-2 text-sm">
++                        {props.models.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
++                    </select>
++                </label>
++                <label className="flex flex-col gap-1 text-xs">Reasoning
++                    <select aria-label="Reasoning" value={props.reasoning ?? ''} disabled={props.disabled || props.efforts.length === 0}
++                        onChange={e => props.onReasoning(e.target.value || null)}
++                        className="min-h-11 w-full rounded-lg border bg-[var(--app-bg)] px-2 text-sm">
++                        {props.efforts.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
++                    </select>
++                </label>
++            </Popover.Content>
++        </Popover.Portal>
++    </Popover.Root>
++}
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index f521140..a5bef83 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -634,6 +634,7 @@ export function ComposerButtons(props: {
+     // The composer must surface that constraint at UI time so the user never
+     // builds a submission the hub will reject — see hub/web/routes/messages.ts.
+     hasAttachments?: boolean
++    modelMenu?: ReactNode
+     // Generic model/effort value buttons
+     modelValueLabel?: string
+     modelValueButtonRef?: Ref<HTMLButtonElement>
+@@ -897,6 +898,8 @@ export function ComposerButtons(props: {
+                 onVoiceToggle={props.onVoiceToggle}
+             />
+ 
++            {props.modelMenu}
++
+             <UnifiedButton
+                 canSend={props.canSend}
+                 voiceStatus={props.voiceStatus}
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index d9d8032..767ca58 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -443,3 +443,37 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         expect(screen.queryByText('Effort')).toBeNull()
+     })
+ })
++
++
++describe('compact chat model menu', () => {
++    it('edits both values from a popover next to send on mobile', () => {
++        runtime.narrowViewport = true
++        const onModelChange = vi.fn()
++        const onEffortChange = vi.fn()
++        renderComposer('claude', {compactModelControls:true,
++            model:'claude-opus-5-5', effort:'high', onModelChange, onEffortChange,
++            availableModelOptions:[{value:'claude-opus-5-5',label:'Opus 5.5'}, {value:'claude-sonnet-5-5',label:'Sonnet 5.5'}],
++            availableEffortOptions:[{value:'low',name:'Low'},{value:'high',name:'High'}],
++        })
++        const trigger = screen.getByRole('button', {name:'Model and reasoning: Opus 5.5, High'})
++        expect(trigger.compareDocumentPosition(screen.getByRole('button', {name:'Send'})) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++        fireEvent.click(trigger)
++        fireEvent.change(screen.getByRole('combobox', {name:'Model'}), {target:{value:'claude-sonnet-5-5'}})
++        expect(onModelChange).toHaveBeenCalledWith('claude-sonnet-5-5')
++        fireEvent.change(screen.getByRole('combobox', {name:'Reasoning'}), {target:{value:'low'}})
++        expect(onEffortChange).toHaveBeenCalledWith('low')
++        expect(screen.getAllByRole('combobox')).toHaveLength(2)
++        expect(screen.queryByText('Permission Mode')).toBeNull()
++    })
++    it('changes Codex reasoning from the compact menu', () => {
++        const onModelReasoningEffortChange = vi.fn()
++        renderComposer('codex', {compactModelControls:true, modelReasoningEffort:'low', onModelReasoningEffortChange, availableModelReasoningEffortOptions:[{value:'low'},{value:'high'}]})
++        fireEvent.click(screen.getByRole('button', {name:/Model and reasoning:/}))
++        fireEvent.change(screen.getByRole('combobox', {name:'Reasoning'}), {target:{value:'high'}})
++        expect(onModelReasoningEffortChange).toHaveBeenCalledWith('high')
++    })
++    it('disables the compact control during a running turn', () => {
++        renderComposer('claude', {compactModelControls:true, thinking:true})
++        expect(screen.getByRole('button', {name:/Model and reasoning:/})).toBeDisabled()
++    })
++})
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index 03d8f4f..c151fdd 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -1,3 +1,4 @@
++import { ChatModelMenu } from './ChatModelMenu'
+ import {
+     getCodexCollaborationModeOptions,
+     getCopilotAgentModeOptions,
+@@ -285,6 +286,7 @@ export function HappyComposer(props: {
+     focusInputRef?: MutableRefObject<(() => void) | null>
+     onUploadDraftSnapshot?: (text: string, attachments: AttachmentDraftInput[]) => void
+     canRestoreAttachments?: boolean
++    compactModelControls?: boolean
+     disabled?: boolean
+     permissionMode?: PermissionMode
+     collaborationMode?: CodexCollaborationMode
+@@ -1093,7 +1095,7 @@ export function HappyComposer(props: {
+     const claudeEffortOptions = useMemo(
+         () => agentFlavor === 'pi'
+             ? getPiThinkingLevelOptions(effort, selectedPiModel?.thinkingLevelMap)
+-            : agentFlavor === 'grok' && availableEffortOptions && availableEffortOptions.length > 0
++            : (agentFlavor === 'claude' || agentFlavor === 'grok') && availableEffortOptions
+                 ? [
+                     { value: null, label: 'Default' },
+                     ...availableEffortOptions.map((option) => ({
+@@ -1464,10 +1466,12 @@ export function HappyComposer(props: {
+ 
+     const handleModelChange = useCallback((nextModel: { provider: string; modelId: string } | string | null) => {
+         if (!onModelChange || configurationControlsDisabled) return
++        if (agentFlavor === 'claude' && typeof nextModel === 'string' && nextModel.includes('fable')
++            && !window.confirm('Fable may use separately billed usage credits on your Claude plan. Switch this session to Fable?')) return
+         onModelChange(nextModel)
+         dismissSettings()
+         haptic('light')
+-    }, [onModelChange, configurationControlsDisabled, haptic, dismissSettings])
++    }, [onModelChange, configurationControlsDisabled, haptic, dismissSettings, agentFlavor])
+ 
+     const handleCursorModelRowClick = useCallback((nextModel: string | null) => {
+         if (!onModelChange || controlsDisabled) return
+@@ -2333,6 +2337,15 @@ export function HappyComposer(props: {
+                         ) : null}
+ 
+                         <ComposerButtons
++                            modelMenu={props.compactModelControls && (agentFlavor === 'claude' || agentFlavor === 'codex') ? <ChatModelMenu
++                                model={model === 'auto' || model === 'default' ? null : model}
++                                reasoning={agentFlavor === 'codex' ? modelReasoningEffort : effort}
++                                models={modelOptions}
++                                efforts={agentFlavor === 'codex' ? codexReasoningEffortOptions : claudeEffortOptions}
++                                disabled={thinking || modelEffortControlsDisabled}
++                                onModel={handleModelChange}
++                                onReasoning={agentFlavor === 'codex' ? handleModelReasoningEffortChange : handleEffortChange}
++                            /> : undefined}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
+                             showSettingsButton={showSettingsButton}
+@@ -2366,11 +2379,11 @@ export function HappyComposer(props: {
+                             onSchedule={handleUserSchedule}
+                             onClearSchedule={onUserClearSchedule}
+                             hasAttachments={blocksScheduling}
+-                            modelValueLabel={modelValueLabel}
++                            modelValueLabel={props.compactModelControls ? undefined : modelValueLabel}
+                             modelValueDisabled={modelEffortControlsDisabled}
+                             modelValueOpen={showSettings && settingsSection !== 'effort'}
+                             onModelValueToggle={handleModelValueToggle}
+-                            effortValueLabel={effortValueLabel}
++                            effortValueLabel={props.compactModelControls ? undefined : effortValueLabel}
+                             effortValueDisabled={modelEffortControlsDisabled}
+                             effortValueOpen={showSettings && settingsSection !== 'model'}
+                             onEffortValueToggle={handleEffortValueToggle}
+diff --git a/web/src/components/AssistantChat/modelOptions.test.ts b/web/src/components/AssistantChat/modelOptions.test.ts
+index c0b0eea..9e66147 100644
+--- a/web/src/components/AssistantChat/modelOptions.test.ts
++++ b/web/src/components/AssistantChat/modelOptions.test.ts
+@@ -64,37 +64,10 @@ describe('getModelOptionsForFlavor', () => {
+         expect(options.some((o) => o.value === 'opus')).toBe(true)
+     })
+ 
+-    it('keeps Claude presets when explicit options only include Sonnet models', () => {
+-        const options = getModelOptionsForFlavor('claude', null, [
+-            { value: null, label: 'Default' },
+-            { value: 'sonnet', label: 'Sonnet' },
+-            { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+-        ])
+-        expect(options).toEqual([
+-            { value: null, label: 'Default' },
+-            { value: 'sonnet', label: 'Sonnet' },
+-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
+-            { value: 'opus', label: 'Opus' },
+-            { value: 'opus[1m]', label: 'Opus 1M' },
+-            { value: 'fable', label: 'Fable' },
+-            { value: 'fable[1m]', label: 'Fable 1M' }
+-        ])
+-    })
+-
+-    it('adds non-preset Claude options without hiding Opus presets', () => {
+-        const options = getModelOptionsForFlavor('claude', null, [
+-            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' }
+-        ])
+-        expect(options).toEqual([
+-            { value: null, label: 'Default' },
+-            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' },
+-            { value: 'sonnet', label: 'Sonnet' },
+-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
+-            { value: 'opus', label: 'Opus' },
+-            { value: 'opus[1m]', label: 'Opus 1M' },
+-            { value: 'fable', label: 'Fable' },
+-            { value: 'fable[1m]', label: 'Fable 1M' }
+-        ])
++    it('uses the live Claude catalog instead of injecting obsolete aliases', () => {
++        const live = [{ value: null, label: 'Default (Opus 5.5)' }, { value: 'claude-opus-5-5', label: 'Opus 5.5' }]
++        expect(getModelOptionsForFlavor('claude', null, live)).toEqual(live)
++        expect(getModelOptionsForFlavor('claude', 'older-model', live)).toContainEqual({value: 'older-model', label: 'older-model'})
+     })
+ 
+     it('includes custom Gemini model from env/config in options', () => {
+@@ -257,12 +230,12 @@ describe('getNextModelForFlavor', () => {
+         expect(next).not.toBeNull()
+     })
+ 
+-    it('cycles through Claude presets when explicit options only include Sonnet models', () => {
++    it('cycles only the discovered Claude options', () => {
+         const next = getNextModelForFlavor('claude', 'sonnet[1m]', [
+             { value: 'sonnet', label: 'Sonnet' },
+             { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+         ])
+-        expect(next).toBe('opus')
++        expect(next).toBeNull()
+     })
+ 
+     it('cycles explicit model options', () => {
+diff --git a/web/src/components/AssistantChat/modelOptions.ts b/web/src/components/AssistantChat/modelOptions.ts
+index d68e5a6..2f53902 100644
+--- a/web/src/components/AssistantChat/modelOptions.ts
++++ b/web/src/components/AssistantChat/modelOptions.ts
+@@ -53,32 +53,9 @@ function getClaudeModelOptions(currentModel?: string | null, customOptions?: Mod
+         return getClaudeComposerModelOptions(currentModel)
+     }
+ 
+-    const options = getClaudeComposerModelOptions(currentModel)
+-    const nextOptions = [...options]
+-    let insertIndex = Math.max(1, nextOptions.findIndex((option) => option.value !== null))
+-
+-    for (const option of customOptions) {
+-        const normalizedValue = normalizeCurrentModel(option.value)
+-        if (!normalizedValue) {
+-            continue
+-        }
+-
+-        const existingIndex = nextOptions.findIndex((nextOption) => nextOption.value === normalizedValue)
+-        if (existingIndex >= 0) {
+-            if (nextOptions[existingIndex]?.label === normalizedValue) {
+-                nextOptions[existingIndex] = option
+-            }
+-            continue
+-        }
+-
+-        nextOptions.splice(insertIndex, 0, {
+-            value: normalizedValue,
+-            label: option.label
+-        })
+-        insertIndex += 1
+-    }
++    const options = customOptions.some(o => o.value === null) ? customOptions : [{value: null, label: 'Default'}, ...customOptions]
++    return withCurrentModelOption(options, currentModel)
+ 
+-    return nextOptions
+ }
+ 
+ function getAgyModelOptions(currentModel?: string | null, customOptions?: ModelOption[]): ModelOption[] {
+diff --git a/web/src/components/QuickApproval.test.tsx b/web/src/components/QuickApproval.test.tsx
+new file mode 100644
+index 0000000..b35600f
+--- /dev/null
++++ b/web/src/components/QuickApproval.test.tsx
+@@ -0,0 +1,25 @@
++import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { QuickApproval } from './QuickApproval'
++import type { ApiClient } from '@/api/client'
++afterEach(cleanup)
++describe('quick approvals', () => {
++    it('approves the exact request once without escalating session mode', async () => {
++        const approvePermission = vi.fn().mockResolvedValue(undefined)
++        render(<QuickApproval api={{approvePermission} as unknown as ApiClient} sessionId="s" active agentState={{requests:{r:{tool:'Bash', arguments:{command:'git status'}}}}} />)
++        fireEvent.click(screen.getByText('Yes, allow'))
++        await waitFor(() => expect(approvePermission).toHaveBeenCalledWith('s','r',{decision:'approved'}))
++        await waitFor(() => expect(screen.queryByText('Yes, allow')).toBeNull())
++        expect(approvePermission).toHaveBeenCalledTimes(1)
++    })
++    it('does not turn a user question or plan decision into a yes button', () => {
++        render(<QuickApproval api={{} as ApiClient} sessionId="s" active agentState={{requests:{r:{tool:'AskUserQuestion',arguments:{}},p:{tool:'ExitPlanMode',arguments:{}}}}} />)
++        expect(screen.queryByText('Yes, allow')).toBeNull()
++    })
++    it('keeps an unsuccessful approval visible with its error', async () => {
++        render(<QuickApproval api={{approvePermission:vi.fn().mockRejectedValue(new Error('offline'))} as unknown as ApiClient} sessionId="s" active agentState={{requests:{r:{tool:'Edit',arguments:{}}}}} />)
++        fireEvent.click(screen.getByText('Yes, allow'))
++        expect(await screen.findByRole('alert')).toHaveTextContent('offline')
++        expect(screen.getByText('Yes, allow')).toBeEnabled()
++    })
++})
+diff --git a/web/src/components/QuickApproval.tsx b/web/src/components/QuickApproval.tsx
+new file mode 100644
+index 0000000..5c22d70
+--- /dev/null
++++ b/web/src/components/QuickApproval.tsx
+@@ -0,0 +1,33 @@
++import { useState } from 'react'
++import { computePendingRequests, type AgentState } from '@hapi/protocol'
++import type { ApiClient } from '@/api/client'
++
++export function QuickApproval(props: {api: ApiClient; sessionId: string; agentState?: AgentState | null; active: boolean}) {
++    const [busy, setBusy] = useState<string | null>(null)
++    const [settled, setSettled] = useState<string[]>([])
++    const [error, setError] = useState<string | null>(null)
++    const permissions = computePendingRequests(props.agentState, 0, Infinity).filter(r => r.kind === 'permission' && !settled.includes(r.id))
++    const request = permissions[0]
++    if (!request) return null
++    const args = props.agentState?.requests?.[request.id]?.arguments
++    const details = JSON.stringify(args, null, 2)
++    const decide = async (allow: boolean) => {
++        if (busy || !props.active) return
++        setBusy(request.id); setError(null)
++        try {
++            if (allow) await props.api.approvePermission(props.sessionId, request.id, {decision:'approved'})
++            else await props.api.denyPermission(props.sessionId, request.id, {decision:'denied'})
++            setSettled(old => [...old, request.id])
++        } catch (e) { setError(e instanceof Error ? e.message : 'Could not submit approval') }
++        finally { setBusy(null) }
++    }
++    return <div role="region" aria-label="Waiting for permission" className="mx-3 mb-2 shrink-0 rounded-xl border border-[var(--app-link)] bg-[var(--app-bg)] p-3">
++        <div className="mb-2 text-sm font-medium">Allow {request.tool}?{permissions.length > 1 ? ` (${permissions.length} waiting)` : ''}</div>
++        <details className="mb-2 text-xs"><summary className="cursor-pointer">Review command / details</summary><pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all">{details}</pre></details>
++        <div className="flex gap-2">
++            <button type="button" disabled={!!busy || !props.active} onClick={() => void decide(true)} className="min-h-11 flex-1 rounded-lg bg-[var(--app-link)] px-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Sending…' : 'Yes, allow'}</button>
++            <button type="button" disabled={!!busy || !props.active} onClick={() => void decide(false)} className="min-h-11 rounded-lg border px-4 text-sm disabled:opacity-50">No</button>
++        </div>
++        {error && <div role="alert" className="mt-2 text-sm text-red-500">{error}</div>}
++    </div>
++}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index e59d367..5594471 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,7 +1,8 @@
++import { QuickApproval } from './QuickApproval'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { flushSync } from 'react-dom'
+ import { useNavigate } from '@tanstack/react-router'
+-import { useQueryClient } from '@tanstack/react-query'
++import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import { PRESERVE_SESSION_SIDEBAR_SCROLL } from '@/lib/sessionNavigation'
+ import { AssistantRuntimeProvider, useAui, useAuiState } from '@assistant-ui/react'
+ import { DragDropZone } from '@/components/AssistantChat/DragDropZone'
+@@ -968,6 +969,20 @@ function SessionChatInner(props: SessionChatProps) {
+     }, [agentFlavor, sessionId, sessionModel, queryClient])
+     const controlledByUser = props.session.agentState?.controlledByUser === true && !props.session.metadata?.capabilities?.concurrentClients
+     const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
++    const claudeCatalog = useQuery({
++        queryKey: ['local-claude-models', props.session.metadata?.machineId],
++        queryFn: () => props.api.getMachineClaudeModels(props.session.metadata!.machineId!),
++        enabled: agentFlavor === 'claude' && Boolean(props.session.metadata?.machineId),
++        staleTime: 60_000,
++        retry: false,
++    })
++    const claudeModels = claudeCatalog.data?.models
++    const claudeModelOptions = claudeModels?.map(m => ({
++        value: m.value === 'default' ? null : (m.resolvedModel ?? m.value),
++        label: m.value === 'default' ? `Default (${m.resolvedModel ?? m.displayName})` : m.displayName,
++    }))
++    const currentClaudeModel = claudeModels?.find(m => m.value === (props.session.model ?? 'default') || m.resolvedModel === props.session.model)
++    const claudeEfforts = currentClaudeModel?.supportedEffortLevels?.map(value => ({ value, name: value })) ?? []
+     const codexModelsState = useCodexModels({
+         api: props.api,
+         sessionId: props.session.id,
+@@ -1845,6 +1860,14 @@ function SessionChatInner(props: SessionChatProps) {
+ 
+     return (
+         <div className="flex h-full min-h-0 flex-col">
++            {import.meta.env.VITE_MANAGER_SESSION_ID && (
++                <div className="shrink-0 border-b px-3 py-2 text-sm">
++                    {props.session.id === import.meta.env.VITE_MANAGER_SESSION_ID
++                        ? '★ Persistent manager · delegates and supervises your projects'
++                        : <a className="text-[var(--app-link)] underline" href={`/sessions/${import.meta.env.VITE_MANAGER_SESSION_ID}`}>Open persistent manager — this is a separate chat</a>}
++                </div>
++            )}
++            {agentFlavor === 'claude' && claudeCatalog.isError && <div role="status" className="px-3 text-sm text-[var(--app-hint)]">Live Claude model discovery unavailable. Showing fallback aliases; check CLI authentication.</div>}
+             <SessionHeader
+                 session={props.session}
+                 serviceTier={effectiveCodexServiceTier}
+@@ -2004,6 +2027,7 @@ function SessionChatInner(props: SessionChatProps) {
+                             />
+                         </div>
+ 
++                        <QuickApproval key={props.session.id} api={props.api} sessionId={props.session.id} agentState={props.session.agentState} active={props.session.active} />
+                         <HappyComposer
+                         focusInputRef={focusComposerRef}
+                         key={`composer-${props.session.id}`}
+@@ -2023,13 +2047,16 @@ function SessionChatInner(props: SessionChatProps) {
+                         permissionMode={props.session.permissionMode}
+                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
+                         copilotAgentMode={agentFlavor === 'copilot' ? props.session.copilotAgentMode : undefined}
++                        compactModelControls
+                         model={props.session.model}
+                         modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
+                         effort={props.session.effort}
+                         agentFlavor={agentFlavor}
+                         concurrentClients={props.session.metadata?.capabilities?.concurrentClients}
+                         availableModelOptions={
+-                            agentFlavor === 'codex'
++                            agentFlavor === 'claude'
++                                ? claudeModelOptions
++                                : agentFlavor === 'codex'
+                                 ? codexModelOptions
+                                 : agentFlavor === 'cursor'
+                                     ? (
+@@ -2065,7 +2092,9 @@ function SessionChatInner(props: SessionChatProps) {
+                                     : undefined
+                         }
+                         availableEffortOptions={
+-                            agentFlavor === 'grok' && grokEffortState.options.length > 0
++                            agentFlavor === 'claude' && claudeModels
++                                ? claudeEfforts
++                                : agentFlavor === 'grok' && grokEffortState.options.length > 0
+                                 ? grokEffortState.options
+                                 : undefined
+                         }
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+index c620369..0554a68 100644
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -233,6 +233,11 @@ function SessionsPage() {
+                             <div className="text-sm text-red-600">{error}</div>
+                         </div>
+                     ) : null}
++                    {import.meta.env.VITE_MANAGER_SESSION_ID && (
++                        <a className="m-3 rounded-xl bg-[var(--app-link)] px-4 py-3 text-center font-semibold text-white" href={`/sessions/${import.meta.env.VITE_MANAGER_SESSION_ID}`}>
++                            ★ Open your persistent manager
++                        </a>
++                    )}
+                     <SessionList
+                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}
+                         sessions={sessions}

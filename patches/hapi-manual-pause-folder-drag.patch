@@ -1,0 +1,605 @@
+--- a/hub/src/store/index.ts
++++ b/hub/src/store/index.ts
+@@ -78,6 +78,15 @@
+      * in-memory stores. Used by the legacy → ACP migrator (#824) to take a
+      * backup before a bulk run; treat as read-only.
+      */
++    getManualPause(sessionId: string): number | null {
++        return (this.db.query('SELECT paused_at FROM manual_pauses WHERE session_id = ?').get(sessionId) as { paused_at: number } | null)?.paused_at ?? null
++    }
++
++    setManualPause(sessionId: string, paused: boolean): void {
++        if (paused) this.db.query('INSERT OR REPLACE INTO manual_pauses VALUES (?, ?)').run(sessionId, Date.now())
++        else this.db.query('DELETE FROM manual_pauses WHERE session_id = ?').run(sessionId)
++    }
++
+     get dbPath(): string {
+         return this._dbPath
+     }
+@@ -107,6 +116,7 @@
+         this.db.exec('PRAGMA foreign_keys = ON')
+         this.db.exec('PRAGMA busy_timeout = 5000')
+         this.initSchema()
++        this.db.exec("CREATE TABLE IF NOT EXISTS manual_pauses (session_id TEXT PRIMARY KEY, paused_at INTEGER NOT NULL)")
+ 
+         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
+             for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1027,6 +1027,7 @@
+             deliveryMode?: MessageDeliveryMode
+         }
+     ): Promise<{ deliveryWarning?: string }> {
++        this.assertNotManuallyPaused(sessionId)
+         if (this.historyActionsInFlight.has(sessionId)) {
+             throw new Error('Conversation history action already in progress')
+         }
+@@ -1070,6 +1071,7 @@
+         sessionId: string,
+         messageId: string
+     ): Promise<RetryIndeterminateMessageResult> {
++        this.assertNotManuallyPaused(sessionId)
+         return this.messageService.retryIndeterminateMessage(sessionId, messageId)
+     }
+ 
+@@ -1085,6 +1087,7 @@
+         messageId: string,
+         priority: 'now' | 'next' = 'now'
+     ): Promise<SteerQueuedMessageResponse> {
++        if (this.getManualPause(sessionId) !== null) return { status: 'failed', error: 'Chat manually paused', localId: null }
+         const session = this.getSession(sessionId)
+         if (!session) {
+             return { status: 'failed', error: 'Session not found', localId: null }
+@@ -1154,7 +1157,7 @@
+             if (pending) return pending
+             const operation = (async (): Promise<SteerQueuedMessageResponse> => {
+                 try {
+-                    if (session.thinking) await this.abortSession(sessionId)
++                    if (session.thinking) await this.abortSession(sessionId, false)
+                     return { status: 'steered', localId }
+                 } catch (error) {
+                     return { status: 'failed', error: error instanceof Error ? error.message : 'Stop failed', localId }
+@@ -1192,6 +1195,7 @@
+         decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
+         answers?: Record<string, string[]> | Record<string, { answers: string[] }>
+     ): Promise<void> {
++        this.assertNotManuallyPaused(sessionId)
+         await this.rpcGateway.approvePermission(sessionId, requestId, mode, allowTools, decision, answers)
+     }
+ 
+@@ -1203,8 +1207,30 @@
+         await this.rpcGateway.denyPermission(sessionId, requestId, decision)
+     }
+ 
+-    async abortSession(sessionId: string): Promise<void> {
+-        await this.rpcGateway.abortSession(sessionId)
++    pauseSession(sessionId: string): void { this.store.setManualPause(sessionId, true) }
++
++    getManualPause(sessionId: string): number | null { return this.store.getManualPause(sessionId) }
++
++    resumeManualPause(sessionId: string): void { this.store.setManualPause(sessionId, false) }
++
++    private assertNotManuallyPaused(sessionId: string): void {
++        if (this.getManualPause(sessionId) !== null) throw new Error('Chat manually paused. Use Resume paused work before sending or resuming.')
++    }
++
++    async abortSession(sessionId: string, manualPause = true): Promise<void> {
++        if (!manualPause) { await this.rpcGateway.abortSession(sessionId); return }
++        // Persist intent BEFORE any asynchronous RPC. A failed abort must never
++        // reauthorize supervisor recovery or replay after a hub restart.
++        this.store.setManualPause(sessionId, true)
++        const pending = this.store.messages.getUninvokedLocalMessages(sessionId)
++        const ready = this.getSession(sessionId)?.agentState?.claudeReadyMessages ?? []
++        // Withdraw queued input before interrupting the current turn, which can
++        // otherwise immediately consume the next prompt. Preserve history.
++        await Promise.allSettled([
++            ...pending.map(m => this.messageService.cancelQueuedMessage(sessionId, m.id)),
++            ...ready.filter(m => m.state === 'waiting').map(m => this.cancelNativeReadyMessage(sessionId, m.localId))
++        ])
++        await this.rpcGateway.abortSession(sessionId, true)
+     }
+ 
+     private assertConversationHistoryIdle(session: Session): void {
+@@ -1975,6 +2001,7 @@
+     }
+ 
+     async implementCodexPlan(sessionId: string, namespace: string, planId: string): Promise<ImplementCodexPlanResult> {
++        this.assertNotManuallyPaused(sessionId)
+         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+         if (!access.ok || !access.session.active || access.session.metadata?.flavor !== 'codex'
+             || !access.session.metadata.capabilities?.concurrentClients) {
+@@ -2960,6 +2987,7 @@
+             }
+         }
+ 
++        if (this.getManualPause(access.sessionId) !== null) return { type: 'error', code: 'resume_unavailable', message: 'Chat manually paused. Use Resume paused work first.' }
+         let initialSession = access.session
+         if (await this.recoverInactiveReservedClear(initialSession, namespace)) {
+             initialSession = this.sessionCache.getSessionByNamespace(sessionId, namespace) ?? initialSession
+@@ -3374,6 +3402,7 @@
+      * needed to resume is missing.
+      */
+     async reopenSession(sessionId: string, namespace: string): Promise<ReopenSessionResult> {
++        this.assertNotManuallyPaused(sessionId)
+         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+         if (!access.ok) {
+             return {
+--- a/hub/src/sync/messageService.ts
++++ b/hub/src/sync/messageService.ts
+@@ -455,6 +455,7 @@
+     /** CLI reconnect backfill — excludes future-scheduled rows so the runner does
+      *  not consume them ahead of their scheduled_at.  See messages.ts:getDeliverableMessagesAfter. */
+     getDeliverableMessagesAfter(sessionId: string, options: { afterSeq: number; limit: number; now: number }): DecryptedMessage[] {
++        if (this.store.getManualPause(sessionId) !== null) return []
+         const stored = this.store.messages.getDeliverableMessagesAfter(
+             sessionId,
+             options.afterSeq,
+@@ -862,6 +863,7 @@
+         }
+ 
+         const sentFrom = payload.sentFrom ?? 'webapp'
++        if (this.store.getManualPause(sessionId) !== null) throw new Error('Chat manually paused')
+         const deliveryMode = getNormalizedDeliveryMode(
+             this.store.sessions.getSession(sessionId)?.metadata,
+             payload.deliveryMode,
+@@ -977,6 +979,7 @@
+ 
+     /** Replay durable immediate prompts whenever their CLI session attaches. */
+     replayImmediateQueuedMessages(sessionId: string): number {
++        if (this.store.getManualPause(sessionId) !== null) return 0
+         const queued = this.store.messages.getImmediateQueuedLocalMessages(sessionId)
+         if (queued.length === 0 || this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
+         for (const msg of queued) {
+@@ -1003,6 +1006,7 @@
+ 
+     /** Release a completed clear handoff in finalized seq order. */
+     releaseDeliverableQueuedMessages(sessionId: string, now: number = Date.now()): number {
++        if (this.store.getManualPause(sessionId) !== null) return 0
+         if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
+         const queued = this.store.messages.getUninvokedLocalMessages(sessionId, { deliverableOnly: true })
+             .filter((msg) => msg.scheduledAt === null || msg.scheduledAt <= now)
+@@ -1046,6 +1050,7 @@
+         const maturedSessionIds = new Set<string>()
+         const deliveryGateBySession = new Map<string, boolean>()
+         for (const msg of mature) {
++            if (this.store.getManualPause(msg.sessionId) !== null) continue
+             let deliveryGated = deliveryGateBySession.get(msg.sessionId)
+             if (deliveryGated === undefined) {
+                 deliveryGated = this.store.isOpenCodeClearDeliveryGated(msg.sessionId)
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -174,7 +174,7 @@
+             return sessionResult
+         }
+ 
+-        return c.json({ session: sessionResult.session })
++        return c.json({ session: { ...sessionResult.session, manualPausedAt: engine.getManualPause(sessionResult.sessionId) } })
+     })
+ 
+     app.get('/sessions/:id/cursor-chat-store', async (c) => {
+@@ -357,6 +357,27 @@
+         return c.json(await engine.cancelNativeReadyMessage(session.sessionId, c.req.param('localId')))
+     })
+ 
++    app.get('/sessions/:id/manual-pause', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const session = requireSessionFromParam(c, engine)
++        if (session instanceof Response) return session
++        return c.json({ pausedAt: engine.getManualPause(session.sessionId) })
++    })
++
++    // Explicit user action only. Ordinary resume/send and automated recovery
++    // deliberately cannot clear a manual stop, even with old authorizations.
++    app.post('/sessions/:id/manual-resume', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const session = requireSessionFromParam(c, engine)
++        if (session instanceof Response) return session
++        const body = await c.req.json().catch(() => null)
++        if (body?.explicitUserResume !== true) return c.json({ error: 'Explicit user resume required' }, 400)
++        engine.resumeManualPause(session.sessionId)
++        return c.json({ ok: true })
++    })
++
+     app.post('/sessions/:id/abort', async (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+         if (engine instanceof Response) {
+@@ -466,6 +487,7 @@
+             return c.json({ error: 'Session is inactive' }, 409)
+         }
+ 
++        engine.pauseSession(sessionResult.sessionId)
+         await engine.archiveSession(sessionResult.sessionId)
+         return c.json({ ok: true })
+     })
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -626,6 +626,16 @@
+         )
+     }
+ 
++    async getManualPause(sessionId: string): Promise<{ pausedAt: number | null }> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/manual-pause`)
++    }
++
++    async resumeManualPause(sessionId: string): Promise<void> {
++        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/manual-resume`, {
++            method: 'POST', body: JSON.stringify({ explicitUserResume: true })
++        })
++    }
++
+     async abortSession(sessionId: string): Promise<void> {
+         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/abort`, {
+             method: 'POST',
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -1,3 +1,4 @@
++import { ManualPauseBanner } from '@/components/ManualPauseBanner'
+ import { ProviderHandoffDialog, HandoffDraftBanner } from '@/components/ProviderHandoff'
+ import { useEffect, useId, useMemo, useRef, useState } from 'react'
+ import { useIsMutating, useQueryClient } from '@tanstack/react-query'
+@@ -495,6 +496,7 @@
+                 </div>
+             </div>
+ 
++            <ManualPauseBanner api={api} sessionId={session.id} />
+             <HandoffDraftBanner api={api} sessionId={session.id} />
+             {handoffOpen && api && (agentFlavor === 'codex' || agentFlavor === 'claude') ? <ProviderHandoffDialog api={api} sessionId={session.id} provider={agentFlavor} onClose={() => setHandoffOpen(false)} /> : null}
+             <SessionActionMenu
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -60,7 +60,7 @@
+ import { useToast } from '@/lib/toast-context'
+ import { getPathDisplayName } from '@/utils/path'
+ import type { CodexFolder } from '@/api/client'
+-import { CodexFolderNameDialog, MoveToFolderDialog, useCodexFolders } from '@/components/CodexFolders'
++import { CodexFolderNameDialog, MoveToFolderDialog, useCodexFolders, useInvalidateCodexFolders } from '@/components/CodexFolders'
+ import { useManagedSessions } from '@/hooks/useManagedSessions'
+ 
+ export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
+@@ -1445,6 +1445,23 @@
+         const threadId = getChatTab(session) === 'claude' ? session.id : session.metadata?.agentSessionId
+         return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
+     }
++    const invalidateFolders = useInvalidateCodexFolders()
++    const [draggedChat, setDraggedChat] = useState<string | null>(null)
++    const [dropFolder, setDropFolder] = useState<string | null>(null)
++    const [moveError, setMoveError] = useState('')
++    const moveInFlight = useRef(false)
++    const moveDraggedChat = async (sessionId: string, folderId: string | null) => {
++        const session = props.sessions.find(s => s.id === sessionId)
++        if (!session || !api || moveInFlight.current) return
++        const provider = getChatTab(session)
++        if (provider !== activeTab || (provider !== 'codex' && provider !== 'claude')) return
++        const threadId = provider === 'claude' ? session.id : session.metadata?.agentSessionId
++        if (!threadId || folderOf(session) === folderId) return
++        moveInFlight.current = true; setMoveError('')
++        try { await api.assignCodexFolder(threadId, folderId, provider); await invalidateFolders() }
++        catch { setMoveError('Could not move chat. Its folder has not been changed in this view; try again.') }
++        finally { moveInFlight.current = false }
++    }
+     const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null)
+     const [folderDialog, setFolderDialog] = useState<{ folder: CodexFolder | null } | null>(null)
+     const canMoveToFolder = Boolean(api && codexFolders.data)
+@@ -1555,7 +1572,9 @@
+     }
+ 
+     const renderChatRow = (s: SessionSummary, index: number, rows: SessionSummary[]) => (
+-        <div key={s.id} className="contents">
++        <div key={s.id} className="flex flex-col" draggable={canMoveToFolder && (getChatTab(s) === 'claude' || Boolean(s.metadata?.agentSessionId))}
++            onDragStart={event => { event.dataTransfer.setData('application/x-hapi-session', s.id); event.dataTransfer.effectAllowed = 'move'; setDraggedChat(s.id) }}
++            onDragEnd={() => { setDraggedChat(null); setDropFolder(null) }}>
+             {shouldShowPinnedDivider(rows, index) ? (
+                 <div
+                     data-testid="session-pin-divider"
+@@ -1586,7 +1605,9 @@
+         }
+         const tabSessions = chatSessions.filter(session => getChatTab(session) === activeTab)
+         const sections = ['codex', 'claude'].includes(activeTab) && codexFolders.data
+-            ? groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf)
++            ? (draggedChat
++                ? [...codexFolders.data.folders.map(folder => ({ folder, sessions: tabSessions.filter(s => folderOf(s) === folder.id) })), { folder: null, sessions: tabSessions.filter(s => !folderOf(s)) }]
++                : groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf))
+             : [{ folder: undefined, sessions: tabSessions }]
+         return (
+             <div key="chats-section" data-testid="session-chat-list">
+@@ -1631,8 +1652,18 @@
+                             ) : null}
+                         </div>
+                     ) : null}
++                    {moveError && <div role="alert" className="px-2 text-sm text-red-600">{moveError}</div>}
+                     {sections.map(({ folder, sessions }) => (
+-                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} className="flex flex-col gap-0.5">
++                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} className={`flex flex-col gap-0.5 ${dropFolder === (folder?.id ?? 'none') ? 'rounded ring-2 ring-[var(--app-link)]' : ''}`}
++                            onDragOver={event => { if (folder !== undefined && draggedChat) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropFolder(folder?.id ?? 'none') } }}
++                            onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }}
++                            onDrop={event => {
++                                if (folder === undefined || !draggedChat) return
++                                event.preventDefault(); event.stopPropagation()
++                                const id = event.dataTransfer.getData('application/x-hapi-session')
++                                if (id === draggedChat) void moveDraggedChat(id, folder?.id ?? null)
++                                setDraggedChat(null); setDropFolder(null)
++                            }}>
+                             {folder !== undefined ? (
+                                 <div className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
+                                     <button type="button" aria-expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
+--- a/hub/src/sync/rpcGateway.ts
++++ b/hub/src/sync/rpcGateway.ts
+@@ -133,8 +133,8 @@
+         })
+     }
+ 
+-    async abortSession(sessionId: string): Promise<void> {
+-        await this.sessionRpc(sessionId, RPC_METHODS.Abort, { reason: 'User aborted via Telegram Bot' })
++    async abortSession(sessionId: string, manualPause = false): Promise<void> {
++        await this.sessionRpc(sessionId, RPC_METHODS.Abort, { reason: manualPause ? 'Manual user pause' : 'Interrupt for immediate input', manualPause })
+     }
+ 
+     async switchSession(sessionId: string, to: 'remote' | 'local'): Promise<void> {
+--- a/cli/src/modules/common/remote/RemoteLauncherBase.ts
++++ b/cli/src/modules/common/remote/RemoteLauncherBase.ts
+@@ -27,7 +27,7 @@
+ };
+ 
+ export type RemoteLauncherAbortHandlers = {
+-    onAbort: () => void | Promise<void>;
++    onAbort: (manualPause?: boolean) => void | Promise<void>;
+     onSwitch: () => void | Promise<void>;
+ };
+ 
+@@ -173,8 +173,9 @@
+         rpcHandlerManager: RpcHandlerManagerLike,
+         handlers: RemoteLauncherAbortHandlers
+     ): void {
+-        rpcHandlerManager.registerHandler(RPC_METHODS.Abort, async () => {
+-            await handlers.onAbort();
++        rpcHandlerManager.registerHandler(RPC_METHODS.Abort, async (params: unknown) => {
++            const manualPause = typeof params === 'object' && params !== null && (params as { manualPause?: unknown }).manualPause === true;
++            await handlers.onAbort(manualPause);
+         });
+ 
+         rpcHandlerManager.registerHandler(RPC_METHODS.Switch, async () => {
+--- a/cli/src/codex/codexRemoteLauncher.ts
++++ b/cli/src/codex/codexRemoteLauncher.ts
+@@ -1,3 +1,4 @@
++import { pauseNativeGoal } from './utils/manualPause';
+ import React from 'react';
+ import { randomUUID } from 'node:crypto';
+ 
+@@ -3561,7 +3562,13 @@
+         let mcpServers: CodexMcpServersConfig = hapiMcpServers;
+ 
+         this.setupAbortHandlers(session.client.rpcHandlerManager, {
+-            onAbort: () => this.handleAbort(),
++            onAbort: async (manualPause) => {
++                // Goal state is independent of turn/interrupt. Keep its objective
++                // and budget, but prevent another autonomous turn after Stop.
++                try {
++                    if (manualPause && this.currentThreadId) await pauseNativeGoal(this.appServerClient, this.currentThreadId);
++                } finally { await this.handleAbort(); }
++            },
+             onSwitch: () => this.handleSwitchRequest()
+         });
+ 
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -464,9 +464,17 @@
+         });
+         rpc.registerHandler(RPC_METHODS.Switch, async () => { throw new Error('control_mode_not_applicable'); });
+         rpc.registerHandler(RPC_METHODS.HandoffLocal, async () => { throw new Error('control_mode_not_applicable'); });
+-        rpc.registerHandler(RPC_METHODS.Abort, async () => {
+-            const turnId = this.currentTurn;
+-            if (turnId) await this.client.request('turn/interrupt', { threadId: this.threadId, turnId });
++        rpc.registerHandler(RPC_METHODS.Abort, async raw => {
++            try {
++                if (record(raw).manualPause === true) {
++                    const result = record(await this.client.request('thread/goal/get', { threadId: this.threadId }));
++                    const goal = record(result.goal);
++                    if (goal.status === 'active' || goal.status === 'usageLimited') await this.client.request('thread/goal/set', { threadId: this.threadId, status: 'paused' });
++                }
++            } finally {
++                const turnId = this.currentTurn;
++                if (turnId) await this.client.request('turn/interrupt', { threadId: this.threadId, turnId });
++            }
+         });
+         rpc.registerHandler(RPC_METHODS.KillSession, async () => { await this.host.end(this); return { success: true }; });
+         rpc.registerHandler(RPC_METHODS.SetSessionConfig, raw => this.applySettings(raw));
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -213,3 +213,26 @@
+         expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument()
+     })
+ })
++
++describe('folder drag and drop', () => {
++    for (const provider of ['codex', 'claude'] as const) it(`persists ${provider} drops into empty folders without session control`, async () => {
++        const chat = provider === 'codex' ? codex('moving', 'Drag this chat', 'native-thread') : claude('moving', 'Drag this chat')
++        localStorage.setItem('hapi-chat-tab', provider)
++        const api = folderApi({ getCodexFolders: vi.fn().mockResolvedValue({ ...folders, assignments: {} }) })
++        renderList({ api, list: [chat] })
++        await screen.findByRole('button', { name: /No folder folder/ })
++        const row = screen.getByRole('button', { name: /Drag this chat/ }).closest('[draggable]')!
++        const values = new Map<string, string>(); const transfer = { setData: (key: string, value: string) => values.set(key, value), getData: (key: string) => values.get(key) ?? '', effectAllowed: '', dropEffect: '' }
++        fireEvent.dragStart(row, { dataTransfer: transfer })
++        const folder = screen.getByRole('button', { name: 'Blender folder' }).closest('[data-testid="chat-folder"]')!
++        fireEvent.dragOver(folder, { dataTransfer: transfer }); fireEvent.drop(folder, { dataTransfer: transfer })
++        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith(provider === 'codex' ? 'native-thread' : 'moving', 'f-blender', provider))
++        expect(api.assignCodexFolder).toHaveBeenCalledTimes(1)
++    })
++    it('ignores external drops', async () => {
++        const api = folderApi(); renderList({ api })
++        const folder = (await screen.findByRole('button', { name: 'Blender folder' })).closest('[data-testid="chat-folder"]')!
++        fireEvent.drop(folder, { dataTransfer: { getData: () => 'cx-school' } })
++        expect(api.assignCodexFolder).not.toHaveBeenCalled()
++    })
++})
+--- /dev/null
++++ b/hub/src/sync/manualPause.test.ts
+@@ -0,0 +1,93 @@
++import { describe, expect, it, spyOn } from 'bun:test'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Store } from '../store'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { SyncEngine } from './syncEngine'
++import { Hono } from 'hono'
++import { createSessionsRoutes } from '../web/routes/sessions'
++
++function setup(path = ':memory:') {
++    const store = new Store(path), emitted: unknown[] = []
++    const engine = new SyncEngine(store, { of: () => ({ to: () => ({ emit: (...args: unknown[]) => emitted.push(args) }) }) } as never, new RpcRegistry(), { broadcast() {} } as never)
++    const session = engine.getOrCreateSession('test', { path: '/tmp/test', host: 'pc', flavor: 'codex' }, {}, 'default')
++    return { store, engine, session, emitted }
++}
++
++describe('durable manual stop', () => {
++    it('persists before an unsuccessful abort and blocks send/resume/steer after restart', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'pause-')); const path = join(dir, 'db')
++        let env = setup(path)
++        const id = env.session.id
++        try {
++            ;(env.engine as any).rpcGateway.abortSession = async () => { expect(env.store.getManualPause(id)).not.toBeNull(); throw new Error('disconnected') }
++            await expect(env.engine.abortSession(id)).rejects.toThrow('disconnected')
++            env.engine.stop(); env.store.close(); env = setup(path)
++            expect(env.store.getManualPause(id)).not.toBeNull()
++            await expect(env.engine.sendMessage(id, { text: 'old automatic followup' })).rejects.toThrow('manually paused')
++            expect((await env.engine.resumeSession(id, 'default')).type).toBe('error')
++            await expect(env.engine.approvePermission(id, 'old-approval')).rejects.toThrow('manually paused')
++            expect((await env.engine.steerQueuedMessage(id, 'old')).status).toBe('failed')
++            env.engine.resumeManualPause(id)
++            expect(env.store.getManualPause(id)).toBeNull()
++        } finally { env.engine.stop(); env.store.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++    it('holds scheduled/reconnect delivery and preserves history', () => {
++        const { store, engine, session, emitted } = setup()
++        try {
++            store.messages.addMessage(session.id, { role: 'user', content: { text: 'future' } }, 'scheduled', Date.now() - 1)
++            store.messages.addMessage(session.id, { role: 'user', content: { text: 'queued' } }, 'queued')
++            engine.pauseSession(session.id)
++            const service = (engine as any).messageService
++            const before = emitted.length
++            service.releaseMatureScheduledMessages(Date.now())
++            expect(service.replayImmediateQueuedMessages(session.id)).toBe(0)
++            expect(service.releaseDeliverableQueuedMessages(session.id)).toBe(0)
++            expect(service.getDeliverableMessagesAfter(session.id, { afterSeq: 0, limit: 100, now: Date.now() })).toEqual([])
++            expect(emitted.length).toBe(before)
++            expect(store.messages.getMessages(session.id, 100)).toHaveLength(2)
++        } finally { engine.stop(); store.close() }
++    })
++    it('immediate interrupt-and-send does not latch a manual pause', async () => {
++        const { store, engine, session } = setup()
++        try {
++            const abort = spyOn((engine as any).rpcGateway, 'abortSession').mockResolvedValue(undefined)
++            await engine.abortSession(session.id, false)
++            expect(abort).toHaveBeenCalledTimes(1); expect(store.getManualPause(session.id)).toBeNull()
++        } finally { engine.stop(); store.close() }
++    })
++    it('withdraws pending prompts before interrupting, even if cancellation is unconfirmed', async () => {
++        const { store, engine, session } = setup()
++        try {
++            const order: string[] = []
++            store.messages.addMessage(session.id, { text: 'old wake' }, 'wake')
++            ;(engine as any).messageService.cancelQueuedMessage = async () => { order.push('cancel'); throw new Error('unknown') }
++            ;(engine as any).rpcGateway.abortSession = async (_id: string, manual: boolean) => { order.push('abort'); expect(manual).toBe(true) }
++            await engine.abortSession(session.id)
++            expect(order).toEqual(['cancel', 'abort']); expect(store.getManualPause(session.id)).not.toBeNull()
++        } finally { engine.stop(); store.close() }
++    })
++})
++
++
++describe('explicit resume API', () => {
++    it('requires explicit intent and namespace access; reading cannot unpause', async () => {
++        const { store, engine, session } = setup()
++        const app = (ns: string) => {
++            const result = new Hono<any>()
++            result.use('*', async (c, next) => { c.set('namespace', ns); await next() })
++            result.route('/', createSessionsRoutes(() => engine)); return result
++        }
++        try {
++            engine.pauseSession(session.id)
++            const url = `/sessions/${session.id}/manual-resume`
++            expect((await app('other').request(url, { method: 'POST', body: JSON.stringify({ explicitUserResume: true }) })).status).toBe(403)
++            expect((await app('default').request(url, { method: 'POST', body: '{}' })).status).toBe(400)
++            expect((await app('default').request(`/sessions/${session.id}/manual-pause`)).status).toBe(200)
++            expect(engine.getManualPause(session.id)).not.toBeNull()
++            expect((await app('default').request(url, { method: 'POST', body: JSON.stringify({ explicitUserResume: true }) })).status).toBe(200)
++            expect(engine.getManualPause(session.id)).toBeNull()
++        } finally { engine.stop(); store.close() }
++    })
++})
+--- /dev/null
++++ b/web/src/components/ManualPauseBanner.tsx
+@@ -0,0 +1,22 @@
++import { useState } from 'react'
++import { useQuery } from '@tanstack/react-query'
++import type { ApiClient } from '@/api/client'
++
++/** Resuming is a separate user gesture, never an effect of send/reconnect. */
++export function ManualPauseBanner({ api, sessionId }: { api: ApiClient | null; sessionId: string }) {
++    const [busy, setBusy] = useState(false)
++    const [error, setError] = useState('')
++    const state = useQuery({ queryKey: ['manual-pause', sessionId], queryFn: () => api!.getManualPause(sessionId), enabled: Boolean(api?.getManualPause), refetchInterval: 2000, retry: false })
++    if (state.data?.pausedAt == null) return null
++    return <div className="border-b px-3 py-2 text-xs" role="status">
++        Manually paused. Automatic messages and recovery are blocked.
++        <button type="button" disabled={busy} className="ml-2 text-[var(--app-link)]" onClick={async () => {
++            setBusy(true); setError('')
++            try { await api!.resumeManualPause(sessionId); await state.refetch() }
++            catch { setError('Resume failed; the pause remains in effect.') }
++            finally { setBusy(false) }
++        }}>Resume paused work</button>
++        <span className="block text-[var(--app-hint)]">Already launched jobs may continue. Resume unlocks this chat; send a message or reopen it to continue. A paused native goal needs /goal resume.</span>
++        {error && <span role="alert">{error}</span>}
++    </div>
++}
+--- /dev/null
++++ b/web/src/components/ManualPauseBanner.test.tsx
+@@ -0,0 +1,16 @@
++import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { afterEach, expect, it, vi } from 'vitest'
++import type { ApiClient } from '@/api/client'
++import { ManualPauseBanner } from './ManualPauseBanner'
++afterEach(cleanup)
++it('observes without resuming; requires a click and preserves errors', async () => {
++    const api = { getManualPause: vi.fn(async () => ({ pausedAt: 1 })), resumeManualPause: vi.fn(async () => { throw new Error('offline') }) }
++    render(<QueryClientProvider client={new QueryClient()}><ManualPauseBanner api={api as unknown as ApiClient} sessionId="paused" /></QueryClientProvider>)
++    const button = await screen.findByRole('button', { name: 'Resume paused work' })
++    expect(api.resumeManualPause).not.toHaveBeenCalled()
++    fireEvent.click(button)
++    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Resume failed'))
++    expect(api.resumeManualPause).toHaveBeenCalledWith('paused')
++    expect(button).toBeInTheDocument()
++})
+--- /dev/null
++++ b/cli/src/codex/utils/manualPause.ts
+@@ -0,0 +1,10 @@
++/** Keep the native goal intact; turn interruption alone is not a goal pause. */
++export async function pauseNativeGoal(client: {
++    getThreadGoal(params: { threadId: string }): Promise<{ goal: { status: string } | null }>
++    setThreadGoal(params: { threadId: string; status: 'paused' }): Promise<unknown>
++}, threadId: string): Promise<void> {
++    const { goal } = await client.getThreadGoal({ threadId })
++    if (goal?.status === 'active' || goal?.status === 'usageLimited') {
++        await client.setThreadGoal({ threadId, status: 'paused' })
++    }
++}
+--- /dev/null
++++ b/cli/src/codex/utils/manualPause.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it, vi } from 'vitest'
++import { pauseNativeGoal } from './manualPause'
++describe('manual goal pause', () => {
++    it.each(['active', 'usageLimited'])('pauses %s without clearing the objective', async status => {
++        const client = { getThreadGoal: vi.fn(async () => ({ goal: { status } })), setThreadGoal: vi.fn(async () => ({})) }
++        await pauseNativeGoal(client, 'original')
++        expect(client.setThreadGoal).toHaveBeenCalledWith({ threadId: 'original', status: 'paused' })
++    })
++    it.each([null, { status: 'complete' }, { status: 'paused' }])('does not reactivate or rewrite terminal/absent goals', async goal => {
++        const client = { getThreadGoal: vi.fn(async () => ({ goal })), setThreadGoal: vi.fn(async () => ({})) }
++        await pauseNativeGoal(client, 'original'); expect(client.setThreadGoal).not.toHaveBeenCalled()
++    })
++})

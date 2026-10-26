@@ -1,0 +1,18 @@
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index 2ecdfb9..0776608 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1861,13 +1861,6 @@ function SessionChatInner(props: SessionChatProps) {
+ 
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+-            {import.meta.env.VITE_MANAGER_SESSION_ID && (
+-                <div className="shrink-0 border-b px-3 py-2 text-sm">
+-                    {props.session.id === import.meta.env.VITE_MANAGER_SESSION_ID
+-                        ? '★ Persistent manager · delegates and supervises your projects'
+-                        : <a className="text-[var(--app-link)] underline" href={`/sessions/${import.meta.env.VITE_MANAGER_SESSION_ID}`}>Open persistent manager — this is a separate chat</a>}
+-                </div>
+-            )}
+             {agentFlavor === 'claude' && claudeCatalog.isError && <div role="status" className="px-3 text-sm text-[var(--app-hint)]">Live Claude model discovery unavailable. Showing fallback aliases; check CLI authentication.</div>}
+             <SessionHeader
+                 session={props.session}

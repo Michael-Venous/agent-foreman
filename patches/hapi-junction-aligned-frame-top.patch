@@ -1,0 +1,84 @@
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -9,9 +9,12 @@
+ export function fitNodeFrame(frame: NodeAnnotation, positions: Record<string, FramePoint>): NodeAnnotation {
+     const points = (frame.members ?? []).flatMap(id => positions[id] ? [positions[id]] : [])
+     if (frame.kind !== 'frame' || !points.length) return frame
+-    const x = Math.min(...points.map(p => p.x)) - 12, y = Math.min(...points.map(p => p.y)) - 32
++    // Card tops and junction centers are the same input-port alignment line.
++    // The top inset already covers the port/dot radius; do not add it twice.
++    const top = Math.min(...(frame.members ?? []).flatMap(id => positions[id] ? [positions[id].y + (id.startsWith('junction:') ? 8 : 0)] : []))
++    const x = Math.min(...points.map(p => p.x)) - 12, y = top - 28
+     const width = Math.max(180, Math.max(...points.map(p => p.x + (p.width ?? NODE_SIZE.width))) + 12 - x)
+-    const height = Math.max(100, Math.max(...points.map(p => p.y + (p.height ?? NODE_SIZE.height))) + 16 - y)
++    const height = Math.max(100, Math.max(...points.map(p => p.y + (p.height ?? NODE_SIZE.height))) + 12 - y)
+     if (width > 8000 || height > 8000) throw new Error('Frame contents are too far apart. Keep them within 8000 canvas units.')
+     return { ...frame, x, y, width, height }
+ }
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -6,7 +6,7 @@
+     const initial = { A:{x:100,y:120}, B:{x:300,y:300} }
+     const first = placeInFrame([frame], 'A', initial)[0]
+     expect(first.members).toEqual(['A'])
+-    expect(first).toMatchObject({x:88,y:88,width:224,height:128})
++    expect(first).toMatchObject({x:88,y:92,width:224,height:120})
+     const expanded = fitNodeFrame({...first,members:['A','B']},initial)
+     const moved = placeInFrame([expanded], 'A', {...initial,A:{x:-200,y:-100}})[0]
+     expect(moved.members).toEqual(['B','A'])
+@@ -34,7 +34,7 @@
+     const bounds=moved.annotations.find(a=>a.id===parent.id)!
+     expect(bounds.x).toBe(138)
+     expect(bounds.x+bounds.width).toBe(642)
+-    expect(bounds.y+bounds.height).toBe(371)
++    expect(bounds.y+bounds.height).toBe(367)
+     const released=placeInFrame(moved.annotations,'text:note',framePoints(moved.positions,moved.annotations,moved.routing!.junctions),true)
+     expect(released[0].members).not.toContain('text:note')
+ })
+@@ -88,7 +88,7 @@
+     const points = framePoints({ A: { x: 100, y: 120 } }, [], junctions)
+     for (const id of ['A', 'junction:plain', 'junction:labelled']) {
+         const fitted = fitNodeFrame({ ...frame, members: [id] }, points)
+-        expect(points[id].y - fitted.y).toBe(32)
++        expect(points[id].y - fitted.y).toBe(id.startsWith('junction:') ? 20 : 28)
+         expect(fitted.y).toBeLessThan(points[id].y - 14)
+         expect(fitted.y + fitted.height).toBeGreaterThanOrEqual(points[id].y + (points[id].height ?? 80))
+     }
+@@ -109,3 +109,13 @@
+         expect(after.routing?.junctions[0]).toMatchObject({ x: 120, y: 150, label })
+     }
+ })
++
++it('keeps frame bounds unchanged when a junction aligns with a neighboring card input', () => {
++    const group = { ...frame, members: ['A', 'junction:dot'] }
++    const fit = (y: number) => fitNodeFrame(group, framePoints({ A: { x: 100, y: 120 } }, [], [{ id: 'dot', owner: null, x: 260, y }]))
++    const below = fit(150), aligned = fit(120), above = fit(100)
++    expect(aligned).toEqual(below)
++    expect(aligned.y).toBe(92)
++    expect(above.y).toBe(72)
++    expect(above.y + above.height).toBe(aligned.y + aligned.height)
++})
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -32,8 +32,8 @@
+         {a.kind === 'frame' && <>{[
+             ['left', { left: 0, top: 0, bottom: 0, width: 12 }],
+             ['right', { right: 0, top: 0, bottom: 0, width: 12 }],
+-            ['bottom', { left: 0, right: 0, bottom: 0, height: 16 }],
+-            ['top', { left: 0, right: 0, top: 0, height: 32 }],
++            ['bottom', { left: 0, right: 0, bottom: 0, height: 12 }],
++            ['top', { left: 0, right: 0, top: 0, height: 28 }],
+         ].map(([side, style]) => <div key={side as string} data-frame-margin={side} data-annotation-move={a.id}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
+             className="pointer-events-auto absolute cursor-move" style={style as React.CSSProperties} />)}</>}
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1360,7 +1360,7 @@
+         fireEvent.pointerUp(canvas, { pointerId: 4, clientX: 500 - 900 * k, clientY: 500 - 850 * k })
+         await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
+         const enrolled = (await api.getNodeGraph()).graph.annotations!.find(a => a.id === 'group')!
+-        expect(enrolled).toMatchObject({ x: 88, y: 118, width: 304, height: 228, members: ['text:note'] })
++        expect(enrolled).toMatchObject({ x: 88, y: 122, width: 304, height: 220, members: ['text:note'] })
+         fireEvent.click(screen.getByRole('button', { name: 'Junction 1' }))
+         openDotMenu('dot'); fireEvent.click(screen.getByRole('button', { name: 'Move junction' }))
+         const start = dotPoint('dot'), dot = screen.getByRole('button', { name: 'Junction 1' })

@@ -1,0 +1,340 @@
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -991,7 +991,7 @@
+     const waitingReady = readyMessages.filter(message => message.state === 'waiting').at(-1)
+     const interruptReady = (localId: string) => { if (!promoteReady.isPending) promoteReady.mutate({ sessionId: props.session.id, messageId: localId }) }
+ 
+-    const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
++    const codexCollaborationModeSupported = agentFlavor === 'codex' && (!props.session.active || !controlledByUser)
+     const claudeCatalog = useQuery({
+         queryKey: ['local-claude-models', props.session.metadata?.machineId],
+         queryFn: () => props.api.getMachineClaudeModels(props.session.metadata!.machineId!),
+@@ -1271,7 +1271,9 @@
+         setModel,
+         setModelReasoningEffort,
+         setEffort,
+-        setServiceTier
++        setServiceTier,
++        serviceTierPending,
++        serviceTierError
+     } = useSessionActions(
+         props.api,
+         props.session.id,
+@@ -2285,10 +2287,11 @@
+                                 : handleEffortChange
+                         }
+                         serviceTier={effectiveCodexServiceTier}
++                        serviceTierPending={serviceTierPending}
++                        serviceTierError={serviceTierError}
+                         onServiceTierChange={
+                             agentFlavor === 'codex'
+-                                && props.session.active
+-                                && !controlledByUser
++                                && (!props.session.active || !controlledByUser)
+                                 && !codexModelsState.error
+                                 && codexModelAdvertisesFastTier(props.session.model, codexModelsState.models)
+                                 ? handleServiceTierChange
+--- a/web/src/components/AssistantChat/codexFastMode.test.ts
++++ b/web/src/components/AssistantChat/codexFastMode.test.ts
+@@ -25,6 +25,11 @@
+         expect(codexModelAdvertisesFastTier(null, models)).toBe(true)
+         expect(codexModelAdvertisesFastTier(undefined, models)).toBe(true)
+         expect(codexModelAdvertisesFastTier('  ', models)).toBe(true)
++    })
++
++    it('accepts the native priority alias but not unrelated tiers', () => {
++        expect(codexModelAdvertisesFastTier('m', [{ id: 'm', isDefault: true, serviceTiers: ['priority'] }])).toBe(true)
++        expect(codexModelAdvertisesFastTier('m', [{ id: 'm', isDefault: true, serviceTiers: ['ultrafast'] }])).toBe(false)
+     })
+ 
+     it('is false when the active model does not advertise a fast tier', () => {
+--- a/web/src/components/AssistantChat/codexFastMode.ts
++++ b/web/src/components/AssistantChat/codexFastMode.ts
+@@ -13,7 +13,7 @@
+ }
+ 
+ function isFastTierId(tierId: string): boolean {
+-    return /fast/i.test(tierId.trim())
++    return isFastServiceTier(tierId)
+ }
+ 
+ /**
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -582,6 +582,39 @@
+         expect(screen.getAllByRole('combobox')).toHaveLength(2)
+         expect(screen.queryByText('Permission Mode')).toBeNull()
+     })
++    it.each([true, false])('toggles per-chat Fast mode without sending or stopping with active=%s', active => {
++        const onServiceTierChange = vi.fn()
++        renderComposer('codex', { compactModelControls: true, active, allowSendWhenInactive: false,
++            thinking: active, serviceTier: 'priority', onServiceTierChange })
++        fireEvent.click(screen.getByRole('button', { name: /Model and reasoning:/ }))
++        expect(screen.getByRole('switch', { name: 'Fast mode' })).toBeChecked()
++        fireEvent.click(screen.getByRole('switch', { name: 'Fast mode' }))
++        expect(onServiceTierChange).toHaveBeenCalledWith('standard')
++        expect(runtime.sentIntents).toEqual([])
++    })
++    it('turns Fast on explicitly and leaves the model menu open', () => {
++        const onServiceTierChange = vi.fn()
++        renderComposer('codex', { compactModelControls: true, serviceTier: 'standard', onServiceTierChange })
++        fireEvent.click(screen.getByRole('button', { name: /Model and reasoning:/ }))
++        fireEvent.click(screen.getByRole('switch', { name: 'Fast mode' }))
++        expect(onServiceTierChange).toHaveBeenCalledWith('fast')
++        expect(screen.getByRole('combobox', { name: 'Model' })).toBeTruthy()
++    })
++    it('shows save errors and prevents repeated Fast changes while pending', () => {
++        const onServiceTierChange = vi.fn()
++        renderComposer('codex', { compactModelControls: true, serviceTier: 'standard', onServiceTierChange,
++            serviceTierPending: true, serviceTierError: 'Runtime unavailable' })
++        fireEvent.click(screen.getByRole('button', { name: /Model and reasoning:/ }))
++        expect(screen.getByRole('switch', { name: 'Fast mode' })).toBeDisabled()
++        expect(screen.getByRole('alert').textContent).toContain('Runtime unavailable')
++        fireEvent.click(screen.getByRole('switch', { name: 'Fast mode' }))
++        expect(onServiceTierChange).not.toHaveBeenCalled()
++    })
++    it.each(['claude', 'codex'] as const)('hides Fast for %s without a supported change handler', flavor => {
++        renderComposer(flavor, { compactModelControls: true })
++        fireEvent.click(screen.getByRole('button', { name: /Model and reasoning:/ }))
++        expect(screen.queryByRole('switch', { name: 'Fast mode' })).toBeNull()
++    })
+     it('changes Codex reasoning from the compact menu', () => {
+         const onModelReasoningEffortChange = vi.fn()
+         renderComposer('codex', {compactModelControls:true, modelReasoningEffort:'low', onModelReasoningEffortChange, availableModelReasoningEffortOptions:[{value:'low'},{value:'high'}]})
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -342,8 +342,10 @@
+     onEffortChange?: (effort: string | null) => void
+     /** Codex Fast mode (service tier): current value ('fast' or null/standard). */
+     serviceTier?: string | null
+-    /** When provided, a Fast-mode toggle renders (Codex GPT-5.5 / GPT-5.4 only). */
++    /** Shown when the current Codex model/account catalog advertises Fast mode. */
+     onServiceTierChange?: (serviceTier: string | null) => void
++    serviceTierPending?: boolean
++    serviceTierError?: string | null
+     onSwitchToRemote?: () => void
+     onTerminal?: () => void
+     terminalUnsupported?: boolean
+@@ -1588,11 +1590,11 @@
+     }, [onEffortChange, configurationControlsDisabled, haptic, dismissSettings])
+ 
+     const handleServiceTierChange = useCallback((nextServiceTier: string | null) => {
+-        if (!onServiceTierChange || controlsDisabled) return
++        if (!onServiceTierChange || configurationControlsDisabled || props.serviceTierPending) return
+         onServiceTierChange(nextServiceTier)
+         dismissSettings()
+         haptic('light')
+-    }, [onServiceTierChange, controlsDisabled, haptic, dismissSettings])
++    }, [onServiceTierChange, configurationControlsDisabled, props.serviceTierPending, haptic, dismissSettings])
+ 
+     // 'standard' (not null) is the explicit Fast-off choice so it persists
+     // distinctly from an untouched/account-default session.
+@@ -1974,13 +1976,14 @@
+                                 <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
+                                     {t('misc.fastMode')}
+                                 </div>
++                                {props.serviceTierError ? <p role="alert" className="px-3 text-xs text-red-500">{props.serviceTierError}</p> : null}
+                                 {fastModeOptions.map((option) => (
+                                     <button
+                                         key={option.value ?? 'standard'}
+                                         type="button"
+-                                        disabled={controlsDisabled}
++                                        disabled={configurationControlsDisabled || props.serviceTierPending}
+                                         className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+-                                            controlsDisabled
++                                            configurationControlsDisabled || props.serviceTierPending
+                                                 ? 'cursor-not-allowed opacity-50'
+                                                 : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
+                                         }`}
+@@ -2361,6 +2364,10 @@
+                                 <ChatModelMenu
+                                     defaultModel={props.defaultModel}
+                                     defaultReasoning={props.defaultReasoning}
++                                    serviceTier={serviceTier}
++                                    serviceTierPending={props.serviceTierPending}
++                                    serviceTierError={props.serviceTierError}
++                                    onServiceTierChange={onServiceTierChange ? handleServiceTierChange : undefined}
+                                     codex={agentFlavor === 'codex'}
+                                     sessionId={sessionId}
+                                     model={model === 'auto' || model === 'default' ? null : model}
+--- a/web/src/components/AssistantChat/ChatModelMenu.tsx
++++ b/web/src/components/AssistantChat/ChatModelMenu.tsx
+@@ -1,3 +1,4 @@
++import { isFastServiceTier } from './codexFastMode'
+ import { resolvedChoices } from '@/lib/resolvedChoices'
+ import { CodexContextToggle } from './CodexContextToggle'
+ import * as Popover from '@radix-ui/react-popover'
+@@ -15,6 +16,10 @@
+     disabled: boolean
+     /** A turn is running: changes are accepted and take effect from the next turn. */
+     running?: boolean
++    serviceTier?: string | null
++    serviceTierPending?: boolean
++    serviceTierError?: string | null
++    onServiceTierChange?: (value: 'fast' | 'standard') => void
+     onModel: (value: string | null) => void
+     onReasoning: (value: string | null) => void
+ }) {
+@@ -27,7 +32,7 @@
+             <button type="button" aria-label={`Model and reasoning: ${model}${reasoning ? `, ${reasoning}` : ''}`} disabled={props.disabled}
+                 className="flex h-11 max-w-[9rem] shrink-0 flex-col justify-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
+                 <span className="w-full truncate text-xs font-medium">{model}</span>
+-                <span className="w-full truncate text-[11px] text-[var(--app-hint)]">{reasoning ? `${reasoning} ▾` : '▾'}</span>
++                <span className="w-full truncate text-[11px] text-[var(--app-hint)]">{`${reasoning ?? ''}${props.codex && isFastServiceTier(props.serviceTier) ? ' · Fast' : ''} ▾`.trim()}</span>
+             </button>
+         </Popover.Trigger>
+         <Popover.Portal>
+@@ -49,6 +54,21 @@
+                         {efforts.options.map(o => <option key={o.value ?? ''} value={o.value ?? ''}>{o.label}</option>)}
+                     </select>
+                 </label>
++                {props.codex && props.onServiceTierChange ? <div className="mt-3 border-t border-[var(--app-border)] pt-2 text-xs">
++                    <div className="flex min-h-11 items-center justify-between gap-2">
++                        <span>Fast mode</span>
++                        <button type="button" role="switch" aria-label="Fast mode"
++                            aria-checked={isFastServiceTier(props.serviceTier)}
++                            disabled={props.disabled || props.serviceTierPending}
++                            onClick={() => props.onServiceTierChange?.(isFastServiceTier(props.serviceTier) ? 'standard' : 'fast')}
++                            className={`relative h-6 w-10 shrink-0 rounded-full transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--app-link)] disabled:opacity-50 ${isFastServiceTier(props.serviceTier) ? 'bg-[var(--app-link)]' : 'bg-[var(--app-hint)]'}`}>
++                            <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${isFastServiceTier(props.serviceTier) ? 'translate-x-4' : ''}`} />
++                        </button>
++                    </div>
++                    <p className="text-[11px] text-[var(--app-hint)]">This chat only. Faster responses, higher usage.</p>
++                    {props.serviceTierPending ? <p role="status" className="mt-1 text-[11px]">Saving…</p> : null}
++                    {props.serviceTierError ? <p role="alert" className="mt-1 text-[11px] text-red-500">{props.serviceTierError}</p> : null}
++                </div> : null}
+                 {props.codex && props.sessionId ? <CodexContextToggle sessionId={props.sessionId} model={props.model} /> : null}
+                 {props.running ? <p className="mt-2 text-[11px] text-[var(--app-hint)]">Running now: changes apply from the next turn.</p> : null}
+             </Popover.Content>
+--- a/web/src/hooks/mutations/useSessionActions.ts
++++ b/web/src/hooks/mutations/useSessionActions.ts
+@@ -26,6 +26,8 @@
+     setModelReasoningEffort: (modelReasoningEffort: string | null) => Promise<void>
+     setEffort: (effort: string | null) => Promise<void>
+     setServiceTier: (serviceTier: string | null) => Promise<void>
++    serviceTierPending: boolean
++    serviceTierError: string | null
+     renameSession: (name: string) => Promise<void>
+     suggestSessionTitle: () => Promise<string>
+     updateSessionSummary: (text: string) => Promise<void>
+@@ -224,7 +226,7 @@
+             }
+             await api.setServiceTier(sessionId, serviceTier)
+         },
+-        onSuccess: () => void invalidateSession(),
++        onSuccess: () => invalidateSession(),
+     })
+ 
+     const renameMutation = useMutation({
+@@ -292,6 +294,8 @@
+         setModelReasoningEffort: modelReasoningEffortMutation.mutateAsync,
+         setEffort: effortMutation.mutateAsync,
+         setServiceTier: serviceTierMutation.mutateAsync,
++        serviceTierPending: serviceTierMutation.isPending,
++        serviceTierError: serviceTierMutation.error?.message ?? null,
+         renameSession: renameMutation.mutateAsync,
+         suggestSessionTitle: titleSuggestionMutation.mutateAsync,
+         updateSessionSummary: summaryMutation.mutateAsync,
+--- a/hub/src/web/routes/sessions.test.ts
++++ b/hub/src/web/routes/sessions.test.ts
+@@ -674,6 +674,29 @@
+         ])
+     })
+ 
++    it('saves Fast choices for inactive Codex without a controller', async () => {
++        const session = createSession({ active: false,
++            agentState: { controlledByUser: true, requests: {}, completedRequests: {} } })
++        const { app, applySessionConfigCalls } = createApp(session)
++        for (const serviceTier of ['fast', 'standard']) {
++            const response = await app.request('/api/sessions/session-1/service-tier', {
++                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serviceTier })
++            })
++            expect(response.status).toBe(200)
++        }
++        expect(applySessionConfigCalls).toEqual([['session-1', { serviceTier: 'fast' }], ['session-1', { serviceTier: 'standard' }]])
++        expect(session.active).toBe(false)
++    })
++
++    it('rejects Fast mode for Claude', async () => {
++        const { app, applySessionConfigCalls } = createApp(createSession({ metadata: { path: '/tmp', host: 'localhost', flavor: 'claude' } }))
++        const response = await app.request('/api/sessions/session-1/service-tier', {
++            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serviceTier: 'fast' })
++        })
++        expect(response.status).toBe(400)
++        expect(applySessionConfigCalls).toEqual([])
++    })
++
+     it('persists an explicit Standard service tier (distinct from untouched)', async () => {
+         const { app, applySessionConfigCalls } = createApp(createSession())
+ 
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -869,7 +869,7 @@
+             return engine
+         }
+ 
+-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
++        const sessionResult = requireSessionFromParam(c, engine)
+         if (sessionResult instanceof Response) {
+             return sessionResult
+         }
+@@ -878,7 +878,7 @@
+         if (flavor !== 'codex') {
+             return c.json({ error: 'Fast mode is only supported for Codex sessions' }, 400)
+         }
+-        if (sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
++        if (sessionResult.session.active && sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
+             return c.json({ error: 'Fast mode can only be changed for remote sessions' }, 409)
+         }
+ 
+--- /dev/null
++++ b/hub/src/sync/serviceTier.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it, spyOn } from 'bun:test'
++import { Store } from '../store'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { SyncEngine } from './syncEngine'
++
++function createEngine(store: Store) {
++    const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++    engine.stop()
++    return engine
++}
++
++describe('per-chat service tier', () => {
++    it('persists inactive Fast/off through reload without resuming, sending, or clearing manual Stop', async () => {
++        const store = new Store(':memory:')
++        let engine = createEngine(store)
++        try {
++            const session = engine.getOrCreateSession('fast-stopped', { path: '/tmp', host: 'test', flavor: 'codex' }, {}, 'default')
++            engine.pauseSession(session.id)
++            const pause = store.getManualPause(session.id)
++            const resume = spyOn(engine, 'resumeSession'), send = spyOn(engine, 'sendMessage')
++            const request = spyOn((engine as any).rpcGateway, 'requestSessionConfig')
++            for (const serviceTier of ['fast', 'standard']) {
++                await engine.applySessionConfig(session.id, { serviceTier })
++                expect(request).not.toHaveBeenCalled()
++                expect(resume).not.toHaveBeenCalled()
++                expect(send).not.toHaveBeenCalled()
++                engine = createEngine(store)
++                expect(engine.getSession(session.id)?.serviceTier).toBe(serviceTier)
++                expect(engine.getSession(session.id)?.active).toBe(false)
++                expect(store.getManualPause(session.id)).toEqual(pause)
++            }
++        } finally { engine.stop(); store.close() }
++    })
++    it('uses only config RPC during a running turn and preserves its state', async () => {
++        const store = new Store(':memory:'), engine = createEngine(store)
++        try {
++            const session = engine.getOrCreateSession('fast-running', { path: '/tmp', host: 'test', flavor: 'codex' }, {}, 'default')
++            engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true })
++            const gateway = (engine as any).rpcGateway
++            const request = spyOn(gateway, 'requestSessionConfig').mockResolvedValue({ applied: { serviceTier: 'fast' } })
++            const abort = spyOn(engine, 'abortSession'), resume = spyOn(engine, 'resumeSession'), send = spyOn(engine, 'sendMessage')
++            await engine.applySessionConfig(session.id, { serviceTier: 'fast' })
++            expect(request).toHaveBeenCalledWith(session.id, { serviceTier: 'fast' })
++            expect(engine.getSession(session.id)).toMatchObject({ active: true, thinking: true, serviceTier: 'fast' })
++            expect(abort).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled()
++        } finally { engine.stop(); store.close() }
++    })
++})

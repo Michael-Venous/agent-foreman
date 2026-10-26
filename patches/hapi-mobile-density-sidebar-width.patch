@@ -1,0 +1,32 @@
+diff --git a/web/src/index.css b/web/src/index.css
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -243,10 +243,17 @@
+ }
+ 
+ html {
+-    font-size: calc(100% * var(--app-font-scale, 1));
++    --app-ui-scale: 1;
++    font-size: calc(100% * var(--app-font-scale, 1) * var(--app-ui-scale));
+     color-scheme: light;
+     scrollbar-color: var(--app-scrollbar-thumb) transparent;
+     scrollbar-width: thin;
++}
++
++/* Scale rem-based text, icons, controls and spacing together in the mobile layout.
++ * Keep native viewport/pointer coordinates intact for canvas and window gestures. */
++@media (max-width: 919px) {
++    html { --app-ui-scale: 0.8; }
+ }
+ 
+ [data-theme="dark"],
+@@ -403,6 +410,9 @@
+    so the sidebar width/resize applies as soon as the split view appears on
+    compact tablets. */
+ @media (min-width: 920px) {
++    /* The wide-screen reading-column cap belongs to chat content, not a narrow sidebar. */
++    [data-chat-panel] { --content-max-w: 100%; }
++
+     /* Apply resizable width to sidebar.
+        Cap it against the viewport so a wide persisted width (up to 600px, from
+        resizing on desktop) can't crush the detail pane on a compact split.

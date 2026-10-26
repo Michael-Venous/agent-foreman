@@ -1,0 +1,160 @@
+--- a/hub/src/sync/backgroundTasks.ts
++++ b/hub/src/sync/backgroundTasks.ts
+@@ -6,6 +6,17 @@
+     completed: number
+     startedIds?: string[]
+     completedIds?: string[]
++}
++
++/** A successful native TaskStop receipt, not a request, prose claim or failed result. */
++export function stoppedTaskId(result: unknown): string | null {
++    if (typeof result === 'string') {
++        try { result = JSON.parse(result) } catch { return null }
++    }
++    if (!isObject(result) || typeof result.task_id !== 'string' || !/^[\w-]+$/.test(result.task_id)
++        || typeof result.message !== 'string') return null
++    const confirmed = result.message.match(/^Successfully stopped task: ([\w-]+)(?:\s|$)/)?.[1]
++    return confirmed === result.task_id ? confirmed : null
+ }
+ 
+ /** Only native agent output may report tasks; ordinary user text is not evidence. */
+@@ -21,6 +32,8 @@
+         : Array.isArray(value) ? value.map(part => isObject(part) && part.type === 'text' && typeof part.text === 'string' ? part.text : '').join('\n') : ''
+     const start = (block: unknown) => {
+         if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) return
++        const stopped = stoppedTaskId(textOf(block.content))
++        if (stopped) completedIds.add(stopped)
+         for (const match of textOf(block.content).matchAll(/Command running in background with ID:\s*([\w-]+)/g)) startedIds.add(match[1])
+     }
+     if (data.type === 'tool_result') start(data)
+--- a/hub/src/sync/backgroundTasks.test.ts
++++ b/hub/src/sync/backgroundTasks.test.ts
+@@ -6,6 +6,11 @@
+ } } })
+ export const taskEnd = (id: string, status = 'completed') => ({ role: 'agent', content: { type: 'output', data: {
+     type: 'user', message: { role: 'user', content: [{ type: 'text', text: `<task-notification><task-id>${id}</task-id><status>${status}</status></task-notification>` }] }
++} } })
++
++export const taskStop = (id: string, isError = false) => ({ role: 'agent', content: { type: 'output', data: {
++    type: 'user', message: { role: 'user', content: [{ type: 'tool_result', is_error: isError,
++        content: JSON.stringify({ task_id: id, task_type: 'local_bash', message: `Successfully stopped task: ${id} (command)` }) }] }
+ } } })
+ 
+ describe('native background tasks', () => {
+@@ -32,6 +37,28 @@
+         expect(extractBackgroundTaskDelta(event('task_started'))?.startedIds).toEqual(['native'])
+         expect(extractBackgroundTaskDelta(event('task_notification'))?.completedIds).toEqual(['native'])
+     })
++    it('retires exact TaskStop receipts, including replayed historical stops, while preserving other work', () => {
++        const tracker = new BackgroundTaskTracker()
++        const apply = (event: unknown) => tracker.apply(extractBackgroundTaskDelta(event)!)
++        expect(apply(taskStart('b2qv3bn0e'))).toBe(1)
++        expect(apply(taskStart('new-revision'))).toBe(2)
++        expect(apply(taskStop('b2qv3bn0e'))).toBe(1)
++        expect(apply(taskStop('b2qv3bn0e'))).toBe(1)
++        expect(apply(taskStart('b2qv3bn0e'))).toBe(1)
++        expect(apply(taskStop('unknown'))).toBe(1)
++        expect(extractBackgroundTaskDelta(taskStop('new-revision', true))).toBeNull()
++        expect(extractBackgroundTaskDelta({ ...taskStop('new-revision'), role: 'user' })).toBeNull()
++    })
++    it('does not clear tasks from prose, mismatched IDs or mere stop requests', () => {
++        const message = taskStop('a')
++        message.content.data.message.content[0].content = JSON.stringify({ task_id: 'a', message: 'Successfully stopped task: b (other)' })
++        expect(extractBackgroundTaskDelta(message)).toBeNull()
++        message.content.data.message.content[0].content = 'Successfully stopped task: a'
++        expect(extractBackgroundTaskDelta(message)).toBeNull()
++        expect(extractBackgroundTaskDelta({ role: 'agent', content: { type: 'output', data: {
++            type: 'assistant', message: { content: [{ type: 'tool_use', name: 'TaskStop', input: { task_id: 'a' } }] }
++        } } })).toBeNull()
++    })
+     it('ignores nonterminal task progress notifications', () => {
+         expect(extractBackgroundTaskDelta(taskEnd('a', 'running'))).toBeNull()
+     })
+--- a/hub/src/sync/claudeTaskCompletion.ts
++++ b/hub/src/sync/claudeTaskCompletion.ts
+@@ -3,6 +3,7 @@
+ import { homedir } from 'node:os'
+ import { join } from 'node:path'
+ import { isObject } from '@hapi/protocol'
++import { stoppedTaskId } from './backgroundTasks'
+ 
+ const NATIVE_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+ const TERMINAL = new Set(['completed', 'failed', 'stopped', 'cancelled', 'killed'])
+@@ -10,6 +11,16 @@
+ /** Native notifications can be transcript-only and never reach the SDK stream. */
+ export function claudeTaskCompletion(record: unknown): string | null {
+     if (!isObject(record)) return null
++    if (record.type === 'user' && isObject(record.message) && Array.isArray(record.message.content)) {
++        for (const block of record.message.content) {
++            if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) continue
++            const text = Array.isArray(block.content)
++                ? block.content.filter(part => isObject(part) && part.type === 'text').map(part => part.text).join('\n')
++                : block.content
++            const stopped = stoppedTaskId(text)
++            if (stopped) return stopped
++        }
++    }
+     let text: unknown
+     if (record.type === 'queue-operation' && record.operation === 'enqueue') text = record.content
+     if (record.type === 'attachment' && isObject(record.attachment)
+@@ -57,7 +68,7 @@
+                     const line = pending.subarray(0, newline).toString('utf8')
+                     consumed += newline + 1
+                     pending = pending.subarray(newline + 1)
+-                    if (!line.includes('task-notification')) continue
++                    if (!line.includes('task-notification') && !line.includes('Successfully stopped task:')) continue
+                     try {
+                         const id = claudeTaskCompletion(JSON.parse(line))
+                         if (id) this.completed.add(id)
+--- a/hub/src/sync/claudeTaskCompletion.test.ts
++++ b/hub/src/sync/claudeTaskCompletion.test.ts
+@@ -3,6 +3,7 @@
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { ClaudeTaskCompletionReader, claudeTaskCompletion } from './claudeTaskCompletion'
++import { taskStop } from './backgroundTasks.test'
+ const id = 'add4c8b7-55f5-53a1-a65a-bc9acca8a2b7'
+ const notification = (task: string, status = 'completed') => `<task-notification><task-id>${task}</task-id><status>${status}</status></task-notification>`
+ const event = (task: string, status = 'completed') => ({ type: 'queue-operation', operation: 'enqueue', content: notification(task, status) })
+@@ -37,6 +38,21 @@
+         await writeFile(path, JSON.stringify(event('c')) + '\n')
+         expect(await reader.read()).toEqual(['c'])
+     })
++    it('reconciles transcript-only TaskStop receipts incrementally without accepting failed or requested stops', async () => {
++        const root = await mkdtemp(join(tmpdir(), 'claude-task-stop-')); roots.push(root)
++        await mkdir(join(root, 'project'))
++        const path = join(root, 'project', `${id}.jsonl`)
++        const stopped = taskStop('b2qv3bn0e').content.data
++        expect(claudeTaskCompletion(stopped)).toBe('b2qv3bn0e')
++        expect(claudeTaskCompletion(taskStop('still-running', true).content.data)).toBeNull()
++        expect(claudeTaskCompletion({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'TaskStop', input: { task_id: 'still-running' } }] } })).toBeNull()
++        await writeFile(path, JSON.stringify(stopped) + '\n')
++        const reader = new ClaudeTaskCompletionReader(id, root)
++        expect(await reader.read()).toEqual(['b2qv3bn0e'])
++        await appendFile(path, JSON.stringify(taskStop('buunu0kvk').content.data) + '\n')
++        expect(await reader.read()).toEqual(['b2qv3bn0e', 'buunu0kvk'])
++        expect(await reader.read()).toEqual(['b2qv3bn0e', 'buunu0kvk'])
++    })
+     it('rejects invalid native identities and missing transcripts', async () => {
+         const root = await mkdtemp(join(tmpdir(), 'claude-task-empty-')); roots.push(root)
+         expect(await new ClaudeTaskCompletionReader('../other', root).read()).toEqual([])
+--- a/hub/src/sync/sessionCache.backgroundTasks.test.ts
++++ b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+@@ -3,7 +3,7 @@
+ import type { EventPublisher } from './eventPublisher'
+ import { SessionCache } from './sessionCache'
+ import { extractBackgroundTaskDelta } from './backgroundTasks'
+-import { taskStart, taskEnd } from './backgroundTasks.test'
++import { taskStart, taskEnd, taskStop } from './backgroundTasks.test'
+ 
+ describe('SessionCache background task recovery', () => {
+     it('restores only unfinished tasks belonging to the active controller and keeps live accounting consistent', () => {
+@@ -14,6 +14,8 @@
+         store.messages.addMessage(session.id, taskStart('imported'), 'imported', undefined, session.createdAt - 1000)
+         store.messages.addMessage(session.id, taskStart('finished'), 'start-finished')
+         store.messages.addMessage(session.id, taskEnd('finished'), 'end-finished')
++        store.messages.addMessage(session.id, taskStart('stopped'), 'start-stopped')
++        store.messages.addMessage(session.id, taskStop('stopped'), 'stop-stopped')
+         store.messages.addMessage(session.id, taskStart('live'), 'start-live')
+         store.messages.addMessage(session.id, taskStart('live'), 'duplicate-live')
+         const restarted = new SessionCache(store, publisher)

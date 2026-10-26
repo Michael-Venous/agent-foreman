@@ -1,0 +1,71 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -65,8 +65,13 @@
+         setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => {
+             if (collapsed === Boolean(old?.collapsed)) return old
+             const bounds = fitSessionWindow(old?.bounds ?? initialBounds())
+-            const bubble = fitSessionBubble(collapsed ? bounds : old?.bubble ?? bounds)
+-            return { ...old, open: true, collapsed, bubble, bounds: collapsed ? bounds : recoverSessionWindow({ ...bounds, ...bubble }) }
++            // Keep the same center in both directions so repeated toggles don't
++            // walk the window toward the top-left. Recover only at viewport edges.
++            const centeredBubble = { x: bounds.x + (bounds.width - BUBBLE.width) / 2, y: bounds.y + (bounds.height - BUBBLE.height) / 2 }
++            const bubble = fitSessionBubble(collapsed ? centeredBubble : old?.bubble ?? centeredBubble)
++            return { ...old, open: true, collapsed, bubble, bounds: collapsed ? bounds : recoverSessionWindow({
++                ...bounds, x: bubble.x + (BUBBLE.width - bounds.width) / 2, y: bubble.y + (BUBBLE.height - bounds.height) / 2,
++            }) }
+         }),
+         setPinnedCollapsed: (pinnedCollapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, pinnedCollapsed })),
+         setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bounds })),
+diff --git a/web/src/components/SessionManagerWindow.test.tsx b/web/src/components/SessionManagerWindow.test.tsx
+--- a/web/src/components/SessionManagerWindow.test.tsx
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -88,7 +88,7 @@
+ it('collapses, drags without expanding, expands on tap and closes from the bubble', async () => {
+     setup(); await open(); const original = geometry(); await collapse()
+     expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+-    expect(bubblePosition()).toEqual({ x: original.x, y: original.y })
++    expect(bubblePosition()).toEqual({ x: original.x + (original.width - 96) / 2, y: original.y + (original.height - 44) / 2 })
+     const handle = screen.getByRole('button', { name: 'Expand Session Manager' }), before = bubblePosition()
+     fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 1100, clientY: 750 })
+     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 900, clientY: 650 })
+@@ -97,11 +97,37 @@
+     expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+     fireEvent.pointerDown(handle, { pointerId: 2, button: 0, clientX: 900, clientY: 650 })
+     fireEvent.pointerUp(handle, { pointerId: 2 }); fireEvent.click(handle, { detail: 1 })
+-    await screen.findByRole('dialog', { name: 'Session Manager' }); expect(geometry()).toEqual({ ...original, x: before.x - 200, y: 8 })
+-    await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: 8 })
++    await screen.findByRole('dialog', { name: 'Session Manager' }); expect(geometry()).toEqual({ ...original, x: original.x - 200, y: 8 })
++    await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: 8 + (original.height - 44) / 2 })
+     fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+     await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
+     await open(); expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++})
++it.each([
++    { viewportWidth: 1200, bounds: { x: 220, y: 200, width: 480, height: 400 } },
++    { viewportWidth: 390, bounds: { x: 40, y: 160, width: 300, height: 300 } },
++])('expands around the bubble center without cumulative drift at viewport width $viewportWidth', async ({ viewportWidth, bounds }) => {
++    vi.stubGlobal('innerWidth', viewportWidth)
++    const client = new QueryClient()
++    client.setQueryData(['session-manager-window'], { open: true, collapsed: false, bounds })
++    setup(client)
++    await screen.findByRole('dialog', { name: 'Session Manager' })
++    await collapse()
++    const bubble = bubblePosition()
++    expect(bubble.x + 48).toBe(bounds.x + bounds.width / 2)
++    expect(bubble.y + 22).toBe(bounds.y + bounds.height / 2)
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Expand Session Manager' }), { key: 'ArrowRight' })
++    fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
++    await screen.findByRole('dialog', { name: 'Session Manager' })
++    const moved = { ...bounds, x: bounds.x + 10 }
++    expect(geometry()).toEqual(moved)
++    for (let i = 0; i < 2; i++) {
++        await collapse()
++        expect(bubblePosition()).toEqual({ x: bubble.x + 10, y: bubble.y })
++        fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
++        await screen.findByRole('dialog', { name: 'Session Manager' })
++        expect(geometry()).toEqual(moved)
++    }
+ })
+ it('keeps phone resizing and the movable bubble after remount', async () => {
+     vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 844)

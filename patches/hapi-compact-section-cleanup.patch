@@ -1,0 +1,835 @@
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -1,3 +1,4 @@
++import { UtilityPanelHost } from '@/components/UtilityPanelHost'
+ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+ import { Outlet, useLocation, useMatchRoute, useRouter } from '@tanstack/react-router'
+ import { useQueryClient } from '@tanstack/react-query'
+@@ -541,6 +542,7 @@
+                 {!popout && <PopoutNavigation />}
+                 {!popout && <SessionManagerHost />}
+                 {!popout && <NodeGraphHost />}
++                <UtilityPanelHost />
+                 <ToastContainer />
+                 {!popout && <InstallPrompt />}
+             </VoiceProvider>
+diff --git a/web/src/components/AssistantChat/HappyThread.tsx b/web/src/components/AssistantChat/HappyThread.tsx
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -414,11 +414,12 @@
+ 
+     return (
+         <aside
+-            className="absolute inset-y-0 right-0 z-30 flex w-full max-w-[24rem] flex-col bg-[var(--app-bg)] shadow-2xl sm:w-[24rem]"
++            className="absolute inset-y-2 right-2 z-30 flex w-[calc(100%_-_1rem)] max-w-[24rem] flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] shadow-2xl"
++            onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); props.onClose() } }}
+             aria-label={t('session.outline.title')}
+         >
+             <div aria-hidden="true" className="pointer-events-none absolute inset-y-0 -left-px w-px bg-[var(--app-border)]" />
+-            <div className="border-b border-[var(--app-border)] p-3">
++            <div className="app-section-header app-window-chrome">
+                 <div className="flex items-center gap-2">
+                     <div className="relative min-w-0 flex-1">
+                         <svg
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -196,7 +196,7 @@
+         onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="app-window-chrome flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
++        <header className="app-section-header app-window-chrome">
+             <button ref={focusTarget} type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -885,3 +885,34 @@
+         expect(api.editNodeAnnotation).not.toHaveBeenCalled()
+     })
+ })
++
++
++describe('Blender navigation and selection', () => {
++    it('left-click selects and opens a chat; blank click deselects without panning', async () => {
++        const { api, onOpenChat } = setup()
++        const node = await screen.findByRole('button', { name: 'Node Bravo' }), canvas = screen.getByRole('application')
++        fireEvent.click(node)
++        expect(node).toHaveAttribute('aria-pressed', 'true')
++        expect(onOpenChat).toHaveBeenCalledWith('B')
++        const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!, before = world.style.transform
++        fireEvent.pointerDown(canvas, { pointerId: 5, button: 0, clientX: -100, clientY: -100 })
++        fireEvent.pointerMove(canvas, { pointerId: 5, clientX: -20, clientY: -20 })
++        fireEvent.pointerUp(canvas, { pointerId: 5 })
++        expect(node).toHaveAttribute('aria-pressed', 'false')
++        expect(world.style.transform).toBe(before)
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
++    it('middle mouse pans even over a node without selecting, navigating or moving it', async () => {
++        const { api, onOpenChat } = setup()
++        const node = await screen.findByRole('button', { name: 'Node Bravo' }), canvas = screen.getByRole('application')
++        const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!, before = world.style.transform
++        fireEvent.pointerDown(node, { pointerId: 8, button: 1, clientX: 100, clientY: 100 })
++        fireEvent.pointerMove(canvas, { pointerId: 8, clientX: 145, clientY: 125 })
++        fireEvent.pointerUp(canvas, { pointerId: 8, button: 1 })
++        expect(world.style.transform).not.toBe(before)
++        expect(node).toHaveAttribute('aria-pressed', 'false')
++        expect(onOpenChat).not.toHaveBeenCalled()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -49,7 +49,7 @@
+ const errorText = (error: unknown, fallback: string) => error instanceof Error && error.message ? error.message : fallback
+ const round = (point: GraphPoint): GraphPoint => ({ x: Math.round(point.x), y: Math.round(point.y) })
+ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+-const iconButton = 'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:opacity-40'
++const iconButton = 'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:opacity-40'
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+ /** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
+@@ -62,6 +62,7 @@
+     const viewRef = useRef(view); viewRef.current = view
+     const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
+     const [junctionDrafts, setJunctionDrafts] = useState<Record<string, GraphPoint>>({})
++    const [selectedNode, setSelectedNode] = useState<string | null>(null)
+     const [selectedJunction, setSelectedJunction] = useState<string | null>(null)
+     const [movingJunction, setMovingJunction] = useState<string | null>(null)
+     const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
+@@ -131,7 +132,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); cancelTouchMenu(); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); cancelTouchMenu(); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -244,7 +245,13 @@
+         // React portals bubble through this component even though their DOM is
+         // outside the canvas. Capturing those pointers eats dialog clicks.
+         if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui]')) return
+-        if (event.button !== 0 || pending || mutationBusy.current || dropInFlight.current) return
++        if ((event.button !== 0 && event.button !== 1) || pending || mutationBusy.current || dropInFlight.current) return
++        if (event.button === 1) {
++            event.preventDefault(); event.currentTarget.focus({ preventScroll: true }); cancelTouchMenu()
++            pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
++            gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
++            event.currentTarget.setPointerCapture?.(event.pointerId); return
++        }
+         event.currentTarget.focus({ preventScroll: true })
+         cancelTouchMenu()
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+@@ -257,6 +264,7 @@
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+         const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
++        if (!node) setSelectedNode(null)
+         if (dotId) {
+             setMenu(null); setSelectedJunction(dotId)
+             const dot = junctionsRef.current.find(j => j.id === dotId)!
+@@ -267,6 +275,7 @@
+         else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, wire: nodeRouting(graph!.graph).edges.find(e => e.child === input), x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) {
++            setSelectedNode(node)
+             gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
+             if (event.pointerType === 'touch') {
+                 // Navigation is handled on pointerup. Suppress the compatibility click/focus
+@@ -280,7 +289,7 @@
+                 }, 550)
+             }
+         }
+-        else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
++        else gesture.current = event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
+         // Touch has implicit capture; touch-action:none prevents native scrolling.
+         if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
+     }
+@@ -390,11 +399,11 @@
+         }
+     }
+ 
+-    const selectNode = (id: string) => { setMenu(null); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
++    const selectNode = (id: string) => { setSelectedNode(id); setMenu(null); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
+     const openMenu = (id: string, at?: GraphPoint, mode: 'actions' | 'owner' = 'actions') => {
+         const rect = canvas.current?.getBoundingClientRect()
+         const node = canvas.current?.querySelector(`[data-node-id="${CSS.escape(id)}"]`)?.getBoundingClientRect()
+-        setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddMenu(null)
++        setSelectedNode(id); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddMenu(null)
+         setMenu({ id, mode, x: (at?.x ?? node?.left ?? rect?.left ?? 0) - (rect?.left ?? 0), y: (at?.y ?? node?.bottom ?? rect?.top ?? 0) - (rect?.top ?? 0) })
+         setError(null)
+     }
+@@ -546,10 +555,11 @@
+                     event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); showAddMenu(rect.left + rect.width / 2, rect.top + rect.height / 2); return
+                 }
+                 if (event.key === 'Escape' && (link || gesture.current?.kind === 'input')) { event.preventDefault(); event.stopPropagation(); gesture.current = null; pointers.current.clear(); setLink(null) } }}
++            onAuxClick={event => { if (event.button === 1) event.preventDefault() }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
+-            className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab outline-none active:cursor-grabbing">
++            className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-default outline-none">
+             <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
+                 <Popover.Portal><Popover.Content aria-label="Add node" side="bottom" align="start" sideOffset={0} collisionPadding={12}
+@@ -568,9 +578,9 @@
+                     <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addJunction(point) }}>Branch junction</button>
+                 </Popover.Content></Popover.Portal>
+             </Popover.Root>
+-            {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
+-                <div className="flex items-start gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
+-                <div className="pointer-events-auto flex shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++            {graph && <div data-graph-ui className="app-section-header app-window-chrome pointer-events-none absolute inset-x-0 top-0 z-30">
++                <div className="flex w-full min-w-0 items-center gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
++                <div className="pointer-events-auto flex shrink-0 items-center gap-0.5">
+                     <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
+                     <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={() => addJunction()} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
+                     <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
+@@ -619,11 +629,11 @@
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+-                        <button type="button" aria-label={`Node ${name}`} aria-haspopup="dialog" aria-expanded={menu?.id === id}
++                        <button type="button" aria-label={`Node ${name}`} aria-pressed={selectedNode === id} aria-haspopup="dialog" aria-expanded={menu?.id === id}
+                             onClick={event => { if (event.detail === 0) selectNode(id) }}
+                             onContextMenu={event => { event.preventDefault(); openMenu(id, { x: event.clientX, y: event.clientY }) }}
+                             onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); event.stopPropagation(); openMenu(id) } }}
+-                            className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : menu?.id === id ? 'border-[var(--app-link)]' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
++                            className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : selectedNode === id ? 'border-[#ed9b4b] ring-1 ring-[#ed9b4b]/40' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
+                             <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
+                             <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
+                                 {id === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 font-medium text-violet-500">Overseer</span>}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,3 +1,4 @@
++import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { editHistoryPrompt } from '@/lib/history-prompt'
+ import { saveDraft } from '@/lib/composer-drafts'
+ import { ManualPauseBanner } from '@/components/ManualPauseBanner'
+@@ -1695,12 +1696,8 @@
+ 
+     const handleToggleFiles = useCallback(() => {
+         setOutlineOpen(false)
+-        navigate({
+-            to: '/sessions/$sessionId/files',
+-            params: { sessionId: props.session.id },
+-            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+-        })
+-    }, [navigate, props.session.id])
++        openUtilityPanel({ kind: 'files', sessionId: props.session.id })
++    }, [props.session.id])
+ 
+     const handleToggleOutline = useCallback(() => {
+         setOutlineOpen((open) => !open)
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -44,7 +44,7 @@
+ }
+ 
+ function renderHeader(session: Session, extra?: { serviceTier?: string | null; titleSuggestionAvailable?: boolean }) {
+-    return render(
++    const view = render(
+         <QueryClientProvider client={new QueryClient()}>
+             <ToastProvider>
+                 <I18nProvider>
+@@ -59,6 +59,8 @@
+             </ToastProvider>
+         </QueryClientProvider>
+     )
++    fireEvent.click(screen.getByRole('button', { name: 'Session details' }))
++    return view
+ }
+ 
+ describe('resolveSessionHeaderMachineLabel', () => {
+@@ -425,3 +427,16 @@
+         expect(localStorage.getItem('hapi-node-chat-pin')).toBe('false')
+     })
+ })
++
++
++it('keeps metadata out of the compact header until session details is opened', () => {
++    render(<QueryClientProvider client={new QueryClient()}><ToastProvider><I18nProvider>
++        <SessionHeader session={baseSession({ modelReasoningEffort: 'high' })} api={null} />
++    </I18nProvider></ToastProvider></QueryClientProvider>)
++    expect(screen.queryByTestId('session-header-reasoning')).toBeNull()
++    const title = screen.getByRole('button', { name: 'Session details' })
++    fireEvent.click(title)
++    expect(screen.getByRole('dialog', { name: 'Session details' })).toBeInTheDocument()
++    expect(screen.getByTestId('session-header-reasoning')).toHaveTextContent('reasoning high')
++    expect(title.closest('[data-session-header]')).not.toContainElement(screen.getByTestId('session-header-reasoning'))
++})
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -1,3 +1,4 @@
++import * as Popover from '@radix-ui/react-popover'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import { ProviderHandoffDialog, HandoffDraftBanner } from '@/components/ProviderHandoff'
+ import { useEffect, useId, useMemo, useRef, useState } from 'react'
+@@ -365,19 +366,20 @@
+ 
+     return (
+         <>
+-            <div className="app-window-chrome bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+-                <div className="mx-auto w-full max-w-content flex items-center gap-[0.4rem] p-[0.6rem] min-[920px]:gap-2 min-[920px]:p-3">
++            <div data-session-header className="app-section-header app-window-chrome">
++                <div className="flex h-full min-w-0 w-full items-center gap-1.5">
+                     {props.onBack ? <button type="button" aria-label="Back to chats" title="Back to chats" onClick={props.onBack}
+-                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
++                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+                         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><path d="m12 5-7 7 7 7M5 12h14" /></svg>
+                     </button> : null}
+ 
+-                    {/* Session info - two lines: title and path */}
++                    <Popover.Root>
+                     <div className="min-w-0 flex-1">
+-                        <div className="truncate font-semibold">
++                        <Popover.Trigger asChild><button type="button" aria-label="Session details" title="Session details" className="max-w-full truncate text-left text-sm font-semibold hover:text-[var(--app-link)]">
+                             {title}
+                             {session.metadata?.temporary ? <span title="Deleted from HAPI when you choose Archive" className="ml-2 rounded bg-violet-500/15 px-1.5 py-0.5 text-xs font-normal text-violet-500">Temporary</span> : null}
+-                        </div>
++                        </button></Popover.Trigger>
++                        <Popover.Portal><Popover.Content side="bottom" align="start" collisionPadding={8} aria-label="Session details" className="z-[110] w-80 max-w-[calc(100vw-16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 shadow-xl">
+                         {showMobileMetadata ? (
+                             <div className="flex min-w-0 flex-nowrap items-center gap-2 overflow-hidden text-xs text-[var(--app-hint)] sm:hidden">
+                                 {headerMetadata.agent && agentLabel ? (
+@@ -435,7 +437,9 @@
+                                 <span>{headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}{worktreeBranch}</span>
+                             ) : null}
+                         </div>
++                        </Popover.Content></Popover.Portal>
+                     </div>
++                    </Popover.Root>
+ 
+                     <button type="button" aria-label="Pin current chat" aria-pressed={chatPinned}
+                         title={chatPinned ? 'Chat pinned: node clicks keep this chat' : 'Keep this chat open when clicking nodes'}
+diff --git a/web/src/components/SessionList.directory-action.test.tsx b/web/src/components/SessionList.directory-action.test.tsx
+--- a/web/src/components/SessionList.directory-action.test.tsx
++++ b/web/src/components/SessionList.directory-action.test.tsx
+@@ -77,8 +77,7 @@
+         fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
+         const searchInput = screen.getByPlaceholderText(SEARCH_PLACEHOLDER)
+         const headerRow = searchInput.parentElement?.parentElement
+-        expect(headerRow).toHaveClass('px-2')
+-        expect(headerRow).toHaveClass('py-1')
++        expect(headerRow).toHaveClass('app-section-header')
+     })
+ 
+ 
+@@ -111,7 +110,7 @@
+         vi.useRealTimers()
+     })
+ 
+-    it('keeps the date filter beside collapsed search and filters without expanding it', () => {
++    it('keeps the calendar inside search and filters the session list', () => {
+         const recent = makeSession({
+             id: 'recent',
+             updatedAt: Date.now(),
+@@ -139,13 +138,10 @@
+         expect(screen.getByRole('button', { name: /Recent session/ })).toBeInTheDocument()
+         expect(screen.getByRole('button', { name: /Old session/ })).toBeInTheDocument()
+ 
+-        const searchButton = screen.getByRole('button', { name: SEARCH_LABEL })
++        expect(screen.queryByRole('button', { name: 'Filter sessions by last activity' })).toBeNull()
++        fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
+         const filterButton = screen.getByRole('button', { name: 'Filter sessions by last activity' })
+-        const searchControl = searchButton.parentElement
+-        expect(searchControl?.nextElementSibling).toBe(filterButton)
+-        expect(searchControl?.parentElement).toBe(filterButton.parentElement)
+-        expect(searchControl?.parentElement).toHaveClass('relative', 'gap-1')
+-        expect(screen.queryByPlaceholderText(SEARCH_PLACEHOLDER)).toBeNull()
++        expect(screen.getByPlaceholderText(SEARCH_PLACEHOLDER)).toBeInTheDocument()
+ 
+         fireEvent.click(filterButton)
+         const emptyDate = screen.getByRole('button', { name: new Date(2026, 6, 17).toLocaleDateString() })
+@@ -158,10 +154,10 @@
+ 
+         expect(screen.getByRole('button', { name: /Recent session/ })).toBeInTheDocument()
+         expect(screen.queryByRole('button', { name: /Old session/ })).toBeNull()
+-        expect(screen.queryByPlaceholderText(SEARCH_PLACEHOLDER)).toBeNull()
++        expect(screen.getByPlaceholderText(SEARCH_PLACEHOLDER)).toBeInTheDocument()
+         expect(filterButton).toHaveAttribute('title', '2026-07-17 – 2026-07-18')
+         expect(filterButton).toHaveAccessibleName('Filter sessions by last activity: 2026-07-17 – 2026-07-18')
+-        expect(filterButton).toHaveFocus()
++        expect(screen.getByPlaceholderText(SEARCH_PLACEHOLDER)).toHaveFocus()
+     })
+ 
+     it('highlights today without requiring hover or session activity', () => {
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -718,6 +718,7 @@
+ }) {
+     const { t } = useTranslation()
+     const [datePickerOpen, setDatePickerOpen] = useState(false)
++    const searchWrapper = useRef<HTMLDivElement>(null)
+     const inputRef = useRef<HTMLInputElement>(null)
+     const collapsedButtonRef = useRef<HTMLButtonElement>(null)
+     const dateButtonRef = useRef<HTMLButtonElement>(null)
+@@ -730,6 +731,16 @@
+             setDatePickerOpen(false)
+         }
+     }, [props.expanded])
++
++    useEffect(() => {
++        if (!props.expanded) return
++        const outside = (event: globalThis.PointerEvent) => {
++            if (event.target instanceof Node && !searchWrapper.current?.contains(event.target)) props.onExpandedChange(false)
++        }
++        document.addEventListener('pointerdown', outside)
++        return () => document.removeEventListener('pointerdown', outside)
++    }, [props.expanded, props.onExpandedChange])
++    const closeSearch = () => { props.onExpandedChange(false); requestAnimationFrame(() => collapsedButtonRef.current?.focus()) }
+ 
+     const renderDateFilter = (variant: 'standalone' | 'embedded') => {
+         const returnFocus = () => {
+@@ -846,14 +857,15 @@
+                         </button>
+                     ) : null}
+                 </div>
+-                {renderDateFilter('standalone')}
+             </div>
+         )
+     }
+ 
+     return (
+         <div
++            ref={searchWrapper}
+             className="relative min-w-0 flex-1"
++            onKeyDown={event => { if (event.key === 'Escape' && !datePickerOpen) { event.preventDefault(); event.stopPropagation(); closeSearch() } }}
+             onBlur={(event) => {
+                 if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                     props.onExpandedChange(false)
+@@ -873,7 +885,7 @@
+                 title={searchLabel}
+                 className={cn(
+                     'w-full appearance-none rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] py-1.5 pl-8 text-sm text-[var(--app-fg)] outline-none transition-colors placeholder:text-[var(--app-hint)] [text-overflow:ellipsis] focus:border-[var(--app-link)] [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden',
+-                    props.value ? 'pr-16' : 'pr-7'
++                    props.value ? 'pr-24' : 'pr-16'
+                 )}
+             />
+             {props.value ? (
+@@ -885,7 +897,7 @@
+                         // so a later outside click still routes blur through the wrapper.
+                         inputRef.current?.focus()
+                     }}
+-                    className="absolute inset-y-0 right-9 flex items-center rounded p-0.5 text-[var(--app-hint)] hover:text-[var(--app-fg)]"
++                    className="absolute inset-y-0 right-16 flex items-center rounded p-0.5 text-[var(--app-hint)] hover:text-[var(--app-fg)]"
+                     title={t('sessions.search.clear')}
+                 >
+                     <XIcon className="h-3.5 w-3.5" />
+@@ -893,6 +905,7 @@
+             ) : null}
+             <div className="absolute inset-y-0 right-0 flex items-stretch">
+                 {renderDateFilter('embedded')}
++                <button type="button" aria-label="Close search" title="Close search" onClick={closeSearch} className="flex w-8 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]"><XIcon className="h-4 w-4" /></button>
+             </div>
+         </div>
+     )
+@@ -1853,7 +1866,7 @@
+         <div className="flex min-h-0 w-full flex-1 flex-col">
+             <div className="app-window-chrome session-list-scrollbar-offset mx-auto w-full max-w-content shrink-0">
+             {showHeaderRow ? (
+-                <div className="flex items-center gap-1 px-2 py-1">
++                <div className="app-section-header">
+                     {showSearch ? (
+                         <SessionListSearch
+                             value={searchQuery}
+diff --git a/web/src/components/SessionListSearch.dismiss.test.tsx b/web/src/components/SessionListSearch.dismiss.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/SessionListSearch.dismiss.test.tsx
+@@ -0,0 +1,28 @@
++import { useState } from 'react'
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it } from 'vitest'
++import { I18nProvider } from '@/lib/i18n-context'
++import { SessionListSearch } from './SessionList'
++afterEach(cleanup)
++function Harness() {
++    const [expanded, setExpanded] = useState(false), [value, setValue] = useState('')
++    return <I18nProvider><SessionListSearch value={value} onChange={setValue} customStart="" customEnd="" sessionActivityDates={new Set()}
++        onDateRangeChange={() => {}} expanded={expanded} onExpandedChange={setExpanded} /><div data-testid="blank">Blank space</div></I18nProvider>
++}
++it('supports explicit Close, Escape and non-focusable outside clicks without clearing the query', () => {
++    render(<Harness />)
++    expect(screen.queryByRole('button', { name: 'Filter sessions by last activity' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /^Search sessions/ }))
++    const input = screen.getByRole('searchbox')
++    fireEvent.change(input, { target: { value: 'needle' } })
++    fireEvent.keyDown(input, { key: 'Escape' })
++    expect(screen.queryByRole('searchbox')).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /^Search sessions/ }))
++    expect(screen.getByRole('searchbox')).toHaveValue('needle')
++    fireEvent.click(screen.getByRole('button', { name: 'Close search' }))
++    expect(screen.queryByRole('searchbox')).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /^Search sessions/ }))
++    fireEvent.pointerDown(screen.getByTestId('blank'))
++    expect(screen.queryByRole('searchbox')).toBeNull()
++    expect(screen.getByRole('button', { name: /^Search sessions/ })).toHaveAccessibleName(/needle/)
++})
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -148,8 +148,8 @@
+ }
+ 
+ /** Popup-window page body: edge to edge, no window chrome of its own. */
+-function EmbeddedFrame({ children }: { children: ReactNode; count?: number; title?: ReactNode }) {
+-    return <div className="flex h-full min-h-0 flex-col gap-2 overflow-auto p-3">{children}</div>
++function EmbeddedFrame({ children, title }: { children: ReactNode; count?: number; title?: ReactNode }) {
++    return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome truncate text-sm font-semibold">{title ?? 'Session Manager'}</header><div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3">{children}</div></div>
+ }
+ 
+ export function SessionManagerLauncher({ count }: { count: number }) {
+diff --git a/web/src/components/UtilityPanelHost.tsx b/web/src/components/UtilityPanelHost.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/UtilityPanelHost.tsx
+@@ -0,0 +1,47 @@
++import { useEffect, useState } from 'react'
++import { useLocation, useNavigate } from '@tanstack/react-router'
++import { useQueryClient } from '@tanstack/react-query'
++import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
++import { NewSession } from '@/components/NewSession'
++import FilesPage from '@/routes/sessions/files'
++import { useAppContext } from '@/lib/app-context'
++import { useMachines } from '@/hooks/queries/useMachines'
++import { queryKeys } from '@/lib/query-keys'
++import { UTILITY_PANEL_EVENT, type UtilityPanel } from '@/lib/utilityPanels'
++
++/** Compact utility cards above the existing chat. The chat stays mounted underneath. */
++export function UtilityPanelHost() {
++    const { api } = useAppContext()
++    const navigate = useNavigate()
++    const client = useQueryClient()
++    const pathname = useLocation({ select: location => location.pathname })
++    const [panel, setPanel] = useState<UtilityPanel | null>(null)
++    const { machines, isLoading, error } = useMachines(api, panel?.kind === 'new-session')
++    useEffect(() => {
++        const open = (event: Event) => {
++            const value = (event as CustomEvent<UtilityPanel>).detail
++            if (value?.kind === 'new-session' || (value?.kind === 'files' && typeof value.sessionId === 'string')) setPanel(value)
++        }
++        window.addEventListener(UTILITY_PANEL_EVENT, open)
++        return () => window.removeEventListener(UTILITY_PANEL_EVENT, open)
++    }, [])
++    // File opening/explicit navigation can leave the current conversation normally.
++    useEffect(() => { setPanel(null) }, [pathname])
++    if (!panel) return null
++    const close = () => setPanel(null)
++    const title = panel.kind === 'files' ? 'Files' : 'New session'
++    return <Dialog open onOpenChange={open => { if (!open) close() }}>
++        <DialogContent aria-describedby={undefined} className="utility-panel flex max-h-[min(80dvh,800px)] w-[calc(100vw-24px)] max-w-[44rem] flex-col overflow-hidden border border-[var(--app-border)] p-0" closeButtonClassName="right-1.5 top-1.5">
++            <div className="app-section-header app-window-chrome pr-12"><DialogTitle className="text-sm">{title}</DialogTitle></div>
++            <div className="app-scroll-y min-h-0 flex-1">
++                {panel.kind === 'files' ? <FilesPage sessionId={panel.sessionId} onClose={close} /> : <>
++                    {error && <p role="alert" className="p-3 text-sm text-[var(--app-badge-error-text)]">{error}</p>}
++                    <NewSession api={api} machines={machines} isLoading={isLoading} onCancel={close}
++                        initialDirectory={panel.directory} initialMachineId={panel.machineId ?? undefined}
++                        onChooseFolder={args => { close(); void navigate({ to: '/browse', search: args.machineId ? { machineId: args.machineId } : {} }) }}
++                        onSuccess={id => { close(); void client.invalidateQueries({ queryKey: queryKeys.sessions }); void navigate({ to: '/sessions/$sessionId', params: { sessionId: id } }) }} />
++                </>}
++            </div>
++        </DialogContent>
++    </Dialog>
++}
+diff --git a/web/src/index.css b/web/src/index.css
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -780,3 +780,50 @@
+ html[data-color-theme="desktop-midnight"][data-theme="light"] .app-window-chrome {
+     background: linear-gradient(110deg, #e0e7ff 0%, #eee7fc 55%, #f4f6fc 100%);
+ }
++
++
++/* Shared compact section chrome; the mobile density preference scales rem sizes. */
++:root { --app-section-header-height: 2.75rem; }
++.app-section-header {
++    box-sizing: border-box;
++    display: flex;
++    align-items: center;
++    gap: .375rem;
++    flex-shrink: 0;
++    height: var(--app-section-header-height);
++    min-height: var(--app-section-header-height);
++    padding: .375rem .5rem;
++    border-bottom: 1px solid var(--app-divider);
++    background-color: var(--app-bg);
++}
++.app-section-header > button,
++.app-section-header [aria-label^="Move "],
++.app-section-header [aria-label^="Collapse "],
++.app-section-header [aria-label^="Close "] { min-height: 0; max-height: 2rem; }
++.app-section-header button { flex-shrink: 0; min-height: 0; max-height: 2rem; }
++[data-session-header] .flex-1 { flex-shrink: 1; }
++.chat-selector-card {
++    margin: .5rem 0 .5rem .5rem;
++    border: 1px solid var(--app-border);
++    border-radius: .75rem;
++    box-shadow: 0 6px 22px #0002;
++}
++.chat-panel-arrow {
++    position: absolute;
++    z-index: 35;
++    top: .75rem;
++    align-items: center;
++    justify-content: center;
++    width: .875rem;
++    height: 2rem;
++    border: 1px solid var(--app-border);
++    background: var(--app-bg);
++    color: var(--app-hint);
++    font-size: 1rem;
++}
++.chat-panel-arrow:hover { color: var(--app-fg); background: var(--app-subtle-bg); }
++.chat-panel-arrow-open { right: -.875rem; border-radius: 0 .375rem .375rem 0; cursor: w-resize; }
++.chat-panel-arrow-closed { left: 0; border-radius: 0 .375rem .375rem 0; cursor: e-resize; }
++.utility-route-card { margin: .5rem auto; max-width: 44rem; height: calc(100% - 1rem); width: calc(100% - 1rem); overflow: hidden; border: 1px solid var(--app-border); border-radius: .75rem; box-shadow: 0 6px 22px #0002; }
++.utility-panel { box-shadow: 0 20px 65px #0005; }
++.utility-panel > .app-scroll-y > .h-full { height: auto; min-height: 20rem; }
+diff --git a/web/src/lib/utilityPanels.ts b/web/src/lib/utilityPanels.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/utilityPanels.ts
+@@ -0,0 +1,6 @@
++export type UtilityPanel = { kind: 'new-session'; directory?: string; machineId?: string | null } | { kind: 'files'; sessionId: string }
++export const UTILITY_PANEL_EVENT = 'hapi-open-utility-panel'
++/** UI-only: opening a utility never sends a chat message or starts an agent. */
++export function openUtilityPanel(panel: UtilityPanel) {
++    window.dispatchEvent(new CustomEvent<UtilityPanel>(UTILITY_PANEL_EVENT, { detail: panel }))
++}
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -1,3 +1,4 @@
++import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { useQueryClient } from '@tanstack/react-query'
+ import {
+@@ -215,14 +216,8 @@
+     const mobileSidebar = useMobileSidebar(!isSessionsIndex, pathname)
+     useEffect(() => { if (isSessionsIndex) sidebar.setCollapsed(false) }, [isSessionsIndex, sidebar.setCollapsed])
+     const handleNewSessionInDirectory = useCallback((args: { machineId: string | null; directory: string }) => {
+-        navigate({
+-            to: '/sessions/new',
+-            search: args.machineId
+-                ? { directory: args.directory, machineId: args.machineId }
+-                : { directory: args.directory },
+-            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+-        })
+-    }, [navigate])
++        openUtilityPanel({ kind: 'new-session', ...args })
++    }, [])
+ 
+     return (
+         <>
+@@ -230,12 +225,12 @@
+             {mobileSidebar.open && !isSessionsIndex ? <button type="button" aria-label="Close chat panel" onClick={mobileSidebar.close}
+                 className="absolute inset-0 z-30 bg-black/30 split:hidden" /> : null}
+             <div
+-                className={`${isSessionsIndex ? 'flex w-full' : mobileSidebar.open ? 'absolute inset-y-0 left-0 z-40 flex w-[min(85vw,420px)] shadow-xl split:static split:z-auto split:shadow-none' : 'hidden split:flex w-full'} ${sidebar.collapsed ? 'split:hidden!' : ''} shrink-0 flex-col bg-[var(--app-bg)]`}
++                className={`${isSessionsIndex ? 'flex w-full' : mobileSidebar.open ? 'absolute inset-y-0 left-0 z-40 flex w-[min(85vw,420px)] shadow-xl split:static split:z-auto split:shadow-none' : 'hidden split:flex w-full'} ${sidebar.collapsed ? 'split:hidden!' : ''} chat-selector-card relative shrink-0 flex-col bg-[var(--app-bg)]`}
+                 data-chat-panel
+                 aria-label="Chats panel"
+                 style={{ '--sidebar-w': `${sidebar.width}px` } as React.CSSProperties}
+             >
+-                <div className="flex min-h-0 flex-1 flex-col pt-[env(safe-area-inset-top)]">
++                <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[inherit]">
+                     {error ? (
+                         <div className="mx-auto w-full max-w-content px-3 py-2">
+                             <div className="text-sm text-red-600">{error}</div>
+@@ -246,10 +241,7 @@
+                         sessions={sessions}
+                         selectedSessionId={selectedSessionId}
+                         onSelect={(sessionId) => { mobileSidebar.close(); navigate(getSessionListSelectionNavigation(sessionId)) }}
+-                        onNewSession={() => navigate({
+-                            to: '/sessions/new',
+-                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+-                        })}
++                        onNewSession={() => openUtilityPanel({ kind: 'new-session' })}
+                         onNewSessionInDirectory={handleNewSessionInDirectory}
+                         onBrowse={canBrowse ? () => navigate({ to: '/browse' }) : undefined}
+                         onRefresh={handleRefresh}
+@@ -257,15 +249,6 @@
+                         renderHeader={false}
+                         headerActions={(
+                             <div className="flex items-center gap-2">
+-                                <button
+-                                    type="button"
+-                                    onClick={() => { if (mobileSidebar.open) mobileSidebar.close(); else sidebar.setCollapsed(true) }}
+-                                    className={`${mobileSidebar.open ? "block" : "hidden split:block"} p-1.5 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors`}
+-                                    title="Collapse chat panel"
+-                                    aria-label="Collapse chat panel"
+-                                >
+-                                    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M16 10l-2 2 2 2" /></svg>
+-                                </button>
+                                 {canBrowse && (
+                                     <button
+                                         type="button"
+@@ -286,10 +269,7 @@
+                                 </button>
+                                 <button
+                                     type="button"
+-                                    onClick={() => navigate({
+-                                        to: '/sessions/new',
+-                                        ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+-                                    })}
++                                    onClick={() => openUtilityPanel({ kind: 'new-session' })}
+                                     className="session-list-new-button flex h-9 w-9 items-center justify-center rounded-full text-[var(--app-link)] transition-colors"
+                                     title={t('sessions.new')}
+                                 >
+@@ -303,32 +283,12 @@
+                         machinesById={machinesById}
+                     />
+                 </div>
++                <button type="button" aria-label="Collapse chat panel" title="Collapse chat selector" onClick={() => { if (mobileSidebar.open) mobileSidebar.close(); else sidebar.setCollapsed(true) }}
++                    className="chat-panel-arrow chat-panel-arrow-open hidden split:flex">‹</button>
+             </div>
+ 
+-            {/* Resize handle - desktop only */}
+-            {sidebar.collapsed && (
+-                // Collapsed (desktop): a slim rail keeps the way back to the chat list.
+-                <div className="hidden split:flex w-11 shrink-0 flex-col items-center gap-1 border-r border-[var(--app-divider)] bg-[var(--app-bg)] pt-[calc(0.5rem+env(safe-area-inset-top))]">
+-                    <button
+-                        type="button"
+-                        onClick={() => sidebar.setCollapsed(false)}
+-                        className="p-2 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors"
+-                        title="Show sidebar"
+-                        aria-label="Show sidebar"
+-                    >
+-                        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M14 10l2 2-2 2" /></svg>
+-                    </button>
+-                    <button
+-                        type="button"
+-                        onClick={() => navigate({ to: '/sessions/new', ...PRESERVE_SESSION_SIDEBAR_SCROLL })}
+-                        className="p-2 rounded-full text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] transition-colors"
+-                        title={t('sessions.new')}
+-                        aria-label={t('sessions.new')}
+-                    >
+-                        <PlusIcon className="h-5 w-5" />
+-                    </button>
+-                </div>
+-            )}
++            {sidebar.collapsed && <button type="button" aria-label="Show sidebar" title="Show chat selector" onClick={() => sidebar.setCollapsed(false)}
++                className="chat-panel-arrow chat-panel-arrow-closed hidden split:flex">›</button>}
+             <div
+                 className={`sidebar-resize-handle hidden ${sidebar.collapsed ? '' : 'split:block'} shrink-0`}
+                 data-dragging={sidebar.isDragging || undefined}
+@@ -999,8 +959,8 @@
+     }, [navigate, shareTransferId])
+ 
+     return (
+-        <div className="flex h-full min-h-0 flex-col">
+-            <div className="flex items-center gap-2 border-b border-[var(--app-border)] bg-[var(--app-bg)] p-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
++        <div className="utility-route-card flex h-full min-h-0 flex-col">
++            <div className="app-section-header app-window-chrome">
+                 {!isTelegramApp() && (
+                     <button
+                         type="button"
+diff --git a/web/src/routes/sessions/files.tsx b/web/src/routes/sessions/files.tsx
+--- a/web/src/routes/sessions/files.tsx
++++ b/web/src/routes/sessions/files.tsx
+@@ -345,21 +345,24 @@
+ 
+ const SCROLL_KEY_PREFIX = 'hapi-dir-scroll-'
+ 
+-export default function FilesPage() {
++export default function FilesPage(props: { sessionId?: string; onClose?: () => void } = {}) {
+     const { api, titleSuggestionAvailable = false } = useAppContext()
+     const { t, locale } = useTranslation()
+     const navigate = useNavigate()
+     const queryClient = useQueryClient()
+-    const goBack = useAppGoBack()
+-    const { sessionId } = useParams({ from: '/sessions/$sessionId/files' })
+-    const search = useSearch({ from: '/sessions/$sessionId/files' })
++    const routeBack = useAppGoBack()
++    const goBack = props.onClose ?? routeBack
++    const params = useParams({ strict: false })
++    const sessionId = props.sessionId ?? params.sessionId ?? ''
++    const search = useSearch({ strict: false }) as { tab?: FilesTab; query?: string }
+     const { session } = useSession(api, sessionId)
+     const scrollRef = useRef<HTMLDivElement>(null)
+ 
+     const [activeTab, setActiveTab] = useState<FilesTab>(() => search.tab ?? readFilesTab())
+     const [directorySort, setDirectorySort] = useState<DirectorySort>(readDirectorySort)
+     const [fileMenu, setFileMenu] = useState<{ path: string; point: AnchoredMenuPoint } | null>(null)
+-    const searchQuery = search.query ?? ''
++    const [localQuery, setLocalQuery] = useState('')
++    const searchQuery = props.onClose ? localQuery : search.query ?? ''
+ 
+     const openFileMenu = useCallback((path: string, point: AnchoredMenuPoint) => {
+         setFileMenu({ path, point })
+@@ -368,6 +371,7 @@
+     const closeFileMenu = useCallback(() => setFileMenu(null), [])
+ 
+     const setSearchQuery = useCallback((query: string) => {
++        if (props.onClose) { setLocalQuery(query); return }
+         navigate({
+             to: '/sessions/$sessionId/files',
+             params: { sessionId },
+@@ -378,7 +382,7 @@
+             replace: true,
+             ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+         })
+-    }, [activeTab, navigate, sessionId])
++    }, [activeTab, navigate, sessionId, props.onClose])
+ 
+     useEffect(() => {
+         try {
+@@ -493,6 +497,7 @@
+     const handleTabChange = useCallback((nextTab: FilesTab) => {
+         setActiveTab(nextTab)
+         persistFilesTab(nextTab)
++        if (props.onClose) return
+         navigate({
+             to: '/sessions/$sessionId/files',
+             params: { sessionId },
+@@ -506,6 +511,7 @@
+     }, [navigate, searchQuery, sessionId])
+ 
+     const handleToggleFiles = useCallback(() => {
++        if (props.onClose) { props.onClose(); return }
+         navigate({
+             to: '/sessions/$sessionId',
+             params: { sessionId },
+@@ -532,7 +538,7 @@
+ 
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+-            <SessionHeader
++            {!props.onClose && <SessionHeader
+                 session={session}
+                 onBack={goBack}
+                 onToggleFiles={session.metadata?.path ? handleToggleFiles : undefined}
+@@ -554,7 +560,7 @@
+                         }),
+                     )
+                 }}
+-            />
++            />}
+ 
+             <div className="bg-[var(--app-bg)]">
+                 <div className="mx-auto flex w-full max-w-content items-center gap-2 border-b border-[var(--app-border)] p-3">
+diff --git a/web/src/routes/settings/layout.tsx b/web/src/routes/settings/layout.tsx
+--- a/web/src/routes/settings/layout.tsx
++++ b/web/src/routes/settings/layout.tsx
+@@ -27,8 +27,8 @@
+ 
+     return (
+         <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
+-            <header className="shrink-0 border-b border-[var(--app-border)] bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+-                <div className="mx-auto flex w-full max-w-content items-center gap-2 p-3">
++            <header className="app-section-header app-window-chrome">
++                <div className="flex w-full min-w-0 items-center gap-2">
+                     <button type="button" onClick={goBack} aria-label={t('common.back')} className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] lg:hidden">
+                         <BackIcon />
+                     </button>

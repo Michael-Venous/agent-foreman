@@ -1,0 +1,362 @@
+--- a/hub/src/store/sessionManager.ts
++++ b/hub/src/store/sessionManager.ts
+@@ -44,10 +44,15 @@
+             session: JSON.parse(row.summary), activityAt: row.activity_at, dismissedAt: row.dismissed_at
+         }]))
+     }
+-    dismiss(namespace: string, ids: readonly string[]): void {
+-        this.db.transaction(() => {
+-            for (const id of ids) this.db.query(`UPDATE session_manager_entries SET dismissed_at = MAX(?, activity_at)
+-                WHERE session_id = ? AND namespace = ?`).run(Date.now(), id, namespace)
++    dismiss(namespace: string, ids: readonly string[]): string[] {
++        return this.db.transaction(() => {
++            const skipped: string[] = []
++            for (const id of ids) {
++                const result = this.db.query(`UPDATE session_manager_entries SET dismissed_at = MAX(?, activity_at)
++                    WHERE session_id = ? AND namespace = ? AND busy = 0`).run(Date.now(), id, namespace)
++                if (!result.changes) skipped.push(id)
++            }
++            return skipped
+         })()
+     }
+ }
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -315,8 +315,12 @@
+         return true
+     }
+ 
+-    dismissSessionManagerEntries(namespace: string, ids: readonly string[]): void {
+-        this.store.sessionManager.dismiss(namespace, ids)
++    dismissSessionManagerEntries(namespace: string, ids: readonly string[]): string[] {
++        // Recheck authoritative runtime state at the mutation boundary, including
++        // disconnected/deleted entries whose saved summary may still look busy.
++        const records = this.getSessionManager(namespace)
++        for (const id of ids) if (records[id]) this.store.sessionManager.observe(records[id].session, namespace, 0, false, 0, false)
++        return this.store.sessionManager.dismiss(namespace, ids)
+     }
+ 
+     getSessions(): Session[] {
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -88,8 +88,8 @@
+         const body = await c.req.json().catch(() => null)
+         if (!Array.isArray(body?.ids) || body.ids.length > 1000 || !body.ids.every((id: unknown) => typeof id === 'string')) return c.json({ error: 'Expected session ids' }, 400)
+         const namespace = c.get('namespace')
+-        engine.dismissSessionManagerEntries(namespace, body.ids)
+-        return c.json({ entries: engine.getSessionManager(namespace) })
++        const skippedIds = engine.dismissSessionManagerEntries(namespace, body.ids)
++        return c.json({ entries: engine.getSessionManager(namespace), skippedIds })
+     })
+     app.post('/session-manager/:id/add', (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+--- a/hub/src/sync/sessionManager.test.ts
++++ b/hub/src/sync/sessionManager.test.ts
+@@ -71,12 +71,12 @@
+     it('clear is list-only; ordinary updates cannot undo it', async () => {
+         const f = fixture()
+         try {
+-            const s = f.create('Codex'); f.alive(s.id, true)
++            const s = f.create('Codex'); f.alive(s.id, true); f.alive(s.id, false)
+             const before = JSON.stringify(f.engine.getSession(s.id))
+             const response = await f.app().request('/session-manager/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [s.id] }) })
+             expect(response.status).toBe(200)
+             expect(JSON.stringify(f.engine.getSession(s.id))).toBe(before)
+-            f.alive(s.id, true); f.alive(s.id, false)
++            f.alive(s.id, false)
+             const result = await (await f.app().request('/session-manager')).json() as { entries: import('@hapi/protocol/sessionManager').SessionManagerRecords }
+             const entry = result.entries[s.id]
+             expect(entry.dismissedAt).toBeGreaterThanOrEqual(entry.activityAt)
+@@ -181,3 +181,20 @@
+         expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
+     } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
+ })
++
++
++it('rejects stale Clear after inference or background work starts, without hiding it', async () => {
++    const f = fixture()
++    try {
++        const s = f.create('Busy'); f.alive(s.id, true); f.alive(s.id, false)
++        f.alive(s.id, true)
++        const response = await f.app().request('/session-manager/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [s.id] }) })
++        expect((await response.json() as { skippedIds: string[] }).skippedIds).toEqual([s.id])
++        expect(f.engine.getSessionManager('default')[s.id].dismissedAt).toBeNull()
++        f.alive(s.id, false)
++        const record = f.engine.getSessionManager('default')[s.id]
++        f.store.sessionManager.observe({ ...record.session, backgroundTaskCount: 1 }, 'default')
++        expect(f.store.sessionManager.dismiss('default', [s.id])).toEqual([s.id])
++        expect(f.store.sessionManager.list('default')[s.id].dismissedAt).toBeNull()
++    } finally { f.close() }
++})
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -64,7 +64,7 @@
+             dismissed: record.dismissedAt !== null && record.dismissedAt >= record.activityAt,
+             dismissedAt: record.dismissedAt ?? undefined,
+             missing: record.missing ?? false,
+-            stopped: !sessionHasWork(session) || Boolean(old?.stopped && !newWork),
++            stopped: !sessionHasWork(session) || Boolean(old?.stopped && sessionHasWork(old.session) && !newWork),
+             observedWork: record.activityAt > 0
+         }]
+     }))
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+ import type { SessionSummary } from '@/types/api'
+-import { dismissSessions, markSessionStopped, observeSessions } from './sessionManager'
++import { dismissSessions, markSessionStopped, observeSessions, reconcileSessionManager } from './sessionManager'
+ const session = (overrides: Partial<SessionSummary> = {}) => ({ id: 's', active: true, thinking: true, updatedAt: 1, backgroundTaskCount: 0, pendingRequestsCount: 0, ...overrides } as SessionSummary)
+ const dismiss = (state: ReturnType<typeof observeSessions>, ids: string[]) => dismissSessions(ids.reduce((result, id) => markSessionStopped(result, id), state), ids)
+ describe('Session Manager retention', () => {
+@@ -141,3 +141,14 @@
+     expect(observeSessions(hidden, [idle], new Set(), { s: at - 5 }).s?.dismissed).toBe(true)
+     expect(observeSessions(hidden, [idle], new Set(), { s: at + 100 }).s?.dismissed).toBe(false)
+ })
++
++
++it('restored busy state requires Stop immediately even before membership activityAt changes', () => {
++    const idle = session({ thinking: false })
++    const records = { s: { session: idle, activityAt: 100, dismissedAt: null } }
++    const before = reconcileSessionManager({}, records, [idle])
++    const busy = reconcileSessionManager(before, records, [{ ...idle, backgroundTaskCount: 1 }])
++    expect(before.s.stopped).toBe(true)
++    expect(busy.s.stopped).toBe(false)
++    expect(dismissSessions(busy, ['s']).s.dismissed).toBe(false)
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -853,9 +853,11 @@
+     }
+ 
+     async dismissSessionManager(ids: readonly string[]): Promise<SessionManagerRecords> {
+-        return (await this.request<{ entries: SessionManagerRecords }>('/api/session-manager/dismiss', {
++        const result = await this.request<{ entries: SessionManagerRecords; skippedIds: string[] }>('/api/session-manager/dismiss', {
+             method: 'POST', body: JSON.stringify({ ids })
+-        })).entries
++        })
++        if (result.skippedIds.length) throw new Error('Some chats are still busy or unavailable and were not cleared. Stop active work before clearing.')
++        return result.entries
+     }
+ 
+     async unmanageSession(sessionId: string): Promise<void> {
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -13,6 +13,7 @@
+     const [clearError, setClearError] = useState<string | null>(null)
+     const [adding, setAdding] = useState<string | null>(null)
+     const addInFlight = useRef(false)
++    const clearInFlight = useRef(false)
+     const [clearing, setClearing] = useState(false)
+     const remoteEnabled = typeof api?.getSessionManager === 'function'
+     const remote = useQuery<SessionManagerRecords>({
+@@ -35,7 +36,7 @@
+         entries, clearing, adding, error: clearError ?? (remote.error instanceof Error ? remote.error.message : null),
+         markStopped: (id: string) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => markSessionStopped(old ?? {}, id)),
+         add: async (id: string): Promise<boolean> => {
+-            if (addInFlight.current || clearing || !api?.addSessionManager) return false
++            if (addInFlight.current || clearInFlight.current || !api?.addSessionManager) return false
+             addInFlight.current = true; setAdding(id); setClearError(null)
+             try {
+                 await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
+@@ -49,19 +50,24 @@
+             } finally { addInFlight.current = false; setAdding(null) }
+         },
+         dismiss: async (ids: readonly string[]) => {
+-            if (clearing || addInFlight.current) return
++            if (clearInFlight.current || addInFlight.current) return
+             const clearable = ids.filter(id => client.getQueryData<SessionManagerState>(SESSION_MANAGER_KEY)?.[id]?.stopped)
+             if (!remoteEnabled) {
+                 client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => dismissSessions(old ?? {}, clearable))
+                 return
+             }
++            clearInFlight.current = true
+             setClearing(true); setClearError(null)
+             try {
+                 await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
+                 const records = await api!.dismissSessionManager(clearable)
++                await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
+                 client.setQueryData(SESSION_MANAGER_REMOTE_KEY, records)
+-            } catch (error) { setClearError(error instanceof Error ? error.message : 'Clear failed') }
+-            finally { setClearing(false) }
++            } catch (error) {
++                setClearError(error instanceof Error ? error.message : 'Clear failed')
++                await client.invalidateQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
++            }
++            finally { clearInFlight.current = false; setClearing(false) }
+         },
+     }
+ }
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -57,7 +57,7 @@
+     const clearable = displayedRows.filter(e => e.stopped && !(isManaged(e.session.id)
+         && (!e.observedWork || currentManaged[e.session.id]?.projectStatus === 'paused' || currentManaged[e.session.id]?.manualHold)))
+     const addCandidates = (props.sessions ?? []).filter(session => !entries[session.id] || entries[session.id].dismissed)
+-        .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? ''}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
++        .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? 'claude'}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
+         .sort((a, b) => b.updatedAt - a.updatedAt)
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+@@ -119,7 +119,7 @@
+                                 } catch (error) { setErrors(old => ({ ...old, [session.id]: error instanceof Error ? error.message : 'Unmanage failed' })) }
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+                             }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Unmanage</button>}
+-                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing} onClick={() => dismiss([session.id])} className="h-10 w-10 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing || adding !== null} onClick={() => dismiss([session.id])} className="h-10 w-10 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                         : <button type="button" aria-label={`Stop ${getSessionTitle(session)}`} disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+--- a/web/src/components/AssistantChat/NativeReadyMessages.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.tsx
+@@ -1,23 +1,37 @@
+-import { useState } from 'react'
++import { useEffect, useRef, useState } from 'react'
++import { beginQueuedOperation, endQueuedOperation, saveQueuedEditRecovery } from '@/lib/queued-edit-recovery'
+ import { useAui } from '@assistant-ui/react'
+ import type { ApiClient } from '@/api/client'
+ import type { AgentState } from '@/types/api'
+ export function NativeReadyMessages(props: { api?: ApiClient; sessionId?: string; messages: NonNullable<AgentState['claudeReadyMessages']>; busy: boolean; onInterrupt: (localId: string) => void }) {
+     const aui = useAui()
++    const mounted = useRef(true)
++    const currentSession = useRef(props.sessionId)
++    currentSession.current = props.sessionId
++    useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+     const [pending, setPending] = useState(false)
+     const [error, setError] = useState<string | null>(null)
+     const cancel = async (localId: string, edit: boolean) => {
+         if (!props.api || !props.sessionId || pending) return
++        const sessionId = props.sessionId
++        const token = beginQueuedOperation(sessionId)
++        if (!token) return
++        const stillHere = () => mounted.current && currentSession.current === sessionId
+         setPending(true); setError(null)
+         try {
+-            const result = await props.api.cancelNativeReadyMessage(props.sessionId, localId)
+-            if (!result.cancelled) { setError(result.error ?? 'Message was not cancelled'); return }
++            const result = await props.api.cancelNativeReadyMessage(sessionId, localId)
++            if (!result.cancelled) { if (stillHere()) setError(result.error ?? 'Message was not cancelled'); return }
+             if (edit && result.text) {
++                if (!stillHere()) {
++                    saveQueuedEditRecovery(sessionId, { text: result.text, appendText: true,
++                        composerTextAtEdit: '', pendingSchedule: null, pendingScheduleAtEdit: null })
++                    return
++                }
+                 const current = aui.composer().getState().text
+                 aui.composer().setText(current ? current + '\n' + result.text : result.text)
+             }
+-        } catch { setError('Cancellation unconfirmed; no replacement sent') }
+-        finally { setPending(false) }
++        } catch { if (stillHere()) setError('Cancellation unconfirmed; no replacement sent') }
++        finally { endQueuedOperation(sessionId, token); if (stillHere()) setPending(false) }
+     }
+     if (!props.messages.length && !error) return null
+     return <div aria-label="Messages waiting for Claude" className="mx-auto w-full max-h-40 max-w-content space-y-1 overflow-y-auto px-3 pt-2">
+--- a/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
+@@ -1,6 +1,7 @@
+ const composer = vi.hoisted(() => ({ getState: () => ({ text: '' }), setText: vi.fn() }))
+ vi.mock('@assistant-ui/react', () => ({ useAui: () => ({ composer: () => composer }) }))
+-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { getQueuedEditRecovery, clearQueuedEditRecovery } from '@/lib/queued-edit-recovery'
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ import { NativeReadyMessages } from './NativeReadyMessages'
+ afterEach(cleanup)
+@@ -37,3 +38,18 @@
+     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+     expect(screen.getByText(/updated controller/)).toBeInTheDocument()
+ })
++
++
++it('keeps cancelled edit text for its original session when navigation wins the race', async () => {
++    composer.setText.mockClear()
++    let resolve!: (value: { cancelled: boolean; text: string }) => void
++    const api = { cancelNativeReadyMessage: vi.fn(() => new Promise(r => { resolve = r })) }
++    const view = render(<NativeReadyMessages api={api as any} sessionId="original" messages={[{ localId: 'local', text: 'recover me', state: 'waiting', canCancel: true }]} busy={false} onInterrupt={() => {}} />)
++    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
++    view.unmount()
++    await act(async () => { resolve({ cancelled: true, text: 'recover me' }) })
++    expect(composer.setText).not.toHaveBeenCalled()
++    expect(getQueuedEditRecovery('original')).toMatchObject({ text: 'recover me', appendText: true })
++    expect(getQueuedEditRecovery('another')).toBeNull()
++    clearQueuedEditRecovery('original')
++})
+--- a/web/src/lib/queued-edit-recovery.ts
++++ b/web/src/lib/queued-edit-recovery.ts
+@@ -4,6 +4,7 @@
+ 
+ export type QueuedEditRecovery = {
+     id: string
++    appendText?: boolean
+     text: string
+     pendingSchedule: PendingSchedule | null
+     composerTextAtEdit: string
+@@ -87,6 +88,7 @@
+             }
+             result[sessionId] = {
+                 id: record.id,
++                appendText: record.appendText === true,
+                 text: record.text,
+                 pendingSchedule,
+                 composerTextAtEdit: record.composerTextAtEdit,
+@@ -135,6 +137,7 @@
+     return {
+         id: recovery.id,
+         text: recovery.text,
++        ...(recovery.appendText ? { appendText: true } : {}),
+         pendingSchedule: clonePendingSchedule(recovery.pendingSchedule),
+         composerTextAtEdit: recovery.composerTextAtEdit,
+         pendingScheduleAtEdit: clonePendingSchedule(recovery.pendingScheduleAtEdit),
+@@ -147,6 +150,7 @@
+     recoveries[sessionId] = {
+         id: `${Date.now()}:${++recoverySequence}`,
+         text: recovery.text,
++        ...(recovery.appendText ? { appendText: true } : {}),
+         pendingSchedule: clonePendingSchedule(recovery.pendingSchedule),
+         composerTextAtEdit: recovery.composerTextAtEdit,
+         pendingScheduleAtEdit: clonePendingSchedule(recovery.pendingScheduleAtEdit),
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.tsx
+@@ -262,6 +262,14 @@
+         attemptedRecoveryIdsRef.current.add(recovery.id)
+ 
+         const currentText = assistantApi.composer().getState().text
++        if (recovery.appendText) {
++            // Native queue edits restore only text; preserve newer text/scheduling.
++            const text = currentText ? currentText + '\n' + recovery.text : recovery.text
++            assistantApi.composer().setText(text)
++            onEditRef.current?.({ text, pendingSchedule: pendingScheduleRef.current })
++            clearQueuedEditRecovery(sessionId)
++            return
++        }
+         // A new session starts at revision 0. Any schedule interaction, even
+         // select-then-clear back to null, increments it and wins over recovery.
+         const textCompatible = currentText === recovery.composerTextAtEdit
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+@@ -13,7 +13,7 @@
+     sortQueuedMessages,
+ } from './QueuedMessagesBar'
+ import { formatScheduledTime } from '@/lib/scheduledTime'
+-import { clearQueuedEditRecovery, getQueuedEditRecovery } from '@/lib/queued-edit-recovery'
++import { clearQueuedEditRecovery, getQueuedEditRecovery, saveQueuedEditRecovery } from '@/lib/queued-edit-recovery'
+ 
+ type DeferredCancelResult = { status: 'cancelled' | 'invoked' | 'busy'; localId?: string }
+ 
+@@ -883,3 +883,15 @@
+         expect(mocks.addToast).not.toHaveBeenCalled()
+     })
+ })
++
++
++it('restores native cancelled text after remount without replacing a newer draft or schedule', async () => {
++    mocks.composerText = 'Newer draft'
++    saveQueuedEditRecovery('session-1', { text: 'Recovered native prompt', appendText: true,
++        composerTextAtEdit: '', pendingSchedule: null, pendingScheduleAtEdit: null })
++    const schedule = { type: 'preset', preset: '+30m' } as const
++    const { onEdit } = renderQueuedMessage(null, schedule, 3)
++    await waitFor(() => expect(mocks.composerSetText).toHaveBeenCalledWith('Newer draft\nRecovered native prompt'))
++    expect(onEdit).toHaveBeenCalledWith({ text: 'Newer draft\nRecovered native prompt', pendingSchedule: schedule })
++    expect(getQueuedEditRecovery('session-1')).toBeNull()
++})

@@ -1,0 +1,356 @@
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -1,3 +1,4 @@
++import { useChatChromeOffset } from '@/hooks/useChatChromeOffset'
+ import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { useQueryClient } from '@tanstack/react-query'
+@@ -212,6 +213,8 @@
+     }, [baseUrl, error, isLoading, sessions])
+     useSelectedSessionSeen(selectedSessionId, selectedSession?.updatedAt)
+     const isSessionsIndex = pathname === '/sessions' || pathname === '/sessions/'
++    const shellRef = useRef<HTMLDivElement>(null)
++    useChatChromeOffset(shellRef, pathname)
+     const sidebar = useSidebarResize()
+     const mobileSidebar = useMobileSidebar(!isSessionsIndex, pathname)
+     useEffect(() => { if (isSessionsIndex) sidebar.setCollapsed(false) }, [isSessionsIndex, sidebar.setCollapsed])
+@@ -221,7 +224,7 @@
+ 
+     return (
+         <>
+-            <div className="relative flex h-full min-h-0 touch-pan-y split:touch-auto" {...mobileSidebar.handlers}>
++            <div ref={shellRef} className="sessions-shell relative flex h-full min-h-0 touch-pan-y split:touch-auto" {...mobileSidebar.handlers}>
+             {mobileSidebar.open && !isSessionsIndex ? <button type="button" aria-label="Close chat panel" onClick={mobileSidebar.close}
+                 className="absolute inset-0 z-30 bg-black/30 split:hidden" /> : null}
+             <div
+@@ -247,6 +250,7 @@
+                         onRefresh={handleRefresh}
+                         isLoading={isLoading}
+                         renderHeader={false}
++                        showSessionTools={isSessionsIndex || !selectedSessionId}
+                         headerActions={(
+                             <div className="flex items-center gap-2">
+                                 {canBrowse && (
+diff --git a/web/src/index.css b/web/src/index.css
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -428,7 +428,7 @@
+ .sidebar-resize-handle {
+     width: 4px;
+     cursor: col-resize;
+-    background: var(--app-divider);
++    background: transparent;
+     transition: background-color 0.15s;
+ }
+ 
+@@ -811,7 +811,8 @@
+ .chat-panel-arrow {
+     position: absolute;
+     z-index: 35;
+-    top: .75rem;
++    top: 75%;
++    transform: translateY(-50%);
+     align-items: center;
+     justify-content: center;
+     width: .875rem;
+@@ -831,3 +832,19 @@
+ @media (min-width: 920px) {
+     .chat-detail-card { margin: .5rem; border: 1px solid var(--app-border); border-radius: .75rem; overflow: hidden; box-shadow: 0 6px 22px #0002; }
+ }
++
++/* Centered chat tools and a docked selector card below the chat chrome. */
++.chat-header-row {
++    display: grid;
++    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
++    align-items: center;
++    gap: .125rem;
++    width: 100%;
++    min-width: 0;
++    height: 100%;
++}
++@media (min-width: 920px) {
++    .sessions-shell [data-chat-panel] {
++        margin-top: calc(.5rem + var(--chat-chrome-height, 0px));
++    }
++}
+diff --git a/web/src/components/SideChatButton.tsx b/web/src/components/SideChatButton.tsx
+--- a/web/src/components/SideChatButton.tsx
++++ b/web/src/components/SideChatButton.tsx
+@@ -43,7 +43,10 @@
+     }
+     return <>
+         <button type="button" disabled={!api} onClick={() => { setError(null); setOpen(true) }} title="Ask a side question" aria-label="Open side chat"
+-            className="shrink-0 rounded-full px-2 py-1.5 text-sm font-medium text-[var(--app-link)] hover:bg-[var(--app-secondary-bg)]">Side chat</button>
++            className="flex h-8 w-8 shrink-0 flex-col items-center justify-center gap-0 rounded-lg text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]">
++            <span className="text-[9px] font-medium leading-[10px]">Side</span>
++            <svg aria-hidden="true" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z" /></svg>
++        </button>
+         <Dialog open={open} onOpenChange={setOpen}>
+             <DialogContent className="flex max-h-[85dvh] flex-col gap-3">
+                 <DialogHeader>
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -1,3 +1,5 @@
++import { NodesButton } from '@/components/NodeGraphWindow'
++import { SessionManagerLauncher } from '@/components/SessionManagerButton'
+ import * as Popover from '@radix-ui/react-popover'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import { ProviderHandoffDialog, HandoffDraftBanner } from '@/components/ProviderHandoff'
+@@ -367,7 +369,8 @@
+     return (
+         <>
+             <div data-session-header className="app-section-header app-window-chrome">
+-                <div className="flex h-full min-w-0 w-full items-center gap-1.5">
++                <div className="chat-header-row">
++                    <div className="flex min-w-0 items-center gap-1">
+                     {props.onBack ? <button type="button" aria-label="Back to chats" title="Back to chats" onClick={props.onBack}
+                         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+                         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><path d="m12 5-7 7 7 7M5 12h14" /></svg>
+@@ -440,7 +443,12 @@
+                         </Popover.Content></Popover.Portal>
+                     </div>
+                     </Popover.Root>
+-
++                    </div>
++                    <div className="flex items-center justify-center" aria-label="Session tools">
++                        <SessionManagerLauncher />
++                        <NodesButton />
++                    </div>
++                    <div className="flex min-w-0 items-center justify-end">
+                     <button type="button" aria-label="Pin current chat" aria-pressed={chatPinned}
+                         title={chatPinned ? 'Chat pinned: node clicks keep this chat' : 'Keep this chat open when clicking nodes'}
+                         onClick={toggleChatPinned} className={headerToggleClass(chatPinned)}>
+@@ -490,6 +498,7 @@
+                     >
+                         <MoreVerticalIcon />
+                     </button>
++                    </div>
+                 </div>
+             </div>
+ 
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1213,6 +1213,7 @@
+     onBrowse?: () => void
+     onRefresh: () => Promise<unknown> | void
+     isLoading: boolean
++    showSessionTools?: boolean
+     renderHeader?: boolean
+     headerActions?: React.ReactNode
+     api: ApiClient | null
+@@ -1944,10 +1945,10 @@
+                 </div>
+             ) : null}
+ 
+-            <div className="flex shrink-0 items-center gap-1 pr-3" aria-label="Session tools">
++            {props.showSessionTools !== false ? <div className="flex shrink-0 items-center gap-1 pr-3" aria-label="Session tools">
+                 <div className="min-w-0 flex-1"><SessionManagerLauncher count={Object.values(sessionManagerEntries).filter(entry => !entry.dismissed).length} /></div>
+                 <NodesButton />
+-            </div>
++            </div> : null}
+             {showMachineFilterBar ? (
+                 <MachineFilterBar
+                     machines={machineFilterItems}
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -196,16 +196,15 @@
+     return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome text-sm font-semibold"><span className="min-w-0 flex-1 truncate">{title ?? 'Session Manager'}</span>{headerActions}</header><div className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-1">{children}</div></div>
+ }
+ 
+-export function SessionManagerLauncher({ count }: { count: number }) {
++export function SessionManagerLauncher({ count }: { count?: number }) {
+     const { open, collapsed, setOpen, setCollapsed } = useSessionManagerWindow()
+     // Desktop: a real browser popup window; phones (or a blocked popup) keep the in-page window.
+     return (<button type="button" onClick={() => {
+             if (open) { setCollapsed(!collapsed); return }
+             if (canPopout() && openPopout('session-manager')) return
+             setOpen(true)
+-        }} aria-label="Session Manager" aria-expanded={open && !collapsed}
+-            className="mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg px-5 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+-            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+-            <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{count}</span>
++        }} aria-label="Session Manager" title={count === undefined ? 'Session Manager' : `Session Manager (${count})`} aria-expanded={open && !collapsed}
++            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-5 w-5"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+         </button>)
+ }
+diff --git a/web/src/components/NodeGraphWindow.tsx b/web/src/components/NodeGraphWindow.tsx
+--- a/web/src/components/NodeGraphWindow.tsx
++++ b/web/src/components/NodeGraphWindow.tsx
+@@ -25,7 +25,7 @@
+             if (!open && canPopout() && openPopout('nodes')) return
+             if (!open) setOpen(true); else setCollapsed(!collapsed)
+         }}
+-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+-        <NodesIcon className="h-[22px] w-[22px]" />
++        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-fg)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
++        <NodesIcon className="h-5 w-5" />
+     </button>
+ }
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1930,6 +1930,7 @@
+     const managedSessions = useManagedSessions(props.api)
+     return (
+         <div className="flex h-full min-h-0 flex-col">
++            <div data-chat-chrome className="shrink-0">
+             {agentFlavor === 'claude' && claudeCatalog.isError && <div role="status" className="px-3 text-sm text-[var(--app-hint)]">Live Claude model discovery unavailable. Showing fallback aliases; check CLI authentication.</div>}
+             <ManualPauseBanner api={props.api} sessionId={props.session.id} />
+             <SessionHeader
+@@ -1976,6 +1977,7 @@
+                 hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+             />
+ 
++            </div>
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+                 <TeamPanel teamState={props.session.teamState} />
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -398,14 +398,18 @@
+ })
+ 
+ describe('SessionHeader back button', () => {
+-    it('restores Back to chats and moves the Nodes launcher out of the header', () => {
++    it('keeps Back and places both icon launchers in the chat header', () => {
+         const onBack = vi.fn()
+         render(<QueryClientProvider client={new QueryClient()}><ToastProvider><I18nProvider>
+             <SessionHeader session={baseSession()} api={null} onBack={onBack} />
+         </I18nProvider></ToastProvider></QueryClientProvider>)
+         fireEvent.click(screen.getByRole('button', { name: 'Back to chats' }))
+         expect(onBack).toHaveBeenCalledOnce()
+-        expect(screen.queryByRole('button', { name: 'Nodes' })).toBeNull()
++        const tools = screen.getByLabelText('Session tools')
++        expect(tools).toContainElement(screen.getByRole('button', { name: 'Nodes' }))
++        expect(tools).toContainElement(screen.getByRole('button', { name: 'Session Manager' }))
++        expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent(/^$/)
++        expect(screen.getByRole('button', { name: 'Open side chat' })).toHaveTextContent('Side')
+     })
+ })
+ 
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -299,7 +299,7 @@
+         expect(select).toHaveBeenCalledWith('Codex')
+         expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
+         expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
++        expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveAttribute('title', 'Session Manager (2)')
+         expectSelectedFilter('Active')
+         fireEvent.click(screen.getByRole('button', { name: 'Open Claude' }))
+         expect(select).toHaveBeenLastCalledWith('Claude')
+@@ -321,7 +321,7 @@
+     await waitFor(() => expect(toggle).toHaveAttribute('aria-expanded', 'false'))
+     expect(screen.queryByRole('button', { name: 'Open Pinned task' })).toBeNull()
+     expect(screen.getByRole('button', { name: 'Open Other task' })).toBeInTheDocument()
+-    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
++    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveAttribute('title', 'Session Manager (2)')
+     expect(screen.getByRole('separator', { name: 'Pinned sessions' })).toBeInTheDocument()
+     await closeWindow(); open()
+     expect(await screen.findByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
+@@ -344,7 +344,7 @@
+     await screen.findByRole('button', { name: 'Dismiss Other task from Session Manager' })
+     fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Other task' })).toBeNull())
+-    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('1')
++    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveAttribute('title', 'Session Manager (1)')
+     chooseFilter('Active')
+     expect(screen.queryByRole('button', { name: 'Pinned sessions' })).toBeNull()
+     chooseFilter('All')
+diff --git a/web/src/hooks/useChatChromeOffset.ts b/web/src/hooks/useChatChromeOffset.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/useChatChromeOffset.ts
+@@ -0,0 +1,35 @@
++import { useLayoutEffect, type RefObject } from 'react'
++
++/** Desktop CSS consumes this offset; the mobile drawer keeps its existing layout. */
++export function useChatChromeOffset(shell: RefObject<HTMLElement | null>, route: string) {
++    useLayoutEffect(() => {
++        const root = shell.current
++        if (!root) return
++        let resize: ResizeObserver | undefined
++        let disposed = false
++        const clear = () => root.style.removeProperty('--chat-chrome-height')
++        clear()
++        const attach = () => {
++            const chrome = root.querySelector<HTMLElement>('[data-chat-chrome]')
++            if (!chrome || disposed) return
++            const update = () => {
++                if (disposed) return
++                const height = Math.max(0, chrome.getBoundingClientRect().height)
++                const value = `${height}px`
++                if (root.style.getPropertyValue('--chat-chrome-height') !== value) root.style.setProperty('--chat-chrome-height', value)
++            }
++            if (typeof ResizeObserver !== 'undefined') {
++                resize = new ResizeObserver(update)
++                resize.observe(chrome)
++            }
++            update()
++            waiting.disconnect()
++        }
++        // Routes may show a loading placeholder before the chat mounts. Stop
++        // observing mutations once found; streaming messages do not trigger scans.
++        const waiting = new MutationObserver(attach)
++        waiting.observe(root, { childList: true, subtree: true })
++        attach()
++        return () => { disposed = true; waiting.disconnect(); resize?.disconnect(); clear() }
++    }, [shell, route])
++}
+diff --git a/web/src/hooks/useChatChromeOffset.test.tsx b/web/src/hooks/useChatChromeOffset.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/useChatChromeOffset.test.tsx
+@@ -0,0 +1,45 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { useRef } from 'react'
++import { afterEach, expect, it, vi } from 'vitest'
++import { useChatChromeOffset } from './useChatChromeOffset'
++
++const callbacks: Array<() => void> = []
++const disconnected: Array<ReturnType<typeof vi.fn>> = []
++afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); callbacks.length = 0; disconnected.length = 0 })
++function Fixture({ route, ready = true }: { route: string; ready?: boolean }) {
++    const ref = useRef<HTMLDivElement>(null)
++    useChatChromeOffset(ref, route)
++    return <div ref={ref} data-testid="shell">{ready && <div data-chat-chrome>Header + Activity</div>}<div>Chat body</div></div>
++}
++function mockSize() {
++    let height = 108
++    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => ({ height } as DOMRect))
++    vi.stubGlobal('ResizeObserver', class {
++        disconnect = vi.fn()
++        constructor(callback: () => void) { callbacks.push(callback); disconnected.push(this.disconnect) }
++        observe = vi.fn()
++    })
++    return (next: number) => { height = next }
++}
++it('tracks actual chrome height when goal/activity expands and ignores unchanged writes', () => {
++    const setHeight = mockSize()
++    const view = render(<Fixture route="/sessions/a" />)
++    const root = view.getByTestId('shell')
++    expect(root.style.getPropertyValue('--chat-chrome-height')).toBe('108px')
++    const write = vi.spyOn(root.style, 'setProperty')
++    act(() => callbacks[0]()); expect(write).not.toHaveBeenCalled()
++    setHeight(240); act(() => callbacks[0]())
++    expect(root.style.getPropertyValue('--chat-chrome-height')).toBe('240px')
++    view.unmount(); expect(disconnected[0]).toHaveBeenCalled()
++    expect(root.style.getPropertyValue('--chat-chrome-height')).toBe('')
++})
++it('waits for an asynchronously mounted chat and clears offset on routes without a chat', async () => {
++    mockSize()
++    const view = render(<Fixture route="/sessions/a" ready={false} />)
++    expect(view.getByTestId('shell').style.getPropertyValue('--chat-chrome-height')).toBe('')
++    await act(async () => view.rerender(<Fixture route="/sessions/a" ready />))
++    expect(view.getByTestId('shell').style.getPropertyValue('--chat-chrome-height')).toBe('108px')
++    view.rerender(<Fixture route="/sessions" ready={false} />)
++    expect(view.getByTestId('shell').style.getPropertyValue('--chat-chrome-height')).toBe('')
++    expect(disconnected[0]).toHaveBeenCalled()
++})

@@ -1,0 +1,91 @@
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -3,7 +3,7 @@
+ import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+-import { SessionManagerWindow, useSessionManagerWindow, useSessionManagerMobile } from './SessionManagerWindow'
++import { SessionManagerWindow, useSessionManagerWindow } from './SessionManagerWindow'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+@@ -45,8 +45,7 @@
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+     const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+-    const { open, collapsed, setCollapsed, pinnedCollapsed = false, setPinnedCollapsed } = useSessionManagerWindow()
+-    const mobile = useSessionManagerMobile()
++    const { open, collapsed, pinnedCollapsed = false, setPinnedCollapsed } = useSessionManagerWindow()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+     const [showAdd, setShowAdd] = useState(false)
+@@ -111,7 +110,7 @@
+                     {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+                     <div className="flex min-w-0 flex-wrap items-start gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile && !props.embedded) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg px-2 py-2.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex w-full min-w-0 flex-col gap-1 rounded-lg px-2 py-2.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath alignActivityColumns managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+                         <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -267,7 +267,7 @@
+ })
+ 
+ 
+-it('collapses to a bubble on mobile chat selection while preserving filters and counts', async () => {
++it('keeps the mobile window open on chat selection while preserving filters and counts', async () => {
+     const original = window.matchMedia
+     window.matchMedia = vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })) as unknown as typeof window.matchMedia
+     try {
+@@ -276,11 +276,15 @@
+         await screen.findByRole('button', { name: 'Open Codex' })
+         fireEvent.click(screen.getByRole('button', { name: 'Active' }))
+         fireEvent.click(screen.getByRole('button', { name: 'Open Codex' }))
+-        await screen.findByLabelText('Session Manager bubble')
+-        expect(select).toHaveBeenCalledWith('Codex'); expect(screen.queryByRole('dialog')).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Expand Session Manager' })).toHaveTextContent('2')
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
+-        await screen.findByRole('dialog'); expect(screen.getByRole('button', { name: 'Active', pressed: true })).toBeInTheDocument()
++        expect(select).toHaveBeenCalledWith('Codex')
++        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++        expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
++        expect(screen.getByRole('button', { name: 'Active', pressed: true })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Open Claude' }))
++        expect(select).toHaveBeenLastCalledWith('Claude')
++        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+         expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+     } finally { window.matchMedia = original }
+ })
+diff --git a/web/src/components/NodeGraphHost.tsx b/web/src/components/NodeGraphHost.tsx
+--- a/web/src/components/NodeGraphHost.tsx
++++ b/web/src/components/NodeGraphHost.tsx
+@@ -3,7 +3,7 @@
+ import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
+ import { useSessions } from '@/hooks/queries/useSessions'
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+-import { FloatingWindow, useFloatingWindowMobile } from './FloatingWindow'
++import { FloatingWindow } from './FloatingWindow'
+ import { NodeGraphView } from './NodeGraphView'
+ import { NODE_GRAPH_WINDOW, useNodeGraphWindow } from './NodeGraphWindow'
+ 
+@@ -17,12 +17,11 @@
+     const { api } = useAppContext()
+     const navigate = useNavigate()
+     const { sessions, isLoading } = useSessions(api)
+-    const { collapsed, setCollapsed } = useNodeGraphWindow()
+-    const mobile = useFloatingWindowMobile()
++    const { collapsed } = useNodeGraphWindow()
+     const { data } = useNodeGraph(api)
+     const name = activeWorkspaceName(data)
+     return <FloatingWindow config={NODE_GRAPH_WINDOW} title={name ? `Nodes · ${name}` : 'Nodes'} count={data?.graph.nodes.length ?? 0} bodyClassName="flex min-h-0 flex-1 flex-col">
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions} visible={!collapsed}
+-            onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)); if (mobile) setCollapsed(true) }} />
++            onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)) }} />
+     </FloatingWindow>
+ }

@@ -1,0 +1,1040 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -3,13 +3,13 @@
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+-import { useFloatingWindowMobile } from '@/components/FloatingWindow'
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { clampZoom, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+-
+-export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Paused' | 'Inactive' | 'Unavailable' | 'Loading'
++import { undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
++
++export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+ type Mutate = ReturnType<typeof useNodeGraph>['mutate']
+ type Gesture =
+@@ -17,16 +17,17 @@
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint }
+     | { kind: 'link'; pointer: number; from: string }
+-
+-/** Running/Background/Idle from live summary; Paused only when the summary carries manual-pause evidence. */
++    | { kind: 'input'; pointer: number; child: string; x: number; y: number; moved: boolean }
++
++/** Running/Background/Idle from live summary; Stopped only when the summary carries manual-pause evidence. */
+ export function nodeStatus(session: SessionSummary | undefined, loaded = true): NodeStatus {
+     if (!session) return loaded ? 'Unavailable' : 'Loading'
+-    if ((session as { manualPausedAt?: number | null }).manualPausedAt != null) return 'Paused'
++    if ((session as { manualPausedAt?: number | null }).manualPausedAt != null) return 'Stopped'
+     if (!nodeIsIdle(session)) return session.thinking || session.pendingRequestsCount > 0 ? 'Running' : 'Background'
+     return session.active ? 'Idle' : 'Inactive'
+ }
+ const STATUS_DOT: Record<NodeStatus, string> = {
+-    Running: 'bg-emerald-500', Background: 'bg-sky-500', Idle: 'bg-[var(--app-hint)]', Paused: 'bg-amber-500',
++    Running: 'bg-emerald-500', Background: 'bg-sky-500', Idle: 'bg-[var(--app-hint)]', Stopped: 'bg-amber-500',
+     Inactive: 'border border-[var(--app-hint)]', Unavailable: 'bg-[var(--app-badge-error-text)]', Loading: 'border border-dashed border-[var(--app-hint)]',
+ }
+ const errorText = (error: unknown, fallback: string) => error instanceof Error && error.message ? error.message : fallback
+@@ -40,7 +41,6 @@
+     api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; visible?: boolean
+ }) {
+     const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
+-    const mobile = useFloatingWindowMobile()
+     const canvas = useRef<HTMLDivElement>(null)
+     const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
+     const viewRef = useRef(view); viewRef.current = view
+@@ -51,7 +51,11 @@
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
+     const [dropActive, setDropActive] = useState(false)
+     const dropInFlight = useRef<Promise<void> | null>(null)
+-    const [link, setLink] = useState<{ from: string; to: GraphPoint; target: string | null } | null>(null)
++    const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null } | null>(null)
++    const [history, setHistory] = useState<GraphEdit[]>([])
++    const historyRef = useRef(history); historyRef.current = history
++    const undoRef = useRef<() => void>(() => {})
++    const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
+     const pendingSave = useRef<NodeLayoutPositions>({})
+@@ -76,7 +80,7 @@
+         if (!graph) return
+         setOverrides(old => {
+             const saved = new Map(graph.graph.nodes.map(node => [node.sessionId, node]))
+-            const next = Object.fromEntries(Object.entries(old).filter(([id, point]) => { const node = saved.get(id); return node && !(node.x === point.x && node.y === point.y) }))
++            const next = Object.fromEntries(Object.entries(old).filter(([id, point]) => { const node = saved.get(id); return id === graph.overseer || (node && !(node.x === point.x && node.y === point.y)) }))
+             return Object.keys(next).length === Object.keys(old).length ? old : next
+         })
+     }, [graph])
+@@ -88,7 +92,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setMenu(null); fit()
++        setOverrides({}); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -130,9 +134,39 @@
+         return () => element.removeEventListener('wheel', wheel)
+     }, [enabled])
+ 
+-    const linkTarget = (from: string, point: GraphPoint): string | null => {
+-        const target = nodeAtPoint(positionsRef.current, point, ids)
+-        return target && target !== from && target !== overseer && !createsCycle(edges, from, target) ? target : null
++    useEffect(() => {
++        if (!visible) return
++        const key = (event: globalThis.KeyboardEvent) => {
++            if (event.defaultPrevented || event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return
++            const target = event.target instanceof Element ? event.target : document.activeElement
++            if (!canvas.current?.contains(document.activeElement) || target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return
++            event.preventDefault(); undoRef.current()
++        }
++        document.addEventListener('keydown', key)
++        return () => document.removeEventListener('keydown', key)
++    }, [visible])
++    useEffect(() => {
++        if (!menu) return
++        const dismiss = (event: globalThis.PointerEvent) => {
++            const target = event.target instanceof Element ? event.target : null
++            if (!target?.closest('[data-node-menu]') && target?.closest('[data-node-id]')?.getAttribute('data-node-id') !== menu.id) setMenu(null)
++        }
++        document.addEventListener('pointerdown', dismiss)
++        return () => document.removeEventListener('pointerdown', dismiss)
++    }, [menu?.id])
++
++    const portAt = (point: GraphPoint, direction: 'input' | 'output'): string | null => {
++        for (const id of [...ids].reverse()) {
++            const p = positionsRef.current[id]
++            if (!p || (direction === 'input' && id === overseer)) continue
++            if (Math.hypot(point.x - p.x - NODE_SIZE.width / 2, point.y - p.y - (direction === 'output' ? NODE_SIZE.height : 0)) <= Math.max(18, 12 / viewRef.current.k)) return id
++        }
++        return null
++    }
++    const linkTarget = (fixed: string, point: GraphPoint, direction: 'child' | 'owner' = 'child'): string | null => {
++        const target = portAt(point, direction === 'child' ? 'input' : 'output')
++        const owner = direction === 'child' ? fixed : target, child = direction === 'child' ? target : fixed
++        return owner && child && child !== overseer && !createsCycle(edges.filter(edge => edge.child !== child), owner, child) ? target : null
+     }
+     const pinchStart = () => {
+         const [a, b] = [...pointers.current.values()]
+@@ -142,13 +176,18 @@
+     }
+     const down = (event: PointerEvent<HTMLDivElement>) => {
+         const target = event.target as Element
+-        if (target.closest('[data-graph-ui]')) return
++        // React portals bubble through this component even though their DOM is
++        // outside the canvas. Capturing those pointers eats dialog clicks.
++        if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui]')) return
++        if (event.button !== 0 || pending || mutationBusy.current || dropInFlight.current) return
++        event.currentTarget.focus({ preventScroll: true })
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+         if (pointers.current.size >= 2) { pinchStart(); return }
+-        if (event.button !== 0) return
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
++        const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
+-        if (handle) { gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ from: handle, to: toGraph(event.clientX, event.clientY), target: null }) }
++        if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, x: event.clientX, y: event.clientY, moved: false } }
++        else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
+         else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
+         // Touch has implicit capture; touch-action:none prevents native scrolling.
+@@ -170,7 +209,13 @@
+         }
+         if (g.pointer !== event.pointerId) return
+         if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + event.clientX - g.x, y: g.view.y + event.clientY - g.y })
+-        else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ from: g.from, to, target: linkTarget(g.from, to) }) }
++        else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ fixed: g.from, direction: 'child', to, target: linkTarget(g.from, to) }) }
++        else if (g.kind === 'input') {
++            if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
++            g.moved = true
++            const to = toGraph(event.clientX, event.clientY)
++            setLink({ fixed: g.child, direction: 'owner', to, target: linkTarget(g.child, to, 'owner') })
++        }
+         else {
+             const dx = event.clientX - g.x, dy = event.clientY - g.y
+             if (!g.moved && Math.hypot(dx, dy) < 6) return
+@@ -191,21 +236,60 @@
+         const cancelled = event.type === 'pointercancel'
+         if (g.kind === 'node') {
+             // pointercancel coordinates are unreliable; keep the last moved position.
+-            if (g.moved) queueSave(g.id, g.last)
++            if (g.moved) {
++                remember({ kind: 'move', workspace: graph!.activeWorkspaceId, id: g.id, before: g.origin, after: g.last })
++                if (g.id !== overseer || graph?.graph.nodes.some(n => n.sessionId === g.id)) queueSave(g.id, g.last)
++            }
+             else if (!cancelled) openMenu(g.id)
+         } else if (g.kind === 'link') {
+             setLink(null)
+             const target = cancelled ? null : linkTarget(g.from, toGraph(event.clientX, event.clientY))
+-            if (target) void act(`link:${target}`, client => client.setNodeOwner(g.from, target))
++            if (target) void changeOwner(target, g.from)
++        } else if (g.kind === 'input') {
++            setLink(null)
++            if (cancelled || !g.moved) return
++            const point = toGraph(event.clientX, event.clientY), owner = linkTarget(g.child, point, 'owner')
++            if (owner) void changeOwner(g.child, owner)
++            else if (!portAt(point, 'input') && !portAt(point, 'output') && !nodeAtPoint(positionsRef.current, point, ids)) void changeOwner(g.child, null)
+         }
+     }
+ 
+     const openMenu = (id: string) => { setMenu({ id, mode: 'actions' }); setError(null) }
++    const remember = (edit: GraphEdit) => setHistory(old => [...old.slice(-49), edit])
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
++        if (mutationBusy.current || dropInFlight.current) return null
++        mutationBusy.current = true
+         setPending(key); setError(null)
+         try { return await mutate(run, graphOf) }
+         catch (cause) { setError(errorText(cause, 'Action failed')); return null }
+-        finally { setPending(null) }
++        finally { mutationBusy.current = false; setPending(null) }
++    }
++    const changeOwner = (child: string, owner: string | null) => {
++        if (!graph) return Promise.resolve(null)
++        return act(`owner:${child}`, async client => {
++            // Another window may have changed the connection since this view polled.
++            const fresh = await client.getNodeGraph()
++            if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try the edit again.')
++            const before = fresh.graph.edges.find(edge => edge.child === child)?.owner ?? null
++            if (before === owner) return fresh
++            const result = owner ? await client.setNodeOwner(owner, child) : await client.detachNode(child)
++            remember({ kind: 'owner', workspace: fresh.activeWorkspaceId, child, before, after: owner })
++            return result
++        })
++    }
++    undoRef.current = () => {
++        const edit = historyRef.current.at(-1)
++        if (!edit || pending || mutationBusy.current || dropInFlight.current || !graph || edit.workspace !== graph.activeWorkspaceId) return
++        void act('undo', async client => {
++            await flushSave()
++            if (edit.kind === 'move' && edit.id === overseer && !graph.graph.nodes.some(n => n.sessionId === edit.id)) {
++                const point = positionsRef.current[edit.id]
++                if (!point || point.x !== edit.after.x || point.y !== edit.after.y) throw new Error('The node moved elsewhere. Undo is unavailable.')
++                setOverrides(old => ({ ...old, [edit.id]: edit.before }))
++                return graph
++            }
++            return await undoGraphEdit(client, edit) ?? await client.getNodeGraph()
++        }).then(result => { if (result !== null) setHistory(old => old.filter(item => item !== edit)) })
+     }
+ 
+     if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
+@@ -227,8 +311,13 @@
+         dropInFlight.current = (async () => {
+             try {
+                 await flushSave()
+-                if (!ids.includes(id)) await mutate(client => client.addNode(id))
++                const fresh = await api!.getNodeGraph()
++                if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try the drop again.')
++                const exists = fresh.graph.nodes.some(n => n.sessionId === id)
++                const before = exists ? layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions[id] : undefined
++                if (!exists) await mutate(client => client.addNode(id))
+                 await mutate(client => client.saveNodeLayout({ [id]: point }))
++                remember(exists && before ? { kind: 'move', workspace: graph.activeWorkspaceId, id, before, after: point } : { kind: 'add', workspace: graph.activeWorkspaceId, id, point })
+             } catch (cause) { setError(errorText(cause, 'Could not add chat to workspace')) }
+             finally { setPending(null); dropInFlight.current = null }
+         })()
+@@ -241,11 +330,12 @@
+ 
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
+         {(loadError || (error && !menu)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+-        <div ref={canvas} aria-label="Node graph" role="application" onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
++        <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
++            onKeyDown={event => { if (event.key === 'Escape' && (link || gesture.current?.kind === 'input')) { event.preventDefault(); event.stopPropagation(); gesture.current = null; pointers.current.clear(); setLink(null) } }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
+-            className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab active:cursor-grabbing">
++            className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab outline-none active:cursor-grabbing">
+             {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
+                 <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} />
+             </div>}
+@@ -258,6 +348,7 @@
+                     </defs>
+                     {edges.map(({ owner, child }) => {
+                         const from = positions[owner], to = positions[child]
++                        if (link?.direction === 'owner' && link.fixed === child) return null
+                         if (!from || !to) return null
+                         const asleep = edgeAsleep(sessionsById.get(child))
+                         const x1 = from.x + NODE_SIZE.width / 2, y1 = from.y + NODE_SIZE.height, x2 = to.x + NODE_SIZE.width / 2, y2 = to.y
+@@ -266,7 +357,10 @@
+                             fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={asleep ? 1.5 : 2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1}
+                             markerEnd={`url(#${asleep ? 'node-edge-asleep' : 'node-edge-active'})`} />
+                     })}
+-                    {link && positions[link.from] && <path d={`M${positions[link.from]!.x + NODE_SIZE.width / 2} ${positions[link.from]!.y + NODE_SIZE.height} L${link.to.x} ${link.to.y}`} fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />}
++                    {link && positions[link.fixed] && <path d={link.direction === 'child'
++                        ? `M${positions[link.fixed]!.x + NODE_SIZE.width / 2} ${positions[link.fixed]!.y + NODE_SIZE.height} L${link.to.x} ${link.to.y}`
++                        : `M${link.to.x} ${link.to.y} L${positions[link.fixed]!.x + NODE_SIZE.width / 2} ${positions[link.fixed]!.y}`}
++                        fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />}
+                 </svg>
+                 {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
+                 {ids.map(id => {
+@@ -281,8 +375,19 @@
+                                 <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}</span>
+                             </span>
+                         </button>
+-                        {!mobile && <span data-link-handle={id} aria-hidden="true" title="Drag onto another node to make it a child"
+-                            className="absolute -bottom-2 left-1/2 h-4 w-4 -translate-x-1/2 rounded-full border-2 border-[var(--app-link)] bg-[var(--app-bg)] cursor-crosshair" />}
++                        {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
++                            style={{ scale: Math.max(1, 0.85 / view.k) }}
++                            title="Input: connect from an output. Drag to another output to reconnect, or to empty space to disconnect."
++                            onClick={event => { if (event.detail === 0) { setMenu({ id, mode: 'owner' }); setError(null) } }}
++                            className="absolute -top-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                            <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${layout.parent[id] ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'}`} />
++                        </button>}
++                        <button type="button" data-link-handle={id} aria-label={`Output for ${name}`} title="Output: drag to another node’s input to connect."
++                            style={{ scale: Math.max(1, 0.85 / view.k) }}
++                            onClick={event => { if (event.detail === 0) openMenu(id) }}
++                            className="absolute -bottom-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                            <span className="h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] bg-[var(--app-bg)]" />
++                        </button>
+                     </div>
+                 })}
+             </div>}
+@@ -294,8 +399,9 @@
+                 <button type="button" aria-label="Zoom out" onClick={() => zoomAt(1 / 1.25)} className={iconButton}>−</button>
+                 <button type="button" aria-label="Zoom in" onClick={() => zoomAt(1.25)} className={iconButton}>+</button>
+                 <button type="button" aria-label="Fit graph to view" onClick={fit} className={`${iconButton} w-auto px-2 text-xs`}>Fit</button>
++                <button type="button" aria-label="Undo graph edit" title="Undo graph edit (Ctrl+Z)" disabled={!history.length || pending !== null} onClick={() => undoRef.current()} className={`${iconButton} border-l border-[var(--app-divider)]`}>↶</button>
+             </div>
+-            {menu && graph && <section data-graph-ui role="dialog" aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
++            {menu && graph && <section data-graph-ui data-node-menu role="dialog" aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
+                 className="absolute inset-x-2 bottom-2 z-20 mx-auto flex max-h-[80%] max-w-sm flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl">
+                 <header className="flex shrink-0 items-center gap-2 border-b border-[var(--app-divider)] py-1 pl-3 pr-1">
+                     <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{title(menu.id)}</p>
+@@ -306,7 +412,7 @@
+                     {menu.mode === 'actions' ? <>
+                         <button type="button" autoFocus disabled={!menuSession} onClick={() => { const id = menu.id; closeMenu(); onOpenChat(id) }} className={menuItem}>Open chat</button>
+                         {menu.id !== overseer && <button type="button" onClick={() => { setMenu({ ...menu, mode: 'owner' }); setError(null) }} className={menuItem}>Set owner…</button>}
+-                        {menuOwner && <button type="button" disabled={pending !== null} onClick={async () => { if (await act('detach', client => client.detachNode(menu.id)) !== null) closeMenu() }} className={menuItem}>Detach from owner</button>}
++                        {menuOwner && <button type="button" disabled={pending !== null} onClick={async () => { if (await changeOwner(menu.id, null) !== null) closeMenu() }} className={menuItem}>Detach from owner</button>}
+                         {menu.id !== overseer && (menuBusy ? <div className="flex min-h-11 items-center gap-2 px-3 text-sm">
+                             <span className="min-w-0 flex-1 text-xs text-[var(--app-hint)]">Busy. Stop it before removing.</span>
+                             <button type="button" aria-label={`Stop ${title(menu.id)}`} disabled={pending !== null} onClick={async () => {
+@@ -318,17 +424,27 @@
+                             }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">{pending === 'stop' ? 'Stopping…' : 'Stop'}</button>
+                         </div> : <button type="button" disabled={pending !== null} onClick={async () => {
+                             const id = menu.id
+-                            const result = await act('remove', client => client.removeNodes([id]), r => r.graph)
++                            let inverse: GraphEdit | undefined
++                            const result = await act('remove', async client => {
++                                const fresh = await client.getNodeGraph()
++                                if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try removal again.')
++                                const point = layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions[id]
++                                if (point) inverse = { kind: 'remove', workspace: fresh.activeWorkspaceId, id, point, edges: fresh.graph.edges.filter(edge => edge.owner === id || edge.child === id) }
++                                return client.removeNodes([id])
++                            }, r => r.graph)
+                             if (!result) return
+                             if (result.skippedIds.includes(id)) setError(`${title(id)} is still busy or unavailable and was not removed. Stop it first.`)
+-                            else closeMenu()
++                            else {
++                                if (inverse) remember(inverse)
++                                closeMenu()
++                            }
+                         }} className={`${menuItem} text-[var(--app-badge-error-text)]`}>Remove from workspace</button>)}
+                     </> : <div role="group" aria-label="Choose owner">
+                         <button type="button" onClick={() => setMenu({ ...menu, mode: 'actions' })} className={`${menuItem} text-[var(--app-hint)]`}>‹ Back</button>
+                         {ownerCandidates(ids, edges, overseer, menu.id)
+                             .sort((a, b) => Number(b === overseer) - Number(a === overseer) || title(a).localeCompare(title(b)))
+                             .map(candidate => <button key={candidate} type="button" aria-label={`Make ${title(candidate)} the owner`} disabled={pending !== null || candidate === menuOwner}
+-                                onClick={async () => { if (await act('owner', client => client.setNodeOwner(candidate, menu.id)) !== null) closeMenu() }} className={menuItem}>
++                                onClick={async () => { if (await changeOwner(menu.id, candidate) !== null) closeMenu() }} className={menuItem}>
+                                 <span className="min-w-0 flex-1 truncate">{title(candidate)}</span>
+                                 {candidate === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 text-[11px] text-violet-500">Overseer</span>}
+                                 {candidate === menuOwner && <span className="shrink-0 text-xs text-[var(--app-hint)]">current</span>}
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -100,6 +100,20 @@
+     const [, x, y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
+     return { clientX: x! + (parseFloat(card.style.left) + NODE_SIZE.width / 2) * k!, clientY: y! + (parseFloat(card.style.top) + NODE_SIZE.height / 2) * k! }
+ }
++const portPoint = (id: string, kind: 'input' | 'output') => {
++    const centre = nodeCentre(id)
++    const world = document.querySelector<HTMLElement>(`[data-node-id="${id}"]`)!.parentElement!
++    const k = Number(/scale\(([-\d.e]+)\)/.exec(world.style.transform)![1])
++    return { clientX: centre.clientX, clientY: centre.clientY + (kind === 'input' ? -1 : 1) * NODE_SIZE.height / 2 * k }
++}
++const port = (id: string, kind: 'input' | 'output') => document.querySelector(`[data-${kind === 'input' ? 'input' : 'link'}-handle="${id}"]`)!
++const dragPort = (id: string, kind: 'input' | 'output', to: { clientX: number; clientY: number }, ending = 'pointerUp') => {
++    const handle = port(id, kind), canvas = screen.getByRole('application', { name: 'Node graph' })
++    fireEvent.pointerDown(handle, { pointerId: 1, button: 0, ...portPoint(id, kind) })
++    fireEvent.pointerMove(canvas, { pointerId: 1, ...to })
++    if (ending === 'pointercancel') fireEvent.pointerCancel(canvas, { pointerId: 1, ...to })
++    else fireEvent.pointerUp(canvas, { pointerId: 1, ...to })
++}
+ const transfer = (values: Record<string, string>) => ({ types: Object.keys(values), getData: (type: string) => values[type] ?? '', dropEffect: '' })
+ const dropChat = (id: string, clientX = 300, clientY = 250) => fireEvent.drop(screen.getByRole('application', { name: 'Node graph' }), {
+     dataTransfer: transfer({ [SESSION_DRAG_TYPE]: id }), clientX, clientY,
+@@ -111,7 +125,7 @@
+         expect(nodeStatus(session('x', 'x', { backgroundTaskCount: 2 }))).toBe('Background')
+         expect(nodeStatus(session('x', 'x'))).toBe('Idle')
+         expect(nodeStatus(session('x', 'x', { active: false }))).toBe('Inactive')
+-        expect(nodeStatus({ ...session('x', 'x'), manualPausedAt: 5 } as SessionSummary)).toBe('Paused')
++        expect(nodeStatus({ ...session('x', 'x'), manualPausedAt: 5 } as SessionSummary)).toBe('Stopped')
+         expect(nodeStatus(undefined)).toBe('Unavailable')
+         expect(nodeStatus(undefined, false)).toBe('Loading')
+     })
+@@ -303,14 +317,14 @@
+         await screen.findByRole('button', { name: 'Node Charlie' })
+         const handle = (id: string) => document.querySelector(`[data-link-handle="${id}"]`)!
+         // Charlie is Alpha's child: Charlie -> Alpha would be a cycle.
+-        fireEvent.pointerDown(handle('C'), { pointerId: 1, button: 0, ...nodeCentre('C') })
+-        fireEvent.pointerMove(handle('C'), { pointerId: 1, ...nodeCentre('A') })
+-        fireEvent.pointerUp(handle('C'), { pointerId: 1, ...nodeCentre('A') })
++        fireEvent.pointerDown(handle('C'), { pointerId: 1, button: 0, ...portPoint('C', 'output') })
++        fireEvent.pointerMove(handle('C'), { pointerId: 1, ...portPoint('A', 'input') })
++        fireEvent.pointerUp(handle('C'), { pointerId: 1, ...portPoint('A', 'input') })
+         expect(api.setNodeOwner).not.toHaveBeenCalled()
+-        fireEvent.pointerDown(handle('B'), { pointerId: 2, button: 0, ...nodeCentre('B') })
+-        fireEvent.pointerMove(handle('B'), { pointerId: 2, ...nodeCentre('L') })
++        fireEvent.pointerDown(handle('B'), { pointerId: 2, button: 0, ...portPoint('B', 'output') })
++        fireEvent.pointerMove(handle('B'), { pointerId: 2, ...portPoint('L', 'input') })
+         expect(screen.getByRole('button', { name: 'Node Lone one' }).className).toContain('ring-2')
+-        fireEvent.pointerUp(handle('B'), { pointerId: 2, ...nodeCentre('L') })
++        fireEvent.pointerUp(handle('B'), { pointerId: 2, ...portPoint('L', 'input') })
+         await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'L'))
+     })
+ 
+@@ -326,7 +340,141 @@
+     })
+ })
+ 
++describe('explicit ports and graph undo', () => {
++    it('shows top inputs on every non-overseer node and outputs on all nodes', async () => {
++        setup()
++        await screen.findByRole('button', { name: 'Input for Alpha' })
++        expect(screen.getAllByRole('button', { name: /^Input for/ })).toHaveLength(4)
++        expect(screen.queryByRole('button', { name: 'Input for Overseer chat' })).toBeNull()
++        expect(screen.getAllByRole('button', { name: /^Output for/ })).toHaveLength(5)
++    })
++
++    it('reconnects an input to another output, then Ctrl+Z restores its old owner', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Charlie' })
++        dragPort('C', 'input', portPoint('B', 'output'))
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'C'))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.keyDown(screen.getByRole('application'), { key: 'z', ctrlKey: true })
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenLastCalledWith('A', 'C'))
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
++
++    it('disconnects an input on blank space and undo restores that connection', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dragPort('A', 'input', { clientX: -100, clientY: -100 })
++        await waitFor(() => expect(api.detachNode).toHaveBeenCalledWith('A'))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('O', 'A'))
++    })
++
++    it('records the actual owner for undo when another window changed a stale view', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Charlie' })
++        await api.setNodeOwner('B', 'C')
++        dragPort('C', 'input', { clientX: -100, clientY: -100 })
++        await waitFor(() => expect(api.detachNode).toHaveBeenCalledWith('C'))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenLastCalledWith('B', 'C'))
++    })
++
++    it('preserves the old connection on an invalid, cancelled or stationary input drag', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dragPort('A', 'input', portPoint('C', 'output')) // descendant: cycle
++        dragPort('A', 'input', { clientX: -100, clientY: -100 }, 'pointercancel')
++        dragPort('A', 'input', portPoint('A', 'input'))
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.detachNode).not.toHaveBeenCalled()
++        expect(document.querySelector('[data-edge="O->A"]')).toBeInTheDocument()
++    })
++
++    it('Escape cancels a connection drag without changing management', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        const canvas = screen.getByRole('application')
++        fireEvent.pointerDown(port('A', 'input'), { pointerId: 1, button: 0, ...portPoint('A', 'input') })
++        fireEvent.pointerMove(canvas, { pointerId: 1, clientX: -100, clientY: -100 })
++        fireEvent.keyDown(canvas, { key: 'Escape' })
++        fireEvent.pointerUp(canvas, { pointerId: 1, clientX: -100, clientY: -100 })
++        expect(api.detachNode).not.toHaveBeenCalled()
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++    })
++
++    it('clicking away deselects the node, but interacting inside its menu does not', async () => {
++        setup()
++        const menu = await openNode('Bravo')
++        fireEvent.pointerDown(within(menu).getByRole('button', { name: 'Set owner…' }))
++        expect(menu).toBeInTheDocument()
++        fireEvent.pointerDown(screen.getByRole('application'), { pointerId: 2, button: 0, clientX: 0, clientY: 0 })
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-expanded', 'false')
++    })
++
++    it('undoes a position edit while preserving text-field Ctrl+Z', async () => {
++        const { api } = setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' })
++        const start = nodeCentre('B'), before = { x: parseFloat(card.parentElement!.style.left), y: parseFloat(card.parentElement!.style.top) }
++        fireEvent.pointerDown(card, { pointerId: 1, button: 0, ...start })
++        fireEvent.pointerMove(card, { pointerId: 1, clientX: start.clientX + 40, clientY: start.clientY })
++        fireEvent.pointerUp(card, { pointerId: 1, clientX: start.clientX + 40, clientY: start.clientY })
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        const input = screen.getByRole('textbox', { name: 'Preset name' }); input.focus()
++        expect(fireEvent.keyDown(input, { key: 'z', ctrlKey: true })).toBe(true)
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++        const canvas = screen.getByRole('application'); canvas.focus()
++        fireEvent.keyDown(canvas, { key: 'z', ctrlKey: true })
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenLastCalledWith({ B: before }))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeDisabled())
++    })
++
++    it('undoes an idle node removal without resuming or aborting it', async () => {
++        const { api } = setup()
++        const menu = await openNode('Lone one')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Remove from workspace' }))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await screen.findByRole('button', { name: 'Node Lone one' })
++        expect(api.addNode).toHaveBeenCalledWith('L')
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
++
++    it('undoes a sidebar addition and never treats Stop as an undoable edit', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        dropChat('N')
++        await screen.findByRole('button', { name: 'Node New chat' })
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['N']))
++        const menu = await openNode('Alpha')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Stop Alpha' }))
++        await waitFor(() => expect(api.abortSession).toHaveBeenCalledWith('A'))
++        expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeDisabled()
++    })
++})
++
+ describe('WorkspaceBar', () => {
++    for (const action of ['Cancel', 'Stop and switch']) it(`does not capture ${action} pointer events from the portalled confirmation`, async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Switch to Research' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Switch to Research?' })
++        const button = within(dialog).getByRole('button', { name: action })
++        expect(screen.getByRole('application', { hidden: true })).not.toContainElement(button)
++        expect(fireEvent.pointerDown(button, { pointerId: 1, button: 0, clientX: 200, clientY: 200 })).toBe(true)
++        fireEvent.pointerUp(button, { pointerId: 1, clientX: 200, clientY: 200 })
++        fireEvent.click(button)
++        if (action === 'Cancel') {
++            await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Switch to Research?' })).toBeNull())
++            expect(api.activateWorkspace).not.toHaveBeenCalled()
++        } else await waitFor(() => expect(api.activateWorkspace).toHaveBeenCalledWith('p1'))
++    })
++
+     it('confirms a switch, listing the sessions that will be stopped, then shows results', async () => {
+         const { api } = setup()
+         await screen.findByRole('button', { name: 'Node Alpha' })
+diff --git a/web/src/lib/nodeGraphUndo.ts b/web/src/lib/nodeGraphUndo.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/nodeGraphUndo.ts
+@@ -0,0 +1,52 @@
++import { createsCycle, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { ApiClient } from '@/api/client'
++import type { GraphPoint } from './nodeGraphLayout'
++
++type Base = { workspace: string }
++export type GraphEdit = Base & (
++    | { kind: 'move'; id: string; before: GraphPoint; after: GraphPoint }
++    | { kind: 'owner'; child: string; before: string | null; after: string | null }
++    | { kind: 'add'; id: string; point: GraphPoint }
++    | { kind: 'remove'; id: string; point: GraphPoint; edges: Pick<NodeGraphEdge, 'owner' | 'child'>[]; restoring?: boolean }
++)
++
++const changed = () => new Error('The graph changed elsewhere. This edit can no longer be undone safely.')
++const parent = (graph: NodeGraphResponse, child: string) => graph.graph.edges.find(edge => edge.child === child)?.owner ?? null
++const member = (graph: NodeGraphResponse, id: string) => graph.overseer === id || graph.graph.nodes.some(node => node.sessionId === id)
++
++/** Undo only this window's affected fields; never overwrite another editor or undo Stop. */
++export async function undoGraphEdit(client: ApiClient, edit: GraphEdit): Promise<NodeGraphResponse | null> {
++    const graph = await client.getNodeGraph()
++    if (graph.activeWorkspaceId !== edit.workspace) throw changed()
++    const node = 'id' in edit ? graph.graph.nodes.find(n => n.sessionId === edit.id) : undefined
++    switch (edit.kind) {
++        case 'move':
++            if (!node || node.x !== edit.after.x || node.y !== edit.after.y) throw changed()
++            return client.saveNodeLayout({ [edit.id]: edit.before })
++        case 'owner':
++            if (!member(graph, edit.child) || parent(graph, edit.child) !== edit.after || (edit.before && !member(graph, edit.before))) throw changed()
++            return edit.before ? client.setNodeOwner(edit.before, edit.child) : client.detachNode(edit.child)
++        case 'add': {
++            if (!node || node.x !== edit.point.x || node.y !== edit.point.y || graph.graph.edges.some(edge => edge.child === edit.id || edge.owner === edit.id)) throw changed()
++            const result = await client.removeNodes([edit.id])
++            if (result.skippedIds.includes(edit.id)) throw new Error('This chat is busy. Stop it before undoing its addition.')
++            return result.graph
++        }
++        case 'remove': {
++            if (node && (!edit.restoring || (node.x != null && (node.x !== edit.point.x || node.y !== edit.point.y)))) throw changed()
++            const restored = edit.edges
++            const proposed = graph.graph.edges.filter(edge => !restored.some(old => old.child === edge.child))
++            for (const edge of restored) {
++                if ((edge.owner !== edit.id && !member(graph, edge.owner)) || (edge.child !== edit.id && !member(graph, edge.child))) throw changed()
++                const owner = parent(graph, edge.child)
++                if (owner !== null && (!edit.restoring || owner !== edge.owner)) throw changed()
++                if (createsCycle(proposed, edge.owner, edge.child)) throw changed()
++                proposed.push({ ...edge, createdAt: 0, createdBy: 'user' })
++            }
++            if (!node) { await client.addNode(edit.id); edit.restoring = true }
++            let result = await client.saveNodeLayout({ [edit.id]: edit.point })
++            for (const edge of restored) result = await client.setNodeOwner(edge.owner, edge.child)
++            return result
++        }
++    }
++}
+diff --git a/web/src/lib/nodeGraphUndo.test.ts b/web/src/lib/nodeGraphUndo.test.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/nodeGraphUndo.test.ts
+@@ -0,0 +1,98 @@
++import { describe, expect, it, vi } from 'vitest'
++import type { NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { ApiClient } from '@/api/client'
++import { undoGraphEdit, type GraphEdit } from './nodeGraphUndo'
++
++function setup() {
++    const graph: NodeGraphResponse = { activeWorkspaceId: 'w', workspaces: [], overseer: 'O', graph: { workspaceId: 'w',
++        nodes: ['A', 'B', 'C'].map(sessionId => ({ sessionId, x: 10, y: 20, addedAt: 1 })),
++        edges: [{ owner: 'O', child: 'A', createdAt: 1, createdBy: 'user' }, { owner: 'A', child: 'B', createdAt: 1, createdBy: 'user' }],
++    } }
++    const copy = () => structuredClone(graph)
++    const api = {
++        getNodeGraph: vi.fn(async () => copy()),
++        saveNodeLayout: vi.fn(async (points: Record<string, { x: number; y: number }>) => {
++            for (const node of graph.graph.nodes) if (points[node.sessionId]) Object.assign(node, points[node.sessionId])
++            return copy()
++        }),
++        setNodeOwner: vi.fn(async (owner: string, child: string) => {
++            graph.graph.edges = graph.graph.edges.filter(e => e.child !== child)
++            graph.graph.edges.push({ owner, child, createdAt: 2, createdBy: 'user' }); return copy()
++        }),
++        detachNode: vi.fn(async (child: string) => { graph.graph.edges = graph.graph.edges.filter(e => e.child !== child); return copy() }),
++        addNode: vi.fn(async (sessionId: string) => { graph.graph.nodes.push({ sessionId, x: null, y: null, addedAt: 2 }); return copy() }),
++        removeNodes: vi.fn(async (ids: readonly string[]) => {
++            graph.graph.nodes = graph.graph.nodes.filter(n => !ids.includes(n.sessionId))
++            return { graph: copy(), skippedIds: [] as string[] }
++        }),
++    }
++    return { graph, api, client: api as unknown as ApiClient }
++}
++
++describe('graph edit undo', () => {
++    it('restores a position without changing unrelated edges', async () => {
++        const { client, graph, api } = setup()
++        await undoGraphEdit(client, { kind: 'move', workspace: 'w', id: 'A', before: { x: 0, y: 0 }, after: { x: 10, y: 20 } })
++        expect(graph.graph.nodes[0]).toMatchObject({ x: 0, y: 0 })
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++    })
++    it('refuses a move changed by another editor', async () => {
++        const { client, api } = setup()
++        await expect(undoGraphEdit(client, { kind: 'move', workspace: 'w', id: 'A', before: { x: 0, y: 0 }, after: { x: 50, y: 20 } })).rejects.toThrow('changed elsewhere')
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
++    it('restores a replaced owner or detaches a newly created connection', async () => {
++        const { client, graph } = setup()
++        await undoGraphEdit(client, { kind: 'owner', workspace: 'w', child: 'B', before: 'C', after: 'A' })
++        expect(graph.graph.edges.find(e => e.child === 'B')?.owner).toBe('C')
++        await undoGraphEdit(client, { kind: 'owner', workspace: 'w', child: 'B', before: null, after: 'C' })
++        expect(graph.graph.edges.some(e => e.child === 'B')).toBe(false)
++    })
++    it('does not overwrite a concurrent owner change', async () => {
++        const { client, api } = setup()
++        await expect(undoGraphEdit(client, { kind: 'owner', workspace: 'w', child: 'B', before: 'O', after: 'C' })).rejects.toThrow('changed elsewhere')
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++    })
++    it('removes an added lone node, refusing busy nodes and new links', async () => {
++        const { client, api, graph } = setup()
++        const edit: GraphEdit = { kind: 'add', workspace: 'w', id: 'C', point: { x: 10, y: 20 } }
++        api.removeNodes.mockResolvedValueOnce({ graph: structuredClone(graph), skippedIds: ['C'] })
++        await expect(undoGraphEdit(client, edit)).rejects.toThrow('busy')
++        expect(graph.graph.nodes.some(n => n.sessionId === 'C')).toBe(true)
++        graph.graph.edges.push({ owner: 'C', child: 'B', createdAt: 1, createdBy: 'user' })
++        await expect(undoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        graph.graph.edges = graph.graph.edges.filter(e => e.owner !== 'C')
++        await undoGraphEdit(client, edit)
++        expect(graph.graph.nodes.some(n => n.sessionId === 'C')).toBe(false)
++    })
++    it('recreates a removed node with its incoming and outgoing connections', async () => {
++        const { client, graph } = setup()
++        const edges = graph.graph.edges.map(({ owner, child }) => ({ owner, child }))
++        graph.graph.nodes = graph.graph.nodes.filter(n => n.sessionId !== 'A'); graph.graph.edges = []
++        await undoGraphEdit(client, { kind: 'remove', workspace: 'w', id: 'A', point: { x: 35, y: 45 }, edges })
++        expect(graph.graph.nodes.find(n => n.sessionId === 'A')).toMatchObject({ x: 35, y: 45 })
++        expect(graph.graph.edges.map(({ owner, child }) => ({ owner, child }))).toEqual(edges)
++    })
++    it('will not steal a removed node’s child from a new owner', async () => {
++        const { client, graph, api } = setup()
++        graph.graph.nodes = graph.graph.nodes.filter(n => n.sessionId !== 'A')
++        graph.graph.edges = [{ owner: 'C', child: 'B', createdAt: 2, createdBy: 'user' }]
++        await expect(undoGraphEdit(client, { kind: 'remove', workspace: 'w', id: 'A', point: { x: 0, y: 0 }, edges: [{ owner: 'A', child: 'B' }] })).rejects.toThrow('changed elsewhere')
++        expect(api.addNode).not.toHaveBeenCalled()
++    })
++    it('can retry a partially restored node without creating a duplicate', async () => {
++        const { client, graph, api } = setup()
++        graph.graph.nodes = graph.graph.nodes.filter(n => n.sessionId !== 'A'); graph.graph.edges = []
++        const edit: GraphEdit = { kind: 'remove', workspace: 'w', id: 'A', point: { x: 0, y: 0 }, edges: [{ owner: 'O', child: 'A' }] }
++        api.setNodeOwner.mockRejectedValueOnce(new Error('offline'))
++        await expect(undoGraphEdit(client, edit)).rejects.toThrow('offline')
++        await undoGraphEdit(client, edit)
++        expect(api.addNode).toHaveBeenCalledTimes(1)
++        expect(graph.graph.edges[0]).toMatchObject({ owner: 'O', child: 'A' })
++    })
++    it('never applies undo into a different workspace', async () => {
++        const { client, api } = setup()
++        await expect(undoGraphEdit(client, { kind: 'owner', workspace: 'other', child: 'B', before: null, after: 'A' })).rejects.toThrow('changed elsewhere')
++        expect(api.detachNode).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/hooks/mutations/useSendMessage.ts b/web/src/hooks/mutations/useSendMessage.ts
+--- a/web/src/hooks/mutations/useSendMessage.ts
++++ b/web/src/hooks/mutations/useSendMessage.ts
+@@ -1,4 +1,4 @@
+-import { useMutation } from '@tanstack/react-query'
++import { useMutation, useQueryClient } from '@tanstack/react-query'
+ import { useRef, useState } from 'react'
+ import type { ApiClient } from '@/api/client'
+ import type { AttachmentMetadata, DecryptedMessage } from '@/types/api'
+@@ -200,12 +200,14 @@
+         attachments?: AttachmentMetadata[],
+         scheduledAt?: number | null,
+         deliveryMode?: MessageDeliveryMode,
++        userContinue?: boolean,
+     ) => Promise<SendMessageAcceptance | false>
+     retryMessage: (localId: string) => boolean
+     isSending: boolean
+     sendSettlement: SendMessageSettlement | null
+ } {
+     const { haptic } = usePlatform()
++    const queryClient = useQueryClient()
+     const [isResolving, setIsResolving] = useState(false)
+     const [sendSettlement, setSendSettlement] = useState<SendMessageSettlement | null>(null)
+     const resolveGuardRef = useRef(false)
+@@ -280,6 +282,7 @@
+         attachments?: AttachmentMetadata[],
+         scheduledAt?: number | null,
+         deliveryMode: MessageDeliveryMode = 'queue',
++        userContinue = false,
+     ): Promise<SendMessageAcceptance | false> => {
+         if (!api) {
+             options?.onBlocked?.('no-api')
+@@ -299,17 +302,27 @@
+         const createdAt = Date.now()
+         let targetSessionId = sessionId
+         let sendAttachments = attachments
+-        if (options?.resolveSessionId) {
++        if (options?.resolveSessionId || (userContinue && scheduledAt == null)) {
+             resolveGuardRef.current = true
+             setIsResolving(true)
+             try {
+-                const resolved = await options.resolveSessionId(sessionId)
++                // Set only by the current composer submission. Retries, schedules,
++                // background delivery and reconnects never receive this authority.
++                if (userContinue && scheduledAt == null && typeof api.getManualPause === 'function') {
++                    const stop = await api.getManualPause(sessionId)
++                    if (stop.pausedAt != null) {
++                        await api.resumeManualPause(sessionId, stop.pausedAt)
++                        void queryClient.invalidateQueries({ queryKey: ['manual-pause', sessionId] })
++                        void queryClient.invalidateQueries({ queryKey: ['node-graph'] })
++                    }
++                }
++                const resolved = await options?.resolveSessionId?.(sessionId) ?? { sessionId, resumed: false }
+                 targetSessionId = resolved.sessionId
+                 if (resolved.resumed) {
+                     // Await draft transfer / navigation before the mutation so
+                     // hidden inactive attachments move with the resumed id
+                     // (including same-id PTY/Pi/Cursor resumes).
+-                    const resolution = await options.onSessionResolved?.(
++                    const resolution = await options?.onSessionResolved?.(
+                         targetSessionId,
+                         { text, attachments },
+                     )
+diff --git a/web/src/hooks/mutations/useSendMessage.test.tsx b/web/src/hooks/mutations/useSendMessage.test.tsx
+--- a/web/src/hooks/mutations/useSendMessage.test.tsx
++++ b/web/src/hooks/mutations/useSendMessage.test.tsx
+@@ -46,6 +46,45 @@
+ describe('useSendMessage', () => {
+     beforeEach(() => {
+         vi.clearAllMocks()
++    })
++
++    it('continues an observed Stop only for the current composer submission, before inactive resume', async () => {
++        const order: string[] = []
++        const api = { sendMessage: vi.fn(async () => { order.push('send') }),
++            getManualPause: vi.fn(async () => ({ pausedAt: 123 })),
++            resumeManualPause: vi.fn(async () => { order.push('continue') }) } as unknown as ApiClient
++        const { result } = renderHook(() => useSendMessage(api, 'stopped', {
++            resolveSessionId: async id => { order.push('resolve'); return { sessionId: id, resumed: false } },
++        }), { wrapper: createWrapper() })
++        await act(async () => { await result.current.sendMessage('new instruction', undefined, undefined, 'queue', true) })
++        await waitFor(() => expect(api.sendMessage).toHaveBeenCalled())
++        expect(api.resumeManualPause).toHaveBeenCalledWith('stopped', 123)
++        expect(order).toEqual(['continue', 'resolve', 'send'])
++    })
++
++    it('keeps ordinary delivery, schedules and background callers from clearing Stop', async () => {
++        const api = { sendMessage: vi.fn(async () => {}), getManualPause: vi.fn(async () => ({ pausedAt: 123 })), resumeManualPause: vi.fn() } as unknown as ApiClient
++        const { result } = renderHook(() => useSendMessage(api, 'stopped'), { wrapper: createWrapper() })
++        await act(async () => { await result.current.sendMessage('old work') })
++        await waitFor(() => expect(api.sendMessage).toHaveBeenCalledTimes(1))
++        await waitFor(() => expect(result.current.isSending).toBe(false))
++        await act(async () => { await result.current.sendMessage('scheduled work', undefined, Date.now() + 60000, 'queue', true) })
++        await waitFor(() => expect(api.sendMessage).toHaveBeenCalledTimes(2))
++        expect(api.getManualPause).not.toHaveBeenCalled()
++        expect(api.resumeManualPause).not.toHaveBeenCalled()
++    })
++
++    it('does not send or retry continuation when a newer Stop wins the race', async () => {
++        const onError = vi.fn()
++        const api = { sendMessage: vi.fn(), getManualPause: vi.fn(async () => ({ pausedAt: 123 })),
++            resumeManualPause: vi.fn(async () => { throw new ApiError('Stopped again', 409, 'session_manually_paused') }) } as unknown as ApiClient
++        const { result } = renderHook(() => useSendMessage(api, 'stopped', { onError }), { wrapper: createWrapper() })
++        let accepted: unknown
++        await act(async () => { accepted = await result.current.sendMessage('keep draft', undefined, undefined, 'queue', true) })
++        expect(accepted).toBe(false)
++        expect(api.sendMessage).not.toHaveBeenCalled()
++        expect(api.resumeManualPause).toHaveBeenCalledTimes(1)
++        expect(onError).toHaveBeenCalledWith(expect.objectContaining({ text: 'keep draft', mutationStarted: false }))
+     })
+ 
+     it('calls onSuccess with the session ID that was sent', async () => {
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -599,6 +599,7 @@
+         attachments?: AttachmentMetadata[],
+         scheduledAt?: number | null,
+         deliveryMode?: MessageDeliveryMode,
++        userContinue?: boolean,
+     ) => Promise<SendMessageAcceptance | false>
+     resolveSessionIdForUpload?: (sessionId: string) => Promise<string>
+     onUploadSessionResolved?: (sessionId: string) => void
+@@ -944,6 +945,7 @@
+                     ordered,
+                     scheduledAt,
+                     deliveryMode,
++                    true,
+                 )
+                 if (accepted) {
+                     // Hub blobs were copied into the normal upload dir; drop the
+@@ -960,7 +962,7 @@
+                 await navigate({ to: '/sessions/$sessionId', params: { sessionId: result.sessionId }, ...PRESERVE_SESSION_SIDEBAR_SCROLL })
+                 return { attemptId: null }
+             }
+-            return props.onSend(text, attachments, scheduledAt, deliveryMode)
++            return props.onSend(text, attachments, scheduledAt, deliveryMode, true)
+         },
+         [props.onSend, props.api, props.session.id, props.session.metadata?.capabilities?.concurrentClients, navigate, scratchlist, scratchlistMode],
+     )
+diff --git a/web/src/components/ManualPauseBanner.tsx b/web/src/components/ManualPauseBanner.tsx
+--- a/web/src/components/ManualPauseBanner.tsx
++++ b/web/src/components/ManualPauseBanner.tsx
+@@ -2,7 +2,7 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import type { ApiClient } from '@/api/client'
+ 
+-/** Resuming is a separate user gesture, never an effect of send/reconnect. */
++/** The Stop guard persists until a fresh user continuation; observation never clears it. */
+ export function ManualPauseBanner({ api, sessionId }: { api: ApiClient | null; sessionId: string }) {
+     const client = useQueryClient()
+     const [busy, setBusy] = useState(false)
+@@ -10,13 +10,13 @@
+     const state = useQuery({ queryKey: ['manual-pause', sessionId], queryFn: () => api!.getManualPause(sessionId), enabled: Boolean(api?.getManualPause), refetchInterval: 2000, retry: false })
+     if (state.data?.pausedAt == null) return null
+     return <div className="shrink-0 border-b px-3 py-2 text-sm" role="status">
+-        Paused.
++        Stopped.
+         <button type="button" disabled={busy} className="ml-2 text-[var(--app-link)]" onClick={async () => {
+             setBusy(true); setError('')
+             try { await api!.resumeManualPause(sessionId); await state.refetch(); await client.invalidateQueries({ queryKey: ['sessions'] }) }
+-            catch { setError('Resume failed; the pause remains in effect.') }
++            catch { setError('Could not continue; the chat remains stopped.') }
+             finally { setBusy(false) }
+-        }}>Resume</button>
++        }}>Continue</button>
+         {error && <span role="alert">{error}</span>}
+     </div>
+ }
+diff --git a/web/src/components/ManualPauseBanner.test.tsx b/web/src/components/ManualPauseBanner.test.tsx
+--- a/web/src/components/ManualPauseBanner.test.tsx
++++ b/web/src/components/ManualPauseBanner.test.tsx
+@@ -7,10 +7,10 @@
+ it('observes without resuming; requires a click and preserves errors', async () => {
+     const api = { getManualPause: vi.fn(async () => ({ pausedAt: 1 })), resumeManualPause: vi.fn(async () => { throw new Error('offline') }) }
+     render(<QueryClientProvider client={new QueryClient()}><ManualPauseBanner api={api as unknown as ApiClient} sessionId="paused" /></QueryClientProvider>)
+-    const button = await screen.findByRole('button', { name: 'Resume' })
++    const button = await screen.findByRole('button', { name: 'Continue' })
+     expect(api.resumeManualPause).not.toHaveBeenCalled()
+     fireEvent.click(button)
+-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Resume failed'))
++    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Could not continue'))
+     expect(api.resumeManualPause).toHaveBeenCalledWith('paused')
+     expect(button).toBeInTheDocument()
+ })
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -21,8 +21,8 @@
+     })
+     const hasWork = sessionHasWork(session)
+     const managementPaused = managed?.projectStatus === 'paused' || managed?.manualHold
+-    const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Paused'
+-        : managementPaused ? (hasWork ? 'Management paused' : 'Paused')
++    const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Stopped'
++        : managementPaused ? (hasWork ? 'Management held' : 'On hold')
+         : hasWork ? null : session.active ? 'Idle' : 'Inactive'
+     return label ? <div className="flex flex-wrap items-center gap-x-2 px-2 pb-1 text-xs text-[var(--app-hint)]">
+         <p>{label}</p>
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -128,7 +128,7 @@
+     expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull()
+     rerender(view(managed))
+     await screen.findByRole('button', { name: 'Open Terrain' })
+-    expect(screen.getByText('Paused')).toBeInTheDocument()
++    expect(screen.getByText('On hold')).toBeInTheDocument()
+     expect(screen.getByText('Inactive', { selector: 'p' })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: 'Open Unmanaged idle' })).toBeNull()
+     fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+@@ -158,8 +158,8 @@
+     const localApi = { ...controls, getManualPause } as unknown as ApiClient
+     render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={localApi} sessions={[idle, background]} managed={{ Stopped: { role: 'worker' }, 'Background held': { role: 'worker', manualHold: true } }} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>)
+     expect(getManualPause).not.toHaveBeenCalled()
+-    open(); await screen.findByText('Paused')
+-    expect(screen.getByText('Management paused')).toBeInTheDocument()
++    open(); await screen.findByText('Stopped')
++    expect(screen.getByText('Management held')).toBeInTheDocument()
+     fireEvent.click(screen.getByRole('button', { name: 'Active' }))
+     expect(screen.getByRole('button', { name: 'Open Background held' })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: 'Open Stopped' })).toBeNull()
+@@ -202,7 +202,7 @@
+     await waitFor(() => expect(client.getQueryData(queryKeys.sessions)).toBeDefined())
+     open()
+     await screen.findByRole('button', { name: 'Open Terrain' })
+-    expect(screen.getByText('Paused')).toBeInTheDocument()
++    expect(screen.getByText('On hold')).toBeInTheDocument()
+     // SSE/list refetch creates fresh snapshots while the chat remains idle.
+     for (let updatedAt = 2; updatedAt < 5; updatedAt++) {
+         client.setQueryData(queryKeys.sessions, { sessions: [{ ...terrain, updatedAt }] })
+@@ -227,7 +227,7 @@
+     fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Recent result' })).toBeNull())
+     expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
+-    expect(screen.getByText('Paused')).toBeInTheDocument()
++    expect(screen.getByText('On hold')).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -257,7 +257,7 @@
+             const body = await res.text().catch(() => '')
+             const code = parseErrorCode(body)
+             throw new ApiError(
+-                code === 'session_manually_paused' ? 'Chat paused. Select Resume to continue.' : `HTTP ${res.status} ${res.statusText}: ${body}`,
++                code === 'session_manually_paused' ? 'Chat stopped. Send a new message or select Continue.' : `HTTP ${res.status} ${res.statusText}: ${body}`,
+                 res.status,
+                 code,
+                 body || undefined
+@@ -641,9 +641,9 @@
+         return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/manual-pause`)
+     }
+ 
+-    async resumeManualPause(sessionId: string): Promise<void> {
++    async resumeManualPause(sessionId: string, expectedPausedAt?: number): Promise<void> {
+         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/manual-resume`, {
+-            method: 'POST', body: JSON.stringify({ explicitUserResume: true })
++            method: 'POST', body: JSON.stringify({ explicitUserResume: true, expectedPausedAt })
+         })
+     }
+ 
+diff --git a/web/src/api/client.test.ts b/web/src/api/client.test.ts
+--- a/web/src/api/client.test.ts
++++ b/web/src/api/client.test.ts
+@@ -335,6 +335,6 @@
+     globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({ error: 'Chat paused', code: 'session_manually_paused' }), { status: 409 })) as typeof fetch
+     try {
+         const api = new ApiClient('test')
+-        await expect(api.sendMessage('s', 'my draft')).rejects.toMatchObject({ message: 'Chat paused. Select Resume to continue.', status: 409, code: 'session_manually_paused' })
++        await expect(api.sendMessage('s', 'my draft')).rejects.toMatchObject({ message: 'Chat stopped. Send a new message or select Continue.', status: 409, code: 'session_manually_paused' })
+     } finally { globalThis.fetch = original }
+ })
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -357,7 +357,7 @@
+     error: unknown,
+     t: (key: string) => string,
+ ): { message: string; code: string | null } {
+-    if (error instanceof ApiError && error.code === 'session_manually_paused') return { message: 'Chat paused. Select Resume to continue.', code: error.code }
++    if (error instanceof ApiError && error.code === 'session_manually_paused') return { message: 'Chat stopped. Send a new message or select Continue.', code: error.code }
+     if (error instanceof ApiError && error.status === 409 && error.code === 'session_inactive') {
+         return { message: t('chat.sendError.sessionInactive'), code: 'session_inactive' }
+     }
+@@ -531,7 +531,7 @@
+             mutationStarted: rawSendError.mutationStarted,
+             restoreSuppressed: rawSendError.restoreSuppressed,
+             action: rawSendError.code === 'session_manually_paused'
+-                ? { label: 'Resume', onClick: async () => {
++                ? { label: 'Continue', onClick: async () => {
+                     if (!api) return
+                     try { await api.resumeManualPause(sessionId); await queryClient.invalidateQueries({ queryKey: ['manual-pause', sessionId] }); clearSendError() }
+                     catch { /* Keep the error and draft available for retry. */ }
+diff --git a/hub/src/web/routes/sessions.ts b/hub/src/web/routes/sessions.ts
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -413,6 +413,10 @@
+         if (session instanceof Response) return session
+         const body = await c.req.json().catch(() => null)
+         if (body?.explicitUserResume !== true || (body?.origin === 'manager' && (typeof body?.basis !== 'string' || !body.basis.trim()))) return c.json({ error: 'Explicit user resume and manager basis required' }, 400)
++        // A fresh send may continue only the Stop it observed, never a newer Stop.
++        if (body.expectedPausedAt !== undefined && (typeof body.expectedPausedAt !== 'number' || engine.getManualPause(session.sessionId) !== body.expectedPausedAt)) {
++            return c.json({ error: 'Chat stopped again. Send a new message to continue.', code: 'session_manually_paused' }, 409)
++        }
+         engine.resumeManualPause(session.sessionId)
+         return c.json({ ok: true })
+     })
+diff --git a/hub/src/sync/manualPause.test.ts b/hub/src/sync/manualPause.test.ts
+--- a/hub/src/sync/manualPause.test.ts
++++ b/hub/src/sync/manualPause.test.ts
+@@ -72,6 +72,22 @@
+ 
+ 
+ describe('explicit resume API', () => {
++    it('a fresh send cannot clear a newer Stop than the one it observed', async () => {
++        const { store, engine, session } = setup()
++        const app = new Hono<any>()
++        app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++        app.route('/', createSessionsRoutes(() => engine))
++        try {
++            engine.pauseSession(session.id)
++            const at = engine.getManualPause(session.id)!
++            const url = `/sessions/${session.id}/manual-resume`
++            const request = (expectedPausedAt: number) => app.request(url, { method: 'POST', body: JSON.stringify({ explicitUserResume: true, expectedPausedAt }) })
++            expect((await request(at - 1)).status).toBe(409)
++            expect(engine.getManualPause(session.id)).toBe(at)
++            expect((await request(at)).status).toBe(200)
++            expect(engine.getManualPause(session.id)).toBeNull()
++        } finally { engine.stop(); store.close() }
++    })
+     it('requires explicit intent and namespace access; reading cannot unpause', async () => {
+         const { store, engine, session } = setup()
+         const app = (ns: string) => {

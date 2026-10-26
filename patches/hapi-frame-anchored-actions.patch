@@ -1,0 +1,65 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -4,7 +4,7 @@
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import * as Popover from '@radix-ui/react-popover'
+ import { createPortal } from 'react-dom'
+-import { Fragment, useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
++import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+@@ -156,6 +156,22 @@
+     const annotations = (graph?.graph.annotations ?? []).map(a => annotationDrafts[a.id] ?? a)
+     const annotationsRef = useRef(annotations); annotationsRef.current = annotations
+     const selected = annotations.find(a => a.id === selectedAnnotation)
++    const annotationActions = useRef<HTMLDivElement>(null)
++    const [actionSize, setActionSize] = useState({ width: 160, height: 44 })
++    const hasFrameParent = Boolean(selected && annotations.some(a => a.members?.includes(selected.kind + ':' + selected.id)))
++    useLayoutEffect(() => {
++        const element = annotationActions.current
++        if (!element) return
++        const measure = () => { const { width, height } = element.getBoundingClientRect(); if (width > 0 && height > 0) setActionSize({ width, height }) }
++        measure()
++        if (typeof ResizeObserver === 'undefined') return
++        const observer = new ResizeObserver(measure); observer.observe(element); if (canvas.current) observer.observe(canvas.current)
++        return () => observer.disconnect()
++    }, [selected?.id, hasFrameParent, menu])
++    const annotationActionPoint = selected ? {
++        left: Math.max(8, Math.min(view.x + (selected.x + selected.width / 2) * view.k - actionSize.width / 2, (canvas.current?.clientWidth || 800) - actionSize.width - 8)),
++        top: Math.max(8, Math.min(view.y + (selected.y + selected.height) * view.k + 8, (canvas.current?.clientHeight || 600) - actionSize.height - 8)),
++    } : undefined
+ 
+     // Overrides last only until the hub echoes the saved position back.
+     useEffect(() => {
+@@ -997,8 +1013,7 @@
+                     <option value="">{selectedDot.owner ? 'Add branch…' : 'Connect input first'}</option>{ids.filter(id => id !== overseer && id !== selectedDot.owner).map(id => <option key={id} value={id}>{title(id)}</option>)}
+                 </select></label>
+             </section>}
+-            {selected && !menu && <div data-graph-ui className="absolute bottom-16 right-2 z-20 flex max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+-                <span className="max-w-32 truncate px-2 text-xs text-[var(--app-hint)]">{selected.kind === 'frame' ? selected.text || 'Frame' : 'Text box'}</span>
++            {selected && !menu && <div ref={annotationActions} data-graph-ui data-annotation-toolbar aria-label="Annotation actions" style={annotationActionPoint} className="absolute z-20 flex w-max max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                 <button type="button" disabled={pending !== null} onClick={() => editAnnotation(selected)} className="min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)]">Edit</button>
+                 {annotations.some(a => a.members?.includes(selected.kind + ':' + selected.id)) && <button type="button" onClick={() => removeFromFrame(selected.kind + ':' + selected.id)} className={menuItem}>Remove from frame</button>}
+                 <button type="button" aria-label="Delete annotation" disabled={pending !== null} onClick={() => void saveAnnotation(null, selected)} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1635,3 +1635,18 @@
+     expect((await api.getNodeGraph()).graph.nodes.find(n => n.sessionId === 'A')?.x).toBe(a.x! + 20)
+     expect(api.abortSession).not.toHaveBeenCalled()
+ })
++it('anchors the compact Edit/Delete controls below the selected frame without repeating its label', async () => {
++    const graph = initial()
++    graph.graph.nodes = [{ sessionId: 'O', x: 20, y: 50, addedAt: 1 }]; graph.graph.edges = []
++    graph.graph.annotations = [{ id: 'group', kind: 'frame', text: 'Frame name only once', color: 'blue', x: 0, y: 0, width: 300, height: 200 }]
++    setup(makeApi({ graph }))
++    fireEvent.click(await screen.findByRole('button', { name: 'Select frame: Frame name only once' }))
++    const toolbar = screen.getByLabelText('Annotation actions')
++    expect(within(toolbar).getByRole('button', { name: 'Edit' })).toBeTruthy()
++    expect(within(toolbar).getByRole('button', { name: 'Delete annotation' })).toBeTruthy()
++    expect(within(toolbar).queryByText('Frame name only once')).toBeNull()
++    expect(toolbar.style.bottom).toBe('')
++    const world = document.querySelector<HTMLElement>('[data-node-id="O"]')!.parentElement!
++    const [, , y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
++    expect(parseFloat(toolbar.style.top)).toBeCloseTo(y! + 200 * k! + 8)
++})

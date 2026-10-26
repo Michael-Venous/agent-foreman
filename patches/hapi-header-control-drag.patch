@@ -1,0 +1,363 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -2,6 +2,7 @@
+ import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
+ import { createPortal } from 'react-dom'
+ import { useNarrowViewport } from '@/hooks/useNarrowViewport'
++import { useFloatingHeaderDrag } from '@/hooks/useFloatingHeaderDrag'
+ 
+ export type WindowBounds = { x: number; y: number; width: number; height: number }
+ type Position = Pick<WindowBounds, 'x' | 'y'>
+@@ -90,10 +91,15 @@
+     const [view, setView] = useState(viewport)
+     const titleId = useId()
+     const focusTarget = useRef<HTMLButtonElement>(null)
+-    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize' | 'bubble'; x: number; y: number; bounds: WindowBounds } | null>(null)
++    const header = useRef<HTMLElement>(null)
++    const gesture = useRef<{ pointer: number; kind: 'resize' | 'bubble'; x: number; y: number; bounds: WindowBounds } | null>(null)
+     const suppressBubbleClick = useRef(false)
+     const current = useRef({ bounds, bubble })
+     current.current = { bounds, bubble }
++    useFloatingHeaderDrag({ header, enabled: open && !collapsed,
++        getBounds: () => fitSessionWindow(current.current.bounds ?? initialBounds()),
++        onMove: next => setBounds(fitSessionWindow(next)), canStart: () => !gesture.current,
++    })
+     useEffect(() => {
+         if (!open) return
+         let previousView = viewport()
+@@ -125,14 +131,13 @@
+         // Cache setters use the latest state; viewport handlers read refs.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [open, collapsed])
+-    const start = (event: PointerEvent<HTMLElement>, kind: 'move' | 'resize' | 'bubble') => {
++    const start = (event: PointerEvent<HTMLElement>, kind: 'resize' | 'bubble') => {
+         if (event.button !== 0 || gesture.current) return
+         // Touch already has implicit capture; touch-action:none handles dragging.
+         // Preserve native taps instead of cancelling/focusing touch pointerdown.
+         if (event.pointerType !== 'touch') {
+             event.preventDefault()
+-            const focus = kind === 'move' ? focusTarget.current : event.currentTarget
+-            focus?.focus({ preventScroll: true })
++            event.currentTarget.focus({ preventScroll: true })
+             event.currentTarget.setPointerCapture(event.pointerId)
+         }
+         suppressBubbleClick.current = false
+@@ -151,11 +156,9 @@
+             if (suppressBubbleClick.current) setBubble(fitSessionBubble({ x: start.bounds.x + dx, y: start.bounds.y + dy }))
+             return
+         }
+-        const next = start.kind === 'move'
+-            ? { ...start.bounds, x: start.bounds.x + dx, y: start.bounds.y + dy }
+-            : { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
++        const next = { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
+         const view = viewport()
+-        if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
++        next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8)
+         setBounds(fitSessionWindow(next))
+     }
+     const end = (event: PointerEvent<HTMLElement>) => {
+@@ -202,16 +205,7 @@
+         onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="app-section-header app-window-chrome touch-none select-none cursor-move [&_button:not([data-window-drag-handle])]:cursor-pointer"
+-            onPointerDown={event => {
+-                const target = event.target
+-                // Portal controls belong to their own interaction surface. All
+-                // remaining header space, including grid gaps/padding, is a handle.
+-                if (event.defaultPrevented || !(target instanceof Element) || !event.currentTarget.contains(target)) return
+-                const control = target.closest('button,a,input,select,textarea,[contenteditable="true"],[role="button"],[role="combobox"],[data-window-no-drag]')
+-                if (control && control !== focusTarget.current) return
+-                start(event, 'move')
+-            }} {...pointerEvents}
++        <header ref={header} className="app-section-header app-window-chrome touch-none select-none cursor-move [&_button:not([data-window-drag-handle])]:cursor-pointer"
+             style={headerCenter ? { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr)' } : undefined}>
+             <button ref={focusTarget} data-window-drag-handle type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move"
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+diff --git a/web/src/components/NodeGraphHost.test.tsx b/web/src/components/NodeGraphHost.test.tsx
+--- a/web/src/components/NodeGraphHost.test.tsx
++++ b/web/src/components/NodeGraphHost.test.tsx
+@@ -1,3 +1,4 @@
++import * as Popover from '@radix-ui/react-popover'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { createPortal } from 'react-dom'
+@@ -7,7 +8,7 @@
+ 
+ type HeaderTargets = { center: HTMLElement | null; actions: HTMLElement | null }
+ type GraphProps = { headerTargets?: HeaderTargets; onOpenChat: (id: string) => void; visible?: boolean }
+-const state = vi.hoisted(() => ({ navigate: vi.fn(), graphRender: vi.fn(), workspace: 'Current workspace', currentChat: 'current-chat' }))
++const state = vi.hoisted(() => ({ navigate: vi.fn(), graphRender: vi.fn(), workspaceAction: vi.fn(), gridAction: vi.fn(), workspace: 'Current workspace', currentChat: 'current-chat' }))
+ vi.mock('@tanstack/react-router', () => ({ useNavigate: () => state.navigate }))
+ vi.mock('@/lib/app-context', () => ({ useAppContext: () => ({ api: {} }) }))
+ vi.mock('@/hooks/queries/useSessions', () => ({ useSessions: () => ({ sessions: [{ id: state.currentChat }], isLoading: false }) }))
+@@ -17,8 +18,20 @@
+ vi.mock('./NodeGraphView', () => ({
+     NodeGraphView: (props: GraphProps) => {
+         state.graphRender(props)
+-        const workspace = <select aria-label="Workspace"><option>{state.workspace}</option></select>
+-        const actions = <button type="button">Graph options</button>
++        // These Roots belong to GraphView logically, while their triggers are
++        // physically portaled into the FloatingWindow header just like the app.
++        const workspace = <Popover.Root>
++            <Popover.Trigger asChild><button type="button" aria-label="Workspace">{state.workspace}</button></Popover.Trigger>
++            <Popover.Portal><Popover.Content data-graph-ui role="group" aria-label="Workspace menu" onEscapeKeyDown={event => event.stopPropagation()}>
++                <button onClick={state.workspaceAction}>Choose workspace</button>
++            </Popover.Content></Popover.Portal>
++        </Popover.Root>
++        const actions = <Popover.Root>
++            <Popover.Trigger asChild><button type="button">Graph options</button></Popover.Trigger>
++            <Popover.Portal><Popover.Content data-graph-ui role="group" aria-label="Graph options menu" onEscapeKeyDown={event => event.stopPropagation()}>
++                <button onClick={state.gridAction}>Snap to grid</button>
++            </Popover.Content></Popover.Portal>
++        </Popover.Root>
+         return <>
+             {props.headerTargets
+                 ? <>{props.headerTargets.center && createPortal(workspace, props.headerTargets.center)}{props.headerTargets.actions && createPortal(actions, props.headerTargets.actions)}</>
+@@ -75,28 +88,106 @@
+         }
+     })
+ 
+-    it('does not capture or drag workspace, grid or minimize controls', async () => {
+-        setup()
+-        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
+-        const header = panel.querySelector('header')!
+-        const controls = [await within(header).findByRole('combobox', { name: 'Workspace' }), within(header).getByRole('button', { name: 'Graph options' }), within(header).getByRole('button', { name: 'Collapse Nodes' })]
+-        const before = { left: panel.style.left, top: panel.style.top }
+-        for (const control of controls) {
+-            expect(fireEvent.pointerDown(control, { pointerId: 1, button: 0, clientX: 200, clientY: 100 })).toBe(true)
+-            fireEvent.pointerMove(header, { pointerId: 1, clientX: 240, clientY: 130 })
+-            fireEvent.pointerUp(header, { pointerId: 1 })
+-            expect({ left: panel.style.left, top: panel.style.top }).toEqual(before)
+-        }
++    const headerControls = ['Workspace', 'Graph options', 'Collapse Nodes'] as const
++    const controlGestures = ['mouse', 'touch'].flatMap(pointerType => headerControls.map(control => ({ pointerType, control })))
++    const geometry = (panel: HTMLElement) => ({ left: parseFloat(panel.style.left), top: parseFloat(panel.style.top) })
++    const activate = async (control: typeof headerControls[number]) => {
++        if (control === 'Collapse Nodes') await screen.findByLabelText('Nodes bubble')
++        else await screen.findByRole('group', { name: control === 'Workspace' ? 'Workspace menu' : 'Graph options menu' })
++    }
++    const clickGesture = (control: HTMLElement, pointerType: string, pointerId = 2) => {
++        fireEvent.pointerDown(control, { pointerId, pointerType, button: 0, clientX: 200, clientY: 100 })
++        fireEvent.pointerUp(control, { pointerId, pointerType, button: 0, clientX: 200, clientY: 100 })
++        fireEvent.click(control, { detail: 1 })
++    }
++
++    it.each(controlGestures)('drags $control with $pointerType, suppressing only its postdrag click', async ({ pointerType, control: name }) => {
++        if (pointerType === 'touch') vi.stubGlobal('innerWidth', 390)
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const control = await within(header).findByRole('button', { name })
++        const before = geometry(panel)
++        expect(fireEvent.pointerDown(control, { pointerId: 1, pointerType, button: 0, clientX: 200, clientY: 100 })).toBe(true)
+         expect(HTMLElement.prototype.setPointerCapture).not.toHaveBeenCalled()
+-        fireEvent.click(controls[2]!)
+-        await screen.findByLabelText('Nodes bubble')
++        fireEvent.pointerMove(header, { pointerId: 1, pointerType, clientX: 240, clientY: 130 })
++        await waitFor(() => expect(geometry(panel)).toEqual({ left: before.left + 40, top: before.top + 30 }))
++        fireEvent.pointerUp(header, { pointerId: 1, pointerType, clientX: 240, clientY: 130 })
++        fireEvent.click(control, { detail: 1 })
++        expect(screen.getByRole('dialog', { name: 'Nodes' })).toBe(panel)
++        expect(screen.queryByRole('group', { name: /menu$/ })).toBeNull()
++        expect(screen.queryByLabelText('Nodes bubble')).toBeNull()
++        clickGesture(control, pointerType)
++        await activate(name)
++    })
++
++    it.each(controlGestures)('treats subthreshold jitter on $control as a $pointerType click', async ({ pointerType, control: name }) => {
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const control = await within(header).findByRole('button', { name })
++        const before = geometry(panel)
++        expect(fireEvent.pointerDown(control, { pointerId: 1, pointerType, button: 0, clientX: 200, clientY: 100 })).toBe(true)
++        fireEvent.pointerMove(header, { pointerId: 1, pointerType, clientX: 203, clientY: 102 })
++        fireEvent.pointerUp(header, { pointerId: 1, pointerType, clientX: 203, clientY: 102 })
++        expect(geometry(panel)).toEqual(before)
++        expect(HTMLElement.prototype.setPointerCapture).not.toHaveBeenCalled()
++        fireEvent.click(control, { detail: 1 })
++        await activate(name)
++    })
++
++    it.each(['Workspace', 'Graph options'] as const)('does not start a parent drag from portaled %s popup contents', async name => {
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        fireEvent.click(await within(header).findByRole('button', { name }), { detail: 0 })
++        const popup = await screen.findByRole('group', { name: name === 'Workspace' ? 'Workspace menu' : 'Graph options menu' })
++        expect(header.contains(popup)).toBe(false)
++        const before = geometry(panel)
++        fireEvent.pointerDown(popup, { pointerId: 1, button: 0, clientX: 200, clientY: 100 })
++        fireEvent.pointerMove(header, { pointerId: 1, clientX: 240, clientY: 130 })
++        fireEvent.pointerUp(header, { pointerId: 1 })
++        expect(geometry(panel)).toEqual(before)
++        expect(HTMLElement.prototype.setPointerCapture).not.toHaveBeenCalled()
++        fireEvent.click(within(popup).getByRole('button', { name: name === 'Workspace' ? 'Choose workspace' : 'Snap to grid' }))
++        expect(name === 'Workspace' ? state.workspaceAction : state.gridAction).toHaveBeenCalledOnce()
++    })
++
++    it.each(['pointercancel', 'blur', 'lostpointercapture'])('cleans up header-control dragging on %s before a later normal click', async ending => {
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const control = await within(header).findByRole('button', { name: 'Workspace' })
++        const before = geometry(panel)
++        fireEvent.pointerDown(control, { pointerId: 1, button: 0, clientX: 200, clientY: 100 })
++        fireEvent.pointerMove(header, { pointerId: 1, clientX: 240, clientY: 130 })
++        await waitFor(() => expect(geometry(panel)).toEqual({ left: before.left + 40, top: before.top + 30 }))
++        if (ending === 'blur') fireEvent.blur(window)
++        else fireEvent(header, new PointerEvent(ending, { bubbles: true, pointerId: 1, button: 0 }))
++        fireEvent.pointerMove(header, { pointerId: 1, clientX: 280, clientY: 160 })
++        expect(geometry(panel)).toEqual({ left: before.left + 40, top: before.top + 30 })
++        clickGesture(control, 'mouse')
++        await activate('Workspace')
++    })
++
++    it.each(headerControls)('preserves keyboard activation of %s after dragging', async name => {
++        setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const control = await within(header).findByRole('button', { name })
++        fireEvent.pointerDown(control, { pointerId: 1, button: 0, clientX: 200, clientY: 100 })
++        fireEvent.pointerMove(header, { pointerId: 1, clientX: 240, clientY: 130 })
++        fireEvent.pointerUp(header, { pointerId: 1, clientX: 240, clientY: 130 })
++        // Browsers synthesize detail=0 clicks for keyboard activation.
++        fireEvent.click(control, { detail: 0 })
++        await activate(name)
+     })
+ 
+     it('places graph controls in the real top header under a plain Nodes title', async () => {
+         const view = setup()
+         const panel = await screen.findByRole('dialog', { name: 'Nodes' })
+         const header = panel.querySelector('header')!
+-        const workspace = await within(header).findByRole('combobox', { name: 'Workspace' })
++        const workspace = await within(header).findByRole('button', { name: 'Workspace' })
+         const actions = within(header).getByRole('button', { name: 'Graph options' })
+         const targets = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
+         expect(targets.center?.contains(workspace)).toBe(true)
+@@ -107,7 +198,7 @@
+         expect(header).not.toHaveTextContent('Nodes ·')
+         expect(panel.querySelectorAll('header')).toHaveLength(1)
+         expect(screen.queryByRole('toolbar', { name: 'Inline graph toolbar' })).toBeNull()
+-        expect(within(screen.getByRole('region', { name: 'Graph canvas' })).queryByRole('combobox')).toBeNull()
++        expect(within(screen.getByRole('region', { name: 'Graph canvas' })).queryByRole('button', { name: 'Workspace' })).toBeNull()
+         expect(view.container.querySelector('[role=dialog]')).toBeNull()
+         // Workspace changes update the selector while keeping the same slots.
+         state.workspace = 'Other workspace'
+@@ -117,7 +208,7 @@
+         const updated = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
+         expect(updated.center).toBe(targets.center)
+         expect(updated.actions).toBe(targets.actions)
+-        expect(within(panel).getAllByRole('combobox', { name: 'Workspace' })).toHaveLength(1)
++        expect(within(panel).getAllByRole('button', { name: 'Workspace' })).toHaveLength(1)
+     })
+ 
+     it.each([{ kind: 'desktop', width: 1200 }, { kind: 'mobile', width: 390 }])('keeps Nodes expanded when opening its current chat on $kind', async ({ width }) => {
+@@ -146,7 +237,7 @@
+         expect(screen.queryByRole('dialog', { name: 'Nodes' })).toBeNull()
+         fireEvent.click(screen.getByRole('button', { name: 'Expand Nodes' }))
+         const expanded = await screen.findByRole('dialog', { name: 'Nodes' })
+-        await within(expanded.querySelector('header')!).findByRole('combobox', { name: 'Workspace' })
++        await within(expanded.querySelector('header')!).findByRole('button', { name: 'Workspace' })
+         fireEvent.click(within(expanded).getByRole('button', { name: 'Collapse Nodes' }))
+         await screen.findByLabelText('Nodes bubble')
+         fireEvent.click(screen.getByRole('button', { name: 'Close Nodes' }))
+diff --git a/web/src/hooks/useFloatingHeaderDrag.ts b/web/src/hooks/useFloatingHeaderDrag.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/useFloatingHeaderDrag.ts
+@@ -0,0 +1,92 @@
++import { useEffect, useRef, type RefObject } from 'react'
++import type { WindowBounds } from '@/components/FloatingWindow'
++
++type Options = {
++    header: RefObject<HTMLElement | null>
++    enabled: boolean
++    getBounds: () => WindowBounds
++    onMove: (bounds: WindowBounds) => void
++    canStart: () => boolean
++}
++
++/** Physical DOM capture also covers controls portaled into the header by another React owner. */
++export function useFloatingHeaderDrag({ header, enabled, ...callbacks }: Options) {
++    const latest = useRef(callbacks)
++    latest.current = callbacks
++    useEffect(() => {
++        const element = header.current
++        if (!enabled || !element) return
++        let drag: { pointer: number; x: number; y: number; bounds: WindowBounds; moved: boolean } | null = null
++        let suppressClick = false
++        const cancel = () => {
++            const previous = drag
++            drag = null
++            if (!previous) return
++            suppressClick ||= previous.moved
++            if (element.hasPointerCapture?.(previous.pointer)) element.releasePointerCapture(previous.pointer)
++        }
++        const down = (event: PointerEvent) => {
++            // A fresh physical interaction must never inherit an earlier drag's click suppression.
++            cancel()
++            suppressClick = false
++            const target = event.target
++            if (event.button !== 0 || event.isPrimary === false || !(target instanceof Element) || !element.contains(target) || !latest.current.canStart()) return
++            if (target.closest('input,select,textarea,[contenteditable="true"],[data-window-no-drag]')) return
++            drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY, bounds: latest.current.getBounds(), moved: false }
++            // Keep normal focus and control clicks. Capture only after movement proves this is a drag.
++        }
++        const move = (event: PointerEvent) => {
++            if (!drag || drag.pointer !== event.pointerId) return
++            const dx = event.clientX - drag.x, dy = event.clientY - drag.y
++            if (!drag.moved && Math.hypot(dx, dy) < 6) return
++            if (!drag.moved) {
++                drag.moved = true
++                element.setPointerCapture?.(event.pointerId)
++            }
++            event.preventDefault()
++            event.stopPropagation()
++            latest.current.onMove({ ...drag.bounds, x: drag.bounds.x + dx, y: drag.bounds.y + dy })
++        }
++        const up = (event: PointerEvent) => {
++            if (!drag || drag.pointer !== event.pointerId) return
++            if (drag.moved) {
++                event.preventDefault()
++                event.stopPropagation()
++            }
++            cancel()
++        }
++        const lost = (event: PointerEvent) => {
++            // Touch transfers capture from the pressed control to the header on first movement.
++            if (event.target === element && drag?.pointer === event.pointerId) cancel()
++        }
++        const click = (event: MouseEvent) => {
++            if (!suppressClick || event.detail === 0) return
++            suppressClick = false
++            event.preventDefault()
++            event.stopImmediatePropagation()
++        }
++        window.addEventListener('pointerdown', down, true)
++        window.addEventListener('pointermove', move, { capture: true, passive: false })
++        window.addEventListener('pointerup', up, true)
++        window.addEventListener('pointercancel', up, true)
++        window.addEventListener('lostpointercapture', lost, true)
++        window.addEventListener('click', click, true)
++        window.addEventListener('blur', cancel)
++        window.addEventListener('resize', cancel)
++        window.visualViewport?.addEventListener('resize', cancel)
++        window.visualViewport?.addEventListener('scroll', cancel)
++        return () => {
++            cancel()
++            window.removeEventListener('pointerdown', down, true)
++            window.removeEventListener('pointermove', move, true)
++            window.removeEventListener('pointerup', up, true)
++            window.removeEventListener('pointercancel', up, true)
++            window.removeEventListener('lostpointercapture', lost, true)
++            window.removeEventListener('click', click, true)
++            window.removeEventListener('blur', cancel)
++            window.removeEventListener('resize', cancel)
++            window.visualViewport?.removeEventListener('resize', cancel)
++            window.visualViewport?.removeEventListener('scroll', cancel)
++        }
++    }, [header, enabled])
++}

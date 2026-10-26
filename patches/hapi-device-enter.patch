@@ -1,0 +1,215 @@
+--- a/web/src/hooks/useComposerEnterBehavior.ts
++++ b/web/src/hooks/useComposerEnterBehavior.ts
+@@ -2,7 +2,7 @@
+ 
+ export type ComposerEnterBehavior = 'send' | 'newline'
+ 
+-export const DEFAULT_COMPOSER_ENTER_BEHAVIOR: ComposerEnterBehavior = 'newline'
++export const DEFAULT_COMPOSER_ENTER_BEHAVIOR: ComposerEnterBehavior = 'send'
+ 
+ export function getComposerEnterBehaviorOptions(): ReadonlyArray<{ value: ComposerEnterBehavior; labelKey: string }> {
+     return [
+@@ -12,7 +12,7 @@
+ }
+ 
+ function getComposerEnterBehaviorStorageKey(): string {
+-    return 'hapi-composer-enter-behavior'
++    return 'hapi-composer-enter-behavior-v2'
+ }
+ 
+ function isBrowser(): boolean {
+@@ -41,22 +41,13 @@
+     }
+ }
+ 
+-function safeRemoveItem(key: string): void {
+-    if (!isBrowser()) {
+-        return
+-    }
+-    try {
+-        localStorage.removeItem(key)
+-    } catch {
+-        // Ignore storage errors
+-    }
+-}
+-
+ function parseComposerEnterBehavior(raw: string | null): ComposerEnterBehavior {
+     if (raw === 'send' || raw === 'newline') {
+         return raw
+     }
+-    return DEFAULT_COMPOSER_ENTER_BEHAVIOR
++    return typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
++        || (typeof navigator !== 'undefined' && navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
++        ? 'newline' : DEFAULT_COMPOSER_ENTER_BEHAVIOR
+ }
+ 
+ export function getInitialComposerEnterBehavior(): ComposerEnterBehavior {
+@@ -88,11 +79,7 @@
+     const setComposerEnterBehavior = useCallback((behavior: ComposerEnterBehavior) => {
+         setComposerEnterBehaviorState(behavior)
+ 
+-        if (behavior === DEFAULT_COMPOSER_ENTER_BEHAVIOR) {
+-            safeRemoveItem(getComposerEnterBehaviorStorageKey())
+-        } else {
+-            safeSetItem(getComposerEnterBehaviorStorageKey(), behavior)
+-        }
++        safeSetItem(getComposerEnterBehaviorStorageKey(), behavior)
+     }, [])
+ 
+     return { composerEnterBehavior, setComposerEnterBehavior }
+--- a/web/src/hooks/useComposerEnterBehavior.test.ts
++++ b/web/src/hooks/useComposerEnterBehavior.test.ts
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it } from 'vitest'
++import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
+ import {
+     DEFAULT_COMPOSER_ENTER_BEHAVIOR,
+     getComposerEnterBehaviorOptions,
+@@ -20,19 +20,28 @@
+     it('falls back to the default behavior for missing or invalid storage values', () => {
+         expect(getInitialComposerEnterBehavior()).toBe(DEFAULT_COMPOSER_ENTER_BEHAVIOR)
+ 
+-        window.localStorage.setItem('hapi-composer-enter-behavior', 'invalid')
++        window.localStorage.setItem('hapi-composer-enter-behavior-v2', 'invalid')
+         expect(getInitialComposerEnterBehavior()).toBe(DEFAULT_COMPOSER_ENTER_BEHAVIOR)
+     })
+ 
+-    it('defaults Enter to newline while retaining an explicit send preference', () => {
+-        expect(getInitialComposerEnterBehavior()).toBe('newline')
+-        window.localStorage.setItem('hapi-composer-enter-behavior', 'send')
++    it('defaults desktop Enter to send while retaining an explicit preference', () => {
++        expect(getInitialComposerEnterBehavior()).toBe('send')
++        window.localStorage.setItem('hapi-composer-enter-behavior-v2', 'send')
+         expect(getInitialComposerEnterBehavior()).toBe('send')
+     })
+ 
+     it('reads a valid stored enter behavior', () => {
+-        window.localStorage.setItem('hapi-composer-enter-behavior', 'newline')
++        window.localStorage.setItem('hapi-composer-enter-behavior-v2', 'newline')
+ 
+         expect(getInitialComposerEnterBehavior()).toBe('newline')
+     })
+ })
++
++describe('mobile Enter default', () => {
++    afterEach(() => vi.restoreAllMocks())
++    it('uses newline on Android', () => {
++        window.localStorage.clear()
++        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android Mobile')
++        expect(getInitialComposerEnterBehavior()).toBe('newline')
++    })
++})
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -1277,6 +1277,20 @@
+             return
+         }
+ 
++        // Ctrl+Enter inserts a newline before suggestion/send handling.
++        if (key === 'Enter' && e.ctrlKey) {
++            if (e.currentTarget instanceof HTMLTextAreaElement) {
++                e.preventDefault()
++                const input = e.currentTarget
++                const start = input.selectionStart
++                const text = input.value.slice(0, start) + '\n' + input.value.slice(input.selectionEnd)
++                setComposerText(text)
++                setInputState({ text, selection: { start: start + 1, end: start + 1 } })
++                requestAnimationFrame(() => input.setSelectionRange(start + 1, start + 1))
++            }
++            return
++        }
++
+         // Enter with suggestions visible: select the suggestion
+         if (key === 'Enter' && suggestions.length > 0) {
+             e.preventDefault()
+@@ -1373,6 +1387,7 @@
+         richComposerFueStatus,
+         dismissRichComposerFue,
+         flushAndSend,
++        setComposerText,
+         isExpanded,
+         handleExpandedToggle,
+     ])
+--- a/web/src/components/SideChatButton.tsx
++++ b/web/src/components/SideChatButton.tsx
+@@ -1,9 +1,11 @@
++import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
+ import { useEffect, useRef, useState } from 'react'
+ import type { ApiClient } from '@/api/client'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+ 
+ type History = Awaited<ReturnType<ApiClient['getSideChat']>>
+ export function SideChatButton({ api, sessionId }: { api: ApiClient | null; sessionId: string }) {
++    const { composerEnterBehavior } = useComposerEnterBehavior()
+     const [open, setOpen] = useState(false)
+     const [history, setHistory] = useState<History>({ turns: [] })
+     const [draft, setDraft] = useState('')
+@@ -57,7 +59,16 @@
+                 {error ? <p role="alert" className="text-sm text-red-500">{error}</p> : null}
+                 <textarea aria-label="Side question" value={draft} maxLength={4000} rows={3} placeholder="Ask a quick question…"
+                     onChange={e => setDraft(e.target.value)}
+-                    onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void ask() } }}
++                    onKeyDown={e => {
++                        if (e.key === 'Enter' && e.ctrlKey && !e.nativeEvent.isComposing) {
++                            e.preventDefault()
++                            const input = e.currentTarget
++                            const start = input.selectionStart
++                            setDraft(input.value.slice(0, start) + '\n' + input.value.slice(input.selectionEnd))
++                            requestAnimationFrame(() => input.setSelectionRange(start + 1, start + 1))
++                            return
++                        }
++                        if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey && !e.altKey && (composerEnterBehavior === 'send' || e.metaKey) && !e.nativeEvent.isComposing) { e.preventDefault(); void ask() } }}
+                     className="w-full shrink-0 resize-none rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-2 text-sm" />
+                 <button type="button" onClick={() => void ask()} disabled={loading || sending || busy || !draft.trim()}
+                     className="shrink-0 rounded-lg bg-[var(--app-link)] px-3 py-2 text-sm font-medium text-white disabled:opacity-40">{sending || busy ? 'Answering…' : 'Ask'}</button>
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -176,7 +176,7 @@
+         await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Send immediately/ })) })
+         expect(runtime.sentIntents).toEqual(['steer'])
+     })
+-    it.each(['ctrlKey', 'metaKey'])('leaves Enter and Shift+Enter for newlines and sends with %s+Enter', async (modifier) => {
++    it.each(['metaKey'])('leaves Enter and Shift+Enter for newlines and sends with %s+Enter', async (modifier) => {
+         draft()
+         runtime.enterBehavior = 'newline'
+         renderComposer('claude')
+@@ -188,6 +188,17 @@
+         expect(runtime.sentIntents).toEqual(['default'])
+     })
+ 
++    it('sends on desktop Enter and inserts a newline with Ctrl+Enter', async () => {
++        draft()
++        runtime.enterBehavior = 'send'
++        renderComposer('claude')
++        const input = screen.getByRole('textbox') as HTMLTextAreaElement
++        fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true })
++        expect(runtime.sentIntents).toEqual([])
++        await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }) })
++        expect(runtime.sentIntents).toEqual(['default'])
++    })
++
+     it('leaves ordinary send at the queue default', async () => {
+         draft()
+         renderComposer('claude', { active: true, thinking: true, supportsNativePriority: true })
+--- a/web/src/components/SideChatButton.test.tsx
++++ b/web/src/components/SideChatButton.test.tsx
+@@ -16,17 +16,16 @@
+     return { getSideChat, askSideChat }
+ }
+ describe('SideChatButton', () => {
+-    it('only asks on explicit send, keeps Enter as newline, and preserves the separate answer on reopening', async () => {
++    it('sends on desktop Enter and preserves the separate answer on reopening', async () => {
+         const { getSideChat, askSideChat } = setup()
+         expect(getSideChat).not.toHaveBeenCalled(); expect(askSideChat).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: 'Open side chat' }))
+         await waitFor(() => expect(getSideChat).toHaveBeenCalledWith('parent'))
+         const input = screen.getByRole('textbox', { name: 'Side question' })
+         fireEvent.change(input, { target: { value: 'How long?' } })
+-        fireEvent.keyDown(input, { key: 'Enter' })
+         expect(askSideChat).not.toHaveBeenCalled()
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Ask' })).toBeEnabled())
+-        fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
++        fireEvent.keyDown(input, { key: 'Enter' })
+         await waitFor(() => expect(askSideChat).toHaveBeenCalledTimes(1))
+         expect(askSideChat.mock.calls[0]).toEqual(['parent', expect.any(String), 'How long?'])
+         // Keep the fake GET consistent with the accepted side history.

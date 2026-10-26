@@ -1,0 +1,967 @@
+--- a/shared/src/nodeGraph.ts
++++ b/shared/src/nodeGraph.ts
+@@ -24,6 +24,7 @@
+ export type NodeGraphEdge = {
+     owner: string
+     child: string
++    via?: string
+     createdAt: number
+     /** 'user' for UI edits, otherwise the acting session id (overseer or mid-level agent). */
+     createdBy: string
+@@ -41,9 +42,45 @@
+     height: number
+ }
+ 
++/** A transparent wiring point: the real owner remains the upstream chat. */
++export type NodeJunction = { id: string; x: number; y: number; owner: string | null }
++export type NodeRoutingEdge = Pick<NodeGraphEdge, 'owner' | 'child' | 'via'>
++export type NodeRouting = { junctions: NodeJunction[]; edges: NodeRoutingEdge[] }
++
++export function nodeRouting(graph: { junctions?: readonly NodeJunction[]; edges: readonly NodeRoutingEdge[] }): NodeRouting {
++    return {
++        junctions: [...graph.junctions ?? []].map(j => ({ id: j.id, x: j.x, y: j.y, owner: j.owner })).sort((a, b) => a.id.localeCompare(b.id)),
++        edges: graph.edges.map(e => ({ owner: e.owner, child: e.child, ...(e.via ? { via: e.via } : {}) })).sort((a, b) => a.child.localeCompare(b.child)),
++    }
++}
++
++/** Topology validation is shared by pointer previews and the authoritative hub write. */
++export function nodeRoutingError(routing: NodeRouting, overseer: string | null): string | null {
++    const junctions = new Map(routing.junctions.map(j => [j.id, j]))
++    if (junctions.size !== routing.junctions.length) return 'Duplicate junction'
++    const parents = new Map<string, string>()
++    for (const edge of routing.edges) {
++        if (edge.child === overseer) return 'The overseer cannot have an owner'
++        if (junctions.has(edge.owner) || junctions.has(edge.child)) return 'Junctions are wiring points, not chat owners'
++        if (parents.has(edge.child)) return 'A chat can have only one owner'
++        parents.set(edge.child, edge.owner)
++        if (edge.via && junctions.get(edge.via)?.owner !== edge.owner) return 'Connect a chat output to this junction first'
++    }
++    for (const junction of junctions.values()) if (junction.owner && junctions.has(junction.owner)) return 'Connect junctions to chats, not other junctions'
++    for (const child of parents.keys()) {
++        const seen = new Set<string>()
++        for (let id: string | undefined = child; id !== undefined; id = parents.get(id)) {
++            if (seen.has(id)) return 'That connection would create a cycle'
++            seen.add(id)
++        }
++    }
++    return null
++}
++
+ export type NodeGraph = {
+     workspaceId: string
+     annotations?: NodeAnnotation[]
++    junctions?: NodeJunction[]
+     nodes: NodeGraphNode[]
+     edges: NodeGraphEdge[]
+ }
+--- a/hub/src/store/nodeGraph.ts
++++ b/hub/src/store/nodeGraph.ts
+@@ -1,7 +1,7 @@
+ import type { Database } from 'bun:sqlite'
+ import { isDeepStrictEqual } from 'node:util'
+ import { randomUUID } from 'node:crypto'
+-import { createsCycle, type NodeAnnotation, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, type NodeAnnotation, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ 
+ type WorkspaceRow = { id: string; namespace: string; name: string; kind: 'default' | 'preset'; created_at: number; updated_at: number }
+ type MemberRow = { workspace_id: string; session_id: string; x: number | null; y: number | null; added_at: number }
+@@ -18,6 +18,8 @@
+         db.exec(`CREATE TABLE IF NOT EXISTS node_members (
+             workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, x REAL, y REAL, added_at INTEGER NOT NULL,
+             PRIMARY KEY (workspace_id, session_id))`)
++        db.exec('CREATE TABLE IF NOT EXISTS node_junctions (workspace_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (workspace_id, id))')
++        db.exec('CREATE TABLE IF NOT EXISTS node_edge_routes (workspace_id TEXT NOT NULL, child_id TEXT NOT NULL, junction_id TEXT NOT NULL, PRIMARY KEY (workspace_id, child_id))')
+         db.exec('CREATE TABLE IF NOT EXISTS node_annotations (workspace_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (workspace_id, id))')
+         db.exec(`CREATE TABLE IF NOT EXISTS node_edges (
+             workspace_id TEXT NOT NULL, child_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+@@ -53,12 +55,38 @@
+     graph(namespace: string, workspaceId = this.active(namespace)): NodeGraph {
+         const members = this.db.query('SELECT * FROM node_members WHERE workspace_id = ? ORDER BY added_at, session_id').all(workspaceId) as MemberRow[]
+         const edges = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? ORDER BY created_at, child_id').all(workspaceId) as EdgeRow[]
++        const routes = new Map((this.db.query('SELECT child_id, junction_id FROM node_edge_routes WHERE workspace_id = ?').all(workspaceId) as { child_id: string; junction_id: string }[]).map(row => [row.child_id, row.junction_id]))
+         return {
+             workspaceId,
++            junctions: (this.db.query('SELECT data FROM node_junctions WHERE workspace_id = ? ORDER BY id').all(workspaceId) as { data: string }[]).map(row => JSON.parse(row.data) as NodeJunction),
+             annotations: (this.db.query('SELECT data FROM node_annotations WHERE workspace_id = ? ORDER BY rowid').all(workspaceId) as { data: string }[]).map(row => JSON.parse(row.data) as NodeAnnotation),
+             nodes: members.map(m => ({ sessionId: m.session_id, x: m.x, y: m.y, addedAt: m.added_at })),
+-            edges: edges.map(e => ({ owner: e.owner_id, child: e.child_id, createdAt: e.created_at, createdBy: e.created_by })),
++            edges: edges.map(e => ({ owner: e.owner_id, child: e.child_id, ...(routes.has(e.child_id) ? { via: routes.get(e.child_id)! } : {}), createdAt: e.created_at, createdBy: e.created_by })),
+         }
++    }
++
++    /** Atomic wiring edits: logical owner edges stay transparent to the supervisor. */
++    routing(namespace: string, workspaceId: string, value: NodeRouting, expected: NodeRouting, overseer: string | null): boolean {
++        if (!this.workspace(namespace, workspaceId) || this.active(namespace) !== workspaceId) return false
++        return this.db.transaction(() => {
++            const current = nodeRouting(this.graph(namespace, workspaceId))
++            if (!isDeepStrictEqual(current, nodeRouting(expected))) return false
++            const error = nodeRoutingError(value, overseer)
++            if (error) throw new Error(error)
++            const members = new Set([...this.members(namespace, workspaceId), ...(overseer ? [overseer] : [])])
++            if (value.junctions.some(j => members.has(j.id) || (j.owner && !members.has(j.owner)))
++                || value.edges.some(e => !members.has(e.owner) || !members.has(e.child))) throw new Error('Connect only chats in this workspace')
++            const previous = new Map(current.edges.map(e => [e.child, e.owner])), next = new Set(value.edges.map(e => e.child))
++            for (const edge of current.edges) if (!next.has(edge.child)) this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND child_id = ?').run(workspaceId, edge.child)
++            for (const edge of value.edges) if (previous.get(edge.child) !== edge.owner) this.db.query(`INSERT INTO node_edges VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, child_id)
++                DO UPDATE SET owner_id = excluded.owner_id, created_at = excluded.created_at, created_by = excluded.created_by`).run(workspaceId, edge.child, edge.owner, Date.now(), 'user')
++            this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ?').run(workspaceId)
++            this.db.query('DELETE FROM node_junctions WHERE workspace_id = ?').run(workspaceId)
++            for (const junction of value.junctions) this.db.query('INSERT INTO node_junctions VALUES (?, ?, ?)').run(workspaceId, junction.id, JSON.stringify(junction))
++            for (const edge of value.edges) if (edge.via) this.db.query('INSERT INTO node_edge_routes VALUES (?, ?, ?)').run(workspaceId, edge.child, edge.via)
++            this.touch(workspaceId)
++            return true
++        })()
+     }
+ 
+     /** Compare-and-swap avoids overwriting another window's note, including on undo. */
+@@ -95,6 +123,8 @@
+     removeNodes(namespace: string, ids: readonly string[], workspaceId = this.active(namespace)): void {
+         this.db.transaction(() => {
+             for (const id of ids) {
++                this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id IN (SELECT child_id FROM node_edges WHERE workspace_id = ? AND (child_id = ? OR owner_id = ?))').run(workspaceId, workspaceId, id, id)
++                for (const junction of this.graph(namespace, workspaceId).junctions ?? []) if (junction.owner === id) this.db.query('UPDATE node_junctions SET data = ? WHERE workspace_id = ? AND id = ?').run(JSON.stringify({ ...junction, owner: null }), workspaceId, junction.id)
+                 this.db.query('DELETE FROM node_members WHERE workspace_id = ? AND session_id = ?').run(workspaceId, id)
+                 this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND (child_id = ? OR owner_id = ?)').run(workspaceId, id, id)
+             }
+@@ -111,6 +141,8 @@
+             if (owner !== overseer) this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, owner, now)
+             this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, child, now)
+             const existing = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? AND child_id = ?').get(workspaceId, child) as EdgeRow | null
++            const removedRoute = this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id = ?').run(workspaceId, child).changes
++            if (removedRoute) this.touch(workspaceId)
+             if (existing?.owner_id === owner) return { owner, child, createdAt: existing.created_at, createdBy: existing.created_by }
+             this.db.query(`INSERT INTO node_edges VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, child_id)
+                 DO UPDATE SET owner_id = excluded.owner_id, created_at = excluded.created_at, created_by = excluded.created_by`).run(workspaceId, child, owner, now, createdBy)
+@@ -120,8 +152,9 @@
+     }
+ 
+     detach(namespace: string, child: string, workspaceId = this.active(namespace)): boolean {
++        const route = this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id = ?').run(workspaceId, child)
+         const result = this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND child_id = ?').run(workspaceId, child)
+-        if (result.changes) this.touch(workspaceId)
++        if (route.changes || result.changes) this.touch(workspaceId)
+         return result.changes > 0
+     }
+ 
+@@ -139,6 +172,8 @@
+         const source = this.active(namespace), now = Date.now(), id = randomUUID()
+         this.db.transaction(() => {
+             this.db.query('INSERT INTO node_workspaces VALUES (?, ?, ?, ?, ?, ?)').run(id, namespace, name, 'preset', now, now)
++            this.db.query('INSERT INTO node_junctions SELECT ?, id, data FROM node_junctions WHERE workspace_id = ?').run(id, source)
++            this.db.query('INSERT INTO node_edge_routes SELECT ?, child_id, junction_id FROM node_edge_routes WHERE workspace_id = ?').run(id, source)
+             this.db.query('INSERT INTO node_annotations SELECT ?, id, data FROM node_annotations WHERE workspace_id = ?').run(id, source)
+             this.db.query('INSERT INTO node_members SELECT ?, session_id, x, y, added_at FROM node_members WHERE workspace_id = ?').run(id, source)
+             this.db.query('INSERT INTO node_edges SELECT ?, child_id, owner_id, created_at, created_by FROM node_edges WHERE workspace_id = ?').run(id, source)
+@@ -159,6 +194,8 @@
+             this.db.query('DELETE FROM node_members WHERE workspace_id = ?').run(id)
+             this.db.query('DELETE FROM node_edges WHERE workspace_id = ?').run(id)
+             this.db.query('DELETE FROM node_annotations WHERE workspace_id = ?').run(id)
++            this.db.query('DELETE FROM node_junctions WHERE workspace_id = ?').run(id)
++            this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ?').run(id)
+             this.db.query('DELETE FROM node_workspaces WHERE id = ?').run(id)
+         })()
+     }
+@@ -183,6 +220,12 @@
+                 this.db.query('UPDATE node_edges SET owner_id = ? WHERE workspace_id = ? AND owner_id = ?').run(targetId, id, sourceId)
+                 this.db.query('UPDATE OR IGNORE node_edges SET child_id = ? WHERE workspace_id = ? AND child_id = ?').run(targetId, id, sourceId)
+                 this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND (child_id = ? OR owner_id = child_id)').run(id, sourceId)
++                this.db.query('UPDATE OR IGNORE node_edge_routes SET child_id = ? WHERE workspace_id = ? AND child_id = ?').run(targetId, id, sourceId)
++                this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id = ?').run(id, sourceId)
++                for (const junction of this.graph(namespace, id).junctions ?? []) if (junction.owner === sourceId) this.db.query('UPDATE node_junctions SET data = ? WHERE workspace_id = ? AND id = ?').run(JSON.stringify({ ...junction, owner: targetId }), id, junction.id)
++                this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id NOT IN (SELECT child_id FROM node_edges WHERE workspace_id = ?)').run(id, id)
++                const graph = this.graph(namespace, id), junctionOwners = new Map(graph.junctions?.map(j => [j.id, j.owner]))
++                for (const edge of graph.edges) if (edge.via && junctionOwners.get(edge.via) !== edge.owner) this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id = ?').run(id, edge.child)
+             }
+         })()
+     }
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -1,6 +1,6 @@
+ import { Hono } from 'hono'
+ import { z } from 'zod'
+-import type { NodeGraphResponse, NodeLayoutPositions } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, type NodeGraphResponse, NodeLayoutPositions } from '@hapi/protocol/nodeGraph'
+ import { requestManagerControl } from '../../managerControl'
+ import type { SyncEngine } from '../../sync/syncEngine'
+ import type { WebAppEnv } from '../middleware/auth'
+@@ -21,6 +21,13 @@
+     width: z.number().finite().min(180).max(8000), height: z.number().finite().min(100).max(8000),
+ }).strict()
+ const annotationEdit = z.object({ value: annotation.nullable(), expected: annotation.nullable() }).strict()
++
++const routing = z.object({
++    junctions: z.array(z.object({ id: z.string().min(1).max(96).regex(/^[\w-]+$/), owner: z.string().min(1).max(100).nullable(),
++        x: z.number().finite().min(-1_000_000).max(1_000_000), y: z.number().finite().min(-1_000_000).max(1_000_000) }).strict()).max(200),
++    edges: z.array(z.object({ owner: z.string().min(1).max(100), child: z.string().min(1).max(100), via: z.string().min(1).max(96).optional() }).strict()).max(2000),
++}).strict()
++const routingEdit = z.object({ value: routing, expected: routing }).strict()
+ 
+ const name = (value: unknown): string | null => typeof value === 'string' && value.trim() && value.trim().length <= 80 ? value.trim() : null
+ 
+@@ -77,6 +84,25 @@
+         if (!positions || typeof positions !== 'object' || Object.keys(positions).length > 2000) return c.json({ error: 'Expected positions' }, 400)
+         engine.nodeGraph.layout(namespace, positions as NodeLayoutPositions)
+         return c.json({ ok: true })
++    })
++    app.post('/node-graph/workspaces/:workspace/routing', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), workspace = c.req.param('workspace')
++        if (!engine.nodeGraph.exists(namespace, workspace)) return c.json({ error: 'Workspace not found' }, 404)
++        const body = routingEdit.safeParse(await c.req.json().catch(() => null))
++        if (!body.success) return c.json({ error: 'Invalid junction routing' }, 400)
++        const previous = nodeRouting(engine.nodeGraph.graph(namespace, workspace))
++        // Unchanged legacy edges remain readable even if their native controller is unavailable.
++        const knownBefore = new Map(previous.edges.map(e => [e.child, e.owner]))
++        for (const edge of body.data.value.edges) if (knownBefore.get(edge.child) !== edge.owner && (!known(engine, namespace, edge.owner) || !known(engine, namespace, edge.child))) return c.json({ error: 'Session not found' }, 404)
++        for (const junction of body.data.value.junctions) if (junction.owner && previous.junctions.find(j => j.id === junction.id)?.owner !== junction.owner && !known(engine, namespace, junction.owner)) return c.json({ error: 'Session not found' }, 404)
++        try {
++            if (!engine.nodeGraph.routing(namespace, workspace, body.data.value, body.data.expected, overseer(namespace))) return c.json({ error: 'The graph changed elsewhere. Refresh and try again.' }, 409)
++        } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Invalid routing' }, 409) }
++        const next = nodeRouting(engine.nodeGraph.graph(namespace, workspace))
++        if (JSON.stringify(previous.edges.map(e => [e.owner, e.child])) !== JSON.stringify(next.edges.map(e => [e.owner, e.child]))) changed(engine, namespace)
++        return c.json(respond(engine, namespace))
+     })
+     app.post('/node-graph/workspaces/:workspace/annotations/:id', async (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -10,7 +10,7 @@
+ import { taskStart } from './backgroundTasks.test'
+ import { createSessionsRoutes } from '../web/routes/sessions'
+ import type { WebAppEnv } from '../web/middleware/auth'
+-import type { NodeGraphResponse, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, type NodeRouting, type NodeGraphResponse, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
+ 
+ function fixture(path = ':memory:') {
+     const store = new Store(path)
+@@ -255,3 +255,90 @@
+         } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
+     })
+ })
++
++function wiringFixture(path?: string) {
++    const f = fixture(path)
++    const workers = ['A', 'B', 'C'].map(tag => f.create(tag))
++    for (const w of workers) f.engine.addSessionManagerEntry(w.id, 'default')
++    const snapshot = () => nodeRouting(f.engine.nodeGraph.graph('default'))
++    const put = (value: NodeRouting, expected = snapshot(), workspace = f.engine.nodeGraph.active('default'), namespace = 'default') => f.call(`/node-graph/workspaces/${workspace}/routing`, { value, expected }, namespace)
++    const fork = (): NodeRouting => ({ junctions: [{ id: 'j-one', x: 120, y: 180, owner: f.overseer.id }], edges: workers.slice(0, 2).map(w => ({ owner: f.overseer.id, child: w.id, via: 'j-one' })) })
++    return { ...f, workers, snapshot, put, fork }
++}
++describe('branch junction API', () => {
++    it('persists one incoming line with multiple targets as real owner edges, never creating a worker/controller or changing Stop', async () => {
++        const f = wiringFixture()
++        try {
++            const [a, b] = f.workers; f.engine.pauseSession(a!.id)
++            const pause = f.engine.getManualPause(a!.id), before = (await f.call('/node-graph')).json.graph.nodes
++            const value = f.fork(), result = await f.put(value)
++            expect(result.status).toBe(200); expect(nodeRouting(result.json.graph)).toEqual(nodeRouting(value))
++            expect(result.json.graph.nodes).toEqual(before)
++            expect(result.json.graph.edges.map(e => [e.owner, e.child]).sort()).toEqual([[f.overseer.id, a!.id], [f.overseer.id, b!.id]].sort())
++            expect(f.engine.getSession('j-one')).toBeUndefined(); expect(f.engine.getManualPause(a!.id)).toBe(pause)
++        } finally { f.close() }
++    })
++    it('reparents an entire fanout atomically, rejecting a cycle without changing any target', async () => {
++        const f = wiringFixture()
++        try {
++            await f.put(f.fork()); const before = f.snapshot(), a = f.workers[0]!, c = f.workers[2]!
++            const reparent = (owner: string): NodeRouting => ({ junctions: before.junctions.map(j => ({ ...j, owner })), edges: before.edges.map(e => ({ ...e, owner })) })
++            expect((await f.put(reparent(a.id))).status).toBe(409); expect(f.snapshot()).toEqual(before)
++            const valid = await f.put(reparent(c.id)); expect(valid.status).toBe(200)
++            expect(valid.json.graph.edges.map(e => e.owner)).toEqual([c.id, c.id])
++        } finally { f.close() }
++    })
++    it('removes a visual dot without releasing children or nudging management; undo restores routing only', async () => {
++        const f = wiringFixture()
++        try {
++            await f.put(f.fork()); const before = f.snapshot(), wakes = f.nudges()
++            const removed: NodeRouting = { junctions: [], edges: before.edges.map(({ owner, child }) => ({ owner, child })) }
++            expect((await f.put(removed)).status).toBe(200); expect(f.nudges()).toBe(wakes)
++            expect((await f.put(before, removed)).status).toBe(200); expect(f.nudges()).toBe(wakes)
++        } finally { f.close() }
++    })
++    it('rejects stale undo, malformed topology, foreign namespaces and switched workspaces', async () => {
++        const f = wiringFixture()
++        try {
++            const empty = f.snapshot(), value = f.fork(), workspace = f.engine.nodeGraph.active('default')
++            await f.put(value)
++            expect((await f.put(empty, empty)).status).toBe(409)
++            expect((await f.put(value, value, workspace, 'other')).status).toBe(404)
++            expect((await f.put({ ...value, edges: [...value.edges, value.edges[0]!] })).status).toBe(409)
++            expect((await f.put({ ...value, junctions: value.junctions.map(j => ({ ...j, owner: null })) })).status).toBe(409)
++            expect((await f.put({ ...value, junctions: value.junctions.map(j => ({ ...j, x: 1e10 })) })).status).toBe(400)
++            const next = f.engine.nodeGraph.saveAs('default', 'Other'); f.engine.nodeGraph.activate('default', next.id)
++            expect((await f.put(empty, value, workspace)).status).toBe(409)
++        } finally { f.close() }
++    })
++    it('cleans routes when a chat is detached, directly reconnected or removed, preserving other branches', async () => {
++        const f = wiringFixture()
++        try {
++            await f.put(f.fork()); const [a, b] = f.workers
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: a!.id })
++            expect(f.snapshot().edges.find(e => e.child === a!.id)?.via).toBeUndefined()
++            expect(f.snapshot().edges.find(e => e.child === b!.id)?.via).toBe('j-one')
++            await f.call('/node-graph/edges/remove', { child: b!.id }); expect(f.snapshot().edges).toHaveLength(1)
++            f.engine.nodeGraph.removeNodes('default', [f.overseer.id])
++            expect(f.snapshot().junctions[0]?.owner).toBeNull(); expect(f.snapshot().edges).toEqual([])
++        } finally { f.close() }
++    })
++    it('survives restart, copies independently into presets, and follows session-id merges', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-junction-')), path = join(dir, 'hub.db'); let f = wiringFixture(path)
++        try {
++            await f.put(f.fork()); const original = f.snapshot(), workspace = f.engine.nodeGraph.active('default'), preset = f.engine.nodeGraph.saveAs('default', 'Copy')
++            const oldOwner = f.overseer.id, replacement = f.workers[2]!.id
++            f.close(); f = wiringFixture(path)
++            expect(f.snapshot()).toEqual(original)
++            expect(nodeRouting(f.engine.nodeGraph.graph('default', preset.id))).toEqual(original)
++            f.engine.nodeGraph.merge(oldOwner, replacement, 'default')
++            expect(f.snapshot().junctions[0]?.owner).toBe(replacement)
++            expect(f.snapshot().edges.every(e => e.owner === replacement && e.via === 'j-one')).toBe(true)
++            f.engine.nodeGraph.activate('default', preset.id)
++            const before = f.snapshot(); expect((await f.put({ ...before, junctions: before.junctions.map(j => ({ ...j, x: 999 })) })).status).toBe(200)
++            expect(f.engine.nodeGraph.graph('default', workspace).junctions?.[0]?.x).toBe(120)
++            f.engine.nodeGraph.activate('default', workspace); f.engine.nodeGraph.delete('default', preset.id)
++            expect(f.engine.nodeGraph.graph('default', preset.id).junctions).toEqual([])
++        } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,5 +1,5 @@
+ import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+-import type { NodeAnnotation, NodeGraphResponse, NodeLayoutPositions, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
++import type { NodeAnnotation, NodeRouting, NodeGraphResponse, NodeLayoutPositions, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
+ import type {
+     AttachmentMetadata,
+     AuthResponse,
+@@ -902,6 +902,10 @@
+         return nodeGraphOf(await this.nodeGraphPost('/layout', { positions }))
+     }
+ 
++    async editNodeRouting(workspace: string, value: NodeRouting, expected: NodeRouting): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost(`/workspaces/${encodeURIComponent(workspace)}/routing`, { value, expected }))
++    }
++
+     async editNodeAnnotation(workspace: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null): Promise<NodeGraphResponse | null> {
+         return nodeGraphOf(await this.request(`/api/node-graph/workspaces/${encodeURIComponent(workspace)}/annotations/${encodeURIComponent(id)}`, { method: 'POST', body: JSON.stringify({ value, expected }) }))
+     }
+--- a/web/src/api/nodeGraphClient.test.ts
++++ b/web/src/api/nodeGraphClient.test.ts
+@@ -59,3 +59,11 @@
+     await expect(api.editNodeAnnotation('p 1', 'note', value, null)).resolves.toEqual(graph)
+     expect(call(0)).toEqual({ url: '/api/node-graph/workspaces/p%201/annotations/note', method: 'POST', body: { value, expected: null } })
+ })
++
++it('sends workspace-scoped atomic junction edits with their previous wiring', async () => {
++    const api = new ApiClient('token')
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(graph), { status: 200 }))
++    const expected = { junctions: [], edges: [] }, value = { junctions: [{ id: 'j', x: 10, y: 20, owner: null }], edges: [] }
++    await api.editNodeRouting('p 1', value, expected)
++    expect(call(0)).toEqual({ url: '/api/node-graph/workspaces/p%201/routing', method: 'POST', body: { value, expected } })
++})
+--- a/web/src/lib/nodeGraphUndo.ts
++++ b/web/src/lib/nodeGraphUndo.ts
+@@ -1,14 +1,15 @@
+-import { createsCycle, type NodeAnnotation, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, createsCycle, type NodeRouting, type NodeAnnotation, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { GraphPoint } from './nodeGraphLayout'
+ 
+ type Base = { workspace: string }
+ export type GraphEdit = Base & (
++    | { kind: 'routing'; before: NodeRouting; after: NodeRouting }
+     | { kind: 'annotation'; id: string; before: NodeAnnotation | null; after: NodeAnnotation | null }
+     | { kind: 'move'; id: string; before: GraphPoint; after: GraphPoint }
+     | { kind: 'owner'; child: string; before: string | null; after: string | null }
+     | { kind: 'add'; id: string; point: GraphPoint }
+-    | { kind: 'remove'; id: string; point: GraphPoint; edges: Pick<NodeGraphEdge, 'owner' | 'child'>[]; restoring?: boolean }
++    | { kind: 'remove'; id: string; point: GraphPoint; edges: Pick<NodeGraphEdge, 'owner' | 'child'>[]; routing?: { before: NodeRouting; after: NodeRouting }; restoring?: boolean }
+ )
+ 
+ const changed = () => new Error('The graph changed elsewhere. This edit can no longer be undone safely.')
+@@ -21,12 +22,13 @@
+     if (graph.activeWorkspaceId !== edit.workspace) throw changed()
+     const node = 'id' in edit ? graph.graph.nodes.find(n => n.sessionId === edit.id) : undefined
+     switch (edit.kind) {
++        case 'routing': return client.editNodeRouting(edit.workspace, edit.before, edit.after)
+         case 'annotation': return client.editNodeAnnotation(edit.workspace, edit.id, edit.before, edit.after)
+         case 'move':
+             if (!node || node.x !== edit.after.x || node.y !== edit.after.y) throw changed()
+             return client.saveNodeLayout({ [edit.id]: edit.before })
+         case 'owner':
+-            if (!member(graph, edit.child) || parent(graph, edit.child) !== edit.after || (edit.before && !member(graph, edit.before))) throw changed()
++            if (graph.graph.edges.some(e => e.child === edit.child && e.via) || !member(graph, edit.child) || parent(graph, edit.child) !== edit.after || (edit.before && !member(graph, edit.before))) throw changed()
+             return edit.before ? client.setNodeOwner(edit.before, edit.child) : client.detachNode(edit.child)
+         case 'add': {
+             if (!node || node.x !== edit.point.x || node.y !== edit.point.y || graph.graph.edges.some(edge => edge.child === edit.id || edge.owner === edit.id)) throw changed()
+@@ -35,6 +37,7 @@
+             return result.graph
+         }
+         case 'remove': {
++            if (edit.routing && !edit.restoring && JSON.stringify(nodeRouting(graph.graph)) !== JSON.stringify(nodeRouting(edit.routing.after))) throw changed()
+             if (node && (!edit.restoring || (node.x != null && (node.x !== edit.point.x || node.y !== edit.point.y)))) throw changed()
+             const restored = edit.edges
+             const proposed = graph.graph.edges.filter(edge => !restored.some(old => old.child === edge.child))
+@@ -48,6 +51,12 @@
+             if (!node) { await client.addNode(edit.id); edit.restoring = true }
+             let result = await client.saveNodeLayout({ [edit.id]: edit.point })
+             for (const edge of restored) result = await client.setNodeOwner(edge.owner, edge.child)
++            if (edit.routing) {
++                const expected = { junctions: edit.routing.after.junctions, edges: [...edit.routing.after.edges.filter(e => !restored.some(old => old.child === e.child)), ...restored] }
++                const latest = result ?? await client.getNodeGraph()
++                if (JSON.stringify(nodeRouting(latest.graph)) !== JSON.stringify(nodeRouting(expected))) throw changed()
++                return client.editNodeRouting(edit.workspace, edit.routing.before, nodeRouting(expected))
++            }
+             return result
+         }
+     }
+--- a/web/src/lib/nodeGraphUndo.test.ts
++++ b/web/src/lib/nodeGraphUndo.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it, vi } from 'vitest'
+-import type { NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, type NodeRouting, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import { undoGraphEdit, type GraphEdit } from './nodeGraphUndo'
+ 
+@@ -107,3 +107,38 @@
+     vi.mocked(client.editNodeAnnotation).mockRejectedValueOnce(new Error('changed elsewhere'))
+     await expect(undoGraphEdit(client, { kind: 'annotation', workspace: 'w', id: 'note', before: null, after })).rejects.toThrow('changed elsewhere')
+ })
++
++it('undoes junction changes with an atomic wiring snapshot, propagating conflicts without control calls', async () => {
++    const { client, graph, api } = setup()
++    const before = nodeRouting(graph.graph), after = { ...before, junctions: [{ id: 'j', x: 10, y: 20, owner: 'O' }] }
++    client.editNodeRouting = vi.fn(async () => structuredClone(graph))
++    await undoGraphEdit(client, { kind: 'routing', workspace: 'w', before, after })
++    expect(client.editNodeRouting).toHaveBeenCalledWith('w', before, after)
++    vi.mocked(client.editNodeRouting).mockRejectedValueOnce(new Error('Graph changed elsewhere'))
++    await expect(undoGraphEdit(client, { kind: 'routing', workspace: 'w', before, after })).rejects.toThrow('changed elsewhere')
++    expect(api.setNodeOwner).not.toHaveBeenCalled(); expect(api.removeNodes).not.toHaveBeenCalled()
++})
++
++it('restores a removed chat’s junction source and routed branches without flattening its wiring', async () => {
++    const { client, graph } = setup()
++    graph.graph.junctions = [{ id: 'j', owner: 'A', x: 100, y: 120 }]
++    graph.graph.edges.find(e => e.child === 'B')!.via = 'j'
++    const before = nodeRouting(graph.graph), edges = graph.graph.edges.map(({ owner, child }) => ({ owner, child }))
++    graph.graph.nodes = graph.graph.nodes.filter(n => n.sessionId !== 'A'); graph.graph.edges = []; graph.graph.junctions[0]!.owner = null
++    const after = nodeRouting(graph.graph)
++    client.editNodeRouting = vi.fn(async (_workspace: string, value: NodeRouting, expected: NodeRouting) => {
++        expect(nodeRouting(graph.graph)).toEqual(nodeRouting(expected))
++        graph.graph.junctions = value.junctions
++        graph.graph.edges = value.edges.map(e => ({ ...e, createdAt: 1, createdBy: 'user' }))
++        return structuredClone(graph)
++    })
++    await undoGraphEdit(client, { kind: 'remove', workspace: 'w', id: 'A', point: { x: 10, y: 20 }, edges, routing: { before, after } })
++    expect(nodeRouting(graph.graph)).toEqual(before)
++})
++
++it('refuses an old owner undo if a second editor has since routed that connection through a junction', async () => {
++    const { client, graph, api } = setup()
++    graph.graph.edges.find(e => e.child === 'B')!.via = 'j'
++    await expect(undoGraphEdit(client, { kind: 'owner', workspace: 'w', child: 'B', before: 'O', after: 'A' })).rejects.toThrow('changed elsewhere')
++    expect(api.setNodeOwner).not.toHaveBeenCalled()
++})
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+-import { createsCycle, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+@@ -8,12 +8,14 @@
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+ import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
++import { junctionInput, junctionBranch, removeJunction } from '@/lib/nodeGraphJunctions'
+ import { undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+ type Mutate = ReturnType<typeof useNodeGraph>['mutate']
+ type Gesture =
++    | { kind: 'junction-move'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean }
+     | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean }
+     | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+@@ -47,6 +49,9 @@
+     const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
+     const viewRef = useRef(view); viewRef.current = view
+     const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
++    const [junctionDrafts, setJunctionDrafts] = useState<Record<string, GraphPoint>>({})
++    const [selectedJunction, setSelectedJunction] = useState<string | null>(null)
++    const [movingJunction, setMovingJunction] = useState<string | null>(null)
+     const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
+     const [selectedAnnotation, setSelectedAnnotation] = useState<string | null>(null)
+     const [editingAnnotation, setEditingAnnotation] = useState<{ workspace: string; before: NodeAnnotation | null; value: NodeAnnotation } | null>(null)
+@@ -77,9 +82,12 @@
+     }) : null, [graph, overseer, sessionsById])
+     const positions = useMemo(() => ({ ...layout?.positions, ...overrides }), [layout, overrides])
+     const ids = useMemo(() => Object.keys(layout?.positions ?? {}), [layout])
+-    const edges = useMemo(() => Object.entries(layout?.parent ?? {}).map(([child, owner]) => ({ owner, child })), [layout])
++    const edges = useMemo(() => Object.entries(layout?.parent ?? {}).map(([child, owner]) => ({ owner, child, via: graph?.graph.edges.find(e => e.child === child && e.owner === owner)?.via })), [layout, graph])
+     const positionsRef = useRef(positions); positionsRef.current = positions
+ 
++    const junctions = (graph?.graph.junctions ?? []).map(j => ({ ...j, ...junctionDrafts[j.id] }))
++    const junctionsRef = useRef(junctions); junctionsRef.current = junctions
++    const selectedDot = junctions.find(j => j.id === selectedJunction)
+     const annotations = (graph?.graph.annotations ?? []).map(a => annotationDrafts[a.id] ?? a)
+     const annotationsRef = useRef(annotations); annotationsRef.current = annotations
+     const selected = annotations.find(a => a.id === selectedAnnotation)
+@@ -96,7 +104,7 @@
+     const fit = () => {
+         if (!layout) return
+         const element = canvas.current
+-        const rectangles = [layout.bounds, ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
++        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - 16, y: j.y - 16, width: 32, height: 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
+         const x = Math.min(...rectangles.map(r => r.x)), y = Math.min(...rectangles.map(r => r.y))
+         const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
+         setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
+@@ -104,7 +112,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -167,23 +175,41 @@
+         return () => document.removeEventListener('pointerdown', dismiss)
+     }, [menu?.id])
+ 
++    const portPoint = (id: string, direction: 'input' | 'output'): GraphPoint | null => {
++        const junction = junctionsRef.current.find(j => j.id === id)
++        if (junction) return { x: junction.x, y: junction.y }
++        const p = positionsRef.current[id]
++        return p ? { x: p.x + NODE_SIZE.width / 2, y: p.y + (direction === 'output' ? NODE_SIZE.height : 0) } : null
++    }
+     const portAt = (point: GraphPoint, direction: 'input' | 'output'): string | null => {
+-        for (const id of [...ids].reverse()) {
+-            const p = positionsRef.current[id]
+-            if (!p || (direction === 'input' && id === overseer)) continue
+-            if (Math.hypot(point.x - p.x - NODE_SIZE.width / 2, point.y - p.y - (direction === 'output' ? NODE_SIZE.height : 0)) <= Math.max(18, 12 / viewRef.current.k)) return id
++        for (const id of [...junctionsRef.current.map(j => j.id), ...[...ids].reverse()]) {
++            if (direction === 'input' && id === overseer) continue
++            const p = portPoint(id, direction)
++            if (p && Math.hypot(point.x - p.x, point.y - p.y) <= (junctionsRef.current.some(j => j.id === id) ? Math.max(22, 18 / viewRef.current.k) : Math.max(18, 12 / viewRef.current.k))) return id
+         }
+         return null
+     }
+     const linkTarget = (fixed: string, point: GraphPoint, direction: 'child' | 'owner' = 'child'): string | null => {
+         const target = portAt(point, direction === 'child' ? 'input' : 'output')
++        if (!target || !graph) return null
++        const sourceDot = junctionsRef.current.some(j => j.id === fixed), targetDot = junctionsRef.current.some(j => j.id === target)
++        if (sourceDot || targetDot) {
++            if (sourceDot && targetDot) return null
++            try {
++                const routing = nodeRouting(graph.graph)
++                const next = direction === 'owner' ? junctionBranch(routing, target, fixed)
++                    : sourceDot ? junctionBranch(routing, fixed, target) : junctionInput(routing, target, fixed)
++                return nodeRoutingError(next, overseer) ? null : target
++            } catch { return null }
++        }
+         const owner = direction === 'child' ? fixed : target, child = direction === 'child' ? target : fixed
+-        return owner && child && child !== overseer && !createsCycle(edges.filter(edge => edge.child !== child), owner, child) ? target : null
++        return child !== overseer && !createsCycle(edges.filter(edge => edge.child !== child), owner, child) ? target : null
+     }
+     const pinchStart = () => {
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
+         const previous = gesture.current
++        if (previous?.kind === 'junction-move') setJunctionDrafts({})
+         if (previous?.kind === 'annotation') setAnnotationDrafts(old => { const next = { ...old }; delete next[previous.origin.id]; return next })
+         gesture.current = { kind: 'pinch', distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, view: viewRef.current }
+         setLink(null)
+@@ -200,10 +226,18 @@
+         const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
+         const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
+         if (!annotation) setSelectedAnnotation(null)
++        const dotId = target.closest('[data-junction-id]')?.getAttribute('data-junction-id')
++        if (!dotId) { setSelectedJunction(null); setMovingJunction(null) }
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+         const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
+-        if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize') } }
++        if (dotId) {
++            setMenu(null); setSelectedJunction(dotId)
++            const dot = junctionsRef.current.find(j => j.id === dotId)!
++            if (movingJunction === dotId) gesture.current = { kind: 'junction-move', pointer: event.pointerId, id: dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false }
++            else { gesture.current = { kind: 'link', pointer: event.pointerId, from: dotId }; setLink({ fixed: dotId, direction: 'child', to: dot, target: null }) }
++        }
++        else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize') } }
+         else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
+@@ -234,6 +268,12 @@
+             const to = toGraph(event.clientX, event.clientY)
+             setLink({ fixed: g.child, direction: 'owner', to, target: linkTarget(g.child, to, 'owner') })
+         }
++        else if (g.kind === 'junction-move') {
++            const dx = event.clientX - g.x, dy = event.clientY - g.y
++            if (!g.moved && Math.hypot(dx, dy) < 6) return
++            g.moved = true; g.last = round({ x: g.origin.x + dx / viewRef.current.k, y: g.origin.y + dy / viewRef.current.k })
++            setJunctionDrafts(old => ({ ...old, [g.id]: g.last }))
++        }
+         else if (g.kind === 'annotation') {
+             const dx = (event.clientX - g.x) / viewRef.current.k, dy = (event.clientY - g.y) / viewRef.current.k
+             if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
+@@ -260,7 +300,14 @@
+         if (g.pointer !== event.pointerId) return
+         gesture.current = null
+         const cancelled = event.type === 'pointercancel'
+-        if (g.kind === 'annotation') {
++        if (g.kind === 'junction-move') {
++            if (g.moved && !cancelled) void changeRouting(routing => {
++                const current = routing.junctions.find(j => j.id === g.id)
++                if (!current || current.x !== g.origin.x || current.y !== g.origin.y) throw new Error('The junction moved elsewhere. Try again.')
++                return { ...routing, junctions: routing.junctions.map(j => j.id === g.id ? { ...j, ...g.last } : j) }
++            }).finally(() => { setJunctionDrafts({}); setMovingJunction(null) })
++            else setJunctionDrafts({})
++        } else if (g.kind === 'annotation') {
+             if (g.moved && !cancelled) void saveAnnotation(g.last, g.origin)
+             else setAnnotationDrafts(old => { const next = { ...old }; delete next[g.origin.id]; return next })
+         } else if (g.kind === 'node') {
+@@ -273,17 +320,24 @@
+         } else if (g.kind === 'link') {
+             setLink(null)
+             const target = cancelled ? null : linkTarget(g.from, toGraph(event.clientX, event.clientY))
+-            if (target) void changeOwner(target, g.from)
++            if (target) {
++                if (junctionsRef.current.some(j => j.id === g.from)) void changeRouting(r => junctionBranch(r, g.from, target))
++                else if (junctionsRef.current.some(j => j.id === target)) { setSelectedJunction(target); void changeRouting(r => junctionInput(r, target, g.from)) }
++                else void changeOwner(target, g.from)
++            } else if (junctionsRef.current.some(j => j.id === g.from && !j.owner) && portAt(toGraph(event.clientX, event.clientY), 'input') && portAt(toGraph(event.clientX, event.clientY), 'input') !== g.from) setError('Connect a chat output to this junction first')
+         } else if (g.kind === 'input') {
+             setLink(null)
+             if (cancelled || !g.moved) return
+             const point = toGraph(event.clientX, event.clientY), owner = linkTarget(g.child, point, 'owner')
+-            if (owner) void changeOwner(g.child, owner)
++            if (owner) {
++                if (junctionsRef.current.some(j => j.id === owner)) { setSelectedJunction(owner); void changeRouting(r => junctionBranch(r, owner, g.child)) }
++                else void changeOwner(g.child, owner)
++            }
+             else if (!portAt(point, 'input') && !portAt(point, 'output') && !nodeAtPoint(positionsRef.current, point, ids)) void changeOwner(g.child, null)
+         }
+     }
+ 
+-    const openMenu = (id: string) => { setMenu({ id, mode: 'actions' }); setError(null) }
++    const openMenu = (id: string) => { setSelectedJunction(null); setMovingJunction(null); setMenu({ id, mode: 'actions' }); setError(null) }
+     const remember = (edit: GraphEdit) => setHistory(old => [...old.slice(-49), edit])
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
+         if (mutationBusy.current || dropInFlight.current) return null
+@@ -293,6 +347,26 @@
+         catch (cause) { setError(errorText(cause, 'Action failed')); return null }
+         finally { mutationBusy.current = false; setPending(null) }
+     }
++    const changeRouting = async (transform: (routing: NodeRouting) => NodeRouting) => {
++        if (!graph) return null
++        return act('routing', async client => {
++            const fresh = await client.getNodeGraph()
++            if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try again.')
++            const before = nodeRouting(fresh.graph), after = transform(before), invalid = nodeRoutingError(after, fresh.overseer)
++            if (invalid) throw new Error(invalid)
++            if (JSON.stringify(nodeRouting(before)) === JSON.stringify(nodeRouting(after))) return fresh
++            const result = await client.editNodeRouting(fresh.activeWorkspaceId, after, before)
++            if (result) remember({ kind: 'routing', workspace: fresh.activeWorkspaceId, before, after })
++            return result
++        })
++    }
++    const addJunction = () => {
++        const rect = canvas.current?.getBoundingClientRect()
++        const centre = round(toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2))
++        const id = `j-${crypto.randomUUID()}`
++        setMenu(null); setSelectedAnnotation(null)
++        void changeRouting(r => ({ ...r, junctions: [...r.junctions, { id, ...centre, owner: null }] })).then(result => { if (result) setSelectedJunction(id) })
++    }
+     const saveAnnotation = async (value: NodeAnnotation | null, before: NodeAnnotation | null, workspace = graph?.activeWorkspaceId) => {
+         const id = value?.id ?? before?.id
+         if (!workspace || !id) return null
+@@ -309,12 +383,12 @@
+         const rect = canvas.current?.getBoundingClientRect()
+         const centre = toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2)
+         const width = kind === 'frame' ? 480 : 280, height = kind === 'frame' ? 320 : 180
+-        setMenu(null); setError(null)
++        setMenu(null); setSelectedJunction(null); setMovingJunction(null); setError(null)
+         setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...round({ x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
+     }
+     const editAnnotation = (value: NodeAnnotation) => {
+         if (!graph || pending) return
+-        setSelectedAnnotation(value.id); setMenu(null); setError(null)
++        setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(value.id); setMenu(null); setError(null)
+         setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: value, value })
+     }
+     const changeOwner = (child: string, owner: string | null) => {
+@@ -323,7 +397,15 @@
+             // Another window may have changed the connection since this view polled.
+             const fresh = await client.getNodeGraph()
+             if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try the edit again.')
+-            const before = fresh.graph.edges.find(edge => edge.child === child)?.owner ?? null
++            const edge = fresh.graph.edges.find(edge => edge.child === child)
++            const before = edge?.owner ?? null
++            if (edge?.via) {
++                const routingBefore = nodeRouting(fresh.graph)
++                const routingAfter = { ...routingBefore, edges: [...routingBefore.edges.filter(e => e.child !== child), ...(owner ? [{ owner, child }] : [])] }
++                const result = await client.editNodeRouting(fresh.activeWorkspaceId, routingAfter, routingBefore)
++                if (result) remember({ kind: 'routing', workspace: fresh.activeWorkspaceId, before: routingBefore, after: routingAfter })
++                return result
++            }
+             if (before === owner) return fresh
+             const result = owner ? await client.setNodeOwner(owner, child) : await client.detachNode(child)
+             remember({ kind: 'owner', workspace: fresh.activeWorkspaceId, child, before, after: owner })
+@@ -393,35 +475,49 @@
+                 <div className="flex items-start gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
+                 <div className="pointer-events-auto flex shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                     <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
++                    <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={addJunction} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
+                     <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
+                 </div></div>
+             </div>}
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+-                <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
++                <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
+                     onAdjust={value => { const before = annotations.find(a => a.id === value.id); if (before) void saveAnnotation(value, before) }} />
+                 <svg className="pointer-events-none absolute left-0 top-0 overflow-visible z-[1]" width="1" height="1" aria-hidden="true">
+                     <defs>
+                         <marker id="node-edge-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-link)" /></marker>
+                         <marker id="node-edge-asleep" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-hint)" /></marker>
+                     </defs>
+-                    {edges.map(({ owner, child }) => {
++                    {junctions.filter(j => j.owner && positions[j.owner]).map(j => {
++                        const from = portPoint(j.owner!, 'output')!, targets = edges.filter(e => e.via === j.id)
++                        const asleep = !targets.length || targets.every(e => edgeAsleep(sessionsById.get(e.child)))
++                        return <path key={j.id} data-junction-input={j.id} d={`M${from.x} ${from.y} C${from.x} ${from.y + 30} ${j.x} ${j.y - 30} ${j.x} ${j.y}`} fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1} />
++                    })}
++                    {edges.map(({ owner, child, via }) => {
+                         const from = positions[owner], to = positions[child]
+                         if (link?.direction === 'owner' && link.fixed === child) return null
+                         if (!from || !to) return null
+                         const asleep = edgeAsleep(sessionsById.get(child))
+-                        const x1 = from.x + NODE_SIZE.width / 2, y1 = from.y + NODE_SIZE.height, x2 = to.x + NODE_SIZE.width / 2, y2 = to.y
++                        const dot = junctions.find(j => j.id === via)
++                        const x1 = dot?.x ?? from.x + NODE_SIZE.width / 2, y1 = dot?.y ?? from.y + NODE_SIZE.height, x2 = to.x + NODE_SIZE.width / 2, y2 = to.y
+                         const bend = Math.max(30, Math.abs(y2 - y1) / 2)
+                         return <path key={child} data-edge={`${owner}->${child}`} data-asleep={asleep ? 'true' : 'false'} d={`M${x1} ${y1} C${x1} ${y1 + bend} ${x2} ${y2 - bend} ${x2} ${y2}`}
+                             fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={asleep ? 1.5 : 2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1}
+                             markerEnd={`url(#${asleep ? 'node-edge-asleep' : 'node-edge-active'})`} />
+                     })}
+-                    {link && positions[link.fixed] && <path d={link.direction === 'child'
+-                        ? `M${positions[link.fixed]!.x + NODE_SIZE.width / 2} ${positions[link.fixed]!.y + NODE_SIZE.height} L${link.to.x} ${link.to.y}`
+-                        : `M${link.to.x} ${link.to.y} L${positions[link.fixed]!.x + NODE_SIZE.width / 2} ${positions[link.fixed]!.y}`}
+-                        fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />}
++                    {link && portPoint(link.fixed, link.direction === 'child' ? 'output' : 'input') && (() => {
++                        const p = portPoint(link.fixed, link.direction === 'child' ? 'output' : 'input')!
++                        return <path d={`M${p.x} ${p.y} L${link.to.x} ${link.to.y}`} fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />
++                    })()}
++
+                 </svg>
+                 {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
++                {junctions.map((j, index) => <button key={j.id} type="button" data-junction-id={j.id} aria-label={`Junction ${index + 1}`} title={movingJunction === j.id ? 'Drag to move junction' : 'Drag to a chat input to branch. Connect a chat output here for its input.'}
++                    onClick={event => { if (event.detail === 0) { setSelectedJunction(j.id); setSelectedAnnotation(null); setMenu(null) } }}
++                    className={`absolute z-[4] flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${movingJunction === j.id ? 'cursor-move' : 'cursor-crosshair'}`}
++                    style={{ left: j.x, top: j.y, scale: Math.max(1, 0.85 / view.k) }}>
++                    <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${j.owner ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'} ${selectedJunction === j.id || link?.target === j.id ? 'ring-4 ring-[var(--app-link)]/20' : ''}`} />
++                </button>)}
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+@@ -450,7 +546,7 @@
+                     </div>
+                 })}
+             </div>}
+-            {graph && ids.length === 0 && annotations.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-20 text-center text-sm text-[var(--app-hint)]">Drag chats here from the sidebar.</p>}
++            {graph && ids.length === 0 && annotations.length === 0 && junctions.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-20 text-center text-sm text-[var(--app-hint)]">Drag chats here from the sidebar.</p>}
+             {dropActive && <div aria-hidden="true" className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--app-link)] bg-[var(--app-bg)]/70">
+                 <span className="rounded-lg bg-[var(--app-dialog-bg)] px-3 py-2 text-sm text-[var(--app-link)]">Drop chat here</span>
+             </div>}
+@@ -460,6 +556,18 @@
+                 <button type="button" aria-label="Fit graph to view" onClick={fit} className={`${iconButton} w-auto px-2 text-xs`}>Fit</button>
+                 <button type="button" aria-label="Undo graph edit" title="Undo graph edit (Ctrl+Z)" disabled={!history.length || pending !== null} onClick={() => undoRef.current()} className={`${iconButton} border-l border-[var(--app-divider)]`}>↶</button>
+             </div>
++            {selectedDot && !menu && <section data-graph-ui aria-label="Junction actions" className="absolute bottom-16 right-2 z-20 w-64 max-w-[calc(100%_-_16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow">
++                <div className="flex items-center gap-1"><span className="flex-1 px-1 text-xs font-medium">Junction</span>
++                    <button type="button" aria-label="Move junction" aria-pressed={movingJunction === selectedDot.id} disabled={pending !== null} onClick={() => setMovingJunction(old => old === selectedDot.id ? null : selectedDot.id)} className={`min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)] ${movingJunction === selectedDot.id ? 'text-[var(--app-link)]' : ''}`}>Move</button>
++                    <button type="button" aria-label="Delete junction" disabled={pending !== null} onClick={async () => { if (await changeRouting(r => removeJunction(r, selectedDot.id))) setSelectedJunction(null) }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)]">Delete</button>
++                </div>
++                <label className="mt-1 flex items-center gap-2 px-1 text-xs text-[var(--app-hint)]">Input<select aria-label="Junction input" disabled={pending !== null} value={selectedDot.owner ?? ''} onChange={event => { const owner = event.target.value || null; void changeRouting(r => junctionInput(r, selectedDot.id, owner)) }} className="min-h-10 min-w-0 flex-1 rounded-lg bg-[var(--app-subtle-bg)] px-2 text-xs text-[var(--app-fg)]">
++                    <option value="">Unconnected</option>{ids.map(id => <option key={id} value={id}>{title(id)}</option>)}
++                </select></label>
++                <label className="mt-1 flex items-center gap-2 px-1 text-xs text-[var(--app-hint)]">Target<select aria-label="Add junction target" disabled={pending !== null || !selectedDot.owner} value="" onChange={event => { const child = event.target.value; if (child) void changeRouting(r => junctionBranch(r, selectedDot.id, child)) }} className="min-h-10 min-w-0 flex-1 rounded-lg bg-[var(--app-subtle-bg)] px-2 text-xs text-[var(--app-fg)]">
++                    <option value="">{selectedDot.owner ? 'Add branch…' : 'Connect input first'}</option>{ids.filter(id => id !== overseer && id !== selectedDot.owner).map(id => <option key={id} value={id}>{title(id)}</option>)}
++                </select></label>
++            </section>}
+             {selected && !menu && <div data-graph-ui className="absolute bottom-16 right-2 z-20 flex max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                 <span className="max-w-32 truncate px-2 text-xs text-[var(--app-hint)]">{selected.kind === 'frame' ? selected.text || 'Frame' : 'Text box'}</span>
+                 <button type="button" disabled={pending !== null} onClick={() => editAnnotation(selected)} className="min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)]">Edit</button>
+@@ -490,13 +598,15 @@
+                             }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">{pending === 'stop' ? 'Stopping…' : 'Stop'}</button>
+                         </div> : <button type="button" disabled={pending !== null} onClick={async () => {
+                             const id = menu.id
+-                            let inverse: GraphEdit | undefined
++                            let inverse: Extract<GraphEdit, { kind: 'remove' }> | undefined
+                             const result = await act('remove', async client => {
+                                 const fresh = await client.getNodeGraph()
+                                 if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try removal again.')
+                                 const point = layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions[id]
+                                 if (point) inverse = { kind: 'remove', workspace: fresh.activeWorkspaceId, id, point, edges: fresh.graph.edges.filter(edge => edge.owner === id || edge.child === id) }
+-                                return client.removeNodes([id])
++                                const removed = await client.removeNodes([id])
++                                if (inverse && removed.graph && (fresh.graph.junctions?.length ?? 0) > 0) inverse.routing = { before: nodeRouting(fresh.graph), after: nodeRouting(removed.graph.graph) }
++                                return removed
+                             }, r => r.graph)
+                             if (!result) return
+                             if (result.skippedIds.includes(id)) setError(`${title(id)} is still busy or unavailable and was not removed. Stop it first.`)
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1,7 +1,7 @@
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import type { NodeAnnotation, NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import { nodeRouting, nodeRoutingError, type NodeRouting, type NodeAnnotation, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { I18nProvider } from '@/lib/i18n-context'
+@@ -55,6 +55,13 @@
+     }
+     const api = {
+         getNodeGraph: vi.fn(async () => copy()),
++        editNodeRouting: vi.fn(async (workspace: string, value: NodeRouting, expected: NodeRouting) => {
++            if (workspace !== state.activeWorkspaceId || JSON.stringify(nodeRouting(state.graph)) !== JSON.stringify(nodeRouting(expected))) throw new Error('Graph changed elsewhere')
++            const error = nodeRoutingError(value, state.overseer); if (error) throw new Error(error)
++            state.graph.junctions = structuredClone(value.junctions)
++            state.graph.edges = value.edges.map(e => ({ ...e, createdAt: 2, createdBy: 'user' }))
++            return copy()
++        }),
+         editNodeAnnotation: vi.fn(async (workspace: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null) => {
+             const current = state.graph.annotations?.find(a => a.id === id) ?? null
+             if (workspace !== state.activeWorkspaceId || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error('Annotation changed elsewhere')
+@@ -622,3 +629,71 @@
+         expect(within(dialog).getByRole('textbox')).toHaveValue('My unsaved edit')
+     })
+ })
++
++const dotPoint = (id: string) => {
++    const dot = document.querySelector<HTMLElement>(`[data-junction-id="${id}"]`)!, world = dot.parentElement!
++    const [, x, y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
++    return { clientX: x! + parseFloat(dot.style.left) * k!, clientY: y! + parseFloat(dot.style.top) * k! }
++}
++const addDot = async () => {
++    fireEvent.click(await screen.findByRole('button', { name: 'Add junction' }))
++    return (await screen.findByRole('button', { name: 'Junction 1' })).getAttribute('data-junction-id')!
++}
++const dotTo = (id: string, child: string) => {
++    const canvas = screen.getByRole('application'), start = dotPoint(id), end = portPoint(child, 'input')
++    fireEvent.pointerDown(document.querySelector(`[data-junction-id="${id}"]`)!, { pointerId: 1, button: 0, ...start })
++    fireEvent.pointerMove(canvas, { pointerId: 1, ...end }); fireEvent.pointerUp(canvas, { pointerId: 1, ...end })
++}
++describe('branch junction UI', () => {
++    it('connects an owner output to the dot and branches out to multiple chat inputs', async () => {
++        const { api } = setup(), id = await addDot()
++        dragPort('O', 'output', dotPoint(id))
++        await waitFor(() => expect(screen.getByRole('combobox', { name: 'Junction input' })).toHaveValue('O'))
++        dotTo(id, 'B')
++        await waitFor(() => expect(document.querySelector('[data-edge="O->B"]')).toBeInTheDocument())
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'B')?.via).toBe(id))
++        dotTo(id, 'C')
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'C')).toMatchObject({ owner: 'O', via: id }))
++        expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(document.querySelector(`[data-junction-input="${id}"]`)).toBeInTheDocument()
++    })
++    it('deletes only the wiring dot, leaves logical connections and undoes the removal', async () => {
++        const { api } = setup(), id = await addDot()
++        fireEvent.change(screen.getByRole('combobox', { name: 'Junction input' }), { target: { value: 'O' } })
++        await waitFor(() => expect(screen.getByRole('combobox', { name: 'Add junction target' })).toBeEnabled())
++        fireEvent.change(screen.getByRole('combobox', { name: 'Add junction target' }), { target: { value: 'B' } })
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'B')?.via).toBe(id))
++        fireEvent.click(screen.getByRole('button', { name: 'Delete junction' }))
++        await waitFor(() => expect(screen.queryByRole('button', { name: 'Junction 1' })).toBeNull())
++        expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'B')).toEqual({ owner: 'O', child: 'B' })
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await screen.findByRole('button', { name: 'Junction 1' })
++        expect(api.removeNodes).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled()
++    })
++    it('moves a dot in Move mode and undoes its position; blank canvas deselects', async () => {
++        const { api } = setup(), id = await addDot(), start = dotPoint(id)
++        const before = api.editNodeRouting.mock.calls[0][1].junctions[0]!
++        fireEvent.click(screen.getByRole('button', { name: 'Move junction' }))
++        const canvas = screen.getByRole('application')
++        fireEvent.pointerDown(screen.getByRole('button', { name: 'Junction 1' }), { pointerId: 3, button: 0, ...start })
++        fireEvent.pointerMove(canvas, { pointerId: 3, clientX: start.clientX + 40, clientY: start.clientY + 30 })
++        fireEvent.pointerUp(canvas, { pointerId: 3, clientX: start.clientX + 40, clientY: start.clientY + 30 })
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(2))
++        expect(api.editNodeRouting.mock.calls[1][1].junctions[0]?.x).not.toBe(before.x)
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].junctions[0]).toEqual(before))
++        fireEvent.pointerDown(canvas, { pointerId: 4, button: 0, clientX: -1000, clientY: -1000 })
++        fireEvent.pointerUp(canvas, { pointerId: 4 })
++        expect(screen.queryByRole('region', { name: 'Junction actions' })).toBeNull()
++    })
++})
++
++
++it('lets an unconnected junction be tapped without inventing a failed branch or sending another write', async () => {
++    const { api } = setup(), id = await addDot(), point = dotPoint(id), canvas = screen.getByRole('application')
++    fireEvent.pointerDown(screen.getByRole('button', { name: 'Junction 1' }), { pointerId: 1, button: 0, ...point })
++    fireEvent.pointerUp(canvas, { pointerId: 1, ...point })
++    expect(screen.getByRole('region', { name: 'Junction actions' })).toBeInTheDocument()
++    expect(screen.queryByRole('alert')).toBeNull()
++    expect(api.editNodeRouting).toHaveBeenCalledTimes(1)
++})
+--- /dev/null
++++ b/web/src/lib/nodeGraphJunctions.ts
+@@ -0,0 +1,16 @@
++import type { NodeRouting } from '@hapi/protocol/nodeGraph'
++
++export function junctionInput(routing: NodeRouting, id: string, owner: string | null): NodeRouting {
++    return {
++        junctions: routing.junctions.map(j => j.id === id ? { ...j, owner } : j),
++        edges: routing.edges.map(e => e.via !== id ? e : owner ? { ...e, owner } : { owner: e.owner, child: e.child }),
++    }
++}
++export function junctionBranch(routing: NodeRouting, id: string, child: string): NodeRouting {
++    const junction = routing.junctions.find(j => j.id === id)
++    if (!junction?.owner) throw new Error('Connect a chat output to this junction first')
++    return { ...routing, edges: [...routing.edges.filter(e => e.child !== child), { owner: junction.owner, child, via: id }] }
++}
++export function removeJunction(routing: NodeRouting, id: string): NodeRouting {
++    return { junctions: routing.junctions.filter(j => j.id !== id), edges: routing.edges.map(e => e.via === id ? { owner: e.owner, child: e.child } : e) }
++}
+--- /dev/null
++++ b/web/src/lib/nodeGraphJunctions.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from 'vitest'
++import { nodeRoutingError, type NodeRouting } from '@hapi/protocol/nodeGraph'
++import { junctionBranch, junctionInput, removeJunction } from './nodeGraphJunctions'
++const initial = (): NodeRouting => ({ junctions: [{ id: 'j', x: 100, y: 120, owner: null }], edges: [] })
++describe('transparent branch junctions', () => {
++    it('requires an input before adding branches, then fans out to multiple real chat edges', () => {
++        expect(() => junctionBranch(initial(), 'j', 'A')).toThrow('Connect a chat output')
++        const input = junctionInput(initial(), 'j', 'O')
++        const result = junctionBranch(junctionBranch(input, 'j', 'A'), 'j', 'B')
++        expect(result.edges).toEqual([{ owner: 'O', child: 'A', via: 'j' }, { owner: 'O', child: 'B', via: 'j' }])
++        expect(nodeRoutingError(result, 'O')).toBeNull()
++        expect(initial().junctions[0].owner).toBeNull()
++    })
++    it('reparents all branches together while keeping one owner and refusing cycles', () => {
++        let routing = junctionBranch(junctionBranch(junctionInput(initial(), 'j', 'O'), 'j', 'A'), 'j', 'B')
++        routing = junctionInput(routing, 'j', 'C')
++        expect(routing.edges.map(e => e.owner)).toEqual(['C', 'C'])
++        expect(nodeRoutingError(junctionInput(routing, 'j', 'A'), 'O')).toContain('cycle')
++        expect(nodeRoutingError(junctionBranch(routing, 'j', 'O'), 'O')).toContain('overseer')
++    })
++    it('deleting a dot or disconnecting its input preserves actual chat ownership', () => {
++        const routing = junctionBranch(junctionInput(initial(), 'j', 'O'), 'j', 'A')
++        expect(removeJunction(routing, 'j')).toEqual({ junctions: [], edges: [{ owner: 'O', child: 'A' }] })
++        expect(junctionInput(routing, 'j', null)).toEqual({ junctions: [{ id: 'j', x: 100, y: 120, owner: null }], edges: [{ owner: 'O', child: 'A' }] })
++    })
++    it('replaces a target’s earlier owner instead of duplicating it', () => {
++        const routing = junctionInput(initial(), 'j', 'O'); routing.edges.push({ owner: 'X', child: 'A' })
++        expect(junctionBranch(routing, 'j', 'A').edges).toEqual([{ owner: 'O', child: 'A', via: 'j' }])
++    })
++})

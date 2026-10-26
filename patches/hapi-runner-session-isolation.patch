@@ -1,0 +1,129 @@
+--- a/cli/src/commands/runCli.ts
++++ b/cli/src/commands/runCli.ts
+@@ -2,8 +2,16 @@
+ import { getCliArgs } from '@/utils/cliArgs'
+ import { ensureLoopbackProxyBypass } from '@/utils/proxyEnv'
+ import { printCliHelp } from './help'
++import { enterRunnerSessionScope } from '@/runner/sessionScope'
+ 
+ export async function runCli(): Promise<void> {
++    // Detached POSIX process groups still inherit the runner's cgroup. Isolate
++    // before any runtime/agent starts, preserving the runner's exact child PID.
++    try { enterRunnerSessionScope() } catch (error) {
++        console.error('Session isolation failed:', error instanceof Error ? error.message : String(error))
++        process.exitCode = 1
++        return
++    }
+     const args = getCliArgs()
+ 
+     if (args[0] === '--help' || args[0] === '-h' || args[0] === 'help') {
+--- a/cli/src/runner/run.ts
++++ b/cli/src/runner/run.ts
+@@ -1,6 +1,7 @@
+ import fs from 'fs/promises';
+ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+ import os from 'os';
++import { randomUUID } from 'node:crypto';
+ 
+ import { ApiClient } from '@/api/api';
+ import { TrackedSession } from './types';
+@@ -739,7 +740,13 @@
+           stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
+           env: {
+             ...process.env,
+-            ...extraEnv
++            ...extraEnv,
++            // One scope per independent controller/runtime, not per shared
++            // native thread. A memory-heavy job must not take down the runner
++            // and all unrelated controller trees in one oomd victim group.
++            ...(process.env.HAPI_RUNNER_SESSION_ISOLATION === 'systemd'
++              ? { HAPI_RUNNER_CHILD_SCOPE: `hapi-session-${randomUUID()}.scope` }
++              : {})
+           }
+         });
+         happyProcess.once('exit', () => {
+--- /dev/null
++++ b/cli/src/runner/sessionScope.ts
+@@ -0,0 +1,33 @@
++import { execFileSync } from 'node:child_process'
++import { readFileSync } from 'node:fs'
++
++const SCOPE_ENV = 'HAPI_RUNNER_CHILD_SCOPE'
++const SCOPE_PATTERN = /^hapi-session-[0-9a-f-]{36}\.scope$/
++
++/** Move the child itself, before loading a model/runtime. PID and parentage stay intact. */
++export function enterRunnerSessionScope(env: NodeJS.ProcessEnv = process.env, deps = {
++    platform: process.platform as string,
++    pid: process.pid,
++    run: (args: string[]) => { execFileSync('/usr/bin/busctl', args, { timeout: 10_000, stdio: 'pipe' }) },
++    activate: (scope: string) => { execFileSync('/usr/bin/systemctl', ['--user', 'start', scope], { timeout: 10_000, stdio: 'pipe' }) },
++    cgroup: () => readFileSync('/proc/self/cgroup', 'utf8'),
++}): void {
++    const scope = env[SCOPE_ENV]
++    if (!scope) return
++    // Never propagate a one-time scope request to MCP/tools or nested CLI calls.
++    delete env[SCOPE_ENV]
++    if (deps.platform !== 'linux' || !SCOPE_PATTERN.test(scope)) {
++        throw new Error('Invalid runner session systemd scope request')
++    }
++    deps.run(['--user', 'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
++        'org.freedesktop.systemd1.Manager', 'StartTransientUnit', 'ssa(sv)a(sa(sv))',
++        scope, 'fail', '3', 'PIDs', 'au', '1', String(deps.pid),
++        'Description', 's', 'HAPI independent controller and jobs',
++        'CollectMode', 's', 'inactive-or-failed', '0'])
++    // StartTransientUnit returns a job path before its PID move is complete.
++    // Join that same start job before checking the actual kernel placement.
++    deps.activate(scope)
++    if (!deps.cgroup().split('\n').some(line => line.startsWith('0::') && line.endsWith('/' + scope))) {
++        throw new Error('Runner child did not enter its independent systemd scope; refusing unisolated startup')
++    }
++}
+--- /dev/null
++++ b/cli/src/runner/sessionScope.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it, vi } from 'vitest'
++import { enterRunnerSessionScope } from './sessionScope'
++
++const scope = 'hapi-session-48b9f4d2-8181-52c1-9c7c-a3b58c81622c.scope'
++function fixture(cgroup = `0::/user.slice/app.slice/${scope}\n`) {
++    return { platform: 'linux', pid: 123, run: vi.fn(), activate: vi.fn(), cgroup: () => cgroup }
++}
++
++describe('independent runner controller scopes', () => {
++    it('does nothing for ordinary terminal/tool commands', () => {
++        const deps = fixture()
++        enterRunnerSessionScope({}, deps)
++        expect(deps.run).not.toHaveBeenCalled()
++    })
++    it('moves the exact child PID with no wrapper, replacing no existing unit', () => {
++        const env = { HAPI_RUNNER_CHILD_SCOPE: scope }
++        const deps = fixture()
++        enterRunnerSessionScope(env, deps)
++        expect(deps.run.mock.calls[0][0]).toEqual(expect.arrayContaining([
++            scope, 'fail', '3', 'PIDs', 'au', '1', '123',
++        ]))
++        expect(env).toEqual({})
++        expect(deps.activate).toHaveBeenCalledWith(scope)
++        enterRunnerSessionScope(env, deps)
++        expect(deps.run).toHaveBeenCalledTimes(1)
++    })
++    it.each(['../other.scope', 'hapi-runner.service', 'hapi-session-$(bad).scope'])('rejects unsafe unit %s before bus access', value => {
++        const deps = fixture()
++        expect(() => enterRunnerSessionScope({ HAPI_RUNNER_CHILD_SCOPE: value }, deps)).toThrow()
++        expect(deps.run).not.toHaveBeenCalled()
++    })
++    it('fails closed if systemd does not move the PID, rather than starting in the shared group', () => {
++        expect(() => enterRunnerSessionScope({ HAPI_RUNNER_CHILD_SCOPE: scope }, fixture('0::/app.slice/hapi-runner.service\n'))).toThrow('refusing unisolated startup')
++    })
++    it('propagates bus failure and removes the one-time request', () => {
++        const env = { HAPI_RUNNER_CHILD_SCOPE: scope }
++        const deps = fixture(); deps.run.mockImplementation(() => { throw new Error('bus unavailable') })
++        expect(() => enterRunnerSessionScope(env, deps)).toThrow('bus unavailable')
++        expect(env).toEqual({})
++    })
++    it('never silently starts an opted-in controller on an unsupported platform', () => {
++        const deps = { ...fixture(), platform: 'darwin' }
++        expect(() => enterRunnerSessionScope({ HAPI_RUNNER_CHILD_SCOPE: scope }, deps)).toThrow()
++        expect(deps.run).not.toHaveBeenCalled()
++    })
++})

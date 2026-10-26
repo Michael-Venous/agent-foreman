@@ -1,0 +1,1218 @@
+diff --git a/hub/src/codexFolders.ts b/hub/src/codexFolders.ts
+new file mode 100644
+index 0000000..78046ea
+--- /dev/null
++++ b/hub/src/codexFolders.ts
+@@ -0,0 +1,163 @@
++import { spawn } from 'node:child_process'
++import { readFileSync, realpathSync } from 'node:fs'
++import { homedir } from 'node:os'
++import { join, resolve } from 'node:path'
++
++/**
++ * ChatGPT desktop folders are Codex app-server "projects". A thread's canonical
++ * folder is its app-server `projectId`; the ChatGPT app reads and writes the same
++ * field, so changes made here or there show up in both. Assignments the app has
++ * not yet migrated from its own global state are read (never written) as a fallback.
++ */
++export type CodexFolder = { id: string; name: string; position: number }
++export type CodexFolderAssignment = { folderId: string | null; source: 'app-server' | 'chatgpt-pending' }
++export type CodexFoldersResponse = { folders: CodexFolder[]; assignments: Record<string, CodexFolderAssignment> }
++export type Rpc = (method: string, params: unknown) => Promise<Record<string, unknown>>
++export type CodexAppServer = <T>(work: (call: Rpc) => Promise<T>) => Promise<T>
++
++const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
++export const MAX_THREADS = 300
++
++export function codexHome(): string {
++    const home = resolve(process.env.CODEX_HOME || join(homedir(), '.codex'))
++    try { return realpathSync(home) } catch { return home }
++}
++
++/** One short-lived app-server per operation, serialized; no daemon or shared state. */
++export function createStdioAppServer(command = process.env.HAPI_CODEX_FOLDERS_BIN || 'codex', timeoutMs = 20_000): CodexAppServer {
++    let queue: Promise<unknown> = Promise.resolve()
++    return <T>(work: (call: Rpc) => Promise<T>): Promise<T> => {
++        const run = queue.catch(() => {}).then(async () => {
++            const child = spawn(command, ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'], env: process.env })
++            const pending = new Map<number, { resolve: (v: Record<string, unknown>) => void; reject: (e: Error) => void }>()
++            let buffer = ''
++            let nextId = 0
++            const fail = (error: Error) => { for (const p of pending.values()) p.reject(error); pending.clear() }
++            child.on('error', fail)
++            child.on('exit', () => fail(new Error('Codex app-server exited')))
++            child.stdout.setEncoding('utf8')
++            child.stdout.on('data', (chunk: string) => {
++                buffer += chunk
++                let newline: number
++                while ((newline = buffer.indexOf('\n')) >= 0) {
++                    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1)
++                    let message: { id?: number; result?: Record<string, unknown>; error?: { message?: string } }
++                    try { message = JSON.parse(line) } catch { continue }
++                    const waiter = message.id === undefined ? undefined : pending.get(message.id)
++                    if (!waiter) continue
++                    pending.delete(message.id!)
++                    if (message.error) waiter.reject(new Error(message.error.message ?? 'Codex app-server error'))
++                    else waiter.resolve(message.result ?? {})
++                }
++            })
++            const send = (payload: Record<string, unknown>) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...payload }) + '\n')
++            const call: Rpc = (method, params) => new Promise((resolve, reject) => {
++                const id = ++nextId
++                pending.set(id, { resolve, reject })
++                send({ id, method, params })
++            })
++            const timer = setTimeout(() => { fail(new Error('Codex app-server timed out')); child.kill() }, timeoutMs)
++            try {
++                await call('initialize', { clientInfo: { name: 'hapi-folders', title: 'HAPI folders', version: '1' }, capabilities: { experimentalApi: true } })
++                send({ method: 'initialized' })
++                return await work(call)
++            } finally {
++                clearTimeout(timer)
++                child.stdin.end()
++                child.kill()
++            }
++        })
++        queue = run
++        return run as Promise<T>
++    }
++}
++
++type LegacyState = { assignments: Record<string, string | null>; pending: Set<string> }
++
++/** Read-only view of ChatGPT assignments that its app has not migrated to app-server yet. */
++export function readLegacyState(home = codexHome()): LegacyState {
++    const empty: LegacyState = { assignments: {}, pending: new Set() }
++    let state: Record<string, unknown>
++    try { state = JSON.parse(readFileSync(join(home, '.codex-global-state.json'), 'utf8')) } catch { return empty }
++    const host = `local:${home}`
++    const migration = (state['app-server-projects-migration-by-host'] as Record<string, { threadAssignmentsMigrated?: boolean; pendingThreadAssignmentIds?: string[] }> | undefined)?.[host]
++    if (!migration || migration.threadAssignmentsMigrated === true) return empty
++    const idMap = (state['app-server-project-id-by-legacy-project-id-by-host'] as Record<string, Record<string, string>> | undefined)?.[host] ?? {}
++    const legacy = (state['thread-project-assignments'] as Record<string, { projectKind?: string; projectId?: string }> | undefined) ?? {}
++    const assignments: Record<string, string | null> = {}
++    for (const [threadId, value] of Object.entries(legacy)) {
++        if (value?.projectKind === 'local' && value.projectId) assignments[threadId] = idMap[value.projectId] ?? null
++    }
++    return { assignments, pending: new Set(migration.pendingThreadAssignmentIds ?? []) }
++}
++
++export async function listFolders(call: Rpc): Promise<CodexFolder[]> {
++    const folders: CodexFolder[] = []
++    let cursor: string | null = null
++    do {
++        const page = await call('project/list', { cursor, limit: 100 })
++        for (const project of (page.data as Array<{ id: string; name: string; position: number }>) ?? []) {
++            folders.push({ id: project.id, name: project.name, position: project.position })
++        }
++        cursor = (page.nextCursor as string | null) ?? null
++    } while (cursor)
++    return folders.sort((a, b) => a.position - b.position)
++}
++
++export function validThreadIds(raw: string | undefined): string[] {
++    const ids = [...new Set((raw ?? '').split(',').map(id => id.trim()).filter(Boolean))]
++    if (ids.length > MAX_THREADS || ids.some(id => !THREAD_ID.test(id))) throw new Error('Invalid thread IDs')
++    return ids
++}
++
++export async function readFolders(server: CodexAppServer, threadIds: string[], legacy: LegacyState): Promise<CodexFoldersResponse> {
++    return server(async (call) => {
++        const folders = await listFolders(call)
++        const known = new Set(folders.map(f => f.id))
++        const assignments: Record<string, CodexFolderAssignment> = {}
++        for (const threadId of threadIds) {
++            let canonical: string | null
++            try {
++                const thread = (await call('thread/read', { threadId, includeTurns: false })).thread as { projectId?: string | null } | undefined
++                canonical = thread?.projectId ?? null
++            } catch {
++                continue // Unknown/unmaterialized thread: leave unassigned.
++            }
++            // A canonical value wins; otherwise show what ChatGPT still shows from its own state.
++            if (canonical && known.has(canonical)) assignments[threadId] = { folderId: canonical, source: 'app-server' }
++            else if (legacy.pending.has(threadId) && legacy.assignments[threadId] && known.has(legacy.assignments[threadId]!)) {
++                assignments[threadId] = { folderId: legacy.assignments[threadId]!, source: 'chatgpt-pending' }
++            } else assignments[threadId] = { folderId: null, source: 'app-server' }
++        }
++        return { folders, assignments }
++    })
++}
++
++export async function assignFolder(server: CodexAppServer, threadId: string, folderId: string | null): Promise<void> {
++    if (!THREAD_ID.test(threadId)) throw new Error('Invalid thread ID')
++    await server(async (call) => {
++        if (folderId !== null && !(await listFolders(call)).some(f => f.id === folderId)) throw new Error('Folder not found')
++        await call('thread/metadata/update', { threadId, projectId: folderId ?? '' })
++    })
++}
++
++export function folderName(raw: unknown): string {
++    const name = typeof raw === 'string' ? raw.trim() : ''
++    if (!name || name.length > 100) throw new Error('Folder name must be 1-100 characters')
++    return name
++}
++
++export async function createFolder(server: CodexAppServer, name: string, idempotencyKey: string): Promise<CodexFolder> {
++    if (!THREAD_ID.test(idempotencyKey)) throw new Error('Invalid idempotency key')
++    return server(async (call) => {
++        const project = (await call('project/create', { idempotencyKey, name, roots: [] })).project as CodexFolder
++        return { id: project.id, name: project.name, position: project.position }
++    })
++}
++
++export async function renameFolder(server: CodexAppServer, folderId: string, name: string): Promise<CodexFolder> {
++    return server(async (call) => {
++        const project = (await call('project/update', { projectId: folderId, name })).project as CodexFolder
++        return { id: project.id, name: project.name, position: project.position }
++    })
++}
+diff --git a/hub/src/web/routes/codexFolders.test.ts b/hub/src/web/routes/codexFolders.test.ts
+new file mode 100644
+index 0000000..ea10102
+--- /dev/null
++++ b/hub/src/web/routes/codexFolders.test.ts
+@@ -0,0 +1,142 @@
++import { afterAll, describe, expect, it } from 'bun:test'
++import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++import { createCodexFoldersRoutes } from './codexFolders'
++import { createStdioAppServer, readLegacyState, type CodexAppServer, type Rpc } from '../../codexFolders'
++
++const T1 = '62776bc6-32e3-5de0-becc-3f05ee91600e'
++const T2 = '013d0b87-1fe0-5fba-bca0-13e1e567ef63'
++const T3 = '8bcf7a45-dd96-56fe-83ac-c6d77ec19c09'
++
++function fakeServer() {
++    const projects = [
++        { id: 'p-blender', name: 'Blender', position: 1 },
++        { id: 'p-school', name: 'Internships/School', position: 6 },
++    ]
++    const threads: Record<string, string | null> = { [T1]: 'p-school', [T2]: null, [T3]: null }
++    const calls: string[] = []
++    const call: Rpc = async (method, raw) => {
++        const params = raw as Record<string, string>
++        calls.push(method)
++        if (method === 'project/list') return { data: projects, nextCursor: null }
++        if (method === 'thread/read') {
++            if (!(params.threadId in threads)) throw new Error('thread not found')
++            return { thread: { id: params.threadId, projectId: threads[params.threadId] } }
++        }
++        if (method === 'thread/metadata/update') { threads[params.threadId] = params.projectId || null; return { thread: {} } }
++        if (method === 'project/create') { const p = { id: 'p-new', name: params.name, position: 7 }; projects.push(p); return { project: p } }
++        if (method === 'project/update') { const p = projects.find(x => x.id === params.projectId)!; p.name = params.name; return { project: p } }
++        throw new Error('unexpected ' + method)
++    }
++    const server: CodexAppServer = (work) => work(call)
++    return { server, threads, projects, calls }
++}
++
++function app(namespace = 'default', fake = fakeServer(), legacy = { assignments: { [T3]: 'p-blender' } as Record<string, string | null>, pending: new Set([T3]) }) {
++    const root = new Hono<WebAppEnv>()
++    root.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
++    root.route('/api', createCodexFoldersRoutes(fake.server, () => legacy))
++    return { root, fake }
++}
++
++describe('codex folders routes', () => {
++    it('lists ChatGPT folders in order with canonical and not-yet-migrated assignments', async () => {
++        const { root } = app()
++        const res = await root.request(`/api/codex-folders?threads=${T1},${T2},${T3}`)
++        expect(res.status).toBe(200)
++        expect(await res.json()).toEqual({
++            folders: [{ id: 'p-blender', name: 'Blender', position: 1 }, { id: 'p-school', name: 'Internships/School', position: 6 }],
++            assignments: {
++                [T1]: { folderId: 'p-school', source: 'app-server' },
++                [T2]: { folderId: null, source: 'app-server' },
++                [T3]: { folderId: 'p-blender', source: 'chatgpt-pending' },
++            },
++        })
++    })
++
++    it('moves chats between folders through the canonical app-server field, which then wins over legacy state', async () => {
++        const { root, fake } = app()
++        const move = (threadId: string, folderId: string | null) => root.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId, folderId }), headers: { 'content-type': 'application/json' } })
++        expect((await move(T3, 'p-school')).status).toBe(200)
++        expect(fake.threads[T3]).toBe('p-school')
++        const body = await (await root.request(`/api/codex-folders?threads=${T3}`)).json() as { assignments: Record<string, { folderId: string }> }
++        expect(body.assignments[T3]!.folderId).toBe('p-school')
++        expect((await move(T1, null)).status).toBe(200)
++        expect(fake.threads[T1]).toBeNull()
++        expect((await move(T1, 'missing')).status).toBe(400)
++        expect((await move('not-a-thread', 'p-school')).status).toBe(400)
++        expect(fake.threads[T1]).toBeNull()
++    })
++
++    it('creates and renames folders with validated names', async () => {
++        const { root, fake } = app()
++        const json = { 'content-type': 'application/json' }
++        const created = await root.request('/api/codex-folders', { method: 'POST', headers: json, body: JSON.stringify({ name: '  Outreach ', idempotencyKey: '11111111-1111-4111-8111-111111111111' }) })
++        expect(await created.json()).toEqual({ folder: { id: 'p-new', name: 'Outreach', position: 7 } })
++        expect((await root.request('/api/codex-folders', { method: 'POST', headers: json, body: JSON.stringify({ name: '', idempotencyKey: '11111111-1111-4111-8111-111111111111' }) })).status).toBe(400)
++        expect((await root.request('/api/codex-folders', { method: 'POST', headers: json, body: JSON.stringify({ name: 'x', idempotencyKey: 'bad' }) })).status).toBe(400)
++        const renamed = await root.request('/api/codex-folders/p-blender', { method: 'PATCH', headers: json, body: JSON.stringify({ name: 'Blender work' }) })
++        expect(renamed.status).toBe(200)
++        expect(fake.projects[0]!.name).toBe('Blender work')
++    })
++
++    it('is restricted to the hub owner and validates thread lists', async () => {
++        const { root, fake } = app('tenant')
++        expect((await root.request(`/api/codex-folders?threads=${T1}`)).status).toBe(403)
++        expect((await root.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId: T1, folderId: null }) })).status).toBe(403)
++        expect(fake.calls).toEqual([])
++        expect((await app().root.request('/api/codex-folders?threads=../../etc')).status).toBe(400)
++    })
++})
++
++const dir = mkdtempSync(join(tmpdir(), 'hapi-codex-folders-'))
++afterAll(() => rmSync(dir, { recursive: true, force: true }))
++
++describe('legacy ChatGPT state', () => {
++    it('maps unmigrated assignments to app-server folder IDs and ignores migrated state', () => {
++        const host = `local:${dir}`
++        const state = {
++            'app-server-projects-migration-by-host': { [host]: { threadAssignmentsMigrated: false, pendingThreadAssignmentIds: [T3] } },
++            'app-server-project-id-by-legacy-project-id-by-host': { [host]: { 'legacy-blender': 'p-blender' } },
++            'thread-project-assignments': { [T3]: { projectKind: 'local', projectId: 'legacy-blender' }, [T2]: { projectKind: 'remote', projectId: 'x' } },
++        }
++        writeFileSync(join(dir, '.codex-global-state.json'), JSON.stringify(state))
++        const legacy = readLegacyState(dir)
++        expect(legacy.assignments).toEqual({ [T3]: 'p-blender' })
++        expect([...legacy.pending]).toEqual([T3])
++        state['app-server-projects-migration-by-host'][host].threadAssignmentsMigrated = true
++        writeFileSync(join(dir, '.codex-global-state.json'), JSON.stringify(state))
++        expect(readLegacyState(dir).assignments).toEqual({})
++        expect(readLegacyState(join(dir, 'missing')).assignments).toEqual({})
++    })
++})
++
++describe('stdio app-server client', () => {
++    it('initializes, correlates responses, and serializes short-lived processes', async () => {
++        const script = join(dir, 'fake-codex')
++        writeFileSync(script, `#!${process.execPath}
++let buf = ''
++let ready = false
++process.stdin.setEncoding('utf8')
++process.stdin.on('data', c => { buf += c; let i; while ((i = buf.indexOf('\\n')) >= 0) { const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1)
++  if (m.method === 'initialize') { process.stdout.write(JSON.stringify({ id: m.id, result: {} }) + '\\n'); continue }
++  if (m.method === 'initialized') { ready = true; continue }
++  if (!ready) { process.stdout.write(JSON.stringify({ id: m.id, error: { message: 'not initialized' } }) + '\\n'); continue }
++  process.stdout.write(JSON.stringify({ method: 'noise' }) + '\\n')
++  if (m.method === 'boom') process.stdout.write(JSON.stringify({ id: m.id, error: { message: 'boom' } }) + '\\n')
++  else process.stdout.write(JSON.stringify({ id: m.id, result: { echo: m.params } }) + '\\n') } })
++`)
++        chmodSync(script, 0o755)
++        const server = createStdioAppServer(script, 5_000)
++        const [a, b] = await Promise.all([
++            server(call => call('echo', { n: 1 })),
++            server(call => call('echo', { n: 2 })),
++        ])
++        expect(a).toEqual({ echo: { n: 1 } })
++        expect(b).toEqual({ echo: { n: 2 } })
++        await expect(server(call => call('boom', {}))).rejects.toThrow('boom')
++    })
++})
+diff --git a/hub/src/web/routes/codexFolders.ts b/hub/src/web/routes/codexFolders.ts
+new file mode 100644
+index 0000000..cde8be4
+--- /dev/null
++++ b/hub/src/web/routes/codexFolders.ts
+@@ -0,0 +1,47 @@
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++import {
++    assignFolder, createFolder, createStdioAppServer, folderName, readFolders, readLegacyState, renameFolder, validThreadIds,
++    type CodexAppServer
++} from '../../codexFolders'
++
++/** ChatGPT/Codex folders on this machine, shared two-way with the ChatGPT desktop app. */
++export function createCodexFoldersRoutes(server: CodexAppServer = createStdioAppServer(), legacy = readLegacyState): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    // The local Codex store belongs to the hub owner, never to other namespaces.
++    app.use('/codex-folders/*', async (c, next) => c.get('namespace') === 'default' ? next() : c.json({ error: 'Codex folders are only available to the hub owner' }, 403))
++    app.use('/codex-folders', async (c, next) => c.get('namespace') === 'default' ? next() : c.json({ error: 'Codex folders are only available to the hub owner' }, 403))
++    const failure = (c: { json: (body: unknown, status: 400 | 502) => Response }, error: unknown) => {
++        const message = error instanceof Error ? error.message : String(error)
++        const invalid = /^(Invalid|Folder name|Folder not found)/.test(message)
++        return c.json({ error: message }, invalid ? 400 : 502)
++    }
++
++    app.get('/codex-folders', async (c) => {
++        try {
++            c.header('Cache-Control', 'no-store')
++            return c.json(await readFolders(server, validThreadIds(c.req.query('threads')), legacy()))
++        } catch (error) { return failure(c, error) }
++    })
++    app.post('/codex-folders/assign', async (c) => {
++        const body = await c.req.json().catch(() => null) as { threadId?: unknown; folderId?: unknown } | null
++        if (!body || typeof body.threadId !== 'string' || (body.folderId !== null && typeof body.folderId !== 'string')) return c.json({ error: 'Invalid body' }, 400)
++        try {
++            await assignFolder(server, body.threadId, body.folderId as string | null)
++            return c.json({ ok: true })
++        } catch (error) { return failure(c, error) }
++    })
++    app.post('/codex-folders', async (c) => {
++        const body = await c.req.json().catch(() => null) as { name?: unknown; idempotencyKey?: unknown } | null
++        try {
++            return c.json({ folder: await createFolder(server, folderName(body?.name), String(body?.idempotencyKey ?? '')) })
++        } catch (error) { return failure(c, error) }
++    })
++    app.patch('/codex-folders/:id', async (c) => {
++        const body = await c.req.json().catch(() => null) as { name?: unknown } | null
++        try {
++            return c.json({ folder: await renameFolder(server, c.req.param('id'), folderName(body?.name)) })
++        } catch (error) { return failure(c, error) }
++    })
++    return app
++}
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+index 3444b88..407885d 100644
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -21,6 +21,7 @@ import { createSessionsRoutes } from './routes/sessions'
+ import { createMessagesRoutes } from './routes/messages'
+ import { createPermissionsRoutes } from './routes/permissions'
+ import { createMachinesRoutes } from './routes/machines'
++import { createCodexFoldersRoutes } from './routes/codexFolders'
+ import { createStorageRoutes } from './routes/storage'
+ import { createUsageRoutes } from './routes/usage'
+ import { createGitRoutes } from './routes/git'
+@@ -290,6 +291,7 @@ function createWebApp(options: {
+     app.route('/api', createMessagesRoutes(options.getSyncEngine))
+     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
+     app.route('/api', createMachinesRoutes(options.getSyncEngine))
++    app.route('/api', createCodexFoldersRoutes())
+     app.route('/api', createStorageRoutes(configuration.dbPath))
+     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+     app.route('/api', createUsageRoutes(options.store))
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 44d105a..f26b9c9 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -63,6 +63,14 @@ import type { AgentFlavor, MessageDeliveryMode } from '@hapi/protocol'
+ import type { CancelMessageResponse, SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
+ import type { TranscriptionMode, TranscriptionProvider, TranscriptionProviderInfo } from '@hapi/protocol/voice'
+ 
++
++/** ChatGPT desktop folders (Codex app-server projects), shared two-way with that app. */
++export type CodexFolder = { id: string; name: string; position: number }
++export type CodexFoldersResponse = {
++    folders: CodexFolder[]
++    assignments: Record<string, { folderId: string | null; source: 'app-server' | 'chatgpt-pending' }>
++}
++
+ export type RetryIndeterminateMessageResponse =
+     | { status: 'retried' | 'already-queued' | 'retry-unavailable'; localId: string | null }
+     | { status: 'invoked'; message: DecryptedMessage }
+@@ -781,6 +789,23 @@ export class ApiClient {
+         })
+     }
+ 
++    async getCodexFolders(threadIds: string[]): Promise<CodexFoldersResponse> {
++        const params = new URLSearchParams({ threads: threadIds.join(',') })
++        return await this.request<CodexFoldersResponse>(`/api/codex-folders?${params.toString()}`)
++    }
++
++    async assignCodexFolder(threadId: string, folderId: string | null): Promise<void> {
++        await this.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId, folderId }) })
++    }
++
++    async createCodexFolder(name: string, idempotencyKey: string): Promise<CodexFolder> {
++        return (await this.request<{ folder: CodexFolder }>('/api/codex-folders', { method: 'POST', body: JSON.stringify({ name, idempotencyKey }) })).folder
++    }
++
++    async renameCodexFolder(folderId: string, name: string): Promise<CodexFolder> {
++        return (await this.request<{ folder: CodexFolder }>(`/api/codex-folders/${encodeURIComponent(folderId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })).folder
++    }
++
+     async getUsageSummary(
+         range: '7d' | '30d' | 'all' = '7d',
+         timeZone: string = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+diff --git a/web/src/components/CodexFolders.tsx b/web/src/components/CodexFolders.tsx
+new file mode 100644
+index 0000000..bd7fa17
+--- /dev/null
++++ b/web/src/components/CodexFolders.tsx
+@@ -0,0 +1,176 @@
++import { useEffect, useRef, useState } from 'react'
++import { useQuery, useQueryClient } from '@tanstack/react-query'
++import type { ApiClient, CodexFolder, CodexFoldersResponse } from '@/api/client'
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { useTranslation } from '@/lib/use-translation'
++
++const FOLDERS_KEY = 'codex-folders'
++
++/** ChatGPT folders and the folder of each listed Codex thread. Errors leave the list unfoldered. */
++export function useCodexFolders(api: ApiClient | null, threadIds: string[]) {
++    const ids = [...new Set(threadIds)].sort()
++    return useQuery<CodexFoldersResponse>({
++        queryKey: [FOLDERS_KEY, ids.join(',')],
++        queryFn: () => api!.getCodexFolders(ids),
++        enabled: Boolean(api),
++        staleTime: 30_000,
++        refetchOnWindowFocus: true,
++        retry: false,
++    })
++}
++
++export function useInvalidateCodexFolders(): () => Promise<void> {
++    const queryClient = useQueryClient()
++    return () => queryClient.invalidateQueries({ queryKey: [FOLDERS_KEY] })
++}
++
++function FolderNameForm(props: { initial: string; submitLabel: string; onSubmit: (name: string) => Promise<void>; onCancel: () => void }) {
++    const { t } = useTranslation()
++    const [name, setName] = useState(props.initial)
++    const [error, setError] = useState<string | null>(null)
++    const [busy, setBusy] = useState(false)
++    const input = useRef<HTMLInputElement>(null)
++    useEffect(() => { setTimeout(() => { input.current?.focus(); input.current?.select() }, 50) }, [])
++    return (
++        <form
++            className="flex flex-col gap-3"
++            onSubmit={async (event) => {
++                event.preventDefault()
++                const trimmed = name.trim()
++                if (!trimmed) return
++                setBusy(true); setError(null)
++                try { await props.onSubmit(trimmed) } catch { setError(t('folders.error')) } finally { setBusy(false) }
++            }}
++        >
++            <input
++                ref={input}
++                value={name}
++                maxLength={100}
++                onChange={(event) => setName(event.target.value)}
++                aria-label={t('folders.name')}
++                placeholder={t('folders.name')}
++                className="w-full rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2 text-sm text-[var(--app-fg)] focus:outline-none focus:ring-2 focus:ring-[var(--app-link)]"
++            />
++            {error ? <div className="text-sm text-red-600" role="alert">{error}</div> : null}
++            <div className="flex justify-end gap-2">
++                <button type="button" onClick={props.onCancel} className="rounded-lg px-3 py-2 text-sm text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">
++                    {t('button.cancel')}
++                </button>
++                <button type="submit" disabled={busy || !name.trim()} className="rounded-lg bg-[var(--app-button)] px-3 py-2 text-sm font-medium text-[var(--app-button-text)] disabled:opacity-50">
++                    {props.submitLabel}
++                </button>
++            </div>
++        </form>
++    )
++}
++
++/** Create (no folder given) or rename a ChatGPT folder. */
++export function CodexFolderNameDialog(props: { api: ApiClient; folder: CodexFolder | null; isOpen: boolean; onClose: () => void; onSaved?: (folder: CodexFolder) => void }) {
++    const { t } = useTranslation()
++    const invalidate = useInvalidateCodexFolders()
++    return (
++        <Dialog open={props.isOpen} onOpenChange={(open) => !open && props.onClose()}>
++            <DialogContent className="max-w-sm">
++                <DialogHeader className="pr-0">
++                    <DialogTitle className="min-h-6 px-10 text-center leading-6">
++                        {t(props.folder ? 'folders.rename' : 'folders.new')}
++                    </DialogTitle>
++                </DialogHeader>
++                {props.isOpen ? (
++                    <div className="mt-4">
++                        <FolderNameForm
++                            initial={props.folder?.name ?? ''}
++                            submitLabel={t(props.folder ? 'folders.save' : 'folders.create')}
++                            onCancel={props.onClose}
++                            onSubmit={async (name) => {
++                                const saved = props.folder
++                                    ? await props.api.renameCodexFolder(props.folder.id, name)
++                                    : await props.api.createCodexFolder(name, crypto.randomUUID())
++                                await invalidate()
++                                props.onSaved?.(saved)
++                                props.onClose()
++                            }}
++                        />
++                    </div>
++                ) : null}
++            </DialogContent>
++        </Dialog>
++    )
++}
++
++/** Choose a ChatGPT folder for one Codex chat; the change is visible in the ChatGPT app too. */
++export function MoveToFolderDialog(props: {
++    api: ApiClient
++    isOpen: boolean
++    onClose: () => void
++    threadId: string
++    chatTitle: string
++    folders: CodexFolder[]
++    currentFolderId: string | null
++}) {
++    const { t } = useTranslation()
++    const invalidate = useInvalidateCodexFolders()
++    const [creating, setCreating] = useState(false)
++    const [error, setError] = useState<string | null>(null)
++    const [busy, setBusy] = useState(false)
++    useEffect(() => { if (props.isOpen) { setCreating(false); setError(null) } }, [props.isOpen])
++    const move = async (folderId: string | null) => {
++        setBusy(true); setError(null)
++        try {
++            await props.api.assignCodexFolder(props.threadId, folderId)
++            await invalidate()
++            props.onClose()
++        } catch {
++            setError(t('folders.error'))
++        } finally {
++            setBusy(false)
++        }
++    }
++    const option = (id: string | null, label: string) => (
++        <button
++            key={id ?? 'none'}
++            type="button"
++            role="menuitemradio"
++            aria-checked={props.currentFolderId === id}
++            disabled={busy}
++            onClick={() => void move(id)}
++            className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-50"
++        >
++            <span className="truncate">{label}</span>
++            {props.currentFolderId === id ? <span aria-hidden="true" className="text-[var(--app-link)]">✓</span> : null}
++        </button>
++    )
++    return (
++        <Dialog open={props.isOpen} onOpenChange={(open) => !open && props.onClose()}>
++            <DialogContent className="max-w-sm">
++                <DialogHeader className="pr-0">
++                    <DialogTitle className="min-h-6 px-10 text-center leading-6">{t('folders.moveTitle')}</DialogTitle>
++                </DialogHeader>
++                <div className="mt-1 truncate text-center text-xs text-[var(--app-hint)]">{props.chatTitle}</div>
++                {creating ? (
++                    <div className="mt-4">
++                        <FolderNameForm
++                            initial=""
++                            submitLabel={t('folders.createAndMove')}
++                            onCancel={() => setCreating(false)}
++                            onSubmit={async (name) => {
++                                const folder = await props.api.createCodexFolder(name, crypto.randomUUID())
++                                await move(folder.id)
++                            }}
++                        />
++                    </div>
++                ) : (
++                    <div className="mt-3 flex max-h-[60vh] flex-col overflow-y-auto" role="menu">
++                        {props.folders.map((folder) => option(folder.id, folder.name))}
++                        {option(null, t('folders.none'))}
++                        <button type="button" onClick={() => setCreating(true)} className="mt-1 rounded-lg px-3 py-2.5 text-left text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">
++                            + {t('folders.new')}
++                        </button>
++                    </div>
++                )}
++                {error ? <div className="mt-2 text-sm text-red-600" role="alert">{error}</div> : null}
++                <p className="mt-3 text-center text-[11px] text-[var(--app-hint)]">{t('folders.syncNote')}</p>
++            </DialogContent>
++        </Dialog>
++    )
++}
+diff --git a/web/src/components/SessionActionMenu.tsx b/web/src/components/SessionActionMenu.tsx
+index 7d36478..d197cbf 100644
+--- a/web/src/components/SessionActionMenu.tsx
++++ b/web/src/components/SessionActionMenu.tsx
+@@ -18,6 +18,8 @@ type SessionActionMenuProps = {
+     sessionGlobalPinned?: boolean
+     onSetPinMode?: (mode: 'none' | 'project' | 'global') => void
+     onExport?: () => void
++    /** Codex chats only: choose a ChatGPT folder. */
++    onMoveToFolder?: () => void
+     onMarkUnread?: () => void
+     onSyncCodex?: () => void
+     onSyncPi?: () => void
+@@ -31,6 +33,14 @@ type SessionActionMenuProps = {
+     menuId?: string
+ }
+ 
++function FolderIcon(props: { className?: string }) {
++    return (
++        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className} aria-hidden="true">
++            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
++        </svg>
++    )
++}
++
+ function EditIcon(props: { className?: string }) {
+     return (
+         <svg
+@@ -199,6 +209,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
+         sessionGlobalPinned = false,
+         onSetPinMode,
+         onExport,
++        onMoveToFolder,
+         onMarkUnread,
+         onSyncCodex,
+         onSyncPi,
+@@ -250,6 +261,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
+         onExport?.()
+     }
+ 
++    const handleMoveToFolder = () => {
++        onClose()
++        onMoveToFolder?.()
++    }
++
+     const handleMarkUnread = () => {
+         onClose()
+         onMarkUnread?.()
+@@ -350,6 +366,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
+                     </>
+                 ) : null}
+ 
++                {onMoveToFolder ? (
++                    <button
++                        type="button"
++                        role="menuitem"
++                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
++                        onClick={handleMoveToFolder}
++                    >
++                        <FolderIcon className="text-[var(--app-hint)]" />
++                        {t('session.action.moveToFolder')}
++                    </button>
++                ) : null}
++
+                 {onExport ? (
+                     <button
+                         type="button"
+diff --git a/web/src/components/SessionList.chat-tabs.test.tsx b/web/src/components/SessionList.chat-tabs.test.tsx
+new file mode 100644
+index 0000000..78de467
+--- /dev/null
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -0,0 +1,183 @@
++import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { ApiClient, CodexFoldersResponse } from '@/api/client'
++import type { SessionSummary } from '@/types/api'
++import { I18nProvider } from '@/lib/i18n-context'
++import { ToastProvider } from '@/lib/toast-context'
++import { SessionList, groupChatsByFolder } from './SessionList'
++
++afterEach(() => cleanup())
++beforeEach(() => localStorage.clear())
++
++function makeSession(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
++    return {
++        active: false, thinking: false, activeAt: 0, updatedAt: 0, metadata: null, metadataVersion: 0, agentStateVersion: 0,
++        todosUpdatedAt: 0, todoProgress: null, pendingRequestsCount: 0, pendingRequestKinds: [], pendingRequests: [],
++        backgroundTaskCount: 0, futureScheduledMessageCount: 0, nextScheduledAt: null, model: null, effort: null,
++        ...overrides
++    }
++}
++const codex = (id: string, name: string, thread: string, updatedAt = 100) =>
++    makeSession({ id, updatedAt, metadata: { path: '/work/' + id, name, flavor: 'codex', agentSessionId: thread } })
++const claude = (id: string, name: string, updatedAt = 100) =>
++    makeSession({ id, updatedAt, metadata: { path: '/work/' + id, name, flavor: 'claude', agentSessionId: id + '-native' } })
++
++const sessions = [
++    codex('cx-school', 'Internship outreach', 'thread-school', 300),
++    codex('cx-blender', 'Liquid sim', 'thread-blender', 200),
++    codex('cx-loose', 'Loose codex chat', 'thread-loose', 100),
++    claude('cl-a', 'Claude planning', 250),
++]
++const folders: CodexFoldersResponse = {
++    folders: [{ id: 'f-blender', name: 'Blender', position: 1 }, { id: 'f-school', name: 'Internships/School', position: 6 }],
++    assignments: {
++        'thread-school': { folderId: 'f-school', source: 'chatgpt-pending' },
++        'thread-blender': { folderId: 'f-blender', source: 'app-server' },
++        'thread-loose': { folderId: null, source: 'app-server' },
++    },
++}
++
++function renderList(props: { api?: ApiClient | null; selected?: string | null; list?: SessionSummary[] } = {}) {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
++    const ui = (selected: string | null | undefined) => (
++        <QueryClientProvider client={client}>
++            <ToastProvider>
++                <I18nProvider>
++                    <SessionList
++                        sessions={props.list ?? sessions}
++                        selectedSessionId={selected ?? null}
++                        onSelect={vi.fn()}
++                        onNewSession={vi.fn()}
++                        onRefresh={vi.fn()}
++                        isLoading={false}
++                        renderHeader={false}
++                        api={props.api ?? null}
++                    />
++                </I18nProvider>
++            </ToastProvider>
++        </QueryClientProvider>
++    )
++    const result = render(ui(props.selected))
++    return { ...result, rerenderWith: (selected: string | null) => result.rerender(ui(selected)) }
++}
++
++function folderApi(overrides: Partial<ApiClient> = {}) {
++    return {
++        getCodexFolders: vi.fn().mockResolvedValue(folders),
++        assignCodexFolder: vi.fn().mockResolvedValue(undefined),
++        createCodexFolder: vi.fn().mockResolvedValue({ id: 'f-new', name: 'Outreach', position: 7 }),
++        renameCodexFolder: vi.fn().mockResolvedValue({ id: 'f-blender', name: 'Blender work', position: 1 }),
++        ...overrides,
++    } as unknown as ApiClient
++}
++
++describe('SessionList Codex/Claude tabs', () => {
++    it('splits chats into Codex and Claude tabs right below the Chats heading and remembers the choice', () => {
++        renderList()
++        const list = screen.getByTestId('session-chat-list')
++        const tabs = within(list).getAllByRole('tab')
++        expect(tabs.map(tab => tab.textContent)).toEqual(['Codex3', 'Claude1'])
++        expect(within(list).getByText('Chats')).toAppearBefore(tabs[0]!)
++        expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
++        expect(within(list).getByRole('button', { name: /Liquid sim/ })).toBeInTheDocument()
++        expect(within(list).queryByRole('button', { name: /Claude planning/ })).toBeNull()
++
++        fireEvent.click(tabs[1]!)
++        expect(within(list).getByRole('button', { name: /Claude planning/ })).toBeInTheDocument()
++        expect(within(list).queryByRole('button', { name: /Liquid sim/ })).toBeNull()
++        expect(localStorage.getItem('hapi-chat-tab')).toBe('claude')
++
++        cleanup()
++        renderList()
++        expect(screen.getByRole('tab', { name: /Claude/ })).toHaveAttribute('aria-selected', 'true')
++    })
++
++    it('shows the tab of a chat opened elsewhere, once per selection', () => {
++        const { rerenderWith } = renderList({ selected: 'cl-a' })
++        expect(screen.getByRole('tab', { name: /Claude/ })).toHaveAttribute('aria-selected', 'true')
++        fireEvent.click(screen.getByRole('tab', { name: /Codex/ }))
++        expect(screen.getByRole('tab', { name: /Codex/ })).toHaveAttribute('aria-selected', 'true')
++        rerenderWith('cx-blender')
++        expect(screen.getByRole('tab', { name: /Codex/ })).toHaveAttribute('aria-selected', 'true')
++    })
++
++    it('groups Codex chats under ChatGPT folders in ChatGPT order with unfiled chats last', async () => {
++        const api = folderApi()
++        renderList({ api })
++        await waitFor(() => expect(screen.getAllByTestId('chat-folder')).toHaveLength(3))
++        expect(api.getCodexFolders).toHaveBeenCalledWith(['thread-blender', 'thread-loose', 'thread-school'])
++        const [blender, school, none] = screen.getAllByTestId('chat-folder')
++        expect(within(blender!).getByText('Blender')).toBeInTheDocument()
++        expect(within(blender!).getByRole('button', { name: /Liquid sim/ })).toBeInTheDocument()
++        expect(within(school!).getByText('Internships/School')).toBeInTheDocument()
++        expect(within(school!).getByRole('button', { name: /Internship outreach/ })).toBeInTheDocument()
++        expect(within(none!).getByText('No folder')).toBeInTheDocument()
++        expect(within(none!).getByRole('button', { name: /Loose codex chat/ })).toBeInTheDocument()
++        // Claude chats are never sent to the Codex folder service.
++        fireEvent.click(screen.getByRole('tab', { name: /Claude/ }))
++        expect(screen.queryAllByTestId('chat-folder')).toHaveLength(0)
++    })
++
++    it('moves a Codex chat to another ChatGPT folder from the row menu', async () => {
++        const api = folderApi()
++        renderList({ api })
++        await waitFor(() => expect(screen.getAllByTestId('chat-folder')).toHaveLength(3))
++        fireEvent.contextMenu(screen.getByRole('button', { name: /Loose codex chat/ }))
++        fireEvent.click(await screen.findByRole('menuitem', { name: /Move to folder/ }))
++        const dialog = await screen.findByRole('dialog')
++        expect(within(dialog).getByRole('menuitemradio', { name: /No folder/ })).toHaveAttribute('aria-checked', 'true')
++        fireEvent.click(within(dialog).getByRole('menuitemradio', { name: /Blender/ }))
++        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-loose', 'f-blender'))
++        await waitFor(() => expect(api.getCodexFolders).toHaveBeenCalledTimes(2))
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++    })
++
++    it('creates a folder while moving, and renames folders from their heading', async () => {
++        const api = folderApi()
++        renderList({ api })
++        await waitFor(() => expect(screen.getAllByTestId('chat-folder')).toHaveLength(3))
++        fireEvent.contextMenu(screen.getByRole('button', { name: /Liquid sim/ }))
++        fireEvent.click(await screen.findByRole('menuitem', { name: /Move to folder/ }))
++        fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /New folder/ }))
++        fireEvent.change(screen.getByLabelText('Folder name'), { target: { value: 'Outreach' } })
++        fireEvent.click(screen.getByRole('button', { name: 'Create and move' }))
++        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-blender', 'f-new'))
++        expect(api.createCodexFolder).toHaveBeenCalledWith('Outreach', expect.stringMatching(/^[0-9a-f-]{36}$/))
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++
++        fireEvent.click(screen.getByRole('button', { name: 'Rename folder Blender' }))
++        const input = await screen.findByLabelText('Folder name')
++        expect(input).toHaveValue('Blender')
++        fireEvent.change(input, { target: { value: 'Blender work' } })
++        fireEvent.click(screen.getByRole('button', { name: 'Save' }))
++        await waitFor(() => expect(api.renameCodexFolder).toHaveBeenCalledWith('f-blender', 'Blender work'))
++    })
++
++    it('falls back to a flat Codex list without folder actions when folders are unavailable', async () => {
++        const api = folderApi({ getCodexFolders: vi.fn().mockRejectedValue(new Error('offline')) as never })
++        renderList({ api })
++        expect(await screen.findByText('ChatGPT folders unavailable')).toBeInTheDocument()
++        expect(screen.queryAllByTestId('chat-folder')).toHaveLength(0)
++        expect(screen.getByRole('button', { name: /Liquid sim/ })).toBeInTheDocument()
++        fireEvent.contextMenu(screen.getByRole('button', { name: /Liquid sim/ }))
++        await screen.findAllByRole('menuitem')
++        expect(screen.queryByRole('menuitem', { name: /Move to folder/ })).toBeNull()
++    })
++
++    it('shows an Other tab only when other agent types exist', () => {
++        renderList({ list: [...sessions, makeSession({ id: 'cur', updatedAt: 1, metadata: { path: '/w', name: 'Cursor chat', flavor: 'cursor' } })] })
++        expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['Codex3', 'Claude1', 'Other1'])
++    })
++})
++
++describe('groupChatsByFolder', () => {
++    it('drops unknown folder IDs into No folder and omits empty folders', () => {
++        const groups = groupChatsByFolder(
++            [codex('a', 'A', 't-a'), codex('b', 'B', 't-b')],
++            [{ id: 'f1', name: 'One', position: 1 }, { id: 'f2', name: 'Two', position: 2 }],
++            session => session.id === 'a' ? 'f2' : 'deleted-folder'
++        )
++        expect(groups.map(g => [g.folder?.name ?? null, g.sessions.map(s => s.id)])).toEqual([['Two', ['a']], [null, ['b']]])
++    })
++})
+diff --git a/web/src/components/SessionList.directory-action.test.tsx b/web/src/components/SessionList.directory-action.test.tsx
+index 38aa3f5..e8fed6e 100644
+--- a/web/src/components/SessionList.directory-action.test.tsx
++++ b/web/src/components/SessionList.directory-action.test.tsx
+@@ -496,7 +496,7 @@ describe('SessionList flat chats', () => {
+         const onSelect = vi.fn()
+         const sessions = [
+             makeSession({ id: 'session-a', updatedAt: 100, metadata: { path: '/work/a', name: 'Alpha chat', flavor: 'codex' } }),
+-            makeSession({ id: 'session-b', updatedAt: 90, metadata: { path: '/work/b', name: 'Beta chat', flavor: 'claude' } }),
++            makeSession({ id: 'session-b', updatedAt: 90, metadata: { path: '/work/b', name: 'Beta chat', flavor: 'codex' } }),
+         ]
+         const { rerender } = render(renderList(sessions, 'session-a', onSelect))
+         expect(screen.getByRole('button', { name: /Alpha chat/ })).toHaveAttribute('aria-current', 'page')
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+index 8484763..2348b5e 100644
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -59,6 +59,8 @@ import { Spinner } from '@/components/Spinner'
+ import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+ import { useToast } from '@/lib/toast-context'
+ import { getPathDisplayName } from '@/utils/path'
++import type { CodexFolder } from '@/api/client'
++import { CodexFolderNameDialog, MoveToFolderDialog, useCodexFolders } from '@/components/CodexFolders'
+ 
+ export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
+ 
+@@ -282,6 +284,33 @@ export function getPreviousSessionVisibleCount(current: number, step: number): n
+     return Math.max(normalizedStep, current - normalizedStep)
+ }
+ 
++export type ChatTab = 'codex' | 'claude' | 'other'
++const CHAT_TAB_KEY = 'hapi-chat-tab'
++
++export function getChatTab(session: SessionSummary): ChatTab {
++    const flavor = session.metadata?.flavor
++    return flavor === 'codex' ? 'codex' : flavor === 'claude' || !flavor ? 'claude' : 'other'
++}
++
++/** Folder sections for the Codex tab in ChatGPT order; chats without a folder last. */
++export function groupChatsByFolder(
++    sessions: SessionSummary[],
++    folders: CodexFolder[],
++    folderOf: (session: SessionSummary) => string | null
++): Array<{ folder: CodexFolder | null; sessions: SessionSummary[] }> {
++    const byFolder = new Map<string | null, SessionSummary[]>()
++    const known = new Set(folders.map(folder => folder.id))
++    for (const session of sessions) {
++        const id = folderOf(session)
++        const key = id && known.has(id) ? id : null
++        byFolder.set(key, [...(byFolder.get(key) ?? []), session])
++    }
++    return [
++        ...folders.filter(folder => byFolder.has(folder.id)).map(folder => ({ folder, sessions: byFolder.get(folder.id)! })),
++        ...(byFolder.has(null) ? [{ folder: null, sessions: byFolder.get(null)! }] : []),
++    ]
++}
++
+ export function sortChatSessions(sessions: SessionSummary[]): SessionSummary[] {
+     return [...sessions].sort((a, b) => {
+         if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
+@@ -397,6 +426,22 @@ function groupByMachine(
+     })
+ }
+ 
++function FolderGlyph(props: { className?: string }) {
++    return (
++        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className} aria-hidden="true">
++            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
++        </svg>
++    )
++}
++
++function PencilGlyph(props: { className?: string }) {
++    return (
++        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className} aria-hidden="true">
++            <path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
++        </svg>
++    )
++}
++
+ function SearchIcon(props: { className?: string }) {
+     return (
+         <svg
+@@ -851,6 +896,7 @@ function SessionItem(props: {
+     projectLabel?: string
+     machineLabel?: string
+     lastSeenVersion: number
++    onMoveToFolder?: (session: SessionSummary) => void
+ }) {
+     const { t } = useTranslation()
+     const { addToast } = useToast()
+@@ -1005,6 +1051,7 @@ function SessionItem(props: {
+                 onSetPinMode={(mode) => void handleSetPinMode(mode)}
+                 onRename={() => setRenameOpen(true)}
+                 onExport={() => setExportOpen(true)}
++                onMoveToFolder={props.onMoveToFolder ? () => props.onMoveToFolder!(s) : undefined}
+                 onMarkUnread={() => markSessionUnread(s.id, s.updatedAt)}
+                 onArchive={() => setArchiveOpen(true)}
+                 onReopen={cursorReopenDisabledReason ? undefined : handleReopen}
+@@ -1345,6 +1392,50 @@ export function SessionList(props: {
+         },
+         [machineFilteredSessions, pinInProgressSessions, searchScoreIndex, hasTextQuery]
+     )
++    const tabCounts = useMemo(() => {
++        const counts: Record<ChatTab, number> = { codex: 0, claude: 0, other: 0 }
++        for (const session of chatSessions) counts[getChatTab(session)] += 1
++        return counts
++    }, [chatSessions])
++    const [storedTab, setStoredTab] = useState<ChatTab | null>(() => {
++        try {
++            const value = localStorage.getItem(CHAT_TAB_KEY)
++            return value === 'codex' || value === 'claude' || value === 'other' ? value : null
++        } catch { return null }
++    })
++    const selectedChat = selectedSessionId ? chatSessions.find(session => session.id === selectedSessionId) : undefined
++    const availableTabs = (['codex', 'claude', 'other'] as ChatTab[]).filter(tab => tab !== 'other' || tabCounts.other > 0)
++    const activeTab: ChatTab = storedTab && availableTabs.includes(storedTab)
++        ? storedTab
++        : selectedChat ? getChatTab(selectedChat) : tabCounts.codex > 0 || tabCounts.claude === 0 ? 'codex' : 'claude'
++    const chooseTab = (tab: ChatTab) => {
++        setStoredTab(tab)
++        try { localStorage.setItem(CHAT_TAB_KEY, tab) } catch { /* private mode */ }
++    }
++    // Opening a chat from elsewhere (e.g. In progress) shows its tab once per selection.
++    const lastSelectedRef = useRef<string | null>(null)
++    useEffect(() => {
++        if (!selectedChat || lastSelectedRef.current === selectedChat.id) return
++        lastSelectedRef.current = selectedChat.id
++        if (getChatTab(selectedChat) !== activeTab) setStoredTab(getChatTab(selectedChat))
++    }, [selectedChat, activeTab])
++    const codexThreadIds = useMemo(
++        () => props.sessions
++            .filter(session => session.metadata?.flavor === 'codex' && session.metadata?.agentSessionId)
++            .map(session => session.metadata!.agentSessionId!),
++        [props.sessions]
++    )
++    const codexFolders = useCodexFolders(api, codexThreadIds)
++    const folderOf = (session: SessionSummary): string | null => {
++        const threadId = session.metadata?.agentSessionId
++        return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
++    }
++    const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null)
++    const [folderDialog, setFolderDialog] = useState<{ folder: CodexFolder | null } | null>(null)
++    const canMoveToFolder = Boolean(api && codexFolders.data)
++    const handleMoveToFolder = (session: SessionSummary) => {
++        if (session.metadata?.flavor === 'codex' && session.metadata?.agentSessionId) setMoveTarget(session)
++    }
+     const [runningSectionCollapsed, setRunningSectionCollapsed] = useState(false)
+     const [activeSectionCollapsed, setActiveSectionCollapsed] = useState(false)
+     const [pinnedSectionCollapsed, setPinnedSectionCollapsed] = useState(false)
+@@ -1438,10 +1529,39 @@ export function SessionList(props: {
+         )
+     }
+ 
++    const renderChatRow = (s: SessionSummary, index: number, rows: SessionSummary[]) => (
++        <div key={s.id} className="contents">
++            {shouldShowPinnedDivider(rows, index) ? (
++                <div
++                    data-testid="session-pin-divider"
++                    className="ml-2.5 mr-2 my-1 border-t border-[var(--app-border)]"
++                    aria-hidden="true"
++                />
++            ) : null}
++            <SessionItem
++                session={s}
++                onSelect={props.onSelect}
++                showPath={false}
++                api={api}
++                titleSuggestionAvailable={titleSuggestionAvailable}
++                selected={s.id === selectedSessionId}
++                showDetailedStatus={showDetailedStatus}
++                projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
++                machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
++                lastSeenVersion={lastSeenVersion}
++                onMoveToFolder={canMoveToFolder && getChatTab(s) === 'codex' ? handleMoveToFolder : undefined}
++            />
++        </div>
++    )
++
+     const renderChatList = () => {
+         if (chatSessions.length === 0) {
+             return null
+         }
++        const tabSessions = chatSessions.filter(session => getChatTab(session) === activeTab)
++        const sections = activeTab === 'codex' && codexFolders.data
++            ? groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf)
++            : [{ folder: undefined, sessions: tabSessions }]
+         return (
+             <div key="chats-section" data-testid="session-chat-list">
+                 <div className="flex min-w-0 w-full select-none items-center gap-2 py-1.5 pl-2 pr-2">
+@@ -1452,31 +1572,79 @@ export function SessionList(props: {
+                         ({chatSessions.length})
+                     </span>
+                 </div>
+-                <div className="flex flex-col gap-0.5 py-1">
+-                    {chatSessions.map((s, index) => (
+-                        <div key={s.id} className="contents">
+-                            {shouldShowPinnedDivider(chatSessions, index) ? (
+-                                <div
+-                                    data-testid="session-pin-divider"
+-                                    className="ml-2.5 mr-2 my-1 border-t border-[var(--app-border)]"
+-                                    aria-hidden="true"
+-                                />
++                <div role="tablist" aria-label={t('sessions.tabs')} className="mx-1 mb-1 flex gap-1 rounded-xl bg-[var(--app-subtle-bg)] p-1">
++                    {availableTabs.map((tab) => (
++                        <button
++                            key={tab}
++                            type="button"
++                            role="tab"
++                            id={`chat-tab-${tab}`}
++                            aria-selected={activeTab === tab}
++                            aria-controls="chat-tab-panel"
++                            onClick={() => chooseTab(tab)}
++                            className={cn(
++                                'flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg px-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]',
++                                activeTab === tab
++                                    ? 'bg-[var(--app-bg)] text-[var(--app-fg)] shadow-sm'
++                                    : 'text-[var(--app-hint)] hover:text-[var(--app-fg)]'
++                            )}
++                        >
++                            {t(`sessions.tab.${tab}`)}
++                            <span className="text-[11px] tabular-nums opacity-70">{tabCounts[tab]}</span>
++                        </button>
++                    ))}
++                </div>
++                <div id="chat-tab-panel" role="tabpanel" aria-labelledby={`chat-tab-${activeTab}`} className="flex flex-col gap-0.5 py-1">
++                    {activeTab === 'codex' && api ? (
++                        <div className="flex items-center justify-between px-2 pb-1 text-[11px] text-[var(--app-hint)]">
++                            <span>{codexFolders.isError ? t('folders.unavailable') : null}</span>
++                            {codexFolders.data ? (
++                                <button type="button" onClick={() => setFolderDialog({ folder: null })} className="rounded-md px-2 py-1 text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">
++                                    + {t('folders.new')}
++                                </button>
++                            ) : null}
++                        </div>
++                    ) : null}
++                    {sections.map(({ folder, sessions }) => (
++                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} className="flex flex-col gap-0.5">
++                            {folder !== undefined ? (
++                                <div className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
++                                    <FolderGlyph className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]" />
++                                    <span className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
++                                        {folder ? folder.name : t('folders.none')}
++                                    </span>
++                                    {folder ? (
++                                        <button
++                                            type="button"
++                                            onClick={() => setFolderDialog({ folder })}
++                                            aria-label={t('folders.renameButton', { name: folder.name })}
++                                            title={t('folders.rename')}
++                                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-60 hover:bg-[var(--app-subtle-bg)] hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
++                                        >
++                                            <PencilGlyph className="h-3 w-3" />
++                                        </button>
++                                    ) : null}
++                                    <span className="shrink-0 text-[11px] tabular-nums text-[var(--app-hint)]">({sessions.length})</span>
++                                </div>
+                             ) : null}
+-                            <SessionItem
+-                                session={s}
+-                                onSelect={props.onSelect}
+-                                showPath={false}
+-                                api={api}
+-                                titleSuggestionAvailable={titleSuggestionAvailable}
+-                                selected={s.id === selectedSessionId}
+-                                showDetailedStatus={showDetailedStatus}
+-                                projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+-                                machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
+-                                lastSeenVersion={lastSeenVersion}
+-                            />
++                            {sessions.map((s, index) => renderChatRow(s, index, sessions))}
+                         </div>
+                     ))}
+                 </div>
++                {api && moveTarget?.metadata?.agentSessionId && codexFolders.data ? (
++                    <MoveToFolderDialog
++                        api={api}
++                        isOpen
++                        onClose={() => setMoveTarget(null)}
++                        threadId={moveTarget.metadata.agentSessionId}
++                        chatTitle={getSessionTitle(moveTarget)}
++                        folders={codexFolders.data.folders}
++                        currentFolderId={folderOf(moveTarget)}
++                    />
++                ) : null}
++                {api && folderDialog ? (
++                    <CodexFolderNameDialog api={api} folder={folderDialog.folder} isOpen onClose={() => setFolderDialog(null)} />
++                ) : null}
+             </div>
+         )
+     }
+diff --git a/web/src/lib/locales/en.ts b/web/src/lib/locales/en.ts
+index e469d4c..4a08ba4 100644
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -94,6 +94,23 @@ export default {
+   'sessions.group.collapse': 'Collapse {n}',
+   'sessions.runningSection': 'In progress',
+   'sessions.chatsSection': 'Chats',
++  'folders.error': 'Could not update ChatGPT folders. Try again.',
++  'folders.name': 'Folder name',
++  'folders.rename': 'Rename folder',
++  'folders.renameButton': 'Rename folder {name}',
++  'folders.new': 'New folder',
++  'folders.save': 'Save',
++  'folders.create': 'Create',
++  'folders.moveTitle': 'Move to folder',
++  'folders.createAndMove': 'Create and move',
++  'folders.none': 'No folder',
++  'folders.syncNote': 'Folders are shared with the ChatGPT app.',
++  'folders.unavailable': 'ChatGPT folders unavailable',
++  'session.action.moveToFolder': 'Move to folder…',
++  'sessions.tabs': 'Chat type',
++  'sessions.tab.codex': 'Codex',
++  'sessions.tab.claude': 'Claude',
++  'sessions.tab.other': 'Other',
+   'sessions.activeSection': 'Active sessions',
+   'sessions.group.new': 'New session in this directory',
+   'sessions.machineFilter.label': 'Filter sessions by machine',
+diff --git a/web/src/lib/locales/zh-CN.ts b/web/src/lib/locales/zh-CN.ts
+index 239556f..67ecb27 100644
+--- a/web/src/lib/locales/zh-CN.ts
++++ b/web/src/lib/locales/zh-CN.ts
+@@ -94,6 +94,23 @@ export default {
+   'sessions.group.collapse': '收起 {n} 个',
+   'sessions.runningSection': '进行中',
+   'sessions.chatsSection': '会话',
++  'folders.error': '无法更新 ChatGPT 文件夹，请重试。',
++  'folders.name': '文件夹名称',
++  'folders.rename': '重命名文件夹',
++  'folders.renameButton': '重命名文件夹 {name}',
++  'folders.new': '新建文件夹',
++  'folders.save': '保存',
++  'folders.create': '创建',
++  'folders.moveTitle': '移动到文件夹',
++  'folders.createAndMove': '创建并移动',
++  'folders.none': '无文件夹',
++  'folders.syncNote': '文件夹与 ChatGPT 应用共享。',
++  'folders.unavailable': 'ChatGPT 文件夹不可用',
++  'session.action.moveToFolder': '移动到文件夹…',
++  'sessions.tabs': '会话类型',
++  'sessions.tab.codex': 'Codex',
++  'sessions.tab.claude': 'Claude',
++  'sessions.tab.other': '其他',
+   'sessions.activeSection': '活跃会话',
+   'sessions.group.new': '在此目录新建会话',
+   'sessions.machineFilter.label': '按机器筛选会话',

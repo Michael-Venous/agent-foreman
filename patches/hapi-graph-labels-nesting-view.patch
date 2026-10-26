@@ -1,0 +1,616 @@
+--- a/shared/src/nodeGraph.ts
++++ b/shared/src/nodeGraph.ts
+@@ -45,13 +45,13 @@
+ }
+ 
+ /** A transparent wiring point: the real owner remains the upstream chat. */
+-export type NodeJunction = { id: string; x: number; y: number; owner: string | null }
++export type NodeJunction = { id: string; x: number; y: number; owner: string | null; label?: string }
+ export type NodeRoutingEdge = Pick<NodeGraphEdge, 'owner' | 'child' | 'via'>
+ export type NodeRouting = { junctions: NodeJunction[]; edges: NodeRoutingEdge[] }
+ 
+ export function nodeRouting(graph: { junctions?: readonly NodeJunction[]; edges: readonly NodeRoutingEdge[] }): NodeRouting {
+     return {
+-        junctions: [...graph.junctions ?? []].map(j => ({ id: j.id, x: j.x, y: j.y, owner: j.owner })).sort((a, b) => a.id.localeCompare(b.id)),
++        junctions: [...graph.junctions ?? []].map(j => ({ id: j.id, x: j.x, y: j.y, owner: j.owner, ...(j.label ? { label: j.label } : {}) })).sort((a, b) => a.id.localeCompare(b.id)),
+         edges: graph.edges.map(e => ({ owner: e.owner, child: e.child, ...(e.via ? { via: e.via } : {}) })).sort((a, b) => a.child.localeCompare(b.child)),
+     }
+ }
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -24,7 +24,7 @@
+ const annotationEdit = z.object({ value: annotation.nullable(), expected: annotation.nullable() }).strict()
+ 
+ const routing = z.object({
+-    junctions: z.array(z.object({ id: z.string().min(1).max(96).regex(/^[\w-]+$/), owner: z.string().min(1).max(100).nullable(),
++    junctions: z.array(z.object({ id: z.string().min(1).max(96).regex(/^[\w-]+$/), owner: z.string().min(1).max(100).nullable(), label: z.string().max(120).optional(),
+         x: z.number().finite().min(-1_000_000).max(1_000_000), y: z.number().finite().min(-1_000_000).max(1_000_000) }).strict()).max(200),
+     edges: z.array(z.object({ owner: z.string().min(1).max(100), child: z.string().min(1).max(100), via: z.string().min(1).max(96).optional() }).strict()).max(2000),
+ }).strict()
+--- a/hub/src/store/nodeGraph.ts
++++ b/hub/src/store/nodeGraph.ts
+@@ -126,7 +126,7 @@
+                 this.db.query('INSERT INTO node_annotations VALUES (?, ?, ?) ON CONFLICT(workspace_id, id) DO UPDATE SET data = excluded.data').run(workspaceId, id, JSON.stringify(value))
+             } else {
+                 this.db.query('DELETE FROM node_annotations WHERE workspace_id = ? AND id = ?').run(workspaceId, id)
+-                if (!allowInactive) for (const a of this.graph(namespace, workspaceId).annotations ?? []) if (a.members?.includes('text:' + id)) this.db.query('UPDATE node_annotations SET data = ? WHERE workspace_id = ? AND id = ?').run(JSON.stringify({ ...a, members: a.members.filter(member => member !== 'text:' + id) }), workspaceId, a.id)
++                if (!allowInactive) for (const a of this.graph(namespace, workspaceId).annotations ?? []) if (a.members?.some(member => member === 'text:' + id || member === 'frame:' + id)) this.db.query('UPDATE node_annotations SET data = ? WHERE workspace_id = ? AND id = ?').run(JSON.stringify({ ...a, members: a.members.filter(member => member !== 'text:' + id && member !== 'frame:' + id) }), workspaceId, a.id)
+             }
+             if (!allowInactive) this.validateFrames(namespace, workspaceId)
+             this.touch(workspaceId)
+@@ -135,13 +135,22 @@
+     }
+ 
+     validateFrames(namespace: string, workspaceId: string): void {
+-        const graph = this.graph(namespace, workspaceId), known = new Set([...this.members(namespace, workspaceId), ...(graph.junctions ?? []).map(j => 'junction:' + j.id), ...(graph.annotations ?? []).filter(a => a.kind === 'text').map(a => 'text:' + a.id)])
++        const graph = this.graph(namespace, workspaceId), known = new Set([...this.members(namespace, workspaceId), ...(graph.junctions ?? []).map(j => 'junction:' + j.id), ...(graph.annotations ?? []).map(a => a.kind + ':' + a.id)])
+         const owned = new Set<string>()
++        const parents = new Map<string, string>()
+         for (const frame of graph.annotations ?? []) for (const member of frame.members ?? []) {
+             if (frame.kind !== 'frame') throw new Error('Only frames contain objects')
+             if (!known.has(member)) throw new Error('Frame members must exist in this workspace')
+             if (owned.has(member)) throw new Error('An object can belong to only one frame')
+             owned.add(member)
++            if (member.startsWith('frame:')) parents.set(member.slice(6), frame.id)
++        }
++        for (const child of parents.keys()) {
++            const seen = new Set<string>()
++            for (let id: string | undefined = child; id !== undefined; id = parents.get(id)) {
++                if (seen.has(id)) throw new Error('Frames cannot contain themselves or form a cycle')
++                seen.add(id)
++            }
+         }
+     }
+ 
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -431,3 +431,23 @@
+         expect(f.engine.nodeGraph.graph('default',workspace).annotations?.find(a=>a.id==='mixed')?.members).not.toContain('junction:dot')
+     } finally {f.close()}
+ })
++
++it('persists junction labels and nested frames, rejects nesting cycles atomically, and releases deleted frame references', async () => {
++    const f = fixture()
++    try {
++        const workspace = f.engine.nodeGraph.active('default'), a = decoration('inner'), outer = { ...decoration('outer'), members: ['frame:inner'] }
++        const path = (id: string) => `/node-graph/workspaces/${workspace}/annotations/${id}`
++        expect((await f.call(path('inner'), { value: a, expected: null })).status).toBe(200)
++        expect((await f.call(path('outer'), { value: outer, expected: null })).status).toBe(200)
++        const snapshot = f.engine.nodeGraph.graph('default', workspace)
++        expect((await f.call(path('inner'), { value: { ...a, members: ['frame:outer'] }, expected: a })).status).toBe(409)
++        expect(f.engine.nodeGraph.graph('default', workspace)).toEqual(snapshot)
++        const value = { junctions: [{ id: 'review', x: 20, y: 40, owner: null, label: 'Final review' }], edges: [] }
++        expect((await f.call(`/node-graph/workspaces/${workspace}/routing`, { value, expected: { junctions: [], edges: [] } })).status).toBe(200)
++        expect(nodeRouting(f.engine.nodeGraph.graph('default', workspace)).junctions[0].label).toBe('Final review')
++        const preset = f.engine.nodeGraph.saveAs('default', 'Organized copy')
++        expect(f.engine.nodeGraph.graph('default', preset.id).annotations?.find(a => a.id === 'outer')?.members).toEqual(['frame:inner'])
++        expect((await f.call(path('inner'), { value: null, expected: a })).status).toBe(200)
++        expect(f.engine.nodeGraph.graph('default', workspace).annotations?.find(a => a.id === 'outer')?.members).toEqual([])
++    } finally { f.close() }
++})
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,10 +1,10 @@
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+-import { fitNodeFrame, framePoints, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
++import { fitNodeFrame, framePoints, frameMemberIds, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
+ import { useNodeGrid } from '@/hooks/useNodeGrid'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import * as Popover from '@radix-ui/react-popover'
+ import { createPortal } from 'react-dom'
+-import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
++import { Fragment, useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+@@ -16,6 +16,7 @@
+ import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
+ import { junctionInput, junctionBranch, removeJunction } from '@/lib/nodeGraphJunctions'
+ import { redoGraphEdit, undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
++import { readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ import { openChatPopout } from '@/lib/popout'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+@@ -34,8 +35,8 @@
+ type SelectionRect = { x: number; y: number; width: number; height: number }
+ type Gesture =
+     | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
+-    | { kind: 'junction-move'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
+-    | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
++    | { kind: 'junction-move'; editLabel?: boolean; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
++    | { kind: 'annotation'; editLabel?: boolean; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint; frames: NodeAnnotation[]; origins: NodeLayoutPositions; positions: NodeLayoutPositions }
+@@ -70,6 +71,7 @@
+ }) {
+     const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
+     const canvas = useRef<HTMLDivElement>(null)
++    const [editingJunction, setEditingJunction] = useState<{ workspace: string; before: NodeJunction; label: string } | null>(null)
+     const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
+     const viewRef = useRef(view); viewRef.current = view
+     const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
+@@ -133,6 +135,7 @@
+     const pendingSave = useRef<NodeLayoutPositions>({})
+     const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const fittedWorkspace = useRef<string | null>(null)
++    const skipViewWrite = useRef(false)
+ 
+     // Manual-pause evidence comes with the graph response (summaries do not carry it).
+     const sessionsById = useMemo(() => new Map((sessions ?? []).map(session => [session.id, graph?.pausedAt?.[session.id] != null ? { ...session, manualPausedAt: graph.pausedAt[session.id] } : session])), [sessions, graph?.pausedAt])
+@@ -166,18 +169,27 @@
+     const fit = () => {
+         if (!layout) return
+         const element = canvas.current
+-        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - 16, y: j.y - 16, width: 32, height: 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
++        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 48 : 16), width: j.label ? 180 : 32, height: j.label ? 64 : 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
+         const x = Math.min(...rectangles.map(r => r.x)), y = Math.min(...rectangles.map(r => r.y))
+         const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
+         setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
+     }
+     useEffect(() => {
+-        if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+-        fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null); fit()
++        if (!graph || !layout || !visible || fittedWorkspace.current === graph.activeWorkspaceId) return
++        fittedWorkspace.current = graph.activeWorkspaceId; skipViewWrite.current = true
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null)
++        let saved: View | null = null
++        try { const value = JSON.parse(readChatWindowPreference('node-view:' + graph.activeWorkspaceId) ?? 'null'); if (value && [value.x, value.y, value.k].every(Number.isFinite) && value.k > 0 && value.k <= 2.5) saved = value } catch { /* First view fits. */ }
++        if (saved) setView(saved); else fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+-    }, [graph?.activeWorkspaceId, layout])
++    }, [graph?.activeWorkspaceId, layout, visible])
++
++    useEffect(() => {
++        if (skipViewWrite.current) { skipViewWrite.current = false; return }
++        if (graph && visible && fittedWorkspace.current === graph.activeWorkspaceId)
++            writeChatWindowPreference('node-view:' + graph.activeWorkspaceId, JSON.stringify(view))
++    }, [view, graph?.activeWorkspaceId, visible])
+ 
+     const flushSave = async () => {
+         if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
+@@ -326,10 +338,10 @@
+         if (dotId) {
+             setMenu(null); setSelectedJunction(dotId)
+             const dot = junctionsRef.current.find(j => j.id === dotId)!
+-            if (movingJunction === dotId) gesture.current = { kind: 'junction-move', pointer: event.pointerId, id: dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false, frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) }
++            if (movingJunction === dotId || target.closest('[data-junction-label]')) gesture.current = { kind: 'junction-move', editLabel: Boolean(target.closest('[data-junction-label]')), pointer: event.pointerId, id: dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false, frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) }
+             else { gesture.current = { kind: 'link', pointer: event.pointerId, from: dotId }; setLink({ fixed: dotId, direction: 'child', to: dot, target: null }) }
+         }
+-        else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize'), members: Object.fromEntries((annotation.members ?? []).flatMap(id => { const point = framePoints(positionsRef.current, annotationsRef.current, junctionsRef.current)[id]; return point ? [[id, point]] : [] })), frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) } }
++        else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', editLabel: Boolean(target.closest('[data-annotation-label]')), pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize'), members: Object.fromEntries(frameMemberIds(annotation, annotationsRef.current).flatMap(id => { const point = framePoints(positionsRef.current, annotationsRef.current, junctionsRef.current)[id]; return point ? [[id, point]] : [] })), frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) } }
+         else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, wire: nodeRouting(graph!.graph).edges.find(e => e.child === input), x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) {
+@@ -422,7 +434,7 @@
+             setAnnotationDrafts(old => ({ ...old, [g.origin.id]: g.last }))
+             try {
+             if (g.origin.kind === 'frame' && !g.resize) {
+-                const visual = translateFrame(g.origin, g.frames, g.members, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
++                const visual = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
+                 setOverrides(old => ({ ...old, ...visual.positions }))
+                 setAnnotationDrafts(Object.fromEntries(visual.annotations.map(a => [a.id, a])))
+                 setJunctionDrafts(Object.fromEntries(visual.routing!.junctions.map(j => [j.id, { x: j.x, y: j.y }])))
+@@ -473,7 +485,7 @@
+                 if (!current || current.x !== g.origin.x || current.y !== g.origin.y) throw new Error('The junction moved elsewhere. Try again.')
+                 return { ...routing, junctions: routing.junctions.map(j => j.id === g.id ? { ...j, ...g.last } : j) }
+             }).finally(() => { setJunctionDrafts({}); setMovingJunction(null) })
+-            else setJunctionDrafts({})
++            else { setJunctionDrafts({}); if (!cancelled && g.editLabel) { const dot = graph?.graph.junctions?.find(j => j.id === g.id); if (dot && graph) setEditingJunction({ workspace: graph.activeWorkspaceId, before: dot, label: dot.label ?? '' }) } }
+         } else if (g.kind === 'annotation') {
+             const clear = () => {
+                 setAnnotationDrafts({}); setJunctionDrafts({})
+@@ -481,12 +493,12 @@
+             }
+             if (g.moved && !cancelled && Object.keys(g.members).length) {
+                 try {
+-                    const after = translateFrame(g.origin, g.frames, g.members, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
+-                    const before = { positions: Object.fromEntries(Object.entries(g.members).filter(([id]) => !id.startsWith('text:') && !id.startsWith('junction:'))), annotations: g.frames, routing: g.routing }
++                    const after = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
++                    const before = { positions: Object.fromEntries(Object.entries(g.members).filter(([id]) => !id.startsWith('text:') && !id.startsWith('junction:') && !id.startsWith('frame:'))), annotations: g.frames, routing: g.routing }
+                     void changeVisual(before, after).finally(clear)
+                 } catch (cause) { setError(errorText(cause, 'Could not fit frame')); clear() }
+             } else if (g.moved && !cancelled) void saveAnnotation(g.last, g.origin).finally(clear)
+-            else clear()
++            else { clear(); if (!cancelled && g.editLabel) editAnnotation(g.origin) }
+         } else if (g.kind === 'node') {
+             const clear = () => { setAnnotationDrafts({}); setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in g.origins)))) }
+             if (cancelled) { clear(); return }
+@@ -611,13 +623,13 @@
+     const adjustAnnotation = (value: NodeAnnotation) => {
+         const before = annotations.find(a => a.id === value.id)
+         if (!before) return
+-        const members = before.kind === 'frame' ? before.members ?? [] : []
++        const members = before.kind === 'frame' ? frameMemberIds(before, annotations) : []
+         if (!members.length) { void saveAnnotation({ ...value, ...snap(value) }, before); return }
+         const delta = snap({ x: value.x - before.x, y: value.y - before.y })
+         const routing = nodeRouting(graph!.graph), points = framePoints(positionsRef.current, annotations, routing.junctions)
+         try {
+             const after = translateFrame(before, annotations, points, routing, delta)
+-            const beforePoints = Object.fromEntries(members.filter(id => !id.startsWith('text:') && !id.startsWith('junction:')).flatMap(id => positionsRef.current[id] ? [[id, positionsRef.current[id]]] : []))
++            const beforePoints = Object.fromEntries(members.filter(id => !id.startsWith('text:') && !id.startsWith('junction:') && !id.startsWith('frame:')).flatMap(id => positionsRef.current[id] ? [[id, positionsRef.current[id]]] : []))
+             void changeVisual({ positions: beforePoints, annotations: graph!.graph.annotations ?? [], routing }, after)
+         } catch (cause) { setError(errorText(cause, 'Could not fit frame')) }
+     }
+@@ -638,8 +650,9 @@
+         const id = value?.id ?? before?.id
+         if (!workspace || !id) return null
+         const current = graph?.graph.annotations ?? []
+-        const member = 'text:' + id
+-        if ((value?.kind === 'text' || before?.kind === 'text') && (current.some(a => a.members?.includes(member)) || (current.some(a => a.kind === 'frame') && (!before || value?.x !== before.x || value?.y !== before.y)))) {
++        const member = (value?.kind ?? before?.kind) + ':' + id
++        if (((value?.kind === 'frame' || before?.kind === 'frame') && current.some(a => a.kind === 'frame' && a.id !== id)) || ((value?.kind === 'text' || before?.kind === 'text') && (current.some(a => a.members?.includes(member)) || (current.some(a => a.kind === 'frame') && (!before || value?.x !== before.x || value?.y !== before.y))))) {
++            if (JSON.stringify(current.find(a => a.id === id) ?? null) !== JSON.stringify(before)) { setError('Annotation changed elsewhere. Reopen the editor.'); return null }
+             let next = [...current.filter(a => a.id !== id), ...(value ? [value] : [])]
+             try { next = placeInFrame(next, member, framePoints(positionsRef.current, next, junctionsRef.current), !value) }
+             catch (cause) { setError(errorText(cause, 'Could not fit frame')); setAnnotationDrafts({}); return null }
+@@ -892,7 +905,7 @@
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+                 <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
+-                    onAdjust={adjustAnnotation} onContextMenu={(id, x, y) => openObjectMenu('text:' + id, x, y)} />
++                    onAdjust={adjustAnnotation} onContextMenu={(id, x, y) => { const a = annotations.find(a => a.id === id); if (a) openObjectMenu(a.kind + ':' + id, x, y) }} />
+                 <svg className="pointer-events-none absolute left-0 top-0 overflow-visible z-[1]" width="1" height="1" aria-hidden="true">
+                     <defs>
+                         <marker id="node-edge-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-link)" /></marker>
+@@ -923,12 +936,13 @@
+ 
+                 </svg>
+                 {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
+-                {junctions.map((j, index) => <button key={j.id} type="button" data-junction-id={j.id} aria-label={`Junction ${index + 1}`} onContextMenu={e => { e.preventDefault(); setSelectedJunction(j.id); openObjectMenu('junction:' + j.id, e.clientX, e.clientY) }} title={movingJunction === j.id ? 'Drag to move junction' : 'Drag to a chat input to branch. Connect a chat output here for its input.'}
++                {junctions.map((j, index) => <Fragment key={j.id}><button key={j.id} type="button" data-junction-id={j.id} aria-label={`Junction ${index + 1}`} onContextMenu={e => { e.preventDefault(); setSelectedJunction(j.id); openObjectMenu('junction:' + j.id, e.clientX, e.clientY) }} title={movingJunction === j.id ? 'Drag to move junction' : 'Drag to a chat input to branch. Connect a chat output here for its input.'}
+                     onClick={event => { if (event.detail === 0) { setSelectedJunction(j.id); setSelectedAnnotation(null); setMenu(null) } }}
+                     className={`absolute z-[4] flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${movingJunction === j.id ? 'cursor-move' : 'cursor-crosshair'}`}
+                     style={{ left: j.x, top: j.y, scale: Math.max(1, 0.85 / view.k) }}>
+                     <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${j.owner ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'} ${selectedJunction === j.id || link?.target === j.id ? 'ring-4 ring-[var(--app-link)]/20' : ''}`} />
+-                </button>)}
++                </button>{j.label && <button type="button" data-junction-id={j.id} data-junction-label={j.id} aria-label={`Edit junction label: ${j.label}`} title={j.label}
++                    className="absolute z-[4] max-w-[180px] -translate-x-1/2 -translate-y-full cursor-move truncate rounded px-1 text-xs text-[var(--app-fg)]" style={{ left: j.x, top: j.y - 20 }}>{j.label}</button>}</Fragment>)}
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+@@ -971,7 +985,7 @@
+                 <button type="button" aria-label="Redo graph edit" title="Redo graph edit (Ctrl+Shift+Z)" disabled={!redoHistory.length || pending !== null} onClick={() => redoRef.current()} className={iconButton}>↷</button>
+             </div>
+             {selectedDot && !menu && <section data-graph-ui aria-label="Junction actions" className="absolute bottom-16 right-2 z-20 w-64 max-w-[calc(100%_-_16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow">
+-                <div className="flex items-center gap-1"><span className="flex-1 px-1 text-xs font-medium">Junction</span>
++                <div className="flex items-center gap-1"><button type="button" aria-label="Edit junction label" onClick={() => setEditingJunction({ workspace: graph!.activeWorkspaceId, before: selectedDot, label: selectedDot.label ?? '' })} className="min-w-0 flex-1 truncate px-1 text-left text-xs font-medium">{selectedDot.label || 'Label…'}</button>
+                     <button type="button" aria-label="Move junction" aria-pressed={movingJunction === selectedDot.id} disabled={pending !== null} onClick={() => setMovingJunction(old => old === selectedDot.id ? null : selectedDot.id)} className={`min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)] ${movingJunction === selectedDot.id ? 'text-[var(--app-link)]' : ''}`}>Move</button>
+                     <button type="button" aria-label="Delete junction" disabled={pending !== null} onClick={async () => { if (await changeRouting(r => removeJunction(r, selectedDot.id))) setSelectedJunction(null) }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)]">Delete</button>
+                 </div>
+@@ -986,9 +1000,16 @@
+             {selected && !menu && <div data-graph-ui className="absolute bottom-16 right-2 z-20 flex max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                 <span className="max-w-32 truncate px-2 text-xs text-[var(--app-hint)]">{selected.kind === 'frame' ? selected.text || 'Frame' : 'Text box'}</span>
+                 <button type="button" disabled={pending !== null} onClick={() => editAnnotation(selected)} className="min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)]">Edit</button>
+-                {annotations.some(a => a.members?.includes('text:' + selected.id)) && <button type="button" onClick={() => removeFromFrame('text:' + selected.id)} className={menuItem}>Remove from frame</button>}
++                {annotations.some(a => a.members?.includes(selected.kind + ':' + selected.id)) && <button type="button" onClick={() => removeFromFrame(selected.kind + ':' + selected.id)} className={menuItem}>Remove from frame</button>}
+                 <button type="button" aria-label="Delete annotation" disabled={pending !== null} onClick={() => void saveAnnotation(null, selected)} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>
+             </div>}
++            {editingJunction && <Dialog open onOpenChange={open => { if (!open && !pending) setEditingJunction(null) }}><DialogContent data-graph-ui aria-describedby={undefined}>
++                <DialogHeader><DialogTitle>Junction label</DialogTitle></DialogHeader>
++                <form onSubmit={async event => { event.preventDefault(); const edit = editingJunction; if (edit.workspace !== graph?.activeWorkspaceId) { setEditingJunction(null); return }
++                    if (await changeRouting(r => { const dot = r.junctions.find(j => j.id === edit.before.id); if (!dot || dot.x !== edit.before.x || dot.y !== edit.before.y || dot.owner !== edit.before.owner || (dot.label ?? '') !== (edit.before.label ?? '')) throw new Error('Junction changed elsewhere. Reopen the label.'); return { ...r, junctions: r.junctions.map(j => j.id === dot.id ? { ...j, label: edit.label.trim() } : j) } })) setEditingJunction(null) }}>
++                    <input autoFocus aria-label="Junction label" maxLength={120} value={editingJunction.label} onChange={event => setEditingJunction({ ...editingJunction, label: event.target.value })} className="my-3 min-h-11 w-full rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-3" />
++                    {error && <p role="alert">{error}</p>}<div className="flex justify-end gap-2"><button type="button" disabled={pending !== null} onClick={() => setEditingJunction(null)} className={iconButton}>Cancel</button><button type="submit" disabled={pending !== null} className={iconButton}>Save</button></div>
++                </form></DialogContent></Dialog>}
+             {editingAnnotation && <GraphAnnotationEditor key={editingAnnotation.value.id} initial={editingAnnotation.value} pending={pending !== null} error={error} onClose={() => setEditingAnnotation(null)}
+                 onSave={async value => { if (await saveAnnotation(value, editingAnnotation.before, editingAnnotation.workspace)) { setEditingAnnotation(null); setSelectedAnnotation(value.id) } }} />}
+             <Popover.Root open={Boolean(objectMenu)} onOpenChange={open => { if (!open) setObjectMenu(null) }}>
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -5,7 +5,7 @@
+ const COLORS = { slate: '#64748b', blue: '#3b82f6', violet: '#8b5cf6', green: '#16a34a', amber: '#d97706' } as const
+ const label = (a: NodeAnnotation) => a.kind === 'frame' ? a.text || 'Untitled frame' : a.text.split('\n')[0] || 'Text box'
+ 
+-/** Frames sit behind connections/cards; only their header and resize grip capture pointers. */
++/** Frame surfaces capture selection/move; nested frames and cards remain above them. */
+ export function GraphAnnotationLayer({ annotations, selected, zoom, onSelect, onEdit, onAdjust, onContextMenu }: {
+     annotations: readonly NodeAnnotation[]; selected: string | null; zoom: number;
+     onSelect: (id: string) => void; onEdit: (annotation: NodeAnnotation) => void;
+@@ -19,16 +19,21 @@
+         event.preventDefault(); event.stopPropagation()
+         onAdjust(resize ? { ...a, width: Math.max(180, Math.min(8000, a.width + dx)), height: Math.max(100, Math.min(8000, a.height + dy)) } : { ...a, x: a.x + dx, y: a.y + dy })
+     }
+-    return <>{annotations.map(a => <section key={a.id} data-annotation-id={a.id} data-annotation-kind={a.kind} aria-label={`${a.kind === 'frame' ? 'Frame' : 'Text box'}: ${label(a)}`}
++    const depth = (a: NodeAnnotation) => { let d = 0, id = a.id; const seen = new Set<string>(); for (;;) { const parent = annotations.find(f => f.members?.includes('frame:' + id)); if (!parent || seen.has(parent.id)) return d; seen.add(parent.id); id = parent.id; d++ } }
++    const ordered = [...annotations].sort((a, b) => Number(a.kind !== 'frame') - Number(b.kind !== 'frame') || depth(a) - depth(b))
++    return <>{ordered.map(a => <section key={a.id} data-annotation-id={a.id} data-annotation-kind={a.kind} aria-label={`${a.kind === 'frame' ? 'Frame' : 'Text box'}: ${label(a)}`}
+         className="pointer-events-none absolute rounded-xl border text-[var(--app-fg)]"
+         style={{ left: a.x, top: a.y, width: a.width, height: a.height, zIndex: a.kind === 'frame' ? 'auto' : 3,
+             borderColor: COLORS[a.color], borderWidth: selected === a.id ? 2 : 1,
+             background: `color-mix(in srgb, ${COLORS[a.color]} ${a.kind === 'frame' ? 7 : 12}%, var(--app-bg))` }}>
++        {a.kind === 'frame' && <button type="button" data-annotation-move={a.id} aria-label={`Select frame: ${label(a)}`} onClick={event => { if (event.detail === 0) onSelect(a.id) }}
++            onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
++            className="pointer-events-auto absolute inset-0 h-full w-full cursor-move rounded-xl focus-visible:outline-2 focus-visible:outline-[var(--app-link)]" />}
+         <button type="button" data-annotation-move={a.id} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+             style={{ zIndex: a.kind === 'frame' && selected === a.id ? 4 : undefined }}
+-            onContextMenu={event => { if (a.kind === 'text') { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) } }} onClick={event => { if (event.detail === 0) onSelect(a.id) }} onDoubleClick={() => onEdit(a)} onKeyDown={event => keys(event, a)}
++            onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }} onClick={event => { if (event.detail === 0) onSelect(a.id) }} onKeyDown={event => keys(event, a)}
+             className={`pointer-events-auto absolute inset-x-0 top-0 min-h-10 min-w-0 cursor-move rounded-t-xl px-3 py-2 text-left text-sm focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'font-semibold' : 'h-full overflow-hidden rounded-b-xl'}`}>
+-            {a.kind === 'frame' ? <span className="block truncate">{label(a)}</span> : <span className="block h-full whitespace-pre-wrap break-words leading-relaxed">{a.text || 'Text box'}</span>}
++            {a.kind === 'frame' ? <span data-annotation-label={a.id} className="inline-block max-w-full truncate align-middle">{label(a)}</span> : <span data-annotation-label={a.id} className="block h-full whitespace-pre-wrap break-words leading-relaxed">{a.text || 'Text box'}</span>}
+         </button>
+         {selected === a.id && !(a.kind === 'frame' && a.members?.length) && <button type="button" data-annotation-resize={a.id} aria-label={`Resize ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+             onKeyDown={event => keys(event, a, true)}
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -3,7 +3,7 @@
+ export type FramePoint = GraphPoint & { width?: number; height?: number }
+ export type NodeVisualState = { positions: Record<string, FramePoint>; annotations: NodeAnnotation[]; routing?: NodeRouting }
+ export function framePoints(positions: Record<string, FramePoint>, annotations: readonly NodeAnnotation[], junctions: NodeRouting['junctions']): Record<string, FramePoint> {
+-    return { ...positions, ...Object.fromEntries(annotations.filter(a => a.kind === 'text').map(a => ['text:' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - 8, y: j.y - 8, width: 16, height: 16 }])) }
++    return { ...positions, ...Object.fromEntries(annotations.map(a => [a.kind + ':' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - (j.label ? 90 : 8), y: j.y - (j.label ? 48 : 8), width: j.label ? 180 : 16, height: j.label ? 64 : 16 }])) }
+ }
+ /** Tight bounds around members, reserving space for the frame title and ports. */
+ export function fitNodeFrame(frame: NodeAnnotation, positions: Record<string, FramePoint>): NodeAnnotation {
+@@ -15,39 +15,67 @@
+     if (width > 8000 || height > 8000) throw new Error('Frame contents are too far apart. Keep them within 8000 canvas units.')
+     return { ...frame, x, y, width, height }
+ }
+-/** Existing membership is sticky outside a frame; explicit Remove from frame releases it. */
++/** Descendants are visual members only; cycle-safe even for a stale response. */
++export function frameMemberIds(frame: NodeAnnotation, annotations: readonly NodeAnnotation[]): string[] {
++    const members = new Set<string>(), seen = new Set([frame.id])
++    const visit = (value: NodeAnnotation) => { for (const member of value.members ?? []) {
++        members.add(member)
++        if (member.startsWith('frame:')) { const id = member.slice(6), child = annotations.find(a => a.id === id)
++            if (seen.has(id)) throw new Error('Frames cannot form a cycle')
++            if (child) { seen.add(id); visit(child) }
++        }
++    } }
++    visit(frame); return [...members]
++}
++/** Fit inner groups first, then propagate their changed bounds up the tree. */
++export function fitFrames(annotations: NodeAnnotation[], positions: Record<string, FramePoint>): NodeAnnotation[] {
++    const points = framePoints(positions, annotations, []), fitted = new Map<string, NodeAnnotation>(), visiting = new Set<string>()
++    const fit = (a: NodeAnnotation): NodeAnnotation => {
++        if (fitted.has(a.id)) return fitted.get(a.id)!
++        if (visiting.has(a.id)) throw new Error('Frames cannot form a cycle')
++        visiting.add(a.id)
++        for (const member of a.members ?? []) if (member.startsWith('frame:')) { const child = annotations.find(b => b.id === member.slice(6)); if (child) fit(child) }
++        const value = fitNodeFrame(a, points); fitted.set(a.id, value); visiting.delete(a.id)
++        points[a.kind + ':' + a.id] = value
++        return value
++    }
++    return annotations.map(fit)
++}
++function targetFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false) {
++    const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
++    if (detach || !p) return undefined
++    const own = id.startsWith('frame:') ? annotations.find(a => a.id === id.slice(6)) : undefined
++    const excluded = new Set(own ? [id, ...frameMemberIds(own, annotations)] : [])
++    return annotations.filter(a => a.kind === 'frame' && !excluded.has('frame:' + a.id)
++        && (own ? p.x >= a.x && p.y >= a.y && p.x + (p.width ?? 0) <= a.x + a.width && p.y + (p.height ?? 0) <= a.y + a.height
++            : p.x + (p.width ?? NODE_SIZE.width) / 2 >= a.x && p.x + (p.width ?? NODE_SIZE.width) / 2 <= a.x + a.width && p.y + (p.height ?? NODE_SIZE.height) / 2 >= a.y && p.y + (p.height ?? NODE_SIZE.height) / 2 <= a.y + a.height))
++        .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? current
++}
++/** Existing membership is sticky; explicit Remove from frame releases it. */
+ export function placeInFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false): NodeAnnotation[] {
+-    const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
+-    const target = detach || !p ? undefined : annotations.filter(a => a.kind === 'frame' && p.x + (p.width ?? NODE_SIZE.width) / 2 >= a.x && p.x + (p.width ?? NODE_SIZE.width) / 2 <= a.x + a.width && p.y + (p.height ?? NODE_SIZE.height) / 2 >= a.y && p.y + (p.height ?? NODE_SIZE.height) / 2 <= a.y + a.height)
+-        .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? current
+-    return annotations.map(a => {
+-        if (a.kind !== 'frame' || (a !== current && a !== target)) return a
++    const target = targetFrame(annotations, id, positions, detach)
++    return fitFrames(annotations.map(a => {
++        if (a.kind !== 'frame') return a
+         const members = (a.members ?? []).filter(member => member !== id)
+         if (a === target) members.push(id)
+-        return fitNodeFrame({ ...a, members }, positions)
+-    })
++        return members.length || a.members ? { ...a, members } : a
++    }), positions)
+ }
+-
+ /** Resolve every drop against the same frame geometry, then fit once. */
+ export function placeSelectionInFrames(annotations: NodeAnnotation[], ids: string[], positions: Record<string, FramePoint>): NodeAnnotation[] {
+-    const targets = new Map(ids.map(id => {
+-        const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
+-        const target = p ? annotations.filter(a => a.kind === 'frame' && p.x + (p.width ?? NODE_SIZE.width) / 2 >= a.x && p.x + (p.width ?? NODE_SIZE.width) / 2 <= a.x + a.width && p.y + (p.height ?? NODE_SIZE.height) / 2 >= a.y && p.y + (p.height ?? NODE_SIZE.height) / 2 <= a.y + a.height)
+-            .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? current : undefined
+-        return [id, target?.id] as const
+-    }))
+-    return annotations.map(frame => {
+-        if (frame.kind !== 'frame' || !ids.some(id => frame.members?.includes(id) || targets.get(id) === frame.id)) return frame
++    const targets = new Map(ids.map(id => [id, targetFrame(annotations, id, positions)?.id]))
++    return fitFrames(annotations.map(frame => {
++        if (frame.kind !== 'frame') return frame
+         const members = (frame.members ?? []).filter(id => !targets.has(id) || targets.get(id) === frame.id)
+         for (const id of ids) if (targets.get(id) === frame.id && !members.includes(id)) members.push(id)
+-        return fitNodeFrame({ ...frame, members }, positions)
+-    })
++        return members.length || frame.members ? { ...frame, members } : frame
++    }), positions)
+ }
+-
+ export function translateFrame(frame: NodeAnnotation, annotations: NodeAnnotation[], positions: Record<string, FramePoint>, routing: NodeRouting, delta: GraphPoint): NodeVisualState {
+-    const members = new Set(frame.members ?? [])
++    const members = new Set(frameMemberIds(frame, annotations))
+     const moved = Object.fromEntries(Object.entries(positions).filter(([id]) => members.has(id)).map(([id, p]) => [id, { ...p, x: p.x + delta.x, y: p.y + delta.y }]))
+-    const nextAnnotations = annotations.map(a => a.kind === 'text' && members.has('text:' + a.id) ? { ...a, x: a.x + delta.x, y: a.y + delta.y } : a)
++    const changed = annotations.map(a => a.id === frame.id || members.has(a.kind + ':' + a.id) ? { ...a, x: a.x + delta.x, y: a.y + delta.y } : a)
+     const nextRouting = { ...routing, junctions: routing.junctions.map(j => members.has('junction:' + j.id) ? { ...j, x: j.x + delta.x, y: j.y + delta.y } : j) }
+-    return { positions: Object.fromEntries(Object.entries(moved).filter(([id]) => !id.startsWith('text:') && !id.startsWith('junction:'))), annotations: nextAnnotations.map(a => a.id === frame.id ? fitNodeFrame({ ...frame, x: frame.x + delta.x, y: frame.y + delta.y }, { ...positions, ...moved }) : a), routing: nextRouting }
++    const next = fitFrames(changed, { ...positions, ...moved })
++    return { positions: Object.fromEntries(Object.entries(moved).filter(([id]) => !/^(text|junction|frame):/.test(id))), annotations: placeInFrame(next, 'frame:' + frame.id, framePoints({ ...positions, ...moved }, next, nextRouting.junctions)), routing: nextRouting }
+ }
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -57,3 +57,27 @@
+     expect(result.x).toBe(56)
+     expect(result.x + result.width).toBe(1424)
+ })
++
++it('nests frames, moves all descendants exactly once, and refits ancestors around an inner change', () => {
++    const outer = { ...frame, id: 'outer', width: 1000, height: 800 }
++    const inner = { ...frame, id: 'inner', x: 100, y: 100, width: 400, height: 300, members: ['A', 'text:note', 'junction:dot'] }
++    const note = { ...frame, id: 'note', kind: 'text' as const, x: 200, y: 180, width: 180, height: 100 }
++    const routing = { junctions: [{ id: 'dot', x: 250, y: 220, owner: null, label: 'Review' }], edges: [] }
++    const points = framePoints({ A: { x: 160, y: 160 } }, [outer, inner, note], routing.junctions)
++    const nested = placeInFrame([outer, inner, note], 'frame:inner', points)
++    expect(nested.find(a => a.id === 'outer')?.members).toEqual(['frame:inner'])
++    expect(nested.find(a => a.id === 'inner')?.members).not.toContain('frame:outer')
++    const moved = translateFrame(nested[0], nested, framePoints({ A: points.A }, nested, routing.junctions), routing, { x: 80, y: -40 })
++    expect(moved.positions).toEqual({ A: { x: 240, y: 120 } })
++    expect(moved.annotations.find(a => a.id === 'note')).toMatchObject({ x: 280, y: 140 })
++    expect(moved.routing?.junctions[0]).toMatchObject({ x: 330, y: 180, label: 'Review' })
++    const released = placeInFrame(moved.annotations, 'frame:inner', framePoints(moved.positions, moved.annotations, moved.routing!.junctions), true)
++    expect(released.find(a => a.id === 'outer')?.members).toEqual([])
++    expect(released.find(a => a.id === 'inner')?.members).toEqual(inner.members)
++})
++it('never places an outer frame into itself or its descendant', () => {
++    const outer = { ...frame, id: 'outer', members: ['frame:inner'] }
++    const inner = { ...frame, id: 'inner', x: -100, y: -100, width: 1200, height: 1000 }
++    const result = placeInFrame([outer, inner], 'frame:outer', framePoints({}, [outer, inner], []))
++    expect(result.find(a => a.id === 'inner')?.members ?? []).not.toContain('frame:outer')
++})
+--- a/web/src/lib/nodeGraphLayout.ts
++++ b/web/src/lib/nodeGraphLayout.ts
+@@ -81,6 +81,7 @@
+         })
+     }
+     for (const node of nodes) if (node.x !== null && node.y !== null && Number.isFinite(node.x) && Number.isFinite(node.y)) positions[node.sessionId] = { x: node.x, y: node.y }
++    if (loneLabel) loneLabel = { x: Math.min(...lone.map(id => positions[id]!.x)), y: Math.min(...lone.map(id => positions[id]!.y)) - LONE_LABEL }
+     return { positions, parent, roots, lone, loneLabel, bounds: graphBounds(positions, loneLabel) }
+ }
+ 
+@@ -111,8 +112,9 @@
+ 
+ /** Zoom/offset that fits `bounds` into a viewport, capped so small graphs are not blown up. */
+ export function fitTransform(bounds: GraphBounds, view: { width: number; height: number }, padding = 24): { x: number; y: number; k: number } {
+-    const k = clampZoom(Math.min((view.width - padding * 2) / bounds.width, (view.height - padding * 2) / bounds.height, 1))
++    // Fit must be able to go below the interactive zoom floor on narrow phones.
++    const k = Math.max(0.00001, Math.min(Math.max(1, view.width - padding * 2) / Math.max(1, bounds.width), Math.max(1, view.height - padding * 2) / Math.max(1, bounds.height), 1))
+     return { k, x: (view.width - bounds.width * k) / 2 - bounds.x * k, y: (view.height - bounds.height * k) / 2 - bounds.y * k }
+ }
+ 
+-export const clampZoom = (k: number) => Math.min(2.5, Math.max(0.2, Number.isFinite(k) ? k : 1))
++export const clampZoom = (k: number) => Math.min(2.5, Math.max(0.01, Number.isFinite(k) ? k : 1))
+--- a/web/src/lib/nodeGraphLayout.test.ts
++++ b/web/src/lib/nodeGraphLayout.test.ts
+@@ -89,3 +89,18 @@
+         expect(fitTransform({ x: 0, y: 0, width: 100, height: 100 }, { width: 1000, height: 1000 }).k).toBe(1)
+     })
+ })
++
++it('centers a broad graph on a narrow mobile viewport without clipping at the interactive zoom floor', () => {
++    const bounds = { x: 800, y: -600, width: 4000, height: 1200 }
++    const fitted = fitTransform(bounds, { width: 320, height: 420 })
++    expect(fitted.k).toBeLessThan(.2)
++    expect(fitted.x + (bounds.x + bounds.width / 2) * fitted.k).toBeCloseTo(160)
++    expect(fitted.y + (bounds.y + bounds.height / 2) * fitted.k).toBeCloseTo(210)
++    expect(bounds.width * fitted.k).toBeLessThanOrEqual(272)
++})
++
++it('anchors the lone label to its moved cards instead of stale auto-layout coordinates', () => {
++    const result = layoutNodeGraph({ overseer: null, nodes: [{ sessionId: 'L', x: 5000, y: -900 }], edges: [] })
++    expect(result.loneLabel).toEqual({ x: 5000, y: -928 })
++    expect(result.bounds.x).toBe(5000)
++})
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -7,7 +7,7 @@
+ import { I18nProvider } from '@/lib/i18n-context'
+ import { NODE_SIZE } from '@/lib/nodeGraphLayout'
+ import { NODE_GRID_KEY } from '@/hooks/useNodeGrid'
+-import { fitNodeFrame, framePoints, type NodeVisualState } from '@/lib/nodeFrames'
++import { fitNodeFrame, fitFrames, framePoints, type NodeVisualState } from '@/lib/nodeFrames'
+ import { readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ import { SESSION_DRAG_TYPE } from '@/lib/sessionDrag'
+ import { NodeGraphView, nodeStatus } from './NodeGraphView'
+@@ -52,8 +52,8 @@
+     ] },
+ })
+ 
+-function makeApi(options: { skip?: string[] } = {}) {
+-    let state = initial()
++function makeApi(options: { skip?: string[]; graph?: NodeGraphResponse } = {}) {
++    let state = structuredClone(options.graph ?? initial())
+     const copy = () => structuredClone(state)
+     const setEdges = (child: string, owner?: string) => {
+         state.graph.edges = state.graph.edges.filter(edge => edge.child !== child)
+@@ -1556,3 +1556,82 @@
+     expect(onOpenChat).toHaveBeenCalledWith('B', true)
+     expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-pressed', 'true')
+ })
++
++it('restores the same window/workspace zoom and pan after the graph is unmounted and reopened', async () => {
++    const api = makeApi(), first = setup(api)
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++    const canvas = screen.getByRole('application')
++    fireEvent.pointerDown(canvas, { button: 1, pointerId: 5, clientX: 100, clientY: 100 })
++    fireEvent.pointerMove(canvas, { pointerId: 5, clientX: 175, clientY: 145 })
++    fireEvent.pointerUp(canvas, { button: 1, pointerId: 5, clientX: 175, clientY: 145 })
++    const transform = document.querySelector('[data-node-id="A"]')!.parentElement!.style.transform
++    first.view.unmount(); setup(api)
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    expect(document.querySelector('[data-node-id="A"]')!.parentElement!.style.transform).toBe(transform)
++})
++it('saves a junction label and keeps it through undo/redo and drag without opening its editor', async () => {
++    const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++    const id = await addDot()
++    fireEvent.click(screen.getByRole('button', { name: 'Edit junction label' }))
++    fireEvent.change(screen.getByRole('textbox', { name: 'Junction label' }), { target: { value: 'Review gate' } })
++    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
++    const label = await screen.findByRole('button', { name: 'Edit junction label: Review gate' })
++    const start = dotPoint(id), canvas = screen.getByRole('application')
++    fireEvent.pointerDown(label, { pointerId: 8, button: 0, ...start })
++    fireEvent.pointerMove(canvas, { pointerId: 8, clientX: start.clientX + 50, clientY: start.clientY + 20 })
++    fireEvent.pointerUp(canvas, { pointerId: 8, clientX: start.clientX + 50, clientY: start.clientY + 20 })
++    await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(3))
++    expect(screen.queryByRole('textbox', { name: 'Junction label' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++    await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(4))
++    expect(await screen.findByRole('button', { name: 'Edit junction label: Review gate' })).toBeTruthy()
++    fireEvent.click(screen.getByRole('button', { name: 'Redo graph edit' }))
++    await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(5))
++})
++it('selects a frame across its body, edits its title on a click, and never opens editing after dragging the title', async () => {
++    const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++    await selectAdd('Frame')
++    fireEvent.change(screen.getByRole('textbox', { name: 'Frame title' }), { target: { value: 'Render group' } })
++    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
++    const body = await screen.findByRole('button', { name: 'Select frame: Render group' }), canvas = screen.getByRole('application')
++    fireEvent.pointerDown(body, { pointerId: 2, button: 0, clientX: 250, clientY: 250 }); fireEvent.pointerUp(canvas, { pointerId: 2, clientX: 250, clientY: 250 })
++    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
++    const title = body.parentElement!.querySelector('[data-annotation-label]')!
++    fireEvent.pointerDown(title, { pointerId: 3, button: 0, clientX: 250, clientY: 200 }); fireEvent.pointerMove(canvas, { pointerId: 3, clientX: 300, clientY: 220 }); fireEvent.pointerUp(canvas, { pointerId: 3, clientX: 300, clientY: 220 })
++    await waitFor(() => expect(api.editNodeAnnotation).toHaveBeenCalledTimes(2))
++    expect(screen.queryByRole('textbox', { name: 'Frame title' })).toBeNull()
++    const currentTitle = document.querySelector('[data-annotation-label]')!
++    fireEvent.pointerDown(currentTitle, { pointerId: 4, button: 0, clientX: 300, clientY: 220 }); fireEvent.pointerUp(canvas, { pointerId: 4, clientX: 300, clientY: 220 })
++    expect(await screen.findByRole('textbox', { name: 'Frame title' })).toBeTruthy()
++})
++it('drags a nested outer frame with its chat, note, labeled junction and inner frame in one visual edit', async () => {
++    const graph = initial(), outer: NodeAnnotation = { id: 'outer', kind: 'frame', text: 'Outer', color: 'blue', x: 0, y: 0, width: 600, height: 500, members: ['frame:inner'] }
++    const inner: NodeAnnotation = { ...outer, id: 'inner', text: 'Inner', members: ['A', 'text:note', 'junction:dot'] }
++    const note: NodeAnnotation = { ...outer, id: 'note', kind: 'text', text: 'Preview', x: 300, y: 200, width: 180, height: 100, members: undefined }
++    graph.graph.nodes = graph.graph.nodes.map(n => n.sessionId === 'A' ? { ...n, x: 100, y: 150 } : n)
++    graph.graph.junctions = [{ id: 'dot', x: 300, y: 180, label: 'Gate', owner: null }]
++    graph.graph.annotations = fitFrames([outer, inner, note], framePoints({ A: { x: 100, y: 150 } }, [outer, inner, note], graph.graph.junctions))
++    const api = makeApi({ graph }); setup(api)
++    const body = await screen.findByRole('button', { name: 'Select frame: Outer' }), canvas = screen.getByRole('application')
++    fireEvent.pointerDown(body, { pointerId: 9, button: 0, clientX: 150, clientY: 200 })
++    fireEvent.pointerMove(canvas, { pointerId: 9, clientX: 210, clientY: 230 }); fireEvent.pointerUp(canvas, { pointerId: 9, clientX: 210, clientY: 230 })
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(1))
++    const next = (await api.getNodeGraph()).graph, a = next.nodes.find(n => n.sessionId === 'A')!, dx = a.x! - 100, dy = a.y! - 150
++    expect(dx).not.toBe(0)
++    expect(next.annotations?.find(a => a.id === 'note')).toMatchObject({ x: note.x + dx, y: note.y + dy })
++    const oldInner = graph.graph.annotations.find(a => a.id === 'inner')!
++    expect(next.annotations?.find(a => a.id === 'inner')).toMatchObject({ x: oldInner.x + dx, y: oldInner.y + dy })
++    expect(next.junctions?.[0]).toMatchObject({ x: 300 + dx, y: 180 + dy, label: 'Gate' })
++    expect(nodeRouting(next).edges).toEqual(nodeRouting(graph.graph).edges)
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Move frame: Outer' }), { key: 'ArrowRight' })
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(2))
++    expect((await api.getNodeGraph()).graph.nodes.find(n => n.sessionId === 'A')?.x).toBe(a.x! + 20)
++    fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(3))
++    expect((await api.getNodeGraph()).graph.nodes.find(n => n.sessionId === 'A')?.x).toBe(a.x)
++    fireEvent.click(screen.getByRole('button', { name: 'Redo graph edit' }))
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(4))
++    expect((await api.getNodeGraph()).graph.nodes.find(n => n.sessionId === 'A')?.x).toBe(a.x! + 20)
++    expect(api.abortSession).not.toHaveBeenCalled()
++})

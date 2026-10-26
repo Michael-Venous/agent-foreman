@@ -1,0 +1,33 @@
+diff --git a/web/src/utils/findActiveWord.test.ts b/web/src/utils/findActiveWord.test.ts
+index 6f174dd..fbd853b 100644
+--- a/web/src/utils/findActiveWord.test.ts
++++ b/web/src/utils/findActiveWord.test.ts
+@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest'
+ import { findActiveWord } from './findActiveWord'
+ 
+ describe('findActiveWord', () => {
++    it('never completes command arguments as a different slash command', () => {
++        for (const text of ['/goal clear', '/goal pause', '/model opus', '/goal\tclear']) {
++            expect(findActiveWord(text, { start: text.length, end: text.length }, ['@', '/', '$'])).toBeUndefined()
++        }
++        expect(findActiveWord('/go', { start: 3, end: 3 })?.activeWord).toBe('/go')
++        expect(findActiveWord('@My File', { start: 8, end: 8 })?.activeWord).toBe('@My File')
++    })
+     it('does not let active words span newlines', () => {
+         expect(findActiveWord('@foo\nbar', { start: 8, end: 8 }, ['@', '/'])).toBeUndefined()
+         expect(findActiveWord('/help\nsome', { start: 10, end: 10 }, ['@', '/'])).toBeUndefined()
+diff --git a/web/src/utils/findActiveWord.ts b/web/src/utils/findActiveWord.ts
+index e4a3ec5..bc4b0cd 100644
+--- a/web/src/utils/findActiveWord.ts
++++ b/web/src/utils/findActiveWord.ts
+@@ -136,6 +136,10 @@ export function findActiveWord(
+     const startIndex = findActiveWordStart(content, selection, prefixes)
+     const activeWordPart = content.substring(startIndex, selection.end)
+ 
++    // Slash arguments are literal text, not a fuzzy command query.
++    // In particular, /goal clear must never be replaced with /clear.
++    if (activeWordPart.startsWith('/') && /\s/.test(activeWordPart)) return undefined
++
+     // Check if the active word ends with a space - if so, no active word
+     if (activeWordPart.endsWith(' ')) {
+         return undefined

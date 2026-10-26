@@ -1,0 +1,240 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -68,7 +68,7 @@
+     const [selectedAnnotation, setSelectedAnnotation] = useState<string | null>(null)
+     const [editingAnnotation, setEditingAnnotation] = useState<{ workspace: string; before: NodeAnnotation | null; value: NodeAnnotation } | null>(null)
+     const { chatPinned, toggleChatPinned } = useNodeChatPin()
+-    const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner' } | null>(null)
++    const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner'; x: number; y: number } | null>(null)
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
+@@ -84,6 +84,9 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
++    const touchMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
++    const cancelTouchMenu = () => { if (touchMenuTimer.current) clearTimeout(touchMenuTimer.current); touchMenuTimer.current = null }
++    useEffect(() => () => cancelTouchMenu(), [])
+     const pendingSave = useRef<NodeLayoutPositions>({})
+     const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const fittedWorkspace = useRef<string | null>(null)
+@@ -128,7 +131,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); cancelTouchMenu(); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -243,6 +246,7 @@
+         if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui]')) return
+         if (event.button !== 0 || pending || mutationBusy.current || dropInFlight.current) return
+         event.currentTarget.focus({ preventScroll: true })
++        cancelTouchMenu()
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+         if (pointers.current.size >= 2) { pinchStart(); return }
+         const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
+@@ -262,7 +266,20 @@
+         else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize') } }
+         else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, wire: nodeRouting(graph!.graph).edges.find(e => e.child === input), x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+-        else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
++        else if (node && positionsRef.current[node]) {
++            gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
++            if (event.pointerType === 'touch') {
++                // Navigation is handled on pointerup. Suppress the compatibility click/focus
++                // that would dismiss a hold-opened popover as soon as the finger lifts.
++                event.preventDefault()
++                const at = { x: event.clientX, y: event.clientY }
++                touchMenuTimer.current = setTimeout(() => {
++                    touchMenuTimer.current = null
++                    if (gesture.current?.kind !== 'node' || gesture.current.moved) return
++                    gesture.current = null; pointers.current.clear(); openMenu(node, at)
++                }, 550)
++            }
++        }
+         else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
+         // Touch has implicit capture; touch-action:none prevents native scrolling.
+         if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
+@@ -282,6 +299,7 @@
+             return
+         }
+         if (g.pointer !== event.pointerId) return
++        if (g.kind === 'node' && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) cancelTouchMenu()
+         if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + event.clientX - g.x, y: g.view.y + event.clientY - g.y })
+         else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ fixed: g.from, direction: 'child', to, target: linkTarget(g.from, to) }) }
+         else if (g.kind === 'input') {
+@@ -315,6 +333,7 @@
+         }
+     }
+     const up = (event: PointerEvent<HTMLDivElement>) => {
++        cancelTouchMenu()
+         pointers.current.delete(event.pointerId)
+         const g = gesture.current
+         if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+@@ -371,8 +390,14 @@
+         }
+     }
+ 
+-    const selectNode = (id: string) => { openMenu(id); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
+-    const openMenu = (id: string) => { setSelectedJunction(null); setMovingJunction(null); setMenu({ id, mode: 'actions' }); setError(null) }
++    const selectNode = (id: string) => { setMenu(null); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
++    const openMenu = (id: string, at?: GraphPoint, mode: 'actions' | 'owner' = 'actions') => {
++        const rect = canvas.current?.getBoundingClientRect()
++        const node = canvas.current?.querySelector(`[data-node-id="${CSS.escape(id)}"]`)?.getBoundingClientRect()
++        setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddMenu(null)
++        setMenu({ id, mode, x: (at?.x ?? node?.left ?? rect?.left ?? 0) - (rect?.left ?? 0), y: (at?.y ?? node?.bottom ?? rect?.top ?? 0) - (rect?.top ?? 0) })
++        setError(null)
++    }
+     const remember = (edit: GraphEdit) => setHistory(old => [...old.slice(-49), edit])
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
+         if (mutationBusy.current || dropInFlight.current) return null
+@@ -600,7 +625,8 @@
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+                         <button type="button" aria-label={`Node ${name}`} aria-haspopup="dialog" aria-expanded={menu?.id === id}
+                             onClick={event => { if (event.detail === 0) selectNode(id) }}
+-                            onContextMenu={event => { event.preventDefault(); openMenu(id) }}
++                            onContextMenu={event => { event.preventDefault(); openMenu(id, { x: event.clientX, y: event.clientY }) }}
++                            onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); event.stopPropagation(); openMenu(id) } }}
+                             className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : menu?.id === id ? 'border-[var(--app-link)]' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
+                             <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
+                             <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
+@@ -611,7 +637,7 @@
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+                             style={{ scale: Math.max(1, 0.85 / view.k) }}
+                             title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+-                            onClick={event => { if (event.detail === 0) { setMenu({ id, mode: 'owner' }); setError(null) } }}
++                            onClick={event => { if (event.detail === 0) { openMenu(id, undefined, 'owner') } }}
+                             className="absolute -top-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                             <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${layout.parent[id] ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'}`} />
+                         </button>}
+@@ -653,8 +679,10 @@
+             </div>}
+             {editingAnnotation && <GraphAnnotationEditor key={editingAnnotation.value.id} initial={editingAnnotation.value} pending={pending !== null} error={error} onClose={() => setEditingAnnotation(null)}
+                 onSave={async value => { if (await saveAnnotation(value, editingAnnotation.before, editingAnnotation.workspace)) { setEditingAnnotation(null); setSelectedAnnotation(value.id) } }} />}
+-            {menu && graph && <section data-graph-ui data-node-menu role="dialog" aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
+-                className="absolute inset-x-2 bottom-2 z-20 mx-auto flex max-h-[80%] max-w-sm flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl">
++            <Popover.Root open={Boolean(menu && graph)} onOpenChange={open => { if (!open) closeMenu() }}>
++                <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: menu?.x ?? 0, top: menu?.y ?? 0 }} /></Popover.Anchor>
++                {menu && graph && <Popover.Portal><Popover.Content data-graph-ui data-node-menu role="dialog" side="bottom" align="start" sideOffset={2} collisionPadding={8} onCloseAutoFocus={event => event.preventDefault()} aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
++                className="z-[110] flex max-h-[var(--radix-popover-content-available-height)] w-80 max-w-[calc(100vw-16px)] flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl">
+                 <header className="flex shrink-0 items-center gap-2 border-b border-[var(--app-divider)] py-1 pl-3 pr-1">
+                     <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{title(menu.id)}</p>
+                         <p className="truncate text-xs text-[var(--app-hint)]">{menu.id === overseer ? 'Overseer · ' : menuOwner ? `Owner: ${title(menuOwner)} · ` : 'Lone · '}{nodeStatus(menuSession, sessions !== undefined)}</p></div>
+@@ -706,7 +734,8 @@
+                     </div>}
+                     {error && <p role="alert" className="break-words px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
+                 </div>
+-            </section>}
++                </Popover.Content></Popover.Portal>}
++            </Popover.Root>
+         </div>
+     </div>
+ }
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1,5 +1,5 @@
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { nodeRouting, nodeRoutingError, type NodeRouting, type NodeAnnotation, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+@@ -103,7 +103,7 @@
+     return { api, client, onOpenChat, view }
+ }
+ const openNode = async (name: string) => {
+-    fireEvent.click(await screen.findByRole('button', { name: `Node ${name}` }))
++    fireEvent.contextMenu(await screen.findByRole('button', { name: `Node ${name}` }), { clientX: 200, clientY: 150 })
+     return screen.findByRole('dialog', { name: `Actions for ${name}` })
+ }
+ /** Client coordinates of a node card's centre under the current pan/zoom. */
+@@ -149,6 +149,7 @@
+         const { onOpenChat } = setup()
+         fireEvent.click(await screen.findByRole('button', { name: 'Node Bravo' }))
+         expect(onOpenChat).toHaveBeenLastCalledWith('B')
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
+         onOpenChat.mockClear()
+         fireEvent.click(screen.getByRole('button', { name: 'Pin current chat' }))
+         fireEvent.click(screen.getByRole('button', { name: 'Node Alpha' }))
+@@ -172,6 +173,58 @@
+         expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('data-asleep', 'true')
+         expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('stroke-dasharray', '5 5')
+         expect(document.querySelector('[data-edge="A->C"]')).toHaveAttribute('data-asleep', 'false')
++    })
++
++    it('touch hold opens contextual actions and release does not navigate', async () => {
++        const { onOpenChat } = setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' }), start = nodeCentre('B')
++        vi.useFakeTimers()
++        try {
++            expect(fireEvent.pointerDown(card, { pointerId: 1, pointerType: 'touch', button: 0, ...start })).toBe(false)
++            act(() => { vi.advanceTimersByTime(550) })
++            expect(screen.getByRole('dialog', { name: 'Actions for Bravo' })).toBeInTheDocument()
++            fireEvent.pointerUp(card, { pointerId: 1, pointerType: 'touch', ...start })
++            expect(onOpenChat).not.toHaveBeenCalled()
++        } finally { vi.useRealTimers() }
++    })
++
++    it('moving a touch node cancels its hold menu', async () => {
++        const { onOpenChat } = setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' }), start = nodeCentre('B')
++        vi.useFakeTimers()
++        try {
++            fireEvent.pointerDown(card, { pointerId: 1, pointerType: 'touch', button: 0, ...start })
++            fireEvent.pointerMove(card, { pointerId: 1, pointerType: 'touch', clientX: start.clientX + 15, clientY: start.clientY })
++            act(() => { vi.advanceTimersByTime(600) })
++            expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++            fireEvent.pointerCancel(card, { pointerId: 1, pointerType: 'touch', clientX: start.clientX + 15, clientY: start.clientY })
++            expect(onOpenChat).not.toHaveBeenCalled()
++        } finally { vi.useRealTimers() }
++    })
++
++    it('right-click opens actions without navigating or changing the graph, and ordinary click dismisses it', async () => {
++        const { api, onOpenChat } = setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' })
++        fireEvent.contextMenu(card, { clientX: 370, clientY: 240 })
++        const menu = await screen.findByRole('dialog', { name: 'Actions for Bravo' })
++        expect(menu).toHaveAttribute('data-side')
++        expect(onOpenChat).not.toHaveBeenCalled()
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.abortSession).not.toHaveBeenCalled()
++        fireEvent.click(card)
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++        expect(onOpenChat).toHaveBeenCalledWith('B')
++    })
++
++    it.each(['F10', 'ContextMenu'])('supports keyboard context actions with %s', async key => {
++        const { onOpenChat } = setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' })
++        card.focus()
++        fireEvent.keyDown(card, { key, shiftKey: key === 'F10' })
++        const menu = await screen.findByRole('dialog', { name: 'Actions for Bravo' })
++        expect(onOpenChat).not.toHaveBeenCalled()
++        fireEvent.keyDown(menu, { key: 'Escape' })
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
+     })
+ 
+     it('opens a chat from the node menu', async () => {
+@@ -330,13 +383,14 @@
+         expect(saved.B!.x).toBe(Math.round(parseFloat(card.parentElement!.style.left)))
+     })
+ 
+-    it('tapping a node without moving opens its menu', async () => {
+-        setup()
++    it('tapping a node opens its chat without showing actions', async () => {
++        const { onOpenChat } = setup()
+         const card = await screen.findByRole('button', { name: 'Node Bravo' })
+         const start = nodeCentre('B')
+         fireEvent.pointerDown(card, { pointerId: 3, pointerType: 'touch', button: 0, ...start })
+         fireEvent.pointerUp(card, { pointerId: 3, pointerType: 'touch', ...start })
+-        expect(await screen.findByRole('dialog', { name: 'Actions for Bravo' })).toBeInTheDocument()
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++        expect(onOpenChat).toHaveBeenCalledWith('B')
+     })
+ 
+     it('drags from an owner handle onto another node to make it a child, refusing cycles', async () => {

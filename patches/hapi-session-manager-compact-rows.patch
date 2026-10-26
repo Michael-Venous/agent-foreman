@@ -1,0 +1,41 @@
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -25,7 +25,7 @@
+     const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Stopped'
+         : managementPaused ? (hasWork ? 'Management held' : 'On hold')
+         : hasWork || sessionFailureLabel(session) ? null : session.active ? 'Idle' : 'Inactive'
+-    return label ? <div className="flex flex-wrap items-center gap-x-2 px-2 pb-1 text-xs text-[var(--app-hint)]">
++    return label ? <div className="col-start-1 row-start-2 flex min-w-0 items-center px-2 text-xs text-[var(--app-hint)]">
+         <p>{label}</p>
+     </div> : null
+ }
+@@ -108,14 +108,14 @@
+                 </button>}
+                 {displayedRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+                     {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+-                    <div className="flex min-w-0 flex-wrap items-start gap-1 border-b border-[var(--app-divider)] py-1">
+-                    <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex w-full min-w-0 flex-col gap-1 rounded-lg px-2 py-2.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-1 border-b border-[var(--app-divider)] py-0.5">
++                    <div className="col-span-2 min-w-0 sm:col-span-1">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex min-h-10 w-full min-w-0 flex-col rounded-lg px-2 py-0.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath alignActivityColumns managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+-                        <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+                     </div>
+-                    <div className="ml-auto flex w-[7.5rem] shrink-0 items-center justify-end gap-1">
++                    <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
++                    <div className="col-start-2 row-start-2 flex w-[7.5rem] items-center justify-end gap-1 sm:row-span-2 sm:row-start-1">
+                         {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+@@ -138,7 +138,7 @@
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+                             }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Stop</button>}
+                     </div>
+-                    {errors[session.id] && <p role="alert" className="w-full break-words text-xs text-[var(--app-badge-error-text)]">{errors[session.id]}</p>}
++                    {errors[session.id] && <p role="alert" className="col-span-2 w-full break-words text-xs text-[var(--app-badge-error-text)]">{errors[session.id]}</p>}
+                 </div></Fragment>)}
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}

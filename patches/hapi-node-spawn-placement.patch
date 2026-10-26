@@ -1,0 +1,446 @@
+--- a/web/src/lib/nodeGraphLayout.ts
++++ b/web/src/lib/nodeGraphLayout.ts
+@@ -1,120 +1,2 @@
+-import { createsCycle, type NodeGraphEdge, type NodeGraphNode } from '@hapi/protocol/nodeGraph'
+-
+-export const DEFAULT_NODE_GRID_SIZE = 20
+-/** Whole default grid cells, with the centered ports also on grid lines. */
+-export const NODE_SIZE = { width: DEFAULT_NODE_GRID_SIZE * 10, height: DEFAULT_NODE_GRID_SIZE * 4 } as const
+-const GAP_X = 28, GAP_Y = 72, TREE_GAP = 56, LONE_GAP = 88, LONE_LABEL = 28
+-
+-export type GraphPoint = { x: number; y: number }
+-export type GraphBounds = { x: number; y: number; width: number; height: number }
+-export type NodeGraphLayout = {
+-    positions: Record<string, GraphPoint>
+-    /** child -> owner after dropping invalid edges (cycles, second owners, overseer as child). */
+-    parent: Record<string, string>
+-    roots: string[]
+-    lone: string[]
+-    loneLabel: GraphPoint | null
+-    bounds: GraphBounds
+-}
+-type LayoutInput = {
+-    overseer: string | null
+-    nodes: readonly Pick<NodeGraphNode, 'sessionId' | 'x' | 'y'>[]
+-    edges: readonly Pick<NodeGraphEdge, 'owner' | 'child'>[]
+-    label?: (id: string) => string
+-}
+-
+-/** Strict owner tree as the UI draws it; tolerant of stale or conflicting edges. */
+-export function graphParents(edges: LayoutInput['edges'], overseer: string | null): Record<string, string> {
+-    const kept: { owner: string; child: string }[] = []
+-    const parent: Record<string, string> = {}
+-    for (const edge of [...edges].sort((a, b) => a.child.localeCompare(b.child) || a.owner.localeCompare(b.owner))) {
+-        if (edge.child === overseer || parent[edge.child] || createsCycle(kept, edge.owner, edge.child)) continue
+-        kept.push(edge); parent[edge.child] = edge.owner
+-    }
+-    return parent
+-}
+-
+-/** Deterministic tidy tree: overseer root first, owner -> child downward, lone nodes in a grid below. */
+-export function layoutNodeGraph({ overseer, nodes, edges, label = id => id }: LayoutInput): NodeGraphLayout {
+-    const ids = new Set(nodes.map(node => node.sessionId))
+-    if (overseer) ids.add(overseer)
+-    for (const edge of edges) { ids.add(edge.owner); ids.add(edge.child) }
+-    const parent = graphParents(edges, overseer)
+-    const order = (a: string, b: string) => label(a).localeCompare(label(b)) || a.localeCompare(b)
+-    const children = new Map<string, string[]>()
+-    for (const [child, owner] of Object.entries(parent)) children.set(owner, [...children.get(owner) ?? [], child])
+-    for (const list of children.values()) list.sort(order)
+-    const unowned = [...ids].filter(id => !parent[id] && id !== overseer).sort(order)
+-    const roots = [...(overseer ? [overseer] : []), ...unowned.filter(id => children.has(id))]
+-    const lone = unowned.filter(id => !children.has(id))
+-
+-    const positions: Record<string, GraphPoint> = {}
+-    const width = new Map<string, number>()
+-    const measure = (id: string): number => {
+-        const kids = children.get(id) ?? []
+-        const span = kids.reduce((sum, kid, index) => sum + measure(kid) + (index ? GAP_X : 0), 0)
+-        const result = Math.max(NODE_SIZE.width, span)
+-        width.set(id, result)
+-        return result
+-    }
+-    let bottom = -Infinity
+-    const place = (id: string, left: number, depth: number) => {
+-        const y = depth * (NODE_SIZE.height + GAP_Y)
+-        positions[id] = { x: left + (width.get(id)! - NODE_SIZE.width) / 2, y }
+-        bottom = Math.max(bottom, y + NODE_SIZE.height)
+-        const kids = children.get(id) ?? []
+-        const span = kids.reduce((sum, kid, index) => sum + width.get(kid)! + (index ? GAP_X : 0), 0)
+-        let cursor = left + (width.get(id)! - span) / 2
+-        for (const kid of kids) { place(kid, cursor, depth + 1); cursor += width.get(kid)! + GAP_X }
+-    }
+-    let left = 0
+-    for (const root of roots) { measure(root); place(root, left, 0); left += width.get(root)! + TREE_GAP }
+-    const treesWidth = Math.max(0, left - TREE_GAP)
+-
+-    let loneLabel: GraphPoint | null = null
+-    if (lone.length) {
+-        const top = (roots.length ? bottom + LONE_GAP : 0) + LONE_LABEL
+-        const columns = Math.max(1, Math.min(lone.length, Math.max(3, Math.floor((treesWidth + GAP_X) / (NODE_SIZE.width + GAP_X)))))
+-        loneLabel = { x: 0, y: top - LONE_LABEL }
+-        lone.forEach((id, index) => {
+-            positions[id] = { x: (index % columns) * (NODE_SIZE.width + GAP_X), y: top + Math.floor(index / columns) * (NODE_SIZE.height + GAP_X) }
+-        })
+-    }
+-    for (const node of nodes) if (node.x !== null && node.y !== null && Number.isFinite(node.x) && Number.isFinite(node.y)) positions[node.sessionId] = { x: node.x, y: node.y }
+-    if (loneLabel) loneLabel = { x: Math.min(...lone.map(id => positions[id]!.x)), y: Math.min(...lone.map(id => positions[id]!.y)) - LONE_LABEL }
+-    return { positions, parent, roots, lone, loneLabel, bounds: graphBounds(positions, loneLabel) }
+-}
+-
+-export function graphBounds(positions: Readonly<Record<string, GraphPoint>>, label?: GraphPoint | null): GraphBounds {
+-    const points = Object.values(positions)
+-    if (!points.length && !label) return { x: 0, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height }
+-    const xs = [...points.map(p => p.x), ...(label ? [label.x] : [])], ys = [...points.map(p => p.y), ...(label ? [label.y] : [])]
+-    const right = Math.max(...points.map(p => p.x + NODE_SIZE.width), ...(label ? [label.x + 60] : []))
+-    const lower = Math.max(...points.map(p => p.y + NODE_SIZE.height), ...(label ? [label.y + 20] : []))
+-    const x = Math.min(...xs), y = Math.min(...ys)
+-    return { x, y, width: right - x, height: lower - y }
+-}
+-
+-/** Valid new owners for `child`: never itself or one of its descendants; the overseer is never a child. */
+-export function ownerCandidates(ids: readonly string[], edges: LayoutInput['edges'], overseer: string | null, child: string): string[] {
+-    if (child === overseer) return []
+-    return ids.filter(id => id !== child && !createsCycle(edges, id, child))
+-}
+-
+-/** Topmost node whose card contains the graph point (later cards draw on top). */
+-export function nodeAtPoint(positions: Readonly<Record<string, GraphPoint>>, point: GraphPoint, order: readonly string[] = Object.keys(positions)): string | null {
+-    for (let index = order.length - 1; index >= 0; index -= 1) {
+-        const id = order[index]!, p = positions[id]
+-        if (p && point.x >= p.x && point.x <= p.x + NODE_SIZE.width && point.y >= p.y && point.y <= p.y + NODE_SIZE.height) return id
+-    }
+-    return null
+-}
+-
+-/** Zoom/offset that fits `bounds` into a viewport, capped so small graphs are not blown up. */
+-export function fitTransform(bounds: GraphBounds, view: { width: number; height: number }, padding = 24): { x: number; y: number; k: number } {
+-    // Fit must be able to go below the interactive zoom floor on narrow phones.
+-    const k = Math.max(0.00001, Math.min(Math.max(1, view.width - padding * 2) / Math.max(1, bounds.width), Math.max(1, view.height - padding * 2) / Math.max(1, bounds.height), 1))
+-    return { k, x: (view.width - bounds.width * k) / 2 - bounds.x * k, y: (view.height - bounds.height * k) / 2 - bounds.y * k }
+-}
+-
+-export const clampZoom = (k: number) => Math.min(2.5, Math.max(0.01, Number.isFinite(k) ? k : 1))
++// Shared with enrollment so new cards use the same geometry as the canvas.
++export * from '@hapi/protocol/nodeGraphLayout'
+--- a/shared/package.json
++++ b/shared/package.json
+@@ -9,6 +9,8 @@
+         ".": "./src/index.ts",
+         "./sessionManager": "./src/sessionManager.ts",
+         "./nodeGraph": "./src/nodeGraph.ts",
++        "./nodeGraphLayout": "./src/nodeGraphLayout.ts",
++        "./nodePlacement": "./src/nodePlacement.ts",
+         "./apiTypes": "./src/apiTypes.ts",
+         "./messages": "./src/messages.ts",
+         "./slashCommands": "./src/slashCommands.ts",
+--- a/hub/src/store/nodeGraph.ts
++++ b/hub/src/store/nodeGraph.ts
+@@ -2,6 +2,7 @@
+ import { isDeepStrictEqual } from 'node:util'
+ import { createHash, randomUUID } from 'node:crypto'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, type NodeAnnotation, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import { newNodePosition } from '@hapi/protocol/nodePlacement'
+ 
+ type WorkspaceRow = { id: string; namespace: string; name: string; kind: 'default' | 'preset'; created_at: number; updated_at: number }
+ type MemberRow = { workspace_id: string; session_id: string; x: number | null; y: number | null; added_at: number }
+@@ -164,9 +165,17 @@
+ 
+     /** Add a lone node (no-op when present). Returns true when newly added. */
+     addNode(namespace: string, sessionId: string, workspaceId = this.active(namespace)): boolean {
+-        const result = this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, sessionId, Date.now())
+-        if (result.changes) this.touch(workspaceId)
+-        return result.changes > 0
++        return this.addPlacedNode(namespace, sessionId, workspaceId)
++    }
++
++    private addPlacedNode(namespace: string, sessionId: string, workspaceId: string, owner: string | null = null, overseer: string | null = null): boolean {
++        return this.db.transaction(() => {
++            if (this.db.query('SELECT 1 FROM node_members WHERE workspace_id = ? AND session_id = ?').get(workspaceId, sessionId)) return false
++            const point = newNodePosition(this.graph(namespace, workspaceId), owner, overseer)
++            this.db.query('INSERT INTO node_members VALUES (?, ?, ?, ?, ?)').run(workspaceId, sessionId, point?.x ?? null, point?.y ?? null, Date.now())
++            this.touch(workspaceId)
++            return true
++        })()
+     }
+ 
+     /** Removing a node cuts its edges; its children become lone nodes. */
+@@ -191,8 +200,8 @@
+         if (createsCycle(edges, owner, child)) throw new Error('That owner would create a cycle')
+         return this.db.transaction(() => {
+             const now = Date.now()
+-            if (owner !== overseer) this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, owner, now)
+-            this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, child, now)
++            if (owner !== overseer) this.addPlacedNode(namespace, owner, workspaceId, null, overseer)
++            this.addPlacedNode(namespace, child, workspaceId, owner, overseer)
+             const existing = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? AND child_id = ?').get(workspaceId, child) as EdgeRow | null
+             const removedRoute = this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ? AND child_id = ?').run(workspaceId, child).changes
+             if (removedRoute) this.touch(workspaceId)
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -36,6 +36,60 @@
+ const nodes = (graph: NodeGraphResponse) => graph.graph.nodes.map(n => n.sessionId).sort()
+ 
+ describe('node graph', () => {
++    it('retains automatic placement through restart and isolates namespace and workspace drawings', () => {
++        const directory = mkdtempSync(join(tmpdir(), 'hapi-node-placement-')), path = join(directory, 'hub.sqlite')
++        let store = new Store(path)
++        try {
++            const graph = store.nodeGraph
++            graph.addNode('one', 'old'); graph.layout('one', { old: { x: -5200, y: -600 } })
++            const preset = graph.saveAs('one', 'Unchanged')
++            graph.addNode('two', 'other'); graph.layout('two', { other: { x: 8000, y: 2000 } })
++            graph.addNode('one', 'new')
++            const first = graph.graph('one')
++            expect(first.nodes.find(n => n.sessionId === 'new')).toMatchObject({ x: -5200, y: -440 })
++            expect(graph.members('one', preset.id)).toEqual(['old'])
++            expect(graph.members('two')).toEqual(['other'])
++            store.close(); store = new Store(path)
++            expect(store.nodeGraph.graph('one')).toEqual(first)
++        } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
++    })
++
++    it('persists automatic enrollment near the moved tree and never moves it on repeat runs', async () => {
++        const f = fixture()
++        try {
++            const old = f.create('Existing'); f.alive(old.id, true); f.alive(old.id, false)
++            await f.call('/node-graph/layout', { positions: { [old.id]: { x: -5200, y: -600 } } })
++            const fresh = f.create('Automatic'); f.alive(fresh.id, true)
++            const first = (await f.call('/node-graph')).json.graph
++            expect(first.nodes.find(n => n.sessionId === fresh.id)).toMatchObject({ x: -5200, y: -440 })
++            expect(first.nodes.find(n => n.sessionId === old.id)).toMatchObject({ x: -5200, y: -600 })
++            await f.call('/node-graph/layout', { positions: { [old.id]: { x: 1000, y: 2000 } } })
++            f.alive(fresh.id, false); f.alive(fresh.id, true)
++            const again = (await f.call('/node-graph')).json.graph
++            expect(again.nodes.find(n => n.sessionId === fresh.id)).toEqual(first.nodes.find(n => n.sessionId === fresh.id))
++        } finally { f.close() }
++    })
++
++    it('places a newly connected child near its owner while preserving existing explicit placements and previews', async () => {
++        const f = fixture()
++        try {
++            const old = f.create('Owner'), child = f.create('Spawned'), explicit = f.create('Explicit')
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: old.id })
++            await f.call('/node-graph/layout', { positions: { [old.id]: { x: -5200, y: -600 } } })
++            const preset = (await f.call('/node-graph/workspaces', { name: 'Snapshot' })).json.workspaces.find(w => w.kind === 'preset')!
++            const previewBefore = f.engine.nodeGraph.graph('default', preset.id)
++            const next = (await f.call('/node-graph/edges', { owner: old.id, child: child.id })).json.graph
++            expect(next.nodes.find(n => n.sessionId === child.id)).toMatchObject({ x: -5200, y: -440 })
++            await f.call('/node-graph/nodes', { sessionId: explicit.id })
++            await f.call('/node-graph/layout', { positions: { [explicit.id]: { x: 123, y: 456 } } })
++            const wired = (await f.call('/node-graph/edges', { owner: old.id, child: explicit.id })).json.graph
++            expect(wired.nodes.find(n => n.sessionId === explicit.id)).toMatchObject({ x: 123, y: 456 })
++            expect(f.engine.nodeGraph.graph('default', preset.id)).toEqual(previewBefore)
++            expect(f.engine.getSession(child.id)?.thinking).toBe(false)
++            expect(f.engine.getManualPause(child.id)).toBeNull()
++        } finally { f.close() }
++    })
++
+     it('enrols a manually started chat as a lone node in the active workspace only', async () => {
+         const f = fixture()
+         try {
+--- /dev/null
++++ b/shared/src/nodeGraphLayout.ts
+@@ -0,0 +1,120 @@
++import { createsCycle, type NodeGraphEdge, type NodeGraphNode } from './nodeGraph'
++
++export const DEFAULT_NODE_GRID_SIZE = 20
++/** Whole default grid cells, with the centered ports also on grid lines. */
++export const NODE_SIZE = { width: DEFAULT_NODE_GRID_SIZE * 10, height: DEFAULT_NODE_GRID_SIZE * 4 } as const
++const GAP_X = 28, GAP_Y = 72, TREE_GAP = 56, LONE_GAP = 88, LONE_LABEL = 28
++
++export type GraphPoint = { x: number; y: number }
++export type GraphBounds = { x: number; y: number; width: number; height: number }
++export type NodeGraphLayout = {
++    positions: Record<string, GraphPoint>
++    /** child -> owner after dropping invalid edges (cycles, second owners, overseer as child). */
++    parent: Record<string, string>
++    roots: string[]
++    lone: string[]
++    loneLabel: GraphPoint | null
++    bounds: GraphBounds
++}
++type LayoutInput = {
++    overseer: string | null
++    nodes: readonly Pick<NodeGraphNode, 'sessionId' | 'x' | 'y'>[]
++    edges: readonly Pick<NodeGraphEdge, 'owner' | 'child'>[]
++    label?: (id: string) => string
++}
++
++/** Strict owner tree as the UI draws it; tolerant of stale or conflicting edges. */
++export function graphParents(edges: LayoutInput['edges'], overseer: string | null): Record<string, string> {
++    const kept: { owner: string; child: string }[] = []
++    const parent: Record<string, string> = {}
++    for (const edge of [...edges].sort((a, b) => a.child.localeCompare(b.child) || a.owner.localeCompare(b.owner))) {
++        if (edge.child === overseer || parent[edge.child] || createsCycle(kept, edge.owner, edge.child)) continue
++        kept.push(edge); parent[edge.child] = edge.owner
++    }
++    return parent
++}
++
++/** Deterministic tidy tree: overseer root first, owner -> child downward, lone nodes in a grid below. */
++export function layoutNodeGraph({ overseer, nodes, edges, label = id => id }: LayoutInput): NodeGraphLayout {
++    const ids = new Set(nodes.map(node => node.sessionId))
++    if (overseer) ids.add(overseer)
++    for (const edge of edges) { ids.add(edge.owner); ids.add(edge.child) }
++    const parent = graphParents(edges, overseer)
++    const order = (a: string, b: string) => label(a).localeCompare(label(b)) || a.localeCompare(b)
++    const children = new Map<string, string[]>()
++    for (const [child, owner] of Object.entries(parent)) children.set(owner, [...children.get(owner) ?? [], child])
++    for (const list of children.values()) list.sort(order)
++    const unowned = [...ids].filter(id => !parent[id] && id !== overseer).sort(order)
++    const roots = [...(overseer ? [overseer] : []), ...unowned.filter(id => children.has(id))]
++    const lone = unowned.filter(id => !children.has(id))
++
++    const positions: Record<string, GraphPoint> = {}
++    const width = new Map<string, number>()
++    const measure = (id: string): number => {
++        const kids = children.get(id) ?? []
++        const span = kids.reduce((sum, kid, index) => sum + measure(kid) + (index ? GAP_X : 0), 0)
++        const result = Math.max(NODE_SIZE.width, span)
++        width.set(id, result)
++        return result
++    }
++    let bottom = -Infinity
++    const place = (id: string, left: number, depth: number) => {
++        const y = depth * (NODE_SIZE.height + GAP_Y)
++        positions[id] = { x: left + (width.get(id)! - NODE_SIZE.width) / 2, y }
++        bottom = Math.max(bottom, y + NODE_SIZE.height)
++        const kids = children.get(id) ?? []
++        const span = kids.reduce((sum, kid, index) => sum + width.get(kid)! + (index ? GAP_X : 0), 0)
++        let cursor = left + (width.get(id)! - span) / 2
++        for (const kid of kids) { place(kid, cursor, depth + 1); cursor += width.get(kid)! + GAP_X }
++    }
++    let left = 0
++    for (const root of roots) { measure(root); place(root, left, 0); left += width.get(root)! + TREE_GAP }
++    const treesWidth = Math.max(0, left - TREE_GAP)
++
++    let loneLabel: GraphPoint | null = null
++    if (lone.length) {
++        const top = (roots.length ? bottom + LONE_GAP : 0) + LONE_LABEL
++        const columns = Math.max(1, Math.min(lone.length, Math.max(3, Math.floor((treesWidth + GAP_X) / (NODE_SIZE.width + GAP_X)))))
++        loneLabel = { x: 0, y: top - LONE_LABEL }
++        lone.forEach((id, index) => {
++            positions[id] = { x: (index % columns) * (NODE_SIZE.width + GAP_X), y: top + Math.floor(index / columns) * (NODE_SIZE.height + GAP_X) }
++        })
++    }
++    for (const node of nodes) if (node.x !== null && node.y !== null && Number.isFinite(node.x) && Number.isFinite(node.y)) positions[node.sessionId] = { x: node.x, y: node.y }
++    if (loneLabel) loneLabel = { x: Math.min(...lone.map(id => positions[id]!.x)), y: Math.min(...lone.map(id => positions[id]!.y)) - LONE_LABEL }
++    return { positions, parent, roots, lone, loneLabel, bounds: graphBounds(positions, loneLabel) }
++}
++
++export function graphBounds(positions: Readonly<Record<string, GraphPoint>>, label?: GraphPoint | null): GraphBounds {
++    const points = Object.values(positions)
++    if (!points.length && !label) return { x: 0, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height }
++    const xs = [...points.map(p => p.x), ...(label ? [label.x] : [])], ys = [...points.map(p => p.y), ...(label ? [label.y] : [])]
++    const right = Math.max(...points.map(p => p.x + NODE_SIZE.width), ...(label ? [label.x + 60] : []))
++    const lower = Math.max(...points.map(p => p.y + NODE_SIZE.height), ...(label ? [label.y + 20] : []))
++    const x = Math.min(...xs), y = Math.min(...ys)
++    return { x, y, width: right - x, height: lower - y }
++}
++
++/** Valid new owners for `child`: never itself or one of its descendants; the overseer is never a child. */
++export function ownerCandidates(ids: readonly string[], edges: LayoutInput['edges'], overseer: string | null, child: string): string[] {
++    if (child === overseer) return []
++    return ids.filter(id => id !== child && !createsCycle(edges, id, child))
++}
++
++/** Topmost node whose card contains the graph point (later cards draw on top). */
++export function nodeAtPoint(positions: Readonly<Record<string, GraphPoint>>, point: GraphPoint, order: readonly string[] = Object.keys(positions)): string | null {
++    for (let index = order.length - 1; index >= 0; index -= 1) {
++        const id = order[index]!, p = positions[id]
++        if (p && point.x >= p.x && point.x <= p.x + NODE_SIZE.width && point.y >= p.y && point.y <= p.y + NODE_SIZE.height) return id
++    }
++    return null
++}
++
++/** Zoom/offset that fits `bounds` into a viewport, capped so small graphs are not blown up. */
++export function fitTransform(bounds: GraphBounds, view: { width: number; height: number }, padding = 24): { x: number; y: number; k: number } {
++    // Fit must be able to go below the interactive zoom floor on narrow phones.
++    const k = Math.max(0.00001, Math.min(Math.max(1, view.width - padding * 2) / Math.max(1, bounds.width), Math.max(1, view.height - padding * 2) / Math.max(1, bounds.height), 1))
++    return { k, x: (view.width - bounds.width * k) / 2 - bounds.x * k, y: (view.height - bounds.height * k) / 2 - bounds.y * k }
++}
++
++export const clampZoom = (k: number) => Math.min(2.5, Math.max(0.01, Number.isFinite(k) ? k : 1))
+--- /dev/null
++++ b/shared/src/nodePlacement.ts
+@@ -0,0 +1,35 @@
++import type { NodeGraph } from './nodeGraph'
++import { DEFAULT_NODE_GRID_SIZE, layoutNodeGraph, NODE_SIZE, type GraphPoint } from './nodeGraphLayout'
++
++/** A new member gets a durable position near the drawing, never a layout rewrite. */
++export function newNodePosition(graph: NodeGraph, owner: string | null = null, overseer: string | null = null): GraphPoint | null {
++    const saved = graph.nodes.filter(n => n.x !== null && n.y !== null && Number.isFinite(n.x) && Number.isFinite(n.y))
++    // Keep the existing tidy layout for an untouched graph. This also avoids
++    // pinning the very first card before an overseer/owner is configured.
++    if (!saved.length) return null
++    const positions = layoutNodeGraph({ ...graph, overseer }).positions
++    const anchor = owner ? positions[owner] : null
++    const preferred = anchor ? { x: anchor.x, y: anchor.y + NODE_SIZE.height + DEFAULT_NODE_GRID_SIZE * 4 }
++        : { x: Math.min(...saved.map(n => n.x!)), y: Math.max(...saved.map(n => n.y!)) + NODE_SIZE.height + DEFAULT_NODE_GRID_SIZE * 4 }
++    const gap = DEFAULT_NODE_GRID_SIZE
++    const occupied = [
++        ...Object.values(positions).map(p => ({ ...p, ...NODE_SIZE })),
++        ...(graph.annotations ?? []).filter(a => a.kind === 'text').map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height })),
++        ...(graph.junctions ?? []).map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 48 : 16), width: j.label ? 180 : 32, height: j.label ? 64 : 32 })),
++    ]
++    const free = (p: GraphPoint) => occupied.every(other => p.x + NODE_SIZE.width + gap <= other.x || other.x + other.width + gap <= p.x || p.y + NODE_SIZE.height + gap <= other.y || other.y + other.height + gap <= p.y)
++    if (free(preferred)) return preferred
++    // Stay near the tree: grow down as well as sideways instead of appending
++    // every new node to the far end of a single row. Frames aren't obstacles.
++    for (let radius = 1; ; radius++) {
++        const candidates: GraphPoint[] = []
++        for (let y = 0; y <= radius; y++) for (let x = -radius; x <= radius; x++) {
++            if (Math.max(Math.abs(x), y) === radius) candidates.push({ x: x * (NODE_SIZE.width + gap), y: y * (NODE_SIZE.height + gap * 4) })
++        }
++        candidates.sort((a, b) => a.x * a.x + a.y * a.y - b.x * b.x - b.y * b.y || a.y - b.y || a.x - b.x)
++        for (const offset of candidates) {
++            const point = { x: preferred.x + offset.x, y: preferred.y + offset.y }
++            if (free(point)) return point
++        }
++    }
++}
+--- /dev/null
++++ b/shared/src/nodePlacement.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, it } from 'bun:test'
++import { newNodePosition } from './nodePlacement'
++import type { NodeGraph } from './nodeGraph'
++
++const graph = (nodes: NodeGraph['nodes'], edges: NodeGraph['edges'] = []): NodeGraph => ({ workspaceId: 'test', nodes, edges })
++const node = (sessionId: string, x: number | null = null, y: number | null = null) => ({ sessionId, x, y, addedAt: 1 })
++const edge = (owner: string, child: string) => ({ owner, child, createdAt: 1, createdBy: 'test' })
++
++describe('new node placement', () => {
++    it('leaves untouched graphs on their existing tidy layout', () => {
++        expect(newNodePosition(graph([]))).toBeNull()
++        expect(newNodePosition(graph([node('old')]))).toBeNull()
++        expect(newNodePosition(graph([node('bad', Infinity, 100)]))).toBeNull()
++    })
++    it('places a lone enrollment below actual negative-coordinate cards, not at the old origin', () => {
++        const g = graph([node('O', -5000, -900), node('a', -5200, -600)], [edge('O', 'a')])
++        const before = JSON.stringify(g)
++        expect(newNodePosition(g)).toEqual({ x: -5200, y: -440 })
++        expect(JSON.stringify(g)).toBe(before)
++    })
++    it('places a spawned child below its actual saved owner', () => {
++        const g = graph([node('O', -5000, -900), node('a', -5400, -600)], [edge('O', 'a')])
++        expect(newNodePosition(g, 'O', 'O')).toEqual({ x: -5000, y: -740 })
++    })
++    it('avoids existing cards, text boxes and labeled junctions near the owner', () => {
++        const g = graph([node('O', -5000, -900), node('a', -5000, -740)], [edge('O', 'a')])
++        g.annotations = [{ id: 'note', kind: 'text', text: 'Notes', color: 'blue', x: -5000, y: -580, width: 200, height: 80 }]
++        g.junctions = [{ id: 'j', x: -5130, y: -700, label: 'Review', owner: 'O' }]
++        const p = newNodePosition(g, 'O', 'O')!
++        expect(p).toEqual({ x: -4780, y: -740 })
++        // The search prefers nearby rows/columns over an ever longer right edge.
++        expect(Math.abs(p.x + 5000)).toBeLessThan(500)
++    })
++    it('is deterministic and uses frame interiors as available space', () => {
++        const g = graph([node('O', 5000, 900), node('a', 5000, 1060)], [edge('O', 'a')])
++        g.annotations = [{ id: 'frame', kind: 'frame', text: 'Group', color: 'blue', x: 4900, y: 800, width: 1000, height: 1000 }]
++        const first = newNodePosition(g, 'O', 'O')
++        expect(first).toEqual({ x: 5000, y: 1220 })
++        expect(newNodePosition({ ...g, nodes: [...g.nodes].reverse() }, 'O', 'O')).toEqual(first)
++    })
++})

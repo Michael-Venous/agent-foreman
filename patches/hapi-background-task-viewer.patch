@@ -1,0 +1,556 @@
+diff --git a/hub/src/backgroundTaskOutput.test.ts b/hub/src/backgroundTaskOutput.test.ts
+new file mode 100644
+index 0000000..777c31a
+--- /dev/null
++++ b/hub/src/backgroundTaskOutput.test.ts
+@@ -0,0 +1,42 @@
++import { afterEach, describe, expect, it } from 'bun:test'
++import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { tmpdir } from 'node:os'
++import { backgroundOutputPath, readBackgroundTail } from './backgroundTaskOutput'
++const native = '8bf7e26e-6e22-54bd-b9bc-55b49351dc46'
++const dirs: string[] = []
++afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })))
++function fixture() {
++    const root = mkdtempSync(join(tmpdir(), 'background-output-')); dirs.push(root)
++    const dir = join(root, 'project', native, 'tasks'); mkdirSync(dir, { recursive: true })
++    return { root, dir }
++}
++export function proof(id: string, path: string) {
++    return { role: 'agent', content: { type: 'output', data: { type: 'user', message: { content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified.` }] } } } }
++}
++describe('background task output', () => {
++    it('requires native tool-result proof for the exact task, never arbitrary user text', () => {
++        const event = proof('job', `/tmp/project/${native}/tasks/job.output`)
++        expect(backgroundOutputPath(event, 'job')).toBe(`/tmp/project/${native}/tasks/job.output`)
++        expect(backgroundOutputPath(event, 'jo')).toBeNull()
++        expect(backgroundOutputPath({ ...event, role: 'user' }, 'job')).toBeNull()
++    })
++    it('reads a bounded tail of only the matching native conversation task', async () => {
++        const { root, dir } = fixture(); const path = join(dir, 'job.output')
++        writeFileSync(path, 'OLD_PREFIX' + 'a'.repeat(70000) + 'LATEST_OUTPUT')
++        const result = await readBackgroundTail(path, native, 'job', root)
++        expect(result.text).toEndWith('LATEST_OUTPUT'); expect(result.text).not.toContain('OLD_PREFIX')
++        expect(Buffer.byteLength(result.text)).toBe(65536); expect(result.truncated).toBe(true)
++        await expect(readBackgroundTail(path, '83417d40-e68f-50cd-8d18-59c1da63a473', 'job', root)).rejects.toThrow()
++        await expect(readBackgroundTail(path, native, '../job', root)).rejects.toThrow()
++        await expect(readBackgroundTail('/etc/passwd', native, 'job', root)).rejects.toThrow()
++    })
++    it('rejects symlinks escaping the task, directories, and missing output without running a command', async () => {
++        const { root, dir } = fixture(); const path = join(dir, 'job.output')
++        const outside = join(root, 'private'); writeFileSync(outside, 'not task output'); symlinkSync(outside, path)
++        await expect(readBackgroundTail(path, native, 'job', root)).rejects.toThrow()
++        rmSync(path); mkdirSync(path)
++        await expect(readBackgroundTail(path, native, 'job', root)).rejects.toThrow()
++        await expect(readBackgroundTail(join(dir, 'missing.output'), native, 'missing', root)).rejects.toThrow()
++    })
++})
+diff --git a/hub/src/backgroundTaskOutput.ts b/hub/src/backgroundTaskOutput.ts
+new file mode 100644
+index 0000000..415a5bc
+--- /dev/null
++++ b/hub/src/backgroundTaskOutput.ts
+@@ -0,0 +1,44 @@
++import { constants } from 'node:fs'
++import { open, realpath, stat } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { basename, join, resolve, sep } from 'node:path'
++import { isObject } from '@hapi/protocol'
++import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
++
++export function backgroundOutputPath(content: unknown, taskId: string): string | null {
++    const record = unwrapRoleWrappedRecordEnvelope(content)
++    if (!record || record.role !== 'agent' || !isObject(record.content) || record.content.type !== 'output') return null
++    const data = record.content.data
++    if (!isObject(data)) return null
++    const blocks = data.type === 'tool_result' ? [data]
++        : isObject(data.message) && Array.isArray(data.message.content) ? data.message.content : []
++    for (const block of blocks) {
++        if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) continue
++        const text = typeof block.content === 'string' ? block.content : Array.isArray(block.content)
++            ? block.content.map(p => isObject(p) && typeof p.text === 'string' ? p.text : '').join('\n') : ''
++        if (text.match(/Command running in background with ID:\s*([\w-]+)/)?.[1] !== taskId) continue
++        const path = text.match(/Output is being written to:\s*(\/[^\r\n]+?\.output)(?:[\s.]|$)/)?.[1]
++        if (path) return path
++    }
++    return null
++}
++export async function readBackgroundTail(candidate: string, nativeId: string, taskId: string,
++    root = join(tmpdir(), `claude-${process.getuid?.() ?? 1000}`)) {
++    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(nativeId) || !/^[\w-]{1,96}$/.test(taskId)) throw new Error('Invalid task identity')
++    const allowedRoot = await realpath(root)
++    const suffix = `${sep}${nativeId}${sep}tasks${sep}${taskId}.output`
++    const claimed = resolve(candidate)
++    if (!claimed.startsWith(allowedRoot + sep) || !claimed.endsWith(suffix)) throw new Error('Output does not belong to this conversation')
++    const path = await realpath(claimed)
++    if (!path.startsWith(allowedRoot + sep) || !path.endsWith(suffix) || basename(path) !== taskId + '.output') throw new Error('Output link leaves the authorized task')
++    if (!(await stat(path)).isFile()) throw new Error('Output is not a regular file')
++    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
++    try {
++        const info = await file.stat()
++        if (!info.isFile()) throw new Error('Output is not a regular file')
++        const start = Math.max(0, info.size - 65536)
++        const buffer = Buffer.alloc(Math.min(info.size, 65536))
++        const { bytesRead } = await file.read(buffer, 0, buffer.length, start)
++        return { text: buffer.subarray(0, bytesRead).toString('utf8'), truncated: start > 0, size: info.size, modifiedAt: info.mtimeMs }
++    } finally { await file.close() }
++}
+diff --git a/hub/src/web/routes/backgroundTasks.test.ts b/hub/src/web/routes/backgroundTasks.test.ts
+new file mode 100644
+index 0000000..034c021
+--- /dev/null
++++ b/hub/src/web/routes/backgroundTasks.test.ts
+@@ -0,0 +1,43 @@
++import { describe, expect, it } from 'bun:test'
++import { Hono } from 'hono'
++import { Store } from '../../store'
++import type { SyncEngine } from '../../sync/syncEngine'
++import type { WebAppEnv } from '../middleware/auth'
++import { createBackgroundTaskRoutes } from './backgroundTasks'
++const native = '8bf7e26e-6e22-54bd-b9bc-55b49351dc46'
++const proof = { role: 'agent', content: { type: 'output', data: { type: 'user', message: { content: [{ type: 'tool_result', content: `Command running in background with ID: job. Output is being written to: /tmp/claude-1000/project/${native}/tasks/job.output.` }] } } } }
++describe('background output access', () => {
++    it('enforces owner, session, machine and recorded-task scope before reading output', async () => {
++        const store = new Store(':memory:'); const previous = process.env.HAPI_LOCAL_CATALOG_MACHINE
++        process.env.HAPI_LOCAL_CATALOG_MACHINE = 'local'
++        const session = store.sessions.getOrCreateSession('local', { path: '/repo', host: 'pc', flavor: 'claude', machineId: 'local', claudeSessionId: native }, null, 'default')
++        const remote = store.sessions.getOrCreateSession('remote', { path: '/repo', host: 'pc', flavor: 'claude', machineId: 'remote', claudeSessionId: native }, null, 'default')
++        const other = store.sessions.getOrCreateSession('other', { path: '/repo', host: 'pc', flavor: 'claude', machineId: 'local', claudeSessionId: native }, null, 'default')
++        store.messages.addMessage(session.id, proof)
++        let reads = 0
++        const engine = { resolveSessionAccess: (id: string) => { const s = [session, remote, other].find(s => s.id === id); return s ? { ok: true, sessionId: id, session: s } : { ok: false, reason: 'not-found' } } } as unknown as SyncEngine
++        const app = (namespace: string) => {
++            const a = new Hono<WebAppEnv>(); a.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
++            a.route('/api', createBackgroundTaskRoutes(() => engine, store, async (path, id, task) => {
++                reads++; expect(path).toBe(`/tmp/claude-1000/project/${native}/tasks/job.output`)
++                expect(id).toBe(native); expect(task).toBe('job')
++                return { text: 'render frame 12', truncated: false, size: 15, modifiedAt: 100 }
++            })); return a
++        }
++        const url = (id: string, task = 'job') => `/api/sessions/${id}/background-tasks/${task}/output`
++        try {
++            expect((await app('other').request(url(session.id))).status).toBe(403)
++            expect((await app('default').request(url('missing'))).status).toBe(404)
++            expect((await app('default').request(url(remote.id))).status).toBe(409)
++            expect((await app('default').request(url(other.id))).status).toBe(404)
++            expect((await app('default').request(url(session.id, 'other-task'))).status).toBe(404)
++            expect(reads).toBe(0)
++            const response = await app('default').request(url(session.id) + '?path=/etc/passwd')
++            expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store')
++            expect((await response.json() as { text: string }).text).toBe('render frame 12'); expect(reads).toBe(1)
++        } finally {
++            if (previous === undefined) delete process.env.HAPI_LOCAL_CATALOG_MACHINE; else process.env.HAPI_LOCAL_CATALOG_MACHINE = previous
++            store.close()
++        }
++    })
++})
+diff --git a/hub/src/web/routes/backgroundTasks.ts b/hub/src/web/routes/backgroundTasks.ts
+new file mode 100644
+index 0000000..39d167a
+--- /dev/null
++++ b/hub/src/web/routes/backgroundTasks.ts
+@@ -0,0 +1,38 @@
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++import type { SyncEngine } from '../../sync/syncEngine'
++import type { Store } from '../../store'
++import { backgroundOutputPath, readBackgroundTail } from '../../backgroundTaskOutput'
++import { requireSessionFromParam, requireSyncEngine } from './guards'
++
++export function createBackgroundTaskRoutes(getEngine: () => SyncEngine | null, store: Store, readOutput = readBackgroundTail): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    const paths = new Map<string, string>()
++    app.get('/sessions/:id/background-tasks/:taskId/output', async c => {
++        if (c.get('namespace') !== 'default') return c.json({ error: 'Only the hub owner can read local task output.' }, 403)
++        const engine = requireSyncEngine(c, getEngine)
++        if (engine instanceof Response) return engine
++        const access = requireSessionFromParam(c, engine)
++        if (access instanceof Response) return access
++        const metadata = access.session.metadata
++        if (!process.env.HAPI_LOCAL_CATALOG_MACHINE || metadata?.machineId !== process.env.HAPI_LOCAL_CATALOG_MACHINE || metadata.flavor !== 'claude') return c.json({ error: 'Live output currently requires a local Claude task. Recorded output remains available.' }, 409)
++        const taskId = c.req.param('taskId')
++        if (!/^[\w-]{1,96}$/.test(taskId)) return c.json({ error: 'Invalid task ID.' }, 400)
++        const nativeId = metadata.claudeSessionId
++        if (!nativeId) return c.json({ error: 'Claude conversation identity is not available.' }, 409)
++        const key = `${access.sessionId}:${nativeId}:${taskId}`
++        let path = paths.get(key)
++        if (!path) {
++            for (const message of store.messages.getAllMessages(access.sessionId)) {
++                path = backgroundOutputPath(message.content, taskId) ?? undefined
++                if (path) break
++            }
++            if (path) paths.set(key, path)
++        }
++        c.header('Cache-Control', 'no-store')
++        if (!path) return c.json({ error: 'Task output was not recorded for this conversation.' }, 404)
++        try { return c.json(await readOutput(path, nativeId, taskId)) }
++        catch { return c.json({ error: 'Live output is no longer available. Recorded output remains below.' }, 404) }
++    })
++    return app
++}
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+index f40827f..f316065 100644
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -28,6 +28,7 @@ import { createManagedSessionsRoutes } from './routes/managedSessions'
+ import { createStorageRoutes } from './routes/storage'
+ import { createChatStatisticsRoutes } from './routes/chatStatistics'
+ import { createSideChatRoutes } from './routes/sideChats'
++import { createBackgroundTaskRoutes } from './routes/backgroundTasks'
+ import { createUsageRoutes } from './routes/usage'
+ import { createGitRoutes } from './routes/git'
+ import { createCliRoutes } from './routes/cli'
+@@ -305,6 +306,7 @@ function createWebApp(options: {
+     app.route('/api', createUsageRoutes(options.store))
+     app.route('/api', createChatStatisticsRoutes(options.getSyncEngine, options.store))
+     app.route('/api', createSideChatRoutes(options.getSyncEngine, options.store))
++    app.route('/api', createBackgroundTaskRoutes(options.getSyncEngine, options.store))
+     app.route('/api', createGitRoutes(options.getSyncEngine))
+     // 中文注释：这里提供两类 Codex 辅助能力：扫描本地 transcript 以导入到 Hapi，以及按需重启 Codex Desktop 客户端。
+     app.route('/api', createCodexDesktopRoutes({
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 7c034cb..459ab11 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -593,6 +593,10 @@ export class ApiClient {
+         return response as CancelMessageResponse
+     }
+ 
++    async getBackgroundTaskOutput(sessionId: string, taskId: string): Promise<{ text: string; truncated: boolean; size: number; modifiedAt: number }> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/background-tasks/${encodeURIComponent(taskId)}/output`)
++    }
++
+     async getSideChat(sessionId: string): Promise<{ turns: Array<{ id: string; question: string; status: 'running' | 'complete' | 'failed' | 'unknown'; answer?: string; error?: string; createdAt: number }> }> {
+         return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/side-chat`)
+     }
+diff --git a/web/src/chat/backgroundTaskViews.test.ts b/web/src/chat/backgroundTaskViews.test.ts
+new file mode 100644
+index 0000000..d52972f
+--- /dev/null
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from 'vitest'
++import type { ChatBlock, NormalizedMessage, ToolCallBlock } from './types'
++import { collectBackgroundTasks } from './backgroundTaskViews'
++export function block(id: string, input: unknown, result: unknown): ToolCallBlock {
++    return { kind: 'tool-call', id, localId: null, createdAt: 100, children: [], tool: { id, name: 'Bash', state: 'completed', input, result, createdAt: 100, startedAt: 100, completedAt: 120, execStartedAt: null, execCompletedAt: null, description: null } }
++}
++const start = 'Command running in background with ID: job. Output is being written to: /tmp/project/job.output.'
++function notification(id: string, status: string): NormalizedMessage {
++    return { id: 'n', localId: null, createdAt: 200, role: 'agent', isSidechain: true, content: [{ type: 'sidechain', uuid: 'n', parentUUID: null, prompt: `<task-notification><task-id>${id}</task-id><status>${status}</status></task-notification>` }] }
++}
++describe('background task views', () => {
++    it('finds native Claude tasks without treating the finished spawn tool as the task completion', () => {
++        const task = collectBackgroundTasks([block('spawn', { command: 'render scene', cwd: '/project' }, start)], [], true, 1)[0]
++        expect(task).toMatchObject({ id: 'job', command: 'render scene', cwd: '/project', state: 'running', liveOutput: true })
++    })
++    it.each(['completed', 'failed', 'stopped', 'cancelled'])('uses exact task %s notifications', status => {
++        const blocks = [block('spawn', { command: 'render' }, start)]
++        expect(collectBackgroundTasks(blocks, [notification('job', status)], true, 0)[0].state).toBe(status === 'cancelled' ? 'stopped' : status)
++        expect(collectBackgroundTasks(blocks, [notification('other', status)], false, 0)[0].state).toBe('unknown')
++    })
++    it('groups Codex process polls into one task and captures its final exit output', () => {
++        const blocks: ChatBlock[] = [block('start', { cmd: 'build' }, 'Process running with session ID 42\nBuilding'),
++            block('poll', { session_id: 42 }, 'Process running with session ID 42\nStill building'),
++            block('end', { session_id: 42 }, 'Process exited with code 0\nBuild complete')]
++        const tasks = collectBackgroundTasks(blocks, [], true, 0)
++        expect(tasks).toHaveLength(1); expect(tasks[0].state).toBe('completed')
++        expect(tasks[0].captured.match(/Still building/g)).toHaveLength(1)
++        expect(tasks[0].captured).toContain('Build complete'); expect(tasks[0].liveOutput).toBe(false)
++    })
++})
++
++
++it('uses recorded TaskOutput completion and bounds captured logs', () => {
++    const start = block('spawn', { command: 'render' }, 'Command running in background with ID: renderjob. Output is being written to: /tmp/job.output.')
++    const completed = block('read', { task_id: 'renderjob' }, '<status>completed</status><exit_code>1</exit_code>' + 'x'.repeat(70000))
++    completed.tool.name = 'TaskOutput'
++    const task = collectBackgroundTasks([start, completed], [], true, 0)[0]
++    expect(task.state).toBe('failed'); expect(task.captured.length).toBe(65536); expect(task.capturedTruncated).toBe(true)
++})
+diff --git a/web/src/chat/backgroundTaskViews.ts b/web/src/chat/backgroundTaskViews.ts
+new file mode 100644
+index 0000000..447e203
+--- /dev/null
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -0,0 +1,84 @@
++import { isObject } from '@hapi/protocol'
++import type { ChatBlock, NormalizedMessage, ToolCallBlock } from './types'
++import { getInputStringAny } from '@/lib/toolInputUtils'
++
++export type BackgroundTaskView = {
++    id: string; provider: 'claude' | 'codex'; command: string; cwd: string | null; block: ToolCallBlock;
++    state: 'running' | 'completed' | 'failed' | 'stopped' | 'unknown'; captured: string; capturedTruncated: boolean; liveOutput: boolean
++}
++function text(value: unknown): string {
++    if (typeof value === 'string') return value
++    if (Array.isArray(value)) return value.map(text).filter(Boolean).join('\n')
++    if (isObject(value)) {
++        if (typeof value.text === 'string') return value.text
++        if ('output' in value) return text(value.output)
++        if ('content' in value) return text(value.content)
++        return Object.values(value).map(text).filter(Boolean).join('\n')
++    }
++    return ''
++}
++function tools(blocks: readonly ChatBlock[]): ToolCallBlock[] {
++    return blocks.flatMap(block => block.kind === 'tool-call' ? [block, ...tools(block.children)] : [])
++}
++function command(block: ToolCallBlock): string {
++    const direct = getInputStringAny(block.tool.input, ['command', 'cmd'])
++    if (direct) return direct
++    if (isObject(block.tool.input) && Array.isArray(block.tool.input.command)) return block.tool.input.command.join(' ')
++    return block.tool.description ?? block.tool.name
++}
++export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, count?: number): BackgroundTaskView[] {
++    const found = new Map<string, BackgroundTaskView>()
++    const all = tools(blocks)
++    for (const block of all) {
++        const output = text(block.tool.result)
++        const claude = output.match(/Command running in background with ID:\s*([\w-]+)/)?.[1]
++        const codex = output.match(/Process running with session ID\s+(\d+)/i)?.[1]
++        if (!claude && !codex) continue
++        const id = claude ?? `codex:${codex}`
++        // A repeated poll of the same process is additional output, not a new task.
++        const existing = found.get(id)
++        if (existing) continue
++        found.set(id, { id, provider: claude ? 'claude' : 'codex', block, command: command(block),
++            cwd: getInputStringAny(block.tool.input, ['cwd', 'workdir']),
++            state: active && (codex || count !== 0) ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
++            liveOutput: Boolean(claude && /Output is being written to:/.test(output)) })
++    }
++    for (const block of all) {
++        if (!isObject(block.tool.input)) continue
++        const session = block.tool.input.session_id
++        const id = typeof session === 'number' || typeof session === 'string' ? `codex:${session}` : ''
++        const nativeTaskId = getInputStringAny(block.tool.input, ['task_id', 'taskId'])
++        const task = found.get(id) ?? (nativeTaskId ? found.get(nativeTaskId) : null)
++        if (!task || block.tool.id === task.block.tool.id) continue
++        const output = text(block.tool.result)
++        if (output) {
++            const next = task.captured + '\n\n' + output
++            task.capturedTruncated ||= next.length > 65536
++            task.captured = next.slice(-65536)
++        }
++        const exit = output.match(/Process exited with code\s+(-?\d+)/i)?.[1]
++        if (exit !== undefined) task.state = exit === '0' ? 'completed' : 'failed'
++        const status = output.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
++        if (status === 'completed') {
++            const code = output.match(/<exit_code>\s*(-?\d+)\s*<\/exit_code>/)?.[1]
++            task.state = code && code !== '0' ? 'failed' : 'completed'
++        } else if (status === 'failed') task.state = 'failed'
++        else if (status === 'stopped' || status === 'cancelled' || (block.tool.name === 'TaskStop' && /Successfully stopped task/i.test(output))) task.state = 'stopped'
++    }
++    for (const message of messages) {
++        if (message.role !== 'agent') continue
++        for (const content of message.content) {
++            if (content.type !== 'sidechain') continue
++            const value = content.prompt.trimStart()
++            if (!value.startsWith('<task-notification>')) continue
++            const id = value.match(/<task-id>\s*([^<]+?)\s*<\/task-id>/)?.[1]
++            const task = id ? found.get(id) : null
++            if (!task) continue
++            const status = value.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
++            if (!status || status === 'completed') task.state = 'completed'
++            else if (status === 'failed') task.state = 'failed'
++            else if (status === 'stopped' || status === 'cancelled') task.state = 'stopped'
++        }
++    }
++    return [...found.values()].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running') || b.block.createdAt - a.block.createdAt)
++}
+diff --git a/web/src/components/BackgroundTasksPanel.test.tsx b/web/src/components/BackgroundTasksPanel.test.tsx
+new file mode 100644
+index 0000000..987b490
+--- /dev/null
++++ b/web/src/components/BackgroundTasksPanel.test.tsx
+@@ -0,0 +1,54 @@
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { useState } from 'react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { ApiClient } from '@/api/client'
++import type { ToolCallBlock } from '@/chat/types'
++import { I18nProvider } from '@/lib/i18n-context'
++import { BackgroundTasksPanel } from './BackgroundTasksPanel'
++vi.mock('@/components/CodeBlock', () => ({ CodeBlock: ({ code }: { code: string }) => <pre>{code}</pre> }))
++afterEach(() => { cleanup(); vi.useRealTimers() })
++const block: ToolCallBlock = { kind: 'tool-call', id: 'spawn', localId: null, createdAt: 100, children: [], tool: {
++    id: 'spawn', name: 'Bash', state: 'completed', input: { command: 'render scene', cwd: '/project' },
++    result: 'Command running in background with ID: job. Output is being written to: /tmp/project/job.output.',
++    createdAt: 100, startedAt: 100, completedAt: 110, execStartedAt: null, execCompletedAt: null, description: null } }
++function Harness({ api }: { api: ApiClient }) {
++    const [viewed, setViewed] = useState<string | null>(null)
++    return <I18nProvider><BackgroundTasksPanel api={api} sessionId="parent" blocks={[block]} messages={[]}
++        active count={1} viewedId={viewed} onView={setViewed} hasMore={false} loadingMore={false} onLoadEarlier={() => {}} /></I18nProvider>
++}
++describe('BackgroundTasksPanel', () => {
++    it('loads live output only when a task is opened and preserves its command and recorded output', async () => {
++        const getBackgroundTaskOutput = vi.fn().mockResolvedValue({ text: 'Rendering frame 42', truncated: true, size: 70000, modifiedAt: 100 })
++        render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
++        expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: /Background tasks \(1\)/ }))
++        expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: 'View background task: job' }))
++        expect(await screen.findByText('Rendering frame 42')).toBeInTheDocument()
++        expect(screen.getByRole('dialog')).toHaveTextContent('render scene')
++        expect(screen.getByText('Showing the latest 64 KB.')).toBeInTheDocument()
++        expect(getBackgroundTaskOutput).toHaveBeenCalledWith('parent', 'job')
++    })
++    it('does not replace recorded output when live output has expired', async () => {
++        const getBackgroundTaskOutput = vi.fn().mockRejectedValue(new Error('Output expired'))
++        render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
++        fireEvent.click(screen.getByRole('button', { name: /Background tasks/ }))
++        fireEvent.click(screen.getByRole('button', { name: 'View background task: job' }))
++        expect(await screen.findByRole('status')).toHaveTextContent('Output expired')
++        expect(screen.getByText(/Command running in background with ID: job/)).toBeInTheDocument()
++        expect(getBackgroundTaskOutput).toHaveBeenCalledTimes(1)
++    })
++    it('refreshes only while the selected task viewer is open', async () => {
++        vi.useFakeTimers()
++        const getBackgroundTaskOutput = vi.fn().mockResolvedValue({ text: 'Progress', truncated: false, size: 8, modifiedAt: 100 })
++        render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
++        fireEvent.click(screen.getByRole('button', { name: /Background tasks/ }))
++        await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'View background task: job' })); await Promise.resolve() })
++        expect(getBackgroundTaskOutput).toHaveBeenCalledTimes(1)
++        await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
++        expect(getBackgroundTaskOutput).toHaveBeenCalledTimes(2)
++        fireEvent.click(screen.getByRole('button', { name: 'Close' }))
++        await act(async () => { await vi.advanceTimersByTimeAsync(6000) })
++        expect(getBackgroundTaskOutput).toHaveBeenCalledTimes(2)
++    })
++})
+diff --git a/web/src/components/BackgroundTasksPanel.tsx b/web/src/components/BackgroundTasksPanel.tsx
+new file mode 100644
+index 0000000..6aaf35b
+--- /dev/null
++++ b/web/src/components/BackgroundTasksPanel.tsx
+@@ -0,0 +1,71 @@
++import { useEffect, useMemo, useState } from 'react'
++import type { ApiClient } from '@/api/client'
++import type { ChatBlock, NormalizedMessage } from '@/chat/types'
++import { collectBackgroundTasks, type BackgroundTaskView } from '@/chat/backgroundTaskViews'
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { CodeBlock } from '@/components/CodeBlock'
++const label = (state: BackgroundTaskView['state']) => state === 'unknown' ? 'Status unconfirmed' : state[0].toUpperCase() + state.slice(1)
++type Output = Awaited<ReturnType<ApiClient['getBackgroundTaskOutput']>> & { id: string }
++export function BackgroundTasksPanel(props: {
++    api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
++    active: boolean; count?: number; viewedId: string | null; onView: (id: string | null) => void;
++    hasMore: boolean; loadingMore: boolean; onLoadEarlier: () => void
++}) {
++    const [expanded, setExpanded] = useState(false)
++    const [output, setOutput] = useState<Output | null>(null)
++    const [error, setError] = useState<string | null>(null)
++    const [loading, setLoading] = useState(false)
++    const [refresh, setRefresh] = useState(0)
++    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, props.count), [props.blocks, props.messages, props.active, props.count])
++    const selected = tasks.find(task => task.id === props.viewedId)
++    const running = Math.max(props.active ? props.count ?? 0 : 0, tasks.filter(t => t.state === 'running').length)
++    useEffect(() => {
++        setError(null)
++        if (!selected?.liveOutput) { setLoading(false); return }
++        let live = true; let timer: ReturnType<typeof setTimeout> | undefined
++        const load = async () => {
++            try {
++                const next = await props.api.getBackgroundTaskOutput(props.sessionId, selected.id)
++                if (!live) return
++                setOutput({ ...next, id: selected.id }); setError(null)
++                if (selected.state === 'running') timer = setTimeout(load, 2000)
++            } catch (err) { if (live) setError(err instanceof Error ? err.message : 'Live output unavailable. Recorded output remains below.') }
++            finally { if (live) setLoading(false) }
++        }
++        setLoading(true); void load()
++        return () => { live = false; clearTimeout(timer) }
++    }, [props.api, props.sessionId, selected?.id, selected?.state, selected?.liveOutput, refresh])
++    const liveOutput = selected && output?.id === selected.id ? output : null
++    return <div className="shrink-0 border-b border-[var(--app-border)] px-3 py-1">
++        <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
++            className="flex min-h-8 w-full items-center gap-2 text-left text-sm text-[var(--app-hint)]">
++            <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>Background tasks ({tasks.length})</span>
++            {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">{running} running</span> : null}
++        </button>
++        {expanded ? <div className="max-h-52 space-y-1 overflow-y-auto pb-2">
++            {!tasks.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
++            {props.active && (props.count ?? 0) > tasks.filter(t => t.state === 'running').length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
++            {tasks.map(task => <button type="button" key={task.id} onClick={() => props.onView(task.id)} aria-label={`View background task: ${task.id}`}
++                className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
++                <span className="min-w-0 flex-1"><code className="block truncate">{task.command}</code><span className="block text-xs text-[var(--app-hint)]">{task.id}</span></span>
++                <span className="shrink-0 text-xs text-[var(--app-hint)]">{label(task.state)}</span><span aria-hidden="true">›</span>
++            </button>)}
++            {props.hasMore ? <button type="button" onClick={props.onLoadEarlier} disabled={props.loadingMore}
++                className="min-h-9 px-2 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
++        </div> : null}
++        <Dialog open={Boolean(selected)} onOpenChange={open => { if (!open) props.onView(null) }}>
++            <DialogContent className="max-h-[90dvh] overflow-y-auto">
++                <DialogHeader><DialogTitle>Background task</DialogTitle><DialogDescription>{selected ? `${selected.id} · ${label(selected.state)}` : ''}</DialogDescription></DialogHeader>
++                {selected ? <div className="mt-3 space-y-3 text-sm">
++                    <div><h3 className="mb-1 font-medium">Command</h3><CodeBlock code={selected.command} language="bash" />{selected.cwd ? <p className="mt-1 break-all text-xs text-[var(--app-hint)]">Working directory: {selected.cwd}</p> : null}</div>
++                    {selected.liveOutput ? <div>
++                        <div className="mb-1 flex items-center justify-between"><h3 className="font-medium">Live output</h3><button type="button" disabled={loading} onClick={() => setRefresh(v => v + 1)} className="min-h-8 px-2 text-[var(--app-link)] disabled:opacity-40">{loading ? 'Loading…' : 'Refresh'}</button></div>
++                        {error ? <p role="status" className="text-xs text-[var(--app-hint)]">{error}</p> : null}
++                        {liveOutput ? <><CodeBlock code={liveOutput.text || '(No output yet.)'} language="text" />{liveOutput.truncated ? <p className="text-xs text-[var(--app-hint)]">Showing the latest 64 KB.</p> : null}</> : null}
++                    </div> : <p className="text-xs text-[var(--app-hint)]">Showing output recorded in the chat.</p>}
++                    <details open={!selected.liveOutput}><summary className="cursor-pointer font-medium">Recorded output{selected.capturedTruncated ? ' (latest 64 KB)' : ''}</summary><CodeBlock code={selected.captured || '(No recorded output.)'} language="text" /></details>
++                </div> : null}
++            </DialogContent>
++        </Dialog>
++    </div>
++}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index e9004e3..7b5578c 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -88,6 +88,7 @@ import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/c
+ import { ChatStatisticsButton } from '@/components/AssistantChat/ChatStatisticsButton'
+ import { SessionHeader } from '@/components/SessionHeader'
+ import { SubagentsPanel } from '@/components/SubagentsPanel'
++import { BackgroundTasksPanel } from '@/components/BackgroundTasksPanel'
+ import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
+ import { TeamPanel } from '@/components/TeamPanel'
+ import { SessionStatusPanel } from '@/components/SessionStatusPanel'
+@@ -640,6 +641,7 @@ function SessionChatInner(props: SessionChatProps) {
+     const navigate = useNavigate()
+     const [historyActionPending, setHistoryActionPending] = useState(false)
+     const [viewedSubagentId, setViewedSubagentId] = useState<string | null>(null)
++    const [viewedBackgroundId, setViewedBackgroundId] = useState<string | null>(null)
+     const [rewindForkFallback, setRewindForkFallback] = useState<string | null>(null)
+ 
+     const onForkConversation = useCallback(async (messageLocalId?: string) => {
+@@ -1906,7 +1908,12 @@ function SessionChatInner(props: SessionChatProps) {
+                 blocks={reconciled.blocks} metadata={props.session.metadata} viewedId={viewedSubagentId} onView={setViewedSubagentId}
+                 hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+             /> : null}
+-            {sessionStatus ? <SessionStatusPanel data={sessionStatus} onViewSubagent={setViewedSubagentId} /> : null}
++            {agentFlavor === 'claude' || agentFlavor === 'codex' ? <BackgroundTasksPanel
++                api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
++                active={props.session.active} count={props.session.backgroundTaskCount} viewedId={viewedBackgroundId} onView={setViewedBackgroundId}
++                hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
++            /> : null}
++            {sessionStatus ? <SessionStatusPanel data={sessionStatus} onViewSubagent={setViewedSubagentId} onViewBackground={setViewedBackgroundId} /> : null}
+ 
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+diff --git a/web/src/components/SessionStatusPanel.tsx b/web/src/components/SessionStatusPanel.tsx
+index 0f5e05e..dbb5e72 100644
+--- a/web/src/components/SessionStatusPanel.tsx
++++ b/web/src/components/SessionStatusPanel.tsx
+@@ -26,7 +26,7 @@ function elapsedSince(startedAt: number | null, now: number): string | null {
+     return formatDuration(Math.max(0, now - startedAt))
+ }
+ 
+-export function SessionStatusPanel({ data, onViewSubagent }: { data: SessionStatusData; onViewSubagent?: (id: string) => void }) {
++export function SessionStatusPanel({ data, onViewSubagent, onViewBackground }: { data: SessionStatusData; onViewSubagent?: (id: string) => void; onViewBackground?: (id: string) => void }) {
+     const { t } = useTranslation()
+     const completedTasks = data.tasks.filter((task) => task.status === 'completed').length
+     const hasLiveElapsed = data.terminals.length > 0
+@@ -98,9 +98,7 @@ export function SessionStatusPanel({ data, onViewSubagent }: { data: SessionStat
+                                 const elapsed = elapsedSince(terminal.startedAt, now)
+                                 return (
+                                     <div key={terminal.id} className="min-w-0">
+-                                        <code className="block overflow-hidden text-ellipsis whitespace-nowrap text-xs text-[var(--app-fg)]" title={terminal.command}>
+-                                            {terminal.command}
+-                                        </code>
++                                        <button type="button" onClick={() => onViewBackground?.(terminal.id)} disabled={!onViewBackground} className="block max-w-full text-left text-[var(--app-link)] disabled:text-[var(--app-fg)]" title={terminal.command}><code className="block overflow-hidden text-ellipsis whitespace-nowrap text-xs">{terminal.command}</code></button>
+                                         {(terminal.cwd || elapsed) ? (
+                                             <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-[var(--app-hint)]">
+                                                 {[terminal.cwd, elapsed].filter(Boolean).join(' · ')}

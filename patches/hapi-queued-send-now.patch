@@ -1,0 +1,408 @@
+diff --git a/hub/src/sync/steerQueuedMessage.test.ts b/hub/src/sync/steerQueuedMessage.test.ts
+index 081ff0d..cd4840f 100644
+--- a/hub/src/sync/steerQueuedMessage.test.ts
++++ b/hub/src/sync/steerQueuedMessage.test.ts
+@@ -53,7 +53,7 @@ describe('SyncEngine.steerQueuedMessage', () => {
+         try {
+             const session = engine.getOrCreateSession(
+                 'steer-claude',
+-                { path: '/tmp/project', host: 'localhost', flavor: 'claude' },
++                { path: '/tmp/project', host: 'localhost', flavor: 'unsupported' },
+                 { requests: {}, completedRequests: {} },
+                 'default'
+             )
+@@ -102,3 +102,84 @@ describe('composer native priority', () => {
+         } finally { engine.stop(); }
+     });
+ });
++
++
++describe('older Claude send now', () => {
++    function setup() {
++        const { store, engine } = createEngine()
++        const session = engine.getOrCreateSession('legacy-now', { path: '/tmp', host: 'localhost', flavor: 'claude' }, {}, 'default')
++        engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true, mode: 'remote' })
++        const message = store.messages.addMessage(session.id, { text: 'correction' }, 'legacy-message')
++        return { store, engine, session, message }
++    }
++    it('stops once for concurrent clicks, preserving the original queued message until native consumption', async () => {
++        const { store, engine, session, message } = setup()
++        try {
++            let finish!: () => void
++            const abort = spyOn(engine, 'abortSession').mockImplementation(() => new Promise<void>(resolve => { finish = resolve }))
++            const first = engine.steerQueuedMessage(session.id, message.id)
++            const second = engine.steerQueuedMessage(session.id, message.id)
++            expect(abort).toHaveBeenCalledTimes(1)
++            finish()
++            expect((await first).status).toBe('steered')
++            expect((await second).status).toBe('steered')
++            expect(store.messages.getMessages(session.id, 10)).toHaveLength(1)
++            expect(store.messages.lookupQueuedMessage(session.id, message.id).status).toBe('queued')
++        } finally { engine.stop() }
++    })
++    it('does not interrupt when the queued message has already been consumed', async () => {
++        const { store, engine, session, message } = setup()
++        try {
++            const abort = spyOn(engine, 'abortSession').mockResolvedValue()
++            store.messages.markMessagesInvoked(session.id, ['legacy-message'], Date.now())
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('invoked')
++            expect(abort).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++    it('preserves the queue and reports an abort failure without retrying', async () => {
++        const { store, engine, session, message } = setup()
++        try {
++            const abort = spyOn(engine, 'abortSession').mockRejectedValue(new Error('Stop timed out'))
++            expect(await engine.steerQueuedMessage(session.id, message.id)).toMatchObject({ status: 'failed', error: 'Stop timed out' })
++            expect(abort).toHaveBeenCalledTimes(1)
++            expect(store.messages.lookupQueuedMessage(session.id, message.id).status).toBe('queued')
++        } finally { engine.stop() }
++    })
++    it('does not stop for missing, scheduled, offline, or local-controlled messages or native-next requests', async () => {
++        const { store, engine, session, message } = setup()
++        try {
++            const abort = spyOn(engine, 'abortSession').mockResolvedValue()
++            expect((await engine.steerQueuedMessage(session.id, 'missing')).status).toBe('failed')
++            const scheduled = store.messages.addMessage(session.id, { text: 'scheduled' }, 'scheduled', Date.now() + 60000)
++            expect((await engine.steerQueuedMessage(session.id, scheduled.id)).status).toBe('failed')
++            expect((await engine.steerQueuedMessage(session.id, message.id, 'next')).status).toBe('failed')
++            store.messages.markMessagesIndeterminate(session.id, ['legacy-message'])
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('failed')
++            const fresh = store.messages.addMessage(session.id, { text: 'fresh' }, 'fresh')
++            session.active = false
++            expect((await engine.steerQueuedMessage(session.id, fresh.id)).status).toBe('failed')
++            session.active = true
++            session.agentState = { controlledByUser: true }
++            expect((await engine.steerQueuedMessage(session.id, fresh.id)).status).toBe('failed')
++            expect(abort).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++})
++
++
++describe('updated Claude native delivery', () => {
++    it('uses native priority without stopping the response', async () => {
++        const { store, engine } = createEngine()
++        try {
++            const session = engine.getOrCreateSession('native-direct', { path: '/tmp', host: 'localhost', flavor: 'claude', capabilities: { claudeInputPriorities: true } }, {}, 'default')
++            engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true, mode: 'remote' })
++            const message = store.messages.addMessage(session.id, { text: 'correction' }, 'native-local')
++            const gateway = (engine as unknown as { rpcGateway: { steerQueuedMessage: (sessionId: string, localId: string, priority: string) => Promise<{ steered: boolean }> } }).rpcGateway
++            const steer = spyOn(gateway, 'steerQueuedMessage').mockResolvedValue({ steered: true })
++            const abort = spyOn(engine, 'abortSession').mockResolvedValue()
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('steered')
++            expect(steer).toHaveBeenCalledWith(session.id, 'native-local', 'now')
++            expect(abort).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++})
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index 4b94d98..402feac 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -200,6 +200,7 @@ export class SyncEngine {
+     private readonly opencodeClearTails = new Map<string, Promise<ClearOpencodeSessionResult>>()
+     /** Serialize fork/rewind per session so concurrent native rollbacks cannot stack. */
+     private readonly historyActionsInFlight = new Set<string>()
++    private readonly legacyImmediateSends = new Map<string, Promise<SteerQueuedMessageResponse>>()
+     /**
+      * Hub owner id for accountable work-graph principals (A2A P1/P3).
+      * Defaults to "1" for unit tests; startHub overwrites with getOrCreateOwnerId().
+@@ -1078,7 +1079,9 @@ export class SyncEngine {
+         if (!session) {
+             return { status: 'failed', error: 'Session not found', localId: null }
+         }
+-        if (!isSteeringSupportedForSession(session.metadata)) {
++        const legacyClaudeNow = session.metadata?.flavor === 'claude'
++            && session.metadata.capabilities?.claudeInputPriorities !== true && priority === 'now'
++        if (!isSteeringSupportedForSession(session.metadata) && !legacyClaudeNow) {
+             return { status: 'failed', error: 'This controller does not support native priority delivery', localId: null }
+         }
+         if (session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
+@@ -1104,6 +1107,9 @@ export class SyncEngine {
+                 }
+             }
+         }
++        if (lookup.status !== 'queued') {
++            return { status: 'failed', error: 'Delivery is already in progress or uncertain; inspect before retrying', localId: lookup.localId }
++        }
+         const { localId, scheduledAt } = lookup
+         if (!localId) {
+             return { status: 'failed', error: 'Message has no localId', localId: null }
+@@ -1115,6 +1121,26 @@ export class SyncEngine {
+             return { status: 'failed', error: 'Scheduled messages cannot be steered', localId }
+         }
+ 
++        if (legacyClaudeNow) {
++            if (!session.active) return { status: 'failed', error: 'Session is offline', localId }
++            // Old Claude controllers already own this waiting message. Stop the
++            // current response and let their normal queue consume it; never
++            // delete/re-send it or mark it consumed before the CLI acknowledges.
++            const key = `${sessionId}:${localId}`
++            const pending = this.legacyImmediateSends.get(key)
++            if (pending) return pending
++            const operation = (async (): Promise<SteerQueuedMessageResponse> => {
++                try {
++                    if (session.thinking) await this.abortSession(sessionId)
++                    return { status: 'steered', localId }
++                } catch (error) {
++                    return { status: 'failed', error: error instanceof Error ? error.message : 'Stop failed', localId }
++                }
++            })()
++            this.legacyImmediateSends.set(key, operation)
++            try { return await operation } finally { this.legacyImmediateSends.delete(key) }
++        }
++
+         try {
+             const result = await this.rpcGateway.steerQueuedMessage(sessionId, localId, priority)
+             if (result.steered) {
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index 2d6b6bf..c25111e 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -885,23 +885,23 @@ export function ComposerButtons(props: {
+                     <Popover.Portal>
+                         <Popover.Content side="top" align="end" sideOffset={8} collisionPadding={12} aria-label="Send options"
+                             className="z-[100] w-64 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-xl">
+-                            {!props.nativePriorityAvailable ? <p className="px-3 py-2 text-xs text-[var(--app-hint)]">Resume this chat with the updated controller to enable native delivery.</p> : null}
++                            {!props.nativePriorityAvailable ? <p className="px-3 py-2 text-xs text-[var(--app-hint)]">This older chat can stop and send now. Resume with the updated controller to enable delivery during the current turn.</p> : null}
+                             <Popover.Close asChild>
+                                 <button type="button" onClick={() => props.onSend('queue')} disabled={props.controlsDisabled}
+-                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)] disabled:opacity-40">
+                                     <span className="block font-medium">After current turn</span><span className="text-xs text-[var(--app-hint)]">Wait for the current response to finish.</span>
+                                 </button>
+                             </Popover.Close>
+                             {props.nativePriorityFlavor === 'claude' ? <Popover.Close asChild>
+                                 <button type="button" onClick={() => props.onSend('next')} disabled={props.controlsDisabled || !props.nativePriorityAvailable}
+-                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)] disabled:opacity-40">
+                                     <span className="block font-medium">During current turn</span><span className="text-xs text-[var(--app-hint)]">Deliver at Claude’s next tool boundary.</span>
+                                 </button>
+                             </Popover.Close> : null}
+                             <Popover.Close asChild>
+-                                <button type="button" onClick={() => props.onSend('steer')} disabled={props.controlsDisabled || !props.nativePriorityAvailable}
+-                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
+-                                    <span className="block font-medium">Send immediately</span><span className="text-xs text-[var(--app-hint)]">{props.nativePriorityFlavor === 'claude' ? 'Use Claude’s native send-now priority.' : 'Steer the active Codex turn.'}</span>
++                                <button type="button" onClick={() => props.onSend('steer')} disabled={props.controlsDisabled || (!props.nativePriorityAvailable && props.nativePriorityFlavor !== 'claude')}
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)] disabled:opacity-40">
++                                    <span className="block font-medium">{props.nativePriorityFlavor === 'claude' && !props.nativePriorityAvailable ? 'Stop & send now' : 'Send immediately'}</span><span className="text-xs text-[var(--app-hint)]">{props.nativePriorityFlavor === 'claude' ? (props.nativePriorityAvailable ? 'Use Claude’s native send-now priority.' : 'Stop the current response and process waiting messages.') : 'Steer the active Codex turn.'}</span>
+                                 </button>
+                             </Popover.Close>
+                         </Popover.Content>
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index a13242e..dbda143 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -185,12 +185,15 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         renderComposer('claude', { active: true, thinking: true, supportsNativePriority: true, onSchedule: vi.fn(), pendingSchedule: { type: 'absolute', ms: Date.now() + 60000 } })
+         expect(screen.queryByRole('button', { name: 'Send options' })).toBeNull()
+     })
+-    it('explains when an existing Claude controller needs a resume', () => {
++    it('offers stop and send now for older Claude without silently disabled immediate delivery', async () => {
+         draft()
+         renderComposer('claude', { active: true, thinking: true, supportsNativePriority: false })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        expect(screen.getByRole('button', { name: /Send immediately/ })).toBeDisabled()
+-        expect(screen.getByText(/Resume this chat/)).toBeTruthy()
++        expect(screen.getByRole('button', { name: /During current turn/ })).toBeDisabled()
++        const sendNow = screen.getByRole('button', { name: /Stop & send now/ })
++        expect(sendNow).not.toBeDisabled()
++        await act(async () => { fireEvent.click(sendNow) })
++        expect(runtime.sentIntents).toEqual(['steer'])
+     })
+     it('shows priority uncertainty without restoring a duplicate draft', () => {
+         renderComposer('claude', { sendSettlement: { attemptId: 'x', status: 'success', warning: 'Priority not confirmed; check waiting queue.' } })
+diff --git a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+index 794a485..71661e6 100644
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+@@ -96,6 +96,7 @@ function renderQueuedMessage(
+     pendingScheduleRevision = 0,
+     canSteer = false,
+     api: ApiClient | null = null,
++    sendNowStopsTurn = false,
+ ) {
+     const onEdit = vi.fn()
+     let currentPendingScheduleRevision = pendingScheduleRevision
+@@ -114,6 +115,7 @@ function renderQueuedMessage(
+                 pendingScheduleRevision={currentPendingScheduleRevision}
+                 onEdit={onEdit}
+                 canSteer={canSteer}
++                sendNowStopsTurn={sendNowStopsTurn}
+             />
+         </QueryClientProvider>
+     )
+@@ -131,6 +133,7 @@ function renderQueuedMessage(
+                         pendingScheduleRevision={currentPendingScheduleRevision}
+                         onEdit={onEdit}
+                         canSteer={canSteer}
++                sendNowStopsTurn={sendNowStopsTurn}
+                     />
+                 </QueryClientProvider>
+             )
+@@ -790,23 +793,34 @@ describe('QueuedMessagesBar steer action', () => {
+ 
+     it('shows the Steer button only when canSteer is set and the row is immediate', () => {
+         const immediate = renderSteerable(true)
+-        expect(screen.getByRole('button', { name: 'Steer queued message' })).toBeTruthy()
++        expect(screen.getByRole('button', { name: 'Send now' })).toBeTruthy()
+         immediate.unmount()
+ 
+         renderSteerable(false)
+-        expect(screen.queryByRole('button', { name: 'Steer queued message' })).toBeNull()
++        expect(screen.queryByRole('button', { name: 'Send now' })).toBeNull()
++    })
++
++    it('labels the older Claude action and places it below the queued text', async () => {
++        mocks.steerMessage.mockResolvedValue({ status: 'steered', localId: 'local-server-message-id' })
++        renderQueuedMessage(null, null, 0, true, { steerMessage: mocks.steerMessage } as unknown as ApiClient, true)
++        const button = screen.getByRole('button', { name: 'Stop & send now' })
++        expect(button.textContent).toContain('Stop & send now')
++        expect(button.previousElementSibling?.className).toContain('line-clamp-3')
++        fireEvent.click(button)
++        await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalledTimes(1))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Cancel queued message' })).not.toBeDisabled())
+     })
+ 
+     it('hides the Steer button on future-scheduled rows', () => {
+         const api = { steerMessage: mocks.steerMessage } as unknown as ApiClient
+         renderQueuedMessage(Date.now() + 60_000, null, 0, true, api)
+-        expect(screen.queryByRole('button', { name: 'Steer queued message' })).toBeNull()
++        expect(screen.queryByRole('button', { name: 'Send now' })).toBeNull()
+     })
+ 
+     it('calls the steer api with the session and message id', async () => {
+         renderSteerable(true)
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Steer queued message' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Send now' }))
+ 
+         await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalledWith('session-1', 'server-message-id'))
+         // Settle the pending mutation so the queued-operation token releases;
+@@ -820,7 +834,7 @@ describe('QueuedMessagesBar steer action', () => {
+     it('toasts when the steer fails and leaves the row queued', async () => {
+         renderSteerable(true)
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Steer queued message' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Send now' }))
+         await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalled())
+         await act(async () => {
+             mocks.resolveSteer?.({ status: 'failed', error: 'Session is not streaming', localId: 'local-server-message-id' })
+@@ -838,7 +852,7 @@ describe('QueuedMessagesBar steer action', () => {
+     it('does not toast on a successful steer (the consumed event clears the row)', async () => {
+         renderSteerable(true)
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Steer queued message' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Send now' }))
+         await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalled())
+         await act(async () => {
+             mocks.resolveSteer?.({ status: 'steered', localId: 'local-server-message-id' })
+@@ -851,7 +865,7 @@ describe('QueuedMessagesBar steer action', () => {
+     it('reconciles a stale queued row when the steer returns invoked (missed consumption SSE)', async () => {
+         renderSteerable(true)
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Steer queued message' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Send now' }))
+         await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalled())
+         await act(async () => {
+             mocks.resolveSteer?.({
+diff --git a/web/src/components/AssistantChat/QueuedMessagesBar.tsx b/web/src/components/AssistantChat/QueuedMessagesBar.tsx
+index 17478eb..d0944c6 100644
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.tsx
+@@ -199,6 +199,7 @@ export function QueuedMessagesBar({
+     pendingScheduleRevision,
+     onEdit,
+     canSteer,
++    sendNowStopsTurn,
+ }: {
+     sessionId: string
+     api: ApiClient | null
+@@ -213,11 +214,13 @@ export function QueuedMessagesBar({
+      */
+     onEdit?: (params: { text: string; pendingSchedule: PendingSchedule | null }) => void
+     /**
+-     * When true, each queued row gets a Steer button that delivers that
+-     * message into the active turn (Pi native steer). The parent computes it
+-     * as: pi flavor && session thinking && remote-controlled.
++     * When true, each queued row gets a Send now button that delivers that
++     * message immediately. Older Claude controllers stop the current response;
++     * supported controllers use native priority delivery.
+      */
+     canSteer?: boolean
++    /** Older Claude controllers deliver immediately by stopping the current response. */
++    sendNowStopsTurn?: boolean
+ }) {
+     const queued = useQueuedMessages(sessionId)
+     const assistantApi = useAui()
+@@ -370,7 +373,7 @@ export function QueuedMessagesBar({
+                             })
+                         }
+ 
+-                        // Steer delivers this message into the active Pi turn. Gated
++                        // Send now delivers this already-saved message. Gated
+                         // on the same server-echo + no-pending-op conditions as
+                         // Edit/Cancel, and never offered for future-scheduled rows
+                         // (the hub rejects those).
+@@ -545,6 +548,20 @@ export function QueuedMessagesBar({
+                                             </span>
+                                         </div>
+                                     )}
++                                    {canSteerRow ? (
++                                        <button
++                                            type="button"
++                                            aria-label={sendNowStopsTurn ? 'Stop & send now' : 'Send now'}
++                                            title={sendNowStopsTurn ? 'Stop the current response and process waiting messages' : 'Deliver this queued message immediately'}
++                                            disabled={steerPending}
++                                            onClick={handleSteer}
++                                            onMouseDown={(e) => e.preventDefault()}
++                                            className="mt-2 inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-[var(--app-border)] px-3 py-1 text-sm font-medium text-[var(--app-link)] hover:bg-[var(--app-bg)] disabled:cursor-not-allowed disabled:opacity-40"
++                                        >
++                                            <SteerIcon />
++                                            {steerPending ? 'Sending…' : sendNowStopsTurn ? 'Stop & send now' : 'Send now'}
++                                        </button>
++                                    ) : null}
+                                 </div>
+                                 <div className="flex shrink-0 items-center gap-1">
+                                     {msg.deliveryState === 'indeterminate' ? (
+@@ -560,19 +577,6 @@ export function QueuedMessagesBar({
+                                             <span aria-hidden="true">↻</span>
+                                         </button>
+                                     ) : null}
+-                                    {canSteerRow ? (
+-                                        <button
+-                                            type="button"
+-                                            aria-label="Steer queued message"
+-                                            title={t('queuedMessages.steer')}
+-                                            disabled={steerPending}
+-                                            onClick={handleSteer}
+-                                            onMouseDown={(e) => e.preventDefault()}
+-                                            className="flex h-6 w-6 items-center justify-center rounded text-[var(--app-hint)] transition-colors hover:bg-[var(--app-border)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-40"
+-                                        >
+-                                            <SteerIcon />
+-                                        </button>
+-                                    ) : null}
+                                     <button
+                                         type="button"
+                                         aria-label="Edit queued message"
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index c83922d..ee6d79b 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -2019,11 +2019,13 @@ function SessionChatInner(props: SessionChatProps) {
+                                     // Restore the schedule so the clock button re-activates
+                                     updatePendingSchedule(restored)
+                                 }}
+-                                canSteer={isSteeringSupportedForSession(props.session.metadata)
+-                                    && (agentFlavor === 'pi'
++                                canSteer={props.session.active
++                                    && (agentFlavor === 'claude' || isSteeringSupportedForSession(props.session.metadata))
++                                    && (agentFlavor === 'pi' || agentFlavor === 'claude'
+                                         ? props.session.thinking
+                                         : props.session.agentState?.steeringActive === true)
+                                     && !controlledByUser}
++                                sendNowStopsTurn={agentFlavor === 'claude' && props.session.metadata?.capabilities?.claudeInputPriorities !== true}
+                             />
+                         </div>
+ 

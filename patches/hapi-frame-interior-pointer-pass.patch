@@ -1,0 +1,20 @@
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -5,7 +5,7 @@
+ const COLORS = { slate: '#64748b', blue: '#3b82f6', violet: '#8b5cf6', green: '#16a34a', amber: '#d97706' } as const
+ const label = (a: NodeAnnotation) => a.kind === 'frame' ? a.text || 'Untitled frame' : a.text.split('\n')[0] || 'Text box'
+ 
+-/** Frame interiors capture selection; margins capture movement; nested frames and cards remain above them. */
++/** Frame interiors pass through to canvas gestures; only margins/title capture pointers. */
+ export function GraphAnnotationLayer({ annotations, selected, selectedTexts = [], zoom, onSelect, onEdit, onAdjust, onContextMenu }: {
+     annotations: readonly NodeAnnotation[]; selected: string | null; selectedTexts?: readonly string[]; zoom: number;
+     onSelect: (id: string) => void; onEdit: (annotation: NodeAnnotation) => void;
+@@ -28,7 +28,7 @@
+             background: `color-mix(in srgb, ${COLORS[a.color]} ${a.kind === 'frame' ? 7 : 12}%, var(--app-bg))` }}>
+         {a.kind === 'frame' && <button type="button" data-annotation-select={a.id} style={{ cursor: 'default' }} aria-label={`Select frame: ${label(a)}`} onClick={event => { if (event.detail === 0) onSelect(a.id) }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
+-            className="pointer-events-auto absolute inset-0 h-full w-full cursor-default rounded-xl focus-visible:outline-2 focus-visible:outline-[var(--app-link)]" />}
++            className="pointer-events-none absolute inset-0 h-full w-full cursor-default rounded-xl focus-visible:outline-2 focus-visible:outline-[var(--app-link)]" />}
+         {a.kind === 'frame' && <>{[
+             ['left', { left: 0, top: 0, bottom: 0, width: 12 }],
+             ['right', { right: 0, top: 0, bottom: 0, width: 12 }],

@@ -1,0 +1,221 @@
+diff --git a/web/src/components/ManagerShortcut.test.tsx b/web/src/components/ManagerShortcut.test.tsx
+deleted file mode 100644
+index 38f1dd0..0000000
+--- a/web/src/components/ManagerShortcut.test.tsx
++++ /dev/null
+@@ -1,42 +0,0 @@
+-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+-import { afterEach, describe, expect, it, vi } from 'vitest'
+-import { readFileSync } from 'node:fs'
+-import { resolve } from 'node:path'
+-// Vitest runs from the web package root.
+-const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8')
+-import { ManagerShortcut } from './ManagerShortcut'
+-afterEach(cleanup)
+-
+-function themeVariables(selector: string): Record<string, string> {
+-    const block = css.slice(css.indexOf(selector + ' {')).split('}')[0]!
+-    const vars: Record<string, string> = {}
+-    for (const match of block.matchAll(/(--app-button(?:-text)?):\s*(?:var\([^,]+,\s*)?(#[0-9a-f]{6})/gi)) vars[match[1]!] = match[2]!
+-    return vars
+-}
+-function luminance(hex: string): number {
+-    const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).map(c => c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)
+-    return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!
+-}
+-
+-describe('ManagerShortcut', () => {
+-    it('uses explicit paired theme foreground/background, never a hardcoded white label', () => {
+-        render(<ManagerShortcut sessionId="m" selected={false} onOpen={vi.fn()} />)
+-        const link = screen.getByRole('link', { name: /Open your persistent manager/ })
+-        expect(link).toHaveClass('bg-[var(--app-button)]', 'text-[var(--app-button-text)]')
+-        expect(link.className).not.toMatch(/text-white|bg-\[var\(--app-link\)\]/)
+-    })
+-    it.each([':root', '[data-theme="dark"]', '[data-theme="oled"]'])('has WCAG AA contrast in %s', (selector) => {
+-        const vars = themeVariables(selector)
+-        const [a, b] = [luminance(vars['--app-button']!), luminance(vars['--app-button-text']!)]
+-        expect((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)).toBeGreaterThanOrEqual(4.5)
+-    })
+-    it('opens the manager in-app and marks it current', () => {
+-        const onOpen = vi.fn()
+-        render(<ManagerShortcut sessionId="manager-id" selected onOpen={onOpen} />)
+-        const link = screen.getByRole('link', { name: /persistent manager/ })
+-        expect(link).toHaveAttribute('href', '/sessions/manager-id')
+-        expect(link).toHaveAttribute('aria-current', 'page')
+-        fireEvent.click(link)
+-        expect(onOpen).toHaveBeenCalledWith('manager-id')
+-    })
+-})
+diff --git a/web/src/components/ManagerShortcut.tsx b/web/src/components/ManagerShortcut.tsx
+deleted file mode 100644
+index 955333a..0000000
+--- a/web/src/components/ManagerShortcut.tsx
++++ /dev/null
+@@ -1,22 +0,0 @@
+-/**
+- * Persistent link to the manager chat. Uses the theme's paired button
+- * colors (light: near-black with white text, dark: white with dark text, OLED: blue
+- * with black text) so the label never inherits a same-colored background.
+- */
+-export function ManagerShortcut(props: { sessionId: string; selected: boolean; onOpen: (sessionId: string) => void }) {
+-    return (
+-        <a
+-            href={`/sessions/${props.sessionId}`}
+-            onClick={(event) => {
+-                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return
+-                event.preventDefault()
+-                props.onOpen(props.sessionId)
+-            }}
+-            aria-current={props.selected ? 'page' : undefined}
+-            data-testid="manager-shortcut"
+-            className="mx-3 mb-2 mt-3 block shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-button)] px-4 py-3 text-center font-semibold text-[var(--app-button-text)] shadow-sm transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--app-bg)]"
+-        >
+-            <span aria-hidden="true">★ </span>Open your persistent manager
+-        </a>
+-    )
+-}
+diff --git a/web/src/components/SessionList.manager-pin.test.tsx b/web/src/components/SessionList.manager-pin.test.tsx
+new file mode 100644
+index 0000000..96e2c07
+--- /dev/null
++++ b/web/src/components/SessionList.manager-pin.test.tsx
+@@ -0,0 +1,51 @@
++import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
++import type { SessionSummary } from '@/types/api'
++
++afterEach(() => cleanup())
++let SessionList: typeof import('./SessionList').SessionList
++let I18nProvider: typeof import('@/lib/i18n-context').I18nProvider
++let ToastProvider: typeof import('@/lib/toast-context').ToastProvider
++beforeAll(async () => {
++    vi.stubEnv('VITE_MANAGER_SESSION_ID', 'manager')
++    vi.resetModules()
++    // Same module instances for the component and its context providers.
++    ;({ SessionList } = await import('./SessionList'))
++    ;({ I18nProvider } = await import('@/lib/i18n-context'))
++    ;({ ToastProvider } = await import('@/lib/toast-context'))
++})
++
++const base = { active: true, thinking: false, activeAt: 0, metadataVersion: 0, agentStateVersion: 0, todosUpdatedAt: 0, todoProgress: null,
++    pendingRequestsCount: 0, pendingRequestKinds: [], pendingRequests: [], backgroundTaskCount: 0, futureScheduledMessageCount: 0,
++    nextScheduledAt: null, model: null, effort: null }
++const session = (id: string, name: string, extra: Partial<SessionSummary> = {}) =>
++    ({ ...base, id, updatedAt: 1, metadata: { path: '/w/' + id, name, flavor: 'codex' }, ...extra }) as SessionSummary
++
++describe('persistent manager pin', () => {
++    it('is always first in Pinned, cannot be unpinned, and is not duplicated elsewhere', async () => {
++        render(
++            <QueryClientProvider client={new QueryClient()}>
++                <ToastProvider><I18nProvider>
++                    <SessionList
++                        sessions={[
++                            session('manager', '★ Manager — active projects', { updatedAt: 10, globalPinned: false }),
++                            session('other-pin', 'Newer global pin', { updatedAt: 999, globalPinned: true }),
++                            session('chat', 'Ordinary chat', { active: false }),
++                        ]}
++                        selectedSessionId={null} onSelect={vi.fn()} onNewSession={vi.fn()} onRefresh={vi.fn()}
++                        isLoading={false} renderHeader={false} api={null}
++                    />
++                </I18nProvider></ToastProvider>
++            </QueryClientProvider>
++        )
++        const manager = screen.getByRole('button', { name: /Manager — active projects/ })
++        expect(manager).toAppearBefore(screen.getByRole('button', { name: /Newer global pin/ }))
++        expect(within(screen.getByTestId('session-chat-list')).queryByRole('button', { name: /Manager/ })).toBeNull()
++        expect(screen.getAllByRole('button', { name: /Manager — active projects/ })).toHaveLength(1)
++        fireEvent.contextMenu(manager)
++        const items = (await screen.findAllByRole('menuitem')).map(item => item.textContent ?? '')
++        expect(items.some(text => /pin/i.test(text))).toBe(false)
++        expect(items.some(text => /Rename/.test(text))).toBe(true)
++    })
++})
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+index 2348b5e..46aad91 100644
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -284,6 +284,13 @@ export function getPreviousSessionVisibleCount(current: number, step: number): n
+     return Math.max(normalizedStep, current - normalizedStep)
+ }
+ 
++/** The persistent manager chat: always first in Pinned and cannot be unpinned. */
++export const MANAGER_SESSION_ID: string | undefined = import.meta.env.VITE_MANAGER_SESSION_ID || undefined
++export function isManagerSession(session: SessionSummary, managerId = MANAGER_SESSION_ID): boolean {
++    return Boolean(managerId) && session.id === managerId
++}
++const isPinnedGlobally = (session: SessionSummary) => Boolean(session.globalPinned) || isManagerSession(session)
++
+ export type ChatTab = 'codex' | 'claude' | 'other'
+ const CHAT_TAB_KEY = 'hapi-chat-tab'
+ 
+@@ -1048,7 +1055,7 @@ function SessionItem(props: {
+                 sessionActive={s.active}
+                 sessionPinned={Boolean(s.pinned)}
+                 sessionGlobalPinned={Boolean(s.globalPinned)}
+-                onSetPinMode={(mode) => void handleSetPinMode(mode)}
++                onSetPinMode={isManagerSession(s) ? undefined : (mode) => void handleSetPinMode(mode)}
+                 onRename={() => setRenameOpen(true)}
+                 onExport={() => setExportOpen(true)}
+                 onMoveToFolder={props.onMoveToFolder ? () => props.onMoveToFolder!(s) : undefined}
+@@ -1328,11 +1335,11 @@ export function SessionList(props: {
+         [unreadFilteredSessions, activeMachineFilter]
+     )
+     const globalPinnedSessions = useMemo(() => {
+-        const pinned = machineFilteredSessions.filter((session) => Boolean(session.globalPinned))
+-        if (searchScoreIndex && hasTextQuery) {
+-            return sortSessionsBySearchRelevance(pinned, searchScoreIndex)
+-        }
+-        return [...pinned].sort((a, b) => b.updatedAt - a.updatedAt)
++        const pinned = machineFilteredSessions.filter(isPinnedGlobally)
++        const sorted = searchScoreIndex && hasTextQuery
++            ? sortSessionsBySearchRelevance(pinned, searchScoreIndex)
++            : [...pinned].sort((a, b) => b.updatedAt - a.updatedAt)
++        return [...sorted.filter(s => isManagerSession(s)), ...sorted.filter(s => !isManagerSession(s))]
+     }, [machineFilteredSessions, searchScoreIndex, hasTextQuery])
+     const runningSessions = useMemo(() => {
+         const buckets: Record<RunningBucketKey, SessionSummary[]> = {
+@@ -1344,7 +1351,7 @@ export function SessionList(props: {
+             return buckets
+         }
+         for (const session of machineFilteredSessions) {
+-            if (session.globalPinned || session.pinned) {
++            if (isPinnedGlobally(session) || session.pinned) {
+                 continue
+             }
+             if (!session.active) {
+@@ -1379,7 +1386,7 @@ export function SessionList(props: {
+     const chatSessions = useMemo(
+         () => {
+             const chats = machineFilteredSessions.filter((session) => {
+-                if (session.globalPinned) return false
++                if (isPinnedGlobally(session)) return false
+                 if (pinInProgressSessions && !session.pinned && isPinnedInProgressSession(session)) return false
+                 return true
+             })
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+index 574e450..c620369 100644
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -52,7 +52,6 @@ import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
+ import { refreshSessionDetailPreservingActive } from '@/lib/session-detail-optimistic'
+ import { inactiveSessionCanResume, resolveCursorReopenGate } from '@/lib/sessionResume'
+ import { initializeSessionLastSeen } from '@/lib/sessionLastSeen'
+-import { ManagerShortcut } from '@/components/ManagerShortcut'
+ import { useSelectedSessionSeen } from '@/hooks/useSelectedSessionSeen'
+ import { useSessionBrowserTitle } from '@/hooks/useSessionBrowserTitle'
+ import { clearCodexImportedSession } from '@/lib/codexImportedSessions'
+@@ -234,13 +233,6 @@ function SessionsPage() {
+                             <div className="text-sm text-red-600">{error}</div>
+                         </div>
+                     ) : null}
+-                    {import.meta.env.VITE_MANAGER_SESSION_ID && (
+-                        <ManagerShortcut
+-                            sessionId={import.meta.env.VITE_MANAGER_SESSION_ID}
+-                            selected={selectedSessionId === import.meta.env.VITE_MANAGER_SESSION_ID}
+-                            onOpen={(sessionId) => navigate(getSessionListSelectionNavigation(sessionId))}
+-                        />
+-                    )}
+                     <SessionList
+                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}
+                         sessions={sessions}

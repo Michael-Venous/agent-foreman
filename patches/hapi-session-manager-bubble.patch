@@ -1,0 +1,352 @@
+--- a/web/src/components/SessionManagerWindow.tsx
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -1,46 +1,73 @@
+ import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useEffect, useId, useRef, type PointerEvent, type ReactNode } from 'react'
++import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
+ import { createPortal } from 'react-dom'
++import { useNarrowViewport } from '@/hooks/useNarrowViewport'
+ 
+ export type WindowBounds = { x: number; y: number; width: number; height: number }
+-type WindowState = { open: boolean; bounds?: WindowBounds }
++type Position = Pick<WindowBounds, 'x' | 'y'>
++type WindowState = { open: boolean; collapsed?: boolean; bounds?: WindowBounds; bubble?: Position }
+ const WINDOW_KEY = ['session-manager-window'] as const
++const BUBBLE = { width: 116, height: 48 }
+ const viewport = () => ({
+     x: window.visualViewport?.offsetLeft ?? 0, y: window.visualViewport?.offsetTop ?? 0,
+     width: window.visualViewport?.width ?? window.innerWidth, height: window.visualViewport?.height ?? window.innerHeight,
+ })
++function mobileDevice(): boolean {
++    return typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
++        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
++}
++export function useSessionManagerMobile(): boolean {
++    const narrow = useNarrowViewport()
++    // Used for returning to the selected chat with a compact bubble on mobile.
++    return narrow || mobileDevice()
++}
+ export function fitSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
+     const availableWidth = Math.max(1, view.width - 16), availableHeight = Math.max(1, view.height - 16)
+     const width = Math.min(availableWidth, Math.max(Math.min(280, availableWidth), bounds.width))
+     const height = Math.min(availableHeight, Math.max(Math.min(260, availableHeight), bounds.height))
+     return { width, height, x: Math.max(view.x + 8, Math.min(bounds.x, view.x + view.width - width - 8)), y: Math.max(view.y + 8, Math.min(bounds.y, view.y + view.height - height - 8)) }
+ }
++export function fitSessionBubble(position: Position, view = viewport()): Position {
++    return { x: Math.max(view.x + 8, Math.min(position.x, view.x + view.width - BUBBLE.width - 8)), y: Math.max(view.y + 8, Math.min(position.y, view.y + view.height - BUBBLE.height - 8)) }
++}
+ function initialBounds(): WindowBounds {
+     const view = viewport(), width = Math.min(480, view.width - 24), height = Math.min(560, view.height * .72)
+     return fitSessionWindow({ width, height, x: view.x + view.width - width - 16, y: view.y + 64 }, view)
++}
++function initialBubble(): Position {
++    const view = viewport()
++    return fitSessionBubble({ x: view.x + view.width - BUBBLE.width - 16, y: view.y + view.height - BUBBLE.height - 96 }, view)
+ }
+ export function useSessionManagerWindow() {
+     const client = useQueryClient()
+     const { data = { open: false } } = useQuery<WindowState>({ queryKey: WINDOW_KEY, queryFn: skipToken, initialData: { open: false }, enabled: false, gcTime: Infinity })
+     return {
+         ...data,
+-        setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open })),
+-        setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ open: old?.open ?? false, bounds })),
++        setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open, ...(open ? { collapsed: false } : {}) })),
++        setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: true, collapsed })),
++        setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bounds })),
++        setBubble: (bubble: Position) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bubble })),
+     }
+ }
+ 
+-/** A non-modal page window: no backdrop, focus trap, or outside-click dismissal. */
+-export function SessionManagerWindow({ children }: { children: ReactNode }) {
+-    const { open, bounds, setBounds, setOpen } = useSessionManagerWindow()
++/** A movable, resizable window or draggable bubble on desktop and mobile. */
++export function SessionManagerWindow({ children, count = 0 }: { children: ReactNode; count?: number }) {
++    const { open, collapsed, bounds, bubble, setBounds, setBubble, setOpen, setCollapsed } = useSessionManagerWindow()
++    const [view, setView] = useState(viewport)
+     const titleId = useId()
+-    const moveButton = useRef<HTMLButtonElement>(null)
+-    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize'; x: number; y: number; bounds: WindowBounds } | null>(null)
+-    const current = useRef(bounds)
+-    current.current = bounds
++    const focusTarget = useRef<HTMLButtonElement>(null)
++    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize' | 'bubble'; x: number; y: number; bounds: WindowBounds } | null>(null)
++    const suppressBubbleClick = useRef(false)
++    const current = useRef({ bounds, bubble })
++    current.current = { bounds, bubble }
+     useEffect(() => {
+         if (!open) return
+-        const fit = () => setBounds(fitSessionWindow(current.current ?? initialBounds()))
+-        fit(); moveButton.current?.focus({ preventScroll: true })
++        const fit = () => {
++            const nextView = viewport(); setView(nextView)
++            if (collapsed) setBubble(fitSessionBubble(current.current.bubble ?? initialBubble(), nextView))
++            else setBounds(fitSessionWindow(current.current.bounds ?? initialBounds(), nextView))
++        }
++        fit(); focusTarget.current?.focus({ preventScroll: true })
+         window.addEventListener('resize', fit)
+         window.visualViewport?.addEventListener('resize', fit)
+         window.visualViewport?.addEventListener('scroll', fit)
+@@ -50,56 +77,92 @@
+             window.visualViewport?.removeEventListener('resize', fit)
+             window.visualViewport?.removeEventListener('scroll', fit)
+         }
+-        // Setters operate on the shared page cache, not captured bounds.
++        // Cache setters use the latest state; viewport handlers read refs.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+-    }, [open])
+-    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize') => {
++    }, [open, collapsed])
++    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize' | 'bubble') => {
+         if (event.button !== 0 || gesture.current) return
+-        event.preventDefault()
+-        event.currentTarget.focus({ preventScroll: true })
+-        event.currentTarget.setPointerCapture(event.pointerId)
+-        gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: fitSessionWindow(current.current ?? initialBounds()) }
++        // Touch already has implicit capture; touch-action:none handles dragging.
++        // Preserve native taps instead of cancelling/focusing touch pointerdown.
++        if (event.pointerType !== 'touch') {
++            event.preventDefault()
++            event.currentTarget.focus({ preventScroll: true })
++            event.currentTarget.setPointerCapture(event.pointerId)
++        }
++        suppressBubbleClick.current = false
++        const rect = kind === 'bubble' ? { ...fitSessionBubble(current.current.bubble ?? initialBubble()), ...BUBBLE } : fitSessionWindow(current.current.bounds ?? initialBounds())
++        gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: rect }
+     }
+     const move = (event: PointerEvent<HTMLButtonElement>) => {
+         const start = gesture.current
+         if (!start || start.pointer !== event.pointerId) return
+         const dx = event.clientX - start.x, dy = event.clientY - start.y
++        if (start.kind === 'bubble') {
++            if (Math.hypot(dx, dy) > 5) {
++                suppressBubbleClick.current = true
++                if (event.pointerType !== 'touch') event.currentTarget.setPointerCapture(event.pointerId)
++            }
++            if (suppressBubbleClick.current) setBubble(fitSessionBubble({ x: start.bounds.x + dx, y: start.bounds.y + dy }))
++            return
++        }
+         const next = start.kind === 'move'
+             ? { ...start.bounds, x: start.bounds.x + dx, y: start.bounds.y + dy }
+             : { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
+-        // Resizing stays anchored at the window's top-left corner.
+         const view = viewport()
+         if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
+         setBounds(fitSessionWindow(next))
+     }
+     const end = (event: PointerEvent<HTMLButtonElement>) => {
+         if (gesture.current?.pointer !== event.pointerId) return
++        if (event.type === 'pointercancel') suppressBubbleClick.current = true
+         gesture.current = null
+-        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
++        // Native touch capture is released by the browser.
++        if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+     }
+-    const keyboard = (event: React.KeyboardEvent, kind: 'move' | 'resize') => {
++    const keyboard = (event: KeyboardEvent, kind: 'move' | 'resize' | 'bubble') => {
+         if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+         event.preventDefault()
+-        const step = event.shiftKey ? 40 : 10, next = { ...(current.current ?? initialBounds()) }
++        const step = event.shiftKey ? 40 : 10
+         const horizontal = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+         const change = (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1) * step
++        if (kind === 'bubble') {
++            const next = { ...(current.current.bubble ?? initialBubble()) }
++            next[horizontal ? 'x' : 'y'] += change
++            setBubble(fitSessionBubble(next)); return
++        }
++        const next = { ...(current.current.bounds ?? initialBounds()) }
+         if (kind === 'move') next[horizontal ? 'x' : 'y'] += change
+         else next[horizontal ? 'width' : 'height'] += change
+         setBounds(fitSessionWindow(next))
+     }
+     if (!open) return null
+-    const rect = fitSessionWindow(bounds ?? initialBounds())
+     const pointerEvents = { onPointerMove: move, onPointerUp: end, onPointerCancel: end, onLostPointerCapture: () => { gesture.current = null } }
++    const close = <button type="button" aria-label="Close Session Manager" onClick={() => setOpen(false)} className="h-11 w-11 shrink-0 rounded-full text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++    if (collapsed) {
++        const position = fitSessionBubble(bubble ?? initialBubble(), view)
++        return createPortal(<aside aria-label="Session Manager bubble" onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false) } }}
++            className="fixed z-[45] flex items-center overflow-hidden rounded-full border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-lg"
++            style={{ left: position.x, top: position.y, ...BUBBLE }}>
++            <button ref={focusTarget} type="button" aria-label="Expand Session Manager" title={`Session Manager · ${count} sessions · drag to move`} onPointerDown={event => start(event, 'bubble')} {...pointerEvents}
++                onKeyDown={event => keyboard(event, 'bubble')} onClick={event => { if (!suppressBubbleClick.current || event.detail === 0) setCollapsed(false); suppressBubbleClick.current = false }}
++                className="flex h-full min-w-0 flex-1 touch-none select-none items-center justify-center gap-1.5 rounded-full cursor-grab active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-5 w-5"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
++                <span className="text-xs tabular-nums">{count}</span>
++            </button>{close}
++        </aside>, document.body)
++    }
++    const rect = fitSessionWindow(bounds ?? initialBounds(), view)
+     return createPortal(<section role="dialog" aria-modal="false" aria-labelledby={titleId}
+-        onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setOpen(false) } }}
++        onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="fixed z-[45] flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+         <header className="flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
+-            <button ref={moveButton} type="button" aria-label="Move Session Manager" title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
++            <button ref={focusTarget} type="button" aria-label="Move Session Manager" title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">Session Manager</span>
+             </button>
+-            <button type="button" aria-label="Close Session Manager" onClick={() => setOpen(false)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++            <button type="button" aria-label="Collapse Session Manager" title="Collapse to bubble" onClick={() => setCollapsed(true)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">−</button>
++            {close}
+         </header>
+         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7">{children}</div>
+         <button type="button" aria-label="Resize Session Manager" title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
+--- a/web/src/components/SessionManagerWindow.test.tsx
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -1,13 +1,17 @@
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+-import { SessionManagerWindow, fitSessionWindow, useSessionManagerWindow } from './SessionManagerWindow'
++import { SessionManagerWindow, fitSessionWindow, fitSessionBubble, useSessionManagerWindow } from './SessionManagerWindow'
+ 
++const mediaListeners = new Set<() => void>()
+ beforeEach(() => {
++    mediaListeners.clear()
++    vi.stubGlobal('matchMedia', () => ({ get matches() { return window.innerWidth <= 640 }, addEventListener: (_: string, listener: () => void) => mediaListeners.add(listener), removeEventListener: (_: string, listener: () => void) => mediaListeners.delete(listener) }))
+     vi.stubGlobal('innerWidth', 1200); vi.stubGlobal('innerHeight', 900)
+     vi.stubGlobal('PointerEvent', class extends MouseEvent {
+         pointerId: number
+-        constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1 }
++        pointerType: string
++        constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1; this.pointerType = init.pointerType ?? 'mouse' }
+     })
+     HTMLElement.prototype.setPointerCapture = vi.fn()
+     HTMLElement.prototype.hasPointerCapture = vi.fn(() => false)
+@@ -40,7 +44,7 @@
+     await waitFor(() => expect(geometry().x).toBe(first.x - 200)); expect(geometry().y).toBe(first.y + 60)
+     fireEvent.pointerUp(title, { pointerId: 1 })
+     const before = geometry(), handle = screen.getByRole('button', { name: 'Resize Session Manager' })
+-    fireEvent.pointerDown(handle, { pointerId: 2, pointerType: 'touch', button: 0, clientX: 900, clientY: 600 })
++    expect(fireEvent.pointerDown(handle, { pointerId: 2, pointerType: 'touch', button: 0, clientX: 900, clientY: 600 })).toBe(true)
+     fireEvent.pointerMove(handle, { pointerId: 2, pointerType: 'touch', clientX: 1000, clientY: 650 })
+     await waitFor(() => expect(geometry().width).toBe(before.width + 100)); expect(geometry().height).toBe(before.height + 50)
+     fireEvent.pointerCancel(handle, { pointerId: 2 }); const cancelled = geometry()
+@@ -54,10 +58,12 @@
+     await waitFor(() => expect(geometry().height).toBe(550))
+     const before = geometry(); fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); await open(); expect(geometry()).toEqual(before)
+     first.unmount(); setup(client); expect(geometry()).toEqual(before)
+-    vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 400); fireEvent(window, new Event('resize'))
++    act(() => { vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 400); window.dispatchEvent(new Event('resize')); mediaListeners.forEach(listener => listener()) })
+     await waitFor(() => expect(geometry().width).toBeLessThanOrEqual(374))
+     const after = geometry(); expect(after.x).toBeGreaterThanOrEqual(8); expect(after.y).toBeGreaterThanOrEqual(8)
+     expect(after.x + after.width).toBeLessThanOrEqual(382); expect(after.y + after.height).toBeLessThanOrEqual(392)
++    expect(screen.getByRole('button', { name: 'Resize Session Manager' })).toBeInTheDocument()
++
+ })
+ it('clamps geometry to narrow phones and keyboard-sized viewports', () => {
+     for (const view of [{ x: 0, y: 0, width: 390, height: 844 }, { x: 5, y: 100, width: 230, height: 180 }]) {
+@@ -67,3 +73,44 @@
+         expect(fitted.y + fitted.height).toBeLessThanOrEqual(view.y + view.height - 8)
+     }
+ })
++
++
++const collapse = async () => { fireEvent.click(screen.getByRole('button', { name: 'Collapse Session Manager' })); await screen.findByLabelText('Session Manager bubble') }
++const bubblePosition = () => { const bubble = screen.getByLabelText('Session Manager bubble'); return { x: parseFloat(bubble.style.left), y: parseFloat(bubble.style.top) } }
++it('collapses, drags without expanding, expands on tap and closes from the bubble', async () => {
++    setup(); await open(); const original = geometry(); await collapse()
++    expect(screen.queryByRole('dialog')).toBeNull()
++    const handle = screen.getByRole('button', { name: 'Expand Session Manager' }), before = bubblePosition()
++    fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 1100, clientY: 750 })
++    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 900, clientY: 650 })
++    await waitFor(() => expect(bubblePosition()).toEqual({ x: before.x - 200, y: before.y - 100 }))
++    fireEvent.pointerUp(handle, { pointerId: 1 }); fireEvent.click(handle, { detail: 1 })
++    expect(screen.queryByRole('dialog')).toBeNull()
++    fireEvent.pointerDown(handle, { pointerId: 2, button: 0, clientX: 900, clientY: 650 })
++    fireEvent.pointerUp(handle, { pointerId: 2 }); fireEvent.click(handle, { detail: 1 })
++    await screen.findByRole('dialog'); expect(geometry()).toEqual(original)
++    await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: before.y - 100 })
++    fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
++    await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
++    await open(); expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++})
++it('keeps phone resizing and the movable bubble after remount', async () => {
++    vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 844)
++    const client = new QueryClient(), first = setup(client); await open()
++    const original = geometry()
++    expect(original.width).toBeLessThan(390)
++    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'false')
++    expect(screen.getByRole('button', { name: 'Move Session Manager' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Resize Session Manager' })).toBeInTheDocument()
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Resize Session Manager' }), { key: 'ArrowUp' })
++    await waitFor(() => expect(geometry().height).toBe(original.height - 10))
++    const resized = geometry()
++    await collapse()
++    const initial = bubblePosition()
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Expand Session Manager' }), { key: 'ArrowLeft', shiftKey: true })
++    await waitFor(() => expect(bubblePosition().x).toBe(initial.x - 40))
++    first.unmount(); setup(client); expect(bubblePosition().x).toBe(initial.x - 40)
++    fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
++    await screen.findByRole('dialog'); expect(geometry()).toEqual(resized)
++    expect(fitSessionBubble({ x: -100, y: 900 }, { x: 0, y: 0, width: 390, height: 844 })).toEqual({ x: 8, y: 788 })
++})
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -2,7 +2,7 @@
+ import { Fragment, useEffect, useMemo, useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+-import { SessionManagerWindow, useSessionManagerWindow } from './SessionManagerWindow'
++import { SessionManagerWindow, useSessionManagerWindow, useSessionManagerMobile } from './SessionManagerWindow'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { sessionHasWork } from '@/lib/sessionManager'
+@@ -40,7 +40,8 @@
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+     const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+-    const { open } = useSessionManagerWindow()
++    const { open, setCollapsed } = useSessionManagerWindow()
++    const mobile = useSessionManagerMobile()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+     const { entries, dismiss, markStopped } = useSessionManager(props.sessions, currentManaged)
+@@ -54,7 +55,7 @@
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+-        {open && <SessionManagerWindow>
++        {open && <SessionManagerWindow count={rows.length}>
+             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+                 <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+                     {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+@@ -74,7 +75,7 @@
+                     {index > 0 && isPinned(visibleRows[index - 1]!.session) && !isPinned(session) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+                     <div className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+                         <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -258,3 +258,22 @@
+     await waitFor(() => expect(order()).toEqual(['Open Global pin', 'Open Unpinned', 'Open Local pin']))
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++
++it('collapses to a bubble on mobile chat selection while preserving filters and counts', async () => {
++    const original = window.matchMedia
++    window.matchMedia = vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })) as unknown as typeof window.matchMedia
++    try {
++        const client = new QueryClient(), select = vi.fn()
++        render(fixture(client, [session('Codex'), session('Claude')], select)); open()
++        await screen.findByRole('button', { name: 'Open Codex' })
++        fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Open Codex' }))
++        await screen.findByLabelText('Session Manager bubble')
++        expect(select).toHaveBeenCalledWith('Codex'); expect(screen.queryByRole('dialog')).toBeNull()
++        expect(screen.getByRole('button', { name: 'Expand Session Manager' })).toHaveTextContent('2')
++        fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
++        await screen.findByRole('dialog'); expect(screen.getByRole('button', { name: 'Active', pressed: true })).toBeInTheDocument()
++        expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++    } finally { window.matchMedia = original }
++})

@@ -1,0 +1,204 @@
+diff --git a/web/src/index.css b/web/src/index.css
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -802,16 +802,15 @@
+ .app-section-header [aria-label^="Close "] { min-height: 0; max-height: 2rem; }
+ .app-section-header button { flex-shrink: 0; min-height: 0; max-height: 2rem; }
+ [data-session-header] .flex-1 { flex-shrink: 1; }
+-.chat-selector-card {
+-    margin: .5rem 0 .5rem .5rem;
+-    border: 1px solid var(--app-border);
+-    border-radius: .75rem;
+-    box-shadow: 0 6px 22px #0002;
++.chat-selector-panel {
++    margin: 0;
++    border-right: 1px solid var(--app-border);
++    border-radius: 0;
+ }
+ .chat-panel-arrow {
+     position: absolute;
+     z-index: 35;
+-    top: 75%;
++    top: 25%;
+     transform: translateY(-50%);
+     align-items: center;
+     justify-content: center;
+@@ -833,7 +832,7 @@
+     .chat-detail-card { margin: .5rem; border: 1px solid var(--app-border); border-radius: .75rem; overflow: hidden; box-shadow: 0 6px 22px #0002; }
+ }
+ 
+-/* Centered chat tools and a docked selector card below the chat chrome. */
++/* Centered chat tools inside the conversation column. */
+ .chat-header-row {
+     display: grid;
+     grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+@@ -843,21 +842,3 @@
+     min-width: 0;
+     height: 100%;
+ }
+-.sessions-chrome-host:empty { display: none; }
+-@media (min-width: 920px) {
+-    .sessions-layout:has(> .sessions-chrome-host:not(:empty)) {
+-        margin: .5rem;
+-        height: calc(100% - 1rem);
+-        min-width: 0;
+-        overflow: hidden;
+-        border: 1px solid var(--app-border);
+-        border-radius: .75rem;
+-        box-shadow: 0 6px 22px #0002;
+-    }
+-    .sessions-layout:has(> .sessions-chrome-host:not(:empty)) .chat-detail-card {
+-        margin: 0;
+-        border: 0;
+-        border-radius: 0;
+-        box-shadow: none;
+-    }
+-}
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -1,4 +1,3 @@
+-import { ChatChromeLayout } from '@/components/ChatChromeLayout'
+ import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { useQueryClient } from '@tanstack/react-query'
+@@ -222,12 +221,11 @@
+ 
+     return (
+         <>
+-            <ChatChromeLayout>
+-            <div className="sessions-shell relative flex min-h-0 flex-1 touch-pan-y split:touch-auto" {...mobileSidebar.handlers}>
++            <div className="sessions-shell relative flex h-full min-h-0 touch-pan-y split:touch-auto" {...mobileSidebar.handlers}>
+             {mobileSidebar.open && !isSessionsIndex ? <button type="button" aria-label="Close chat panel" onClick={mobileSidebar.close}
+                 className="absolute inset-0 z-30 bg-black/30 split:hidden" /> : null}
+             <div
+-                className={`${isSessionsIndex ? 'relative flex w-[calc(100%_-_1rem)]' : mobileSidebar.open ? 'absolute inset-y-0 left-0 z-40 flex w-[min(85vw,420px)] shadow-xl split:relative split:z-auto split:shadow-none' : 'relative hidden split:flex w-full'} ${sidebar.collapsed ? 'split:hidden!' : ''} chat-selector-card shrink-0 flex-col bg-[var(--app-bg)]`}
++                className={`${isSessionsIndex ? 'relative flex w-full' : mobileSidebar.open ? 'absolute inset-y-0 left-0 z-40 flex w-[min(85vw,420px)] split:relative split:z-auto' : 'relative hidden split:flex w-full'} ${sidebar.collapsed ? 'split:hidden!' : ''} chat-selector-panel shrink-0 flex-col bg-[var(--app-bg)]`}
+                 data-chat-panel
+                 aria-label="Chats panel"
+                 style={{ '--sidebar-w': `${sidebar.width}px` } as React.CSSProperties}
+@@ -304,7 +302,6 @@
+                 </div>
+             </div>
+             </div>
+-            </ChatChromeLayout>
+         </>
+     )
+ }
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,4 +1,3 @@
+-import { ChatChrome } from '@/components/ChatChromeLayout'
+ import { SessionFailureBanner } from '@/components/SessionFailureBanner'
+ import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { editHistoryPrompt } from '@/lib/history-prompt'
+@@ -1931,7 +1930,7 @@
+     const managedSessions = useManagedSessions(props.api)
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+-            <ChatChrome>
++            <div className="shrink-0">
+             {agentFlavor === 'claude' && claudeCatalog.isError && <div role="status" className="px-3 text-sm text-[var(--app-hint)]">Live Claude model discovery unavailable. Showing fallback aliases; check CLI authentication.</div>}
+             <ManualPauseBanner api={props.api} sessionId={props.session.id} />
+             <SessionHeader
+@@ -1978,7 +1977,7 @@
+                 hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+             />
+ 
+-            </ChatChrome>
++            </div>
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+                 <TeamPanel teamState={props.session.teamState} />
+diff --git a/web/src/components/ChatChromeLayout.tsx b/web/src/components/ChatChromeLayout.tsx
+deleted file mode 100644
+--- a/web/src/components/ChatChromeLayout.tsx
++++ /dev/null
+@@ -1,30 +0,0 @@
+-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+-import { createPortal } from 'react-dom'
+-
+-const ChromeHost = createContext<HTMLElement | null>(null)
+-const splitQuery = '(min-width: 920px)'
+-
+-/** On desktop, only the conversation/composer share width with the docked selector. */
+-export function ChatChromeLayout({ children }: { children: ReactNode }) {
+-    const [host, setHost] = useState<HTMLDivElement | null>(null)
+-    const [desktop, setDesktop] = useState(() => typeof window !== 'undefined' && window.matchMedia(splitQuery).matches)
+-    useEffect(() => {
+-        const media = window.matchMedia(splitQuery)
+-        const change = () => setDesktop(media.matches)
+-        change(); media.addEventListener('change', change)
+-        return () => media.removeEventListener('change', change)
+-    }, [])
+-    return <ChromeHost.Provider value={desktop ? host : null}>
+-        <div className="sessions-layout flex h-full min-h-0 flex-col">
+-            <div ref={setHost} data-chat-chrome-host className="sessions-chrome-host hidden shrink-0 split:block" />
+-            {children}
+-        </div>
+-    </ChromeHost.Provider>
+-}
+-
+-/** Keep runtime/composer mounted; only the chrome changes host at the breakpoint. */
+-export function ChatChrome({ children }: { children: ReactNode }) {
+-    const host = useContext(ChromeHost)
+-    const chrome = <div data-chat-chrome className="shrink-0">{children}</div>
+-    return host ? createPortal(chrome, host) : chrome
+-}
+diff --git a/web/src/components/ChatChromeLayout.test.tsx b/web/src/components/ChatChromeLayout.test.tsx
+deleted file mode 100644
+--- a/web/src/components/ChatChromeLayout.test.tsx
++++ /dev/null
+@@ -1,51 +0,0 @@
+-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+-import { useEffect, type ReactNode } from 'react'
+-import { afterEach, expect, it, vi } from 'vitest'
+-import { ChatChrome, ChatChromeLayout } from './ChatChromeLayout'
+-
+-afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+-function media(initial: boolean) {
+-    let desktop = initial
+-    const listeners = new Set<() => void>()
+-    const query = { get matches() { return desktop }, addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+-        removeEventListener: (_: string, listener: () => void) => listeners.delete(listener) }
+-    vi.stubGlobal('matchMedia', vi.fn(() => query))
+-    return { set: (value: boolean) => act(() => { desktop = value; listeners.forEach(listener => listener()) }), listeners }
+-}
+-const disposed = vi.fn()
+-function Conversation() {
+-    useEffect(() => () => disposed(), [])
+-    return <div data-testid="conversation"><ChatChrome><header>Chat header</header><section>Activity</section></ChatChrome><input aria-label="Draft" /></div>
+-}
+-function Fixture({ collapsed = false }: { collapsed?: boolean }) {
+-    return <ChatChromeLayout><div data-testid="body" className="sessions-shell">
+-        {!collapsed && <aside>Chat selector</aside>}<Conversation />
+-    </div></ChatChromeLayout>
+-}
+-it('places desktop header/activity above both columns, preserving the body when the selector collapses', () => {
+-    media(true);disposed.mockClear()
+-    const view = render(<Fixture />), body = screen.getByTestId('body'), draft = screen.getByRole('textbox', { name: 'Draft' })
+-    const host = view.container.querySelector('[data-chat-chrome-host]')!
+-    expect(host).toContainElement(screen.getByText('Chat header'));expect(host).toContainElement(screen.getByText('Activity'))
+-    expect(body).not.toContainElement(screen.getByText('Chat header'))
+-    expect(host.parentElement).toBe(body.parentElement)
+-    fireEvent.change(draft, { target: { value: 'Do not remount my draft' } })
+-    view.rerender(<Fixture collapsed />)
+-    expect(screen.getByRole('textbox', { name: 'Draft' })).toBe(draft)
+-    expect(draft).toHaveValue('Do not remount my draft');expect(disposed).not.toHaveBeenCalled()
+-})
+-it('keeps mobile chrome inline and moves only chrome at the breakpoint, retaining conversation state', () => {
+-    const viewport = media(false);disposed.mockClear()
+-    const view = render(<Fixture />), body = screen.getByTestId('body'), draft = screen.getByRole('textbox', { name: 'Draft' })
+-    const host = view.container.querySelector('[data-chat-chrome-host]')!
+-    expect(host).toBeEmptyDOMElement();expect(body).toContainElement(screen.getByText('Chat header'))
+-    fireEvent.change(draft, { target: { value: 'Retained across sizes' } })
+-    viewport.set(true);expect(host).toContainElement(screen.getByText('Chat header'));expect(body).not.toContainElement(screen.getByText('Activity'))
+-    viewport.set(false);expect(host).toBeEmptyDOMElement();expect(body).toContainElement(screen.getByText('Activity'))
+-    expect(screen.getByRole('textbox', { name: 'Draft' })).toBe(draft);expect(draft).toHaveValue('Retained across sizes')
+-    expect(disposed).not.toHaveBeenCalled();view.unmount();expect(viewport.listeners.size).toBe(0)
+-})
+-it('retains inline chrome when a standalone chat has no shared layout host', () => {
+-    render(<div data-testid="standalone"><ChatChrome><header>Standalone header</header></ChatChrome></div>)
+-    expect(screen.getByTestId('standalone')).toContainElement(screen.getByText('Standalone header'))
+-})

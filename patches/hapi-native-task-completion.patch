@@ -1,0 +1,317 @@
+diff --git a/hub/src/sync/backgroundTasks.ts b/hub/src/sync/backgroundTasks.ts
+index 6c969c0..afa812b 100644
+--- a/hub/src/sync/backgroundTasks.ts
++++ b/hub/src/sync/backgroundTasks.ts
+@@ -31,7 +31,7 @@ export function extractBackgroundTaskDelta(messageContent: unknown): BackgroundT
+         const text = textOf(isObject(data.message) ? data.message.content : data.content).trimStart()
+         if (text.startsWith('<task-notification>')) {
+             const status = text.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
+-            if (!status || ['completed', 'failed', 'stopped', 'cancelled'].includes(status)) {
++            if (!status || ['completed', 'failed', 'stopped', 'cancelled', 'killed'].includes(status)) {
+                 const id = text.match(/<task-id>\s*([^<]+?)\s*<\/task-id>/)?.[1]
+                 if (id) completedIds.add(id)
+                 else anonymousCompleted++
+@@ -40,7 +40,7 @@ export function extractBackgroundTaskDelta(messageContent: unknown): BackgroundT
+     }
+     if (data.type === 'system' && typeof data.task_id === 'string') {
+         if (data.subtype === 'task_started') startedIds.add(data.task_id)
+-        if (data.subtype === 'task_notification' && ['completed', 'failed', 'stopped', 'cancelled'].includes(String(data.status))) completedIds.add(data.task_id)
++        if (data.subtype === 'task_notification' && ['completed', 'failed', 'stopped', 'cancelled', 'killed'].includes(String(data.status))) completedIds.add(data.task_id)
+     }
+     if (!startedIds.size && !completedIds.size && !anonymousCompleted) return null
+     return { started: startedIds.size, completed: completedIds.size + anonymousCompleted, startedIds: [...startedIds], completedIds: [...completedIds] }
+diff --git a/hub/src/sync/claudeTaskCompletion.test.ts b/hub/src/sync/claudeTaskCompletion.test.ts
+new file mode 100644
+index 0000000..ba942ab
+--- /dev/null
++++ b/hub/src/sync/claudeTaskCompletion.test.ts
+@@ -0,0 +1,45 @@
++import { afterEach, describe, expect, it } from 'bun:test'
++import { mkdtemp, mkdir, appendFile, writeFile, rm } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { ClaudeTaskCompletionReader, claudeTaskCompletion } from './claudeTaskCompletion'
++const id = 'add4c8b7-55f5-53a1-a65a-bc9acca8a2b7'
++const notification = (task: string, status = 'completed') => `<task-notification><task-id>${task}</task-id><status>${status}</status></task-notification>`
++const event = (task: string, status = 'completed') => ({ type: 'queue-operation', operation: 'enqueue', content: notification(task, status) })
++const roots: string[] = []
++afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }) })
++describe('native Claude task completions', () => {
++    it('recognizes enqueued, transcript-only user and absorbed attachment notifications', () => {
++        expect(claudeTaskCompletion(event('a'))).toBe('a')
++        expect(claudeTaskCompletion({ type: 'user', origin: { kind: 'task-notification' }, message: { content: notification('b', 'stopped') } })).toBe('b')
++        expect(claudeTaskCompletion({ type: 'attachment', attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: notification('c', 'failed') } })).toBe('c')
++        expect(claudeTaskCompletion(event('d', 'killed'))).toBe('d')
++    })
++    it('does not treat arbitrary user prose, quoted results or running events as completion', () => {
++        expect(claudeTaskCompletion({ type: 'user', message: { content: notification('a') } })).toBeNull()
++        expect(claudeTaskCompletion({ ...event('a'), operation: 'remove' })).toBeNull()
++        expect(claudeTaskCompletion(event('a', 'running'))).toBeNull()
++        expect(claudeTaskCompletion({ ...event('a'), content: 'quoted ' + notification('a') })).toBeNull()
++    })
++    it('reads incrementally, deduplicates, retries partial writes, handles CRLF and truncation', async () => {
++        const root = await mkdtemp(join(tmpdir(), 'claude-task-test-')); roots.push(root)
++        await mkdir(join(root, 'project'))
++        const path = join(root, 'project', `${id}.jsonl`)
++        await writeFile(path, JSON.stringify(event('a')) + '\r\n' + '{bad}\n')
++        const reader = new ClaudeTaskCompletionReader(id, root)
++        expect(await reader.read()).toEqual(['a'])
++        expect(await reader.read()).toEqual(['a'])
++        const next = JSON.stringify(event('b'))
++        await appendFile(path, next.slice(0, 20))
++        expect(await reader.read()).toEqual(['a'])
++        await appendFile(path, next.slice(20) + '\n' + JSON.stringify(event('a')) + '\n')
++        expect(await reader.read()).toEqual(['a', 'b'])
++        await writeFile(path, JSON.stringify(event('c')) + '\n')
++        expect(await reader.read()).toEqual(['c'])
++    })
++    it('rejects invalid native identities and missing transcripts', async () => {
++        const root = await mkdtemp(join(tmpdir(), 'claude-task-empty-')); roots.push(root)
++        expect(await new ClaudeTaskCompletionReader('../other', root).read()).toEqual([])
++        expect(await new ClaudeTaskCompletionReader(id, root).read()).toEqual([])
++    })
++})
+diff --git a/hub/src/sync/claudeTaskCompletion.ts b/hub/src/sync/claudeTaskCompletion.ts
+new file mode 100644
+index 0000000..6c45cd1
+--- /dev/null
++++ b/hub/src/sync/claudeTaskCompletion.ts
+@@ -0,0 +1,72 @@
++import { createReadStream } from 'node:fs'
++import { readdir, stat } from 'node:fs/promises'
++import { homedir } from 'node:os'
++import { join } from 'node:path'
++import { isObject } from '@hapi/protocol'
++
++const NATIVE_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
++const TERMINAL = new Set(['completed', 'failed', 'stopped', 'cancelled', 'killed'])
++
++/** Native notifications can be transcript-only and never reach the SDK stream. */
++export function claudeTaskCompletion(record: unknown): string | null {
++    if (!isObject(record)) return null
++    let text: unknown
++    if (record.type === 'queue-operation' && record.operation === 'enqueue') text = record.content
++    if (record.type === 'attachment' && isObject(record.attachment)
++        && record.attachment.type === 'queued_command' && record.attachment.commandMode === 'task-notification') text = record.attachment.prompt
++    if (record.type === 'user' && isObject(record.origin) && record.origin.kind === 'task-notification'
++        && isObject(record.message)) text = record.message.content
++    if (typeof text !== 'string' || !text.trimStart().startsWith('<task-notification>')) return null
++    const status = text.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
++    const id = text.match(/<task-id>\s*([\w-]+)\s*<\/task-id>/)?.[1]
++    return id && status && TERMINAL.has(status) ? id : null
++}
++
++/** Incremental, asynchronous transcript reader; no prompt, tool execution, or controller attachment. */
++export class ClaudeTaskCompletionReader {
++    private path: string | null = null
++    private offset = 0
++    private inode: number | null = null
++    private completed = new Set<string>()
++    constructor(private readonly nativeId: string, private readonly projects = join(homedir(), '.claude', 'projects')) {}
++
++    async read(): Promise<string[]> {
++        if (!NATIVE_ID.test(this.nativeId)) return []
++        if (!this.path) {
++            for (const dir of await readdir(this.projects, { withFileTypes: true })) {
++                if (!dir.isDirectory()) continue
++                const candidate = join(this.projects, dir.name, `${this.nativeId}.jsonl`)
++                try { if ((await stat(candidate)).isFile()) { this.path = candidate; break } } catch {}
++            }
++        }
++        if (!this.path) return []
++        const info = await stat(this.path)
++        if (!info.isFile()) return []
++        if (info.ino !== this.inode || info.size < this.offset) {
++            this.offset = 0; this.completed.clear(); this.inode = info.ino
++        }
++        if (info.size > this.offset) {
++            const start = this.offset
++            let consumed = 0
++            // Snapshot the end so continuously appended output cannot extend this read forever.
++            let pending = Buffer.alloc(0)
++            for await (const chunk of createReadStream(this.path, { start, end: info.size - 1 })) {
++                pending = Buffer.concat([pending, chunk as Buffer])
++                let newline: number
++                while ((newline = pending.indexOf(10)) >= 0) {
++                    const line = pending.subarray(0, newline).toString('utf8')
++                    consumed += newline + 1
++                    pending = pending.subarray(newline + 1)
++                    if (!line.includes('task-notification')) continue
++                    try {
++                        const id = claudeTaskCompletion(JSON.parse(line))
++                        if (id) this.completed.add(id)
++                    } catch {}
++                }
++            }
++            this.offset = start + consumed
++        }
++        // Return the set even on unchanged files: starts may arrive after their completion.
++        return [...this.completed]
++    }
++}
+diff --git a/hub/src/sync/sessionCache.backgroundTasks.test.ts b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+index 8dbe6fd..44c2f11 100644
+--- a/hub/src/sync/sessionCache.backgroundTasks.test.ts
++++ b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+@@ -36,3 +36,54 @@ describe('SessionCache background task recovery', () => {
+         expect(restarted.getSession(session.id)?.backgroundTaskCount).toBe(0)
+     })
+ })
++
++describe('native transcript reconciliation on keepalive', () => {
++    it('removes only native-confirmed terminal tasks without prompting or ending the controller', async () => {
++        const { spyOn } = await import('bun:test')
++        const { ClaudeTaskCompletionReader } = await import('./claudeTaskCompletion')
++        const previous = process.env.HAPI_LOCAL_CATALOG_MACHINE
++        process.env.HAPI_LOCAL_CATALOG_MACHINE = 'local-test'
++        const read = spyOn(ClaudeTaskCompletionReader.prototype, 'read').mockResolvedValue(['finished'])
++        try {
++            const store = new Store(':memory:')
++            const cache = new SessionCache(store, { emit: () => {} } as unknown as EventPublisher)
++            const session = cache.getOrCreateSession('native-bg', { path: '/tmp', host: 'test', machineId: 'local-test', claudeSessionId: 'add4c8b7-55f5-53a1-a65a-bc9acca8a2b7' }, null, 'default')
++            store.messages.addMessage(session.id, taskStart('finished'))
++            store.messages.addMessage(session.id, taskStart('still-running'))
++            cache.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++            await new Promise(resolve => setTimeout(resolve, 0))
++            expect(read).toHaveBeenCalledTimes(1)
++            expect(cache.getSession(session.id)).toMatchObject({ active: true, thinking: false, backgroundTaskCount: 1 })
++            cache.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++            expect(read).toHaveBeenCalledTimes(1)
++        } finally {
++            read.mockRestore()
++            if (previous === undefined) delete process.env.HAPI_LOCAL_CATALOG_MACHINE
++            else process.env.HAPI_LOCAL_CATALOG_MACHINE = previous
++        }
++    })
++    it('skips remote sessions and retains tasks when native evidence is unavailable', async () => {
++        const { spyOn } = await import('bun:test')
++        const { ClaudeTaskCompletionReader } = await import('./claudeTaskCompletion')
++        const previous = process.env.HAPI_LOCAL_CATALOG_MACHINE
++        process.env.HAPI_LOCAL_CATALOG_MACHINE = 'local-test'
++        const read = spyOn(ClaudeTaskCompletionReader.prototype, 'read').mockRejectedValue(new Error('unavailable'))
++        try {
++            const store = new Store(':memory:')
++            const cache = new SessionCache(store, { emit: () => {} } as unknown as EventPublisher)
++            for (const [key, machineId, namespace] of [['remote', 'other-machine', 'default'], ['namespace', 'local-test', 'other'], ['local', 'local-test', 'default']]) {
++                const session = cache.getOrCreateSession(key, { path: '/tmp', host: 'test', machineId, claudeSessionId: 'add4c8b7-55f5-53a1-a65a-bc9acca8a2b7' }, null, namespace)
++                store.messages.addMessage(session.id, taskStart('unfinished'))
++                cache.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++                await new Promise(resolve => setTimeout(resolve, 0))
++                expect(cache.getSession(session.id)?.backgroundTaskCount).toBe(1)
++            }
++            expect(read).toHaveBeenCalledTimes(1)
++        } finally {
++            read.mockRestore()
++            if (previous === undefined) delete process.env.HAPI_LOCAL_CATALOG_MACHINE
++            else process.env.HAPI_LOCAL_CATALOG_MACHINE = previous
++        }
++    })
++
++})
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+index a9ac7bd..07787cc 100644
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -6,6 +6,8 @@ import { EventPublisher } from './eventPublisher'
+ import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
+ import { extractBackgroundTaskDelta, BackgroundTaskTracker, type BackgroundTaskDelta } from './backgroundTasks'
+ 
++import { ClaudeTaskCompletionReader } from './claudeTaskCompletion'
++
+ const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
+ // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
+ // restoreSessionArchiveMetadata) retry on version-mismatch with a fresh cache
+@@ -16,6 +18,7 @@ type RuntimeConfigKey = 'permissionMode' | 'model' | 'modelReasoningEffort' | 'e
+ 
+ export class SessionCache {
+     private readonly sessions: Map<string, Session> = new Map()
++    private readonly nativeTaskReaders = new Map<string, { nativeId: string; reader: ClaudeTaskCompletionReader; busy: boolean; checkedAt: number }>()
+     private readonly backgroundTasks = new Map<string, BackgroundTaskTracker>()
+     private readonly lastBroadcastAtBySessionId: Map<string, number> = new Map()
+     private readonly todoBackfillAttemptedSessionIds: Set<string> = new Set()
+@@ -128,6 +131,7 @@ export class SessionCache {
+         let stored = this.store.sessions.getSession(sessionId)
+         if (!stored) {
+             this.backgroundTasks.delete(sessionId)
++            this.nativeTaskReaders.delete(sessionId)
+             const existed = this.sessions.delete(sessionId)
+             this.pendingThinkingUntilBySessionId.delete(sessionId)
+             this.runtimeConfigUpdatedAtBySessionId.delete(sessionId)
+@@ -257,6 +261,7 @@ export class SessionCache {
+         if (!this.backgroundTasks.has(session.id)) {
+             session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
+         }
++        this.reconcileNativeTasks(session)
+         session.activeAt = Math.max(session.activeAt, t)
+ 
+         this.lastBroadcastAtBySessionId.set(session.id, Date.now())
+@@ -397,6 +402,7 @@ export class SessionCache {
+         if (!this.backgroundTasks.has(session.id)) {
+             session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
+         }
++        this.reconcileNativeTasks(session)
+         session.activeAt = Math.max(session.activeAt, t)
+         session.thinking = requestedThinking || preserveQueuedThinking
+         session.thinkingAt = t
+@@ -540,6 +546,28 @@ export class SessionCache {
+         }
+     }
+ 
++    private reconcileNativeTasks(session: Session): void {
++        const nativeId = session.metadata?.claudeSessionId
++        if (!session.active || !session.backgroundTaskCount || typeof nativeId !== 'string'
++            || session.namespace !== 'default' || !process.env.HAPI_LOCAL_CATALOG_MACHINE
++            || session.metadata?.machineId !== process.env.HAPI_LOCAL_CATALOG_MACHINE) return
++        let state = this.nativeTaskReaders.get(session.id)
++        if (!state || state.nativeId !== nativeId) {
++            state = { nativeId, reader: new ClaudeTaskCompletionReader(nativeId), busy: false, checkedAt: 0 }
++            this.nativeTaskReaders.set(session.id, state)
++        }
++        if (state.busy || Date.now() - state.checkedAt < 5000) return
++        state.busy = true
++        state.checkedAt = Date.now()
++        const current = state
++        void current.reader.read().then(ids => {
++            const latest = this.sessions.get(session.id)
++            if (this.nativeTaskReaders.get(session.id) !== current || !latest?.active || latest.metadata?.claudeSessionId !== nativeId || !ids.length) return
++            this.applyBackgroundTaskDelta(session.id, { started: 0, completed: ids.length, completedIds: ids })
++        }).catch(() => { /* Missing/unreadable native evidence must never clear a task. */ })
++            .finally(() => { current.busy = false })
++    }
++
+     private restoreBackgroundTasks(sessionId: string, since: number): number {
+         const tracker = new BackgroundTaskTracker()
+         // Imported transcript history predating this HAPI controller must not
+@@ -565,7 +593,7 @@ export class SessionCache {
+         if (next === (session.backgroundTaskCount ?? 0)) return
+         session.backgroundTaskCount = next
+         this.publisher.emit({
+-            type: 'session-updated', sessionId,
++            type: 'session-updated', sessionId, namespace: session.namespace,
+             data: { backgroundTaskCount: next } satisfies SessionPatch
+         })
+     }
+@@ -650,6 +678,7 @@ export class SessionCache {
+         session.activeTurnStartedAt = null
+         session.backgroundTaskCount = 0
+         this.backgroundTasks.delete(session.id)
++        this.nativeTaskReaders.delete(session.id)
+         this.pendingThinkingUntilBySessionId.delete(session.id)
+ 
+         this.publisher.emit({
+@@ -1103,6 +1132,7 @@ export class SessionCache {
+         }
+ 
+         this.backgroundTasks.delete(sessionId)
++        this.nativeTaskReaders.delete(sessionId)
+         this.sessions.delete(sessionId)
+         this.lastBroadcastAtBySessionId.delete(sessionId)
+         this.todoBackfillAttemptedSessionIds.delete(sessionId)
+@@ -1351,6 +1381,7 @@ export class SessionCache {
+             }
+ 
+             this.backgroundTasks.delete(oldSessionId)
++            this.nativeTaskReaders.delete(oldSessionId)
+             const existed = this.sessions.delete(oldSessionId)
+             if (existed) {
+                 this.publisher.emit({ type: 'session-removed', sessionId: oldSessionId, namespace })

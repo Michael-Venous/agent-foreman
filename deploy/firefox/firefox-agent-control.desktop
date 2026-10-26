@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox — Agents (isolated)
+Comment=Separate cloned agent profile with native control; leaves personal Firefox alone
+Exec=/home/user/.local/bin/firefox-agent-browser gui %u
+Icon=firefox
+Terminal=false
+Categories=Network;WebBrowser;

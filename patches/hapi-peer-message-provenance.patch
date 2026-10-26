@@ -1,0 +1,460 @@
+diff --git a/cli/src/modules/pingPeer/pingPeer.ts b/cli/src/modules/pingPeer/pingPeer.ts
+--- a/cli/src/modules/pingPeer/pingPeer.ts
++++ b/cli/src/modules/pingPeer/pingPeer.ts
+@@ -8,6 +8,7 @@
+  * Callers must not invent parallel auth or arbitrary hosts.
+  */
+ 
++import { randomUUID } from 'node:crypto'
+ import axios, { type AxiosInstance } from 'axios'
+ import { extractAssistantPlainText, isObject } from '@hapi/protocol'
+ import { normalizeSessionIdPrefix } from '@hapi/protocol/sessionCitation'
+@@ -52,6 +53,8 @@
+ export type PingPeerOptions = {
+     sessionIdPrefix: string
+     message: string
++    /** Actual HAPI caller identity, supplied by MCP rather than model arguments. */
++    sourceSessionId?: string
+     waitActiveSecs?: number
+     apiUrl?: string
+     accessToken?: string
+@@ -345,11 +348,12 @@
+     jwt: string,
+     sessionId: string,
+     message: string,
+-    http: AxiosInstance
++    http: AxiosInstance,
++    sourceSessionId?: string
+ ): Promise<void> {
+     const response = await http.post(
+         `${apiUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+-        { text: message },
++        { text: message, localId: randomUUID(), ...(sourceSessionId ? { source: 'peer', sourceSessionId } : {}) },
+         {
+             headers: authHeaders(jwt),
+             timeout: 30_000,
+@@ -455,6 +459,18 @@
+     return rows.join('\n')
+ }
+ 
++/** Read-only guard before the helper may activate any target conversation. */
++async function assertSourceCanSend(apiUrl: string, jwt: string, sourceSessionId: string, http: AxiosInstance): Promise<void> {
++    await getSession(apiUrl, jwt, sourceSessionId, http) // Hub enforces namespace access.
++    const response = await http.get(`${apiUrl}/api/sessions/${encodeURIComponent(sourceSessionId)}/manual-pause`, {
++        headers: authHeaders(jwt), timeout: 10_000, validateStatus: () => true
++    })
++    if (response.status < 200 || response.status >= 300 || !Object.prototype.hasOwnProperty.call(response.data ?? {}, 'pausedAt')) {
++        throw new PingPeerError('send_failed', 'Could not confirm source pause state; no target was resumed or messaged')
++    }
++    if (response.data.pausedAt !== null) throw new PingPeerError('send_failed', 'Source chat manually paused; no target was resumed or messaged')
++}
++
+ export async function pingPeer(options: PingPeerOptions): Promise<PingPeerResult> {
+     const prefix = normalizeSessionIdPrefix(options.sessionIdPrefix ?? '')
+     const message = options.message ?? ''
+@@ -478,6 +494,8 @@
+     const onProgress = options.onProgress
+ 
+     const jwt = await exchangeJwt(apiUrl, accessToken, http)
++    const sourceSessionId = (options.sourceSessionId ?? process.env.HAPI_SESSION_ID)?.trim() || undefined
++    if (sourceSessionId) await assertSourceCanSend(apiUrl, jwt, sourceSessionId, http)
+     const sessions = await listSessions(apiUrl, jwt, http)
+     const matched = resolveSessionByPrefix(sessions, prefix)
+     const name = resolvePeerSessionLabel(matched)
+@@ -516,7 +534,7 @@
+     }
+ 
+     onProgress?.(`sending message (${message.length} chars)...`)
+-    await sendMessage(apiUrl, jwt, matched.id, message, http)
++    await sendMessage(apiUrl, jwt, matched.id, message, http, sourceSessionId)
+ 
+     return {
+         sessionId: matched.id,
+diff --git a/cli/src/modules/pingPeer/pingPeer.test.ts b/cli/src/modules/pingPeer/pingPeer.test.ts
+--- a/cli/src/modules/pingPeer/pingPeer.test.ts
++++ b/cli/src/modules/pingPeer/pingPeer.test.ts
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import {
+     PingPeerError,
+     exitCodeForPingPeerError,
+@@ -31,6 +31,9 @@
+         })
+     }
+ }
++
++beforeEach(() => vi.stubEnv('HAPI_SESSION_ID', ''))
++afterEach(() => vi.unstubAllEnvs())
+ 
+ describe('resolveSessionByPrefix', () => {
+     const sessions: PingPeerSessionSummary[] = [
+@@ -80,7 +83,7 @@
+                     return { status: 200, data: { token: 'jwt' } }
+                 }
+                 if (url.endsWith(`/api/sessions/${sessionId}/messages`)) {
+-                    expect(body).toEqual({ text: 'hello peer' })
++                    expect(body).toEqual({ text: 'hello peer', localId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
+                     return { status: 200, data: { ok: true } }
+                 }
+                 throw new Error(`unexpected POST ${url}`)
+@@ -672,3 +675,55 @@
+         expect(pingParams[0]).toBeUndefined()
+     })
+ })
++
++
++describe('pingPeer origin', () => {
++    async function send(sourceSessionId?: string) {
++        const target = { id: 'target-session', active: true, metadata: { name: 'Target' } }
++        const http = createHttpMock({
++            post: (url) => url.endsWith('/auth') ? { status: 200, data: { token: 'jwt' } } : { status: 200, data: { ok: true } },
++            get: url => ({ status: 200, data: url.endsWith('/manual-pause') ? { pausedAt: null } : url.endsWith('/sessions') ? { sessions: [target] } : { session: target } })
++        })
++        await pingPeer({ sessionIdPrefix: target.id, message: 'Coordination only', accessToken: 'tok', apiUrl: 'http://hub.test', http: http as never, sourceSessionId })
++        return http.post.mock.calls.find(([url]) => url.endsWith('/messages'))![1] as Record<string, unknown>
++    }
++    it('uses the actual MCP caller over an inherited environment identity', async () => {
++        vi.stubEnv('HAPI_SESSION_ID', 'environment-session')
++        expect(await send('actual-mcp-session')).toMatchObject({ source: 'peer', sourceSessionId: 'actual-mcp-session' })
++    })
++    it('uses standalone helper session environment and a unique local delivery identity', async () => {
++        vi.stubEnv('HAPI_SESSION_ID', 'environment-session')
++        const first = await send(), second = await send()
++        expect(first).toMatchObject({ source: 'peer', sourceSessionId: 'environment-session', localId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
++        expect(second.localId).not.toBe(first.localId)
++    })
++    it('keeps standalone sends without a caller conservatively untagged', async () => {
++        const body = await send()
++        expect(body.source).toBeUndefined()
++        expect(body.sourceSessionId).toBeUndefined()
++        expect(body.localId).toEqual(expect.any(String))
++    })
++})
++
++
++it('refuses a paused source before resuming or messaging an inactive target', async () => {
++    const http = createHttpMock({
++        post: url => {
++            if (url.endsWith('/auth')) return { status: 200, data: { token: 'jwt' } }
++            throw new Error('Unexpected target mutation')
++        },
++        get: url => ({ status: 200, data: url.endsWith('/manual-pause') ? { pausedAt: 123 } : url.endsWith('/sessions') ? { sessions: [{ id: 'inactive-target', active: false }] } : { session: { id: 'source-session', active: false } } })
++    })
++    await expect(pingPeer({ sessionIdPrefix: 'inactive-target', message: 'coordination', sourceSessionId: 'source-session', accessToken: 'tok', apiUrl: 'http://hub.test', http: http as never })).rejects.toThrow('Source chat manually paused')
++    expect(http.post.mock.calls.map(([url]) => url)).toEqual(['http://hub.test/api/auth'])
++    expect(http.get.mock.calls.every(([url]) => url.includes('/source-session'))).toBe(true)
++})
++
++it('refuses an inaccessible source before any target mutation', async () => {
++    const http = createHttpMock({
++        post: () => ({ status: 200, data: { token: 'jwt' } }),
++        get: () => ({ status: 403, data: { error: 'Session access denied' } })
++    })
++    await expect(pingPeer({ sessionIdPrefix: 'inactive-target', message: 'coordination', sourceSessionId: 'foreign-source', accessToken: 'tok', apiUrl: 'http://hub.test', http: http as never })).rejects.toThrow('Session access denied')
++    expect(http.post.mock.calls.map(([url]) => url)).toEqual(['http://hub.test/api/auth'])
++})
+diff --git a/cli/src/claude/utils/startHappyServer.ts b/cli/src/claude/utils/startHappyServer.ts
+--- a/cli/src/claude/utils/startHappyServer.ts
++++ b/cli/src/claude/utils/startHappyServer.ts
+@@ -301,6 +301,7 @@
+             const result = await pingPeer({
+                 sessionIdPrefix: args.sessionIdPrefix,
+                 message: args.message,
++                sourceSessionId: client.sessionId,
+             });
+             return {
+                 content: [
+diff --git a/hub/src/web/routes/messages.ts b/hub/src/web/routes/messages.ts
+--- a/hub/src/web/routes/messages.ts
++++ b/hub/src/web/routes/messages.ts
+@@ -2,7 +2,7 @@
+ import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema } from '@hapi/protocol'
+ import type { SyncEngine } from '../../sync/syncEngine'
+ import type { WebAppEnv } from '../middleware/auth'
+-import { requireSessionFromParam, requireSyncEngine } from './guards'
++import { requireSession, requireSessionFromParam, requireSyncEngine } from './guards'
+ 
+ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+@@ -144,11 +144,21 @@
+             return c.json({ error: 'Message requires text or attachments' }, 400)
+         }
+ 
++        // Peer provenance is accepted only from this authenticated namespace.
++        // It does not bypass Stop, inactivity or any message delivery guard.
++        let sourceSessionId: string | undefined
++        if (parsed.data.sourceSessionId) {
++            const source = requireSession(c, engine, parsed.data.sourceSessionId)
++            if (source instanceof Response) return source
++            sourceSessionId = source.sessionId
++            if (engine.getManualPause(sourceSessionId) !== null) return c.json({ error: 'Source chat paused; peer delivery blocked.', code: 'source_session_manually_paused' }, 409)
++        }
+         const delivery = await engine.sendMessage(sessionId, {
+             text: parsed.data.text,
+             localId: parsed.data.localId,
+             attachments: parsed.data.attachments,
+             sentFrom: 'webapp',
++            ...(parsed.data.source === 'peer' ? { source: 'peer' as const, ...(sourceSessionId ? { sourceSessionId } : {}) } : {}),
+             scheduledAt: parsed.data.scheduledAt,
+             deliveryMode: parsed.data.deliveryMode
+         })
+diff --git a/hub/src/web/routes/messages.test.ts b/hub/src/web/routes/messages.test.ts
+--- a/hub/src/web/routes/messages.test.ts
++++ b/hub/src/web/routes/messages.test.ts
+@@ -22,6 +22,9 @@
+ 
+ function createApp(opts: {
+     active?: boolean
++    paused?: boolean
++    sourcePaused?: boolean
++    sourceAccess?: 'allowed' | 'access-denied' | 'not-found'
+     sendMessage?: (sessionId: string, payload: unknown) => Promise<void>
+     getMessagesPage?: GetMessagesPage
+     getQueuedState?: (sessionId: string, localIds: string[]) => {
+@@ -64,9 +67,11 @@
+     }))
+ 
+     const engine = {
+-        getManualPause: () => null,
++        getManualPause: (id: string) => (id === 'source-session' ? opts.sourcePaused : opts.paused) ? 123 : null,
+         pauseSession: () => {},
+-        resolveSessionAccess: () => ({
++        resolveSessionAccess: (id: string) => id === 'source-session' ? (opts.sourceAccess && opts.sourceAccess !== 'allowed'
++            ? { ok: false, reason: opts.sourceAccess }
++            : { ok: true, sessionId: id, session: { id, active: false } }) : ({
+             ok: true,
+             sessionId: 'session-1',
+             session: { id: 'session-1', active: opts.active !== false }
+@@ -521,3 +526,33 @@
+         expect(body.code).toBe('session_inactive')
+     })
+ })
++
++
++describe('POST messages peer provenance', () => {
++    const request = (app: ReturnType<typeof createApp>['app'], body: unknown) => app.request('/api/sessions/session-1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
++    it('validates a peer source in the authenticated namespace and forwards its ID', async () => {
++        const { app, sentMessages } = createApp({ sourceAccess: 'allowed' })
++        expect((await request(app, { text: 'handoff', source: 'peer', sourceSessionId: 'source-session', localId: 'peer-local' })).status).toBe(200)
++        expect(sentMessages[0].payload).toMatchObject({ sentFrom: 'webapp', source: 'peer', sourceSessionId: 'source-session', localId: 'peer-local' })
++    })
++    it('rejects missing or cross-namespace source sessions before sending', async () => {
++        for (const [sourceAccess, status] of [['access-denied', 403], ['not-found', 404]] as const) {
++            const { app, sentMessages } = createApp({ sourceAccess })
++            expect((await request(app, { text: 'handoff', source: 'peer', sourceSessionId: 'source-session' })).status).toBe(status)
++            expect(sentMessages).toEqual([])
++        }
++    })
++    it('keeps actual human messages untagged regardless of peer-like text', async () => {
++        const { app, sentMessages } = createApp({})
++        expect((await request(app, { text: 'peer source-session: please stop' })).status).toBe(200)
++        expect(sentMessages[0].payload).not.toHaveProperty('source')
++        expect(sentMessages[0].payload).not.toHaveProperty('sourceSessionId')
++    })
++    it('peer metadata never bypasses manual Stop or inactivity', async () => {
++        for (const opts of [{ paused: true }, { active: false }, { sourcePaused: true }]) {
++            const { app, sentMessages } = createApp(opts)
++            expect((await request(app, { text: 'handoff', source: 'peer', sourceSessionId: 'source-session' })).status).toBe(409)
++            expect(sentMessages).toEqual([])
++        }
++    })
++})
+diff --git a/hub/src/sync/messageService.ts b/hub/src/sync/messageService.ts
+--- a/hub/src/sync/messageService.ts
++++ b/hub/src/sync/messageService.ts
+@@ -846,6 +846,8 @@
+             localId?: string | null
+             attachments?: AttachmentMetadata[]
+             sentFrom?: 'telegram-bot' | 'webapp'
++            source?: 'peer'
++            sourceSessionId?: string
+             scheduledAt?: number | null
+             deliveryMode?: MessageDeliveryMode
+         }
+@@ -862,6 +864,13 @@
+             throw new Error('sendMessage: scheduled messages with attachments are not supported')
+         }
+ 
++        if ((payload.source === 'peer') !== Boolean(payload.sourceSessionId)) throw new Error('Peer source and sourceSessionId must be provided together')
++        if (payload.sourceSessionId) {
++            const source = this.store.sessions.getSession(payload.sourceSessionId)
++            const target = this.store.sessions.getSession(sessionId)
++            if (!source || !target || source.namespace !== target.namespace) throw new Error('Peer source session unavailable in this namespace')
++            if (this.store.getManualPause(payload.sourceSessionId) !== null) throw new Error('Source chat manually paused')
++        }
+         const sentFrom = payload.sentFrom ?? 'webapp'
+         if (this.store.getManualPause(sessionId) !== null) throw new Error('Chat manually paused')
+         const deliveryMode = getNormalizedDeliveryMode(
+@@ -879,7 +888,8 @@
+             },
+             meta: {
+                 sentFrom,
+-                deliveryMode
++                deliveryMode,
++                ...(payload.source === 'peer' ? { source: 'peer' as const, ...(payload.sourceSessionId ? { sourceSessionId: payload.sourceSessionId } : {}) } : {})
+             }
+         }
+ 
+diff --git a/hub/src/sync/messageService.test.ts b/hub/src/sync/messageService.test.ts
+--- a/hub/src/sync/messageService.test.ts
++++ b/hub/src/sync/messageService.test.ts
+@@ -1214,6 +1214,33 @@
+         return { io, cliEmitted }
+     }
+ 
++    it('persists peer origin and preserves it in CLI delivery, SSE and replay', async () => {
++        const store = makeStore(), target = makeSession(store, 'peer-target'), source = makeSession(store, 'peer-source')
++        const publisher = makePublisher(), { io, cliEmitted } = makeTrackingIo()
++        const service = new MessageService(store, io, publisher as any)
++        await service.sendMessage(target.id, { text: 'coordination', localId: 'peer-local', source: 'peer', sourceSessionId: source.id })
++        const expected = { source: 'peer', sourceSessionId: source.id, sentFrom: 'webapp' }
++        expect(store.messages.getUninvokedLocalMessages(target.id)[0]?.content).toMatchObject({ meta: expected })
++        expect(cliEmitted[0]).toMatchObject({ body: { message: { localId: 'peer-local', content: { meta: expected } } } })
++        expect(publisher.events.find(e => e.type === 'message-received')).toMatchObject({ message: { content: { meta: expected } } })
++        service.replayImmediateQueuedMessages(target.id)
++        expect(cliEmitted[1]).toMatchObject({ body: { message: { content: { meta: expected } } } })
++        await service.sendMessage(target.id, { text: 'actual human', localId: 'human-local' })
++        const human = store.messages.getUninvokedLocalMessages(target.id).find(m => m.localId === 'human-local')?.content as { meta: Record<string, unknown> }
++        expect(human.meta).not.toHaveProperty('source')
++    })
++
++    it('rejects unknown, cross-namespace or manually stopped peer sources without clearing Stop', async () => {
++        const store = makeStore(), target = makeSession(store, 'peer-target'), source = makeSession(store, 'peer-source')
++        const foreign = store.sessions.getOrCreateSession('foreign', { path: '/tmp/foreign' }, null, 'other-namespace')
++        const { io, cliEmitted } = makeTrackingIo(), service = new MessageService(store, io, makePublisher() as any)
++        for (const sourceSessionId of ['missing', foreign.id]) await expect(service.sendMessage(target.id, { text: 'coordination', source: 'peer', sourceSessionId })).rejects.toThrow('namespace')
++        store.setManualPause(source.id, true)
++        await expect(service.sendMessage(target.id, { text: 'coordination', source: 'peer', sourceSessionId: source.id })).rejects.toThrow('Source chat manually paused')
++        expect(store.getManualPause(source.id)).not.toBeNull()
++        expect(cliEmitted).toEqual([])
++    })
++
+     it('skips the OpenCode delivery-gate scan when heartbeat replay has no queued messages', () => {
+         const store = makeStore()
+         const session = makeSession(store, 'empty-heartbeat-replay')
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1129,6 +1129,8 @@
+                 previewUrl?: string
+             }>
+             sentFrom?: 'telegram-bot' | 'webapp'
++            source?: 'peer'
++            sourceSessionId?: string
+             scheduledAt?: number | null
+             deliveryMode?: MessageDeliveryMode
+         }
+diff --git a/shared/src/apiTypes.ts b/shared/src/apiTypes.ts
+--- a/shared/src/apiTypes.ts
++++ b/shared/src/apiTypes.ts
+@@ -531,8 +531,15 @@
+     localId: z.string().min(1).optional(),
+     attachments: z.array(AttachmentMetadataSchema).optional(),
+     scheduledAt: z.number().int().positive().nullable().optional(),
+-    deliveryMode: MessageDeliveryModeSchema.optional()
++    deliveryMode: MessageDeliveryModeSchema.optional(),
++    // Structured helper provenance, never inferred from message text. Callers
++    // already hold equivalent namespace send authority; this is not identity auth.
++    source: z.literal('peer').optional(),
++    sourceSessionId: z.string().trim().min(1).max(100).optional()
+ }).refine(
++    data => (data.source === 'peer') === (data.sourceSessionId != null),
++    { message: 'peer source and sourceSessionId must be provided together', path: ['sourceSessionId'] }
++).refine(
+     (data) => data.scheduledAt == null || typeof data.localId === 'string',
+     { message: 'scheduledAt requires localId', path: ['localId'] }
+ ).refine(
+diff --git a/shared/src/apiTypes.test.ts b/shared/src/apiTypes.test.ts
+--- a/shared/src/apiTypes.test.ts
++++ b/shared/src/apiTypes.test.ts
+@@ -145,3 +145,16 @@
+         }
+     })
+ })
++
++
++describe('SendMessageRequestSchema peer provenance', () => {
++    it('preserves structured peer origin while leaving human messages unchanged', () => {
++        expect(SendMessageRequestSchema.parse({ text: 'human' })).toEqual({ text: 'human' })
++        expect(SendMessageRequestSchema.parse({ text: 'peer', source: 'peer', sourceSessionId: 'session-a', localId: 'delivery-a' })).toMatchObject({ source: 'peer', sourceSessionId: 'session-a', localId: 'delivery-a' })
++    })
++    it('rejects unsupported origins, empty identifiers, or originless source identity', () => {
++        for (const fields of [{ source: 'human' }, { source: 'peer' }, { source: 'peer', sourceSessionId: '' }, { sourceSessionId: 'session-a' }]) {
++            expect(SendMessageRequestSchema.safeParse({ text: 'message', ...fields }).success).toBe(false)
++        }
++    })
++})
+diff --git a/cli/src/claude/utils/startHappyServer.test.ts b/cli/src/claude/utils/startHappyServer.test.ts
+--- a/cli/src/claude/utils/startHappyServer.test.ts
++++ b/cli/src/claude/utils/startHappyServer.test.ts
+@@ -5,6 +5,7 @@
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import type { ApiSessionClient } from '@/api/apiSession'
++import * as peerModule from '@/modules/pingPeer/pingPeer'
+ import { startHappyServer, toClaudeAllowedHapiMcpTools } from './startHappyServer'
+ 
+ type ToolResult = {
+@@ -31,6 +32,7 @@
+     })
+ 
+     afterEach(async () => {
++        vi.restoreAllMocks()
+         await client?.close()
+         stopServer?.()
+         if (originalHome === undefined) {
+@@ -44,6 +46,7 @@
+     async function connect(enableSkillLookup = true): Promise<Client> {
+         sendAgentMessage = vi.fn()
+         const sessionClient = {
++            sessionId: 'actual-source-session',
+             updateMetadata: vi.fn(),
+             sendAgentMessage,
+             sendClaudeSessionMessage: vi.fn()
+@@ -65,6 +68,14 @@
+         await client.connect(new StreamableHTTPClientTransport(new URL(server.url)))
+         return client
+     }
++
++    it('attaches its actual session identity to peer sends, never tool arguments', async () => {
++        const ping = vi.spyOn(peerModule, 'pingPeer').mockResolvedValue({ sessionId: 'target-session', name: 'Target', resumed: false })
++        const mcp = await connect()
++        const result = await mcp.callTool({ name: 'ping_peer', arguments: { sessionIdPrefix: 'target', message: 'status', sourceSessionId: 'forged-session' } }) as ToolResult
++        expect(result.isError).toBe(false)
++        expect(ping).toHaveBeenCalledWith({ sessionIdPrefix: 'target', message: 'status', sourceSessionId: 'actual-source-session' })
++    })
+ 
+     it('returns a discovered SKILL.md body', async () => {
+         const skillDir = join(workingDirectory, '.agents', 'skills', 'review')
+diff --git a/hub/src/socket/handlers/cli/sessionHandlers.test.ts b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+--- a/hub/src/socket/handlers/cli/sessionHandlers.test.ts
++++ b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+@@ -88,6 +88,27 @@
+         sync('consumed', 'executed'); store.messages.markMessagesInvoked(session.id, ['consumed'], Date.now())
+         sync('consumed', 'stale'); sync('consumed', null)
+         expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ content: { content: { text: 'executed' } } })
++    })
++    it('retains peer provenance and one queue row when native input echoes the original localId', () => {
++        const store = new Store(':memory:')
++        try {
++            const session = store.sessions.getOrCreateSession('peer-queue', { capabilities: { concurrentClients: true } }, null, 'default')
++            const origin = { sentFrom: 'webapp', source: 'peer', sourceSessionId: 'source-session' }
++            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'Peer update' }, meta: origin }, 'stable-peer-id')
++            const socket = new FakeSocket()
++            registerSessionHandlers(socket as unknown as CliSocketWithData, {
++                store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {}
++            })
++            socket.trigger('native-queue-message', { sid: session.id, localId: 'stable-peer-id', text: 'Edited peer update' })
++            const messages = store.messages.getAllMessages(session.id)
++            expect(messages).toHaveLength(1)
++            expect(messages[0]).toMatchObject({ localId: 'stable-peer-id', invokedAt: null,
++                content: { content: { text: 'Edited peer update' }, meta: origin } })
++            store.messages.markMessagesInvoked(session.id, ['stable-peer-id'], Date.now())
++            socket.trigger('native-queue-message', { sid: session.id, localId: 'stable-peer-id', text: 'Stale echo' })
++            expect(store.messages.getAllMessages(session.id)).toHaveLength(1)
++            expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ content: { content: { text: 'Edited peer update' }, meta: origin } })
++        } finally { store.close() }
+     })
+     it('preserves immediate queued rows for cleared handoff transfer', () => {
+         const store = new Store(':memory:')

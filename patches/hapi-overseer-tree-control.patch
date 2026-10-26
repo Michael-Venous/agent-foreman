@@ -1,0 +1,438 @@
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -335,16 +335,17 @@
+         return true
+     }
+ 
+-    addSessionManagerEntry(sessionId: string, namespace: string): boolean {
++    addSessionManagerEntry(sessionId: string, namespace: string, options: { workspaceId?: string; notify?: boolean } = {}): boolean {
+         const access = this.resolveSessionAccess(sessionId, namespace)
+         if (!access.ok) return false
+-        this.store.sessionManager.add(toSessionSummary(access.session), namespace)
+-        if (this.store.nodeGraph.addNode(namespace, access.sessionId)) this.nodeGraphChanged(namespace)
++        const workspaceId = options.workspaceId ?? this.store.nodeGraph.active(namespace)
++        if (workspaceId === this.store.nodeGraph.active(namespace)) this.store.sessionManager.add(toSessionSummary(access.session), namespace)
++        if (this.store.nodeGraph.addNode(namespace, access.sessionId, workspaceId) && options.notify !== false) this.nodeGraphChanged(namespace)
+         return true
+     }
+ 
+     /** Removing a node is refused while its session is busy (Stop first); children become lone. */
+-    dismissSessionManagerEntries(namespace: string, ids: readonly string[]): string[] {
++    dismissSessionManagerEntries(namespace: string, ids: readonly string[], options: { workspaceId?: string; notify?: boolean } = {}): string[] {
+         const skipped: string[] = [], removable: string[] = []
+         for (const id of ids) {
+             const current = this.sessionCache.getSession(id)
+@@ -352,16 +353,19 @@
+             else removable.push(id)
+         }
+         if (removable.length) {
+-            // Stamp the activity ledger too, so replayed old evidence cannot re-enrol a removed node.
+-            const ledger = this.store.sessionManager.list(namespace)
+-            for (const id of removable) {
+-                const current = this.sessionCache.getSession(id)
+-                const summary = current && current.namespace === namespace ? toSessionSummary(current) : ledger[id]?.session
+-                if (summary && ledger[id]) this.store.sessionManager.observe(current ? summary : { ...summary, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 }, namespace, 0, false, 0, false)
+-            }
+-            this.store.sessionManager.dismiss(namespace, removable)
+-            this.store.nodeGraph.removeNodes(namespace, removable)
+-            this.nodeGraphChanged(namespace)
++            const workspaceId = options.workspaceId ?? this.store.nodeGraph.active(namespace)
++            if (workspaceId === this.store.nodeGraph.active(namespace)) {
++                // Stamp the activity ledger too, so replayed old evidence cannot re-enrol a removed node.
++                const ledger = this.store.sessionManager.list(namespace)
++                for (const id of removable) {
++                    const current = this.sessionCache.getSession(id)
++                    const summary = current && current.namespace === namespace ? toSessionSummary(current) : ledger[id]?.session
++                    if (summary && ledger[id]) this.store.sessionManager.observe(current ? summary : { ...summary, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 }, namespace, 0, false, 0, false)
++                }
++                this.store.sessionManager.dismiss(namespace, removable)
++            }
++            this.store.nodeGraph.removeNodes(namespace, removable, workspaceId)
++            if (options.notify !== false) this.nodeGraphChanged(namespace)
+         }
+         return skipped
+     }
+--- a/hub/src/store/nodeGraph.ts
++++ b/hub/src/store/nodeGraph.ts
+@@ -1,6 +1,6 @@
+ import type { Database } from 'bun:sqlite'
+ import { isDeepStrictEqual } from 'node:util'
+-import { randomUUID } from 'node:crypto'
++import { createHash, randomUUID } from 'node:crypto'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, type NodeAnnotation, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ 
+ type WorkspaceRow = { id: string; namespace: string; name: string; kind: 'default' | 'preset'; created_at: number; updated_at: number }
+@@ -65,9 +65,34 @@
+         }
+     }
+ 
++    /** Complete workspace state; digest covers content and the current active-slot context. */
++    snapshot(namespace: string, workspaceId: string) {
++        const row = this.workspace(namespace, workspaceId)
++        if (!row) throw new Error('Workspace not found')
++        const workspace: NodeWorkspace = { id: row.id, name: row.name, kind: row.kind, createdAt: row.created_at, updatedAt: row.updated_at }
++        const graph = this.graph(namespace, workspaceId)
++        const version = createHash('sha256').update(JSON.stringify({ activeWorkspaceId: this.active(namespace), name: row.name, kind: row.kind, graph })).digest('hex')
++        return { workspace, graph, version }
++    }
++
++    /** One transaction for a versioned batch, including activity-ledger writes. No effects may be emitted inside change. */
++    edit(namespace: string, workspaceId: string, version: string, change: () => void, dryRun = false) {
++        const rollback = Symbol('graph preview')
++        let result: ReturnType<NodeGraphStore['snapshot']> | undefined
++        try {
++            this.db.transaction(() => {
++                if (this.snapshot(namespace, workspaceId).version !== version) throw new Error('Node tree changed; read it again before retrying')
++                change()
++                result = this.snapshot(namespace, workspaceId)
++                if (dryRun) throw rollback
++            })()
++        } catch (error) { if (error !== rollback) throw error }
++        return { ...result!, version: dryRun ? version : result!.version, dryRun }
++    }
++
+     /** Atomic wiring edits: logical owner edges stay transparent to the supervisor. */
+-    routing(namespace: string, workspaceId: string, value: NodeRouting, expected: NodeRouting, overseer: string | null): boolean {
+-        if (!this.workspace(namespace, workspaceId) || this.active(namespace) !== workspaceId) return false
++    routing(namespace: string, workspaceId: string, value: NodeRouting, expected: NodeRouting, overseer: string | null, allowInactive = false, createdBy = 'user'): boolean {
++        if (!this.workspace(namespace, workspaceId) || (!allowInactive && this.active(namespace) !== workspaceId)) return false
+         return this.db.transaction(() => {
+             const current = nodeRouting(this.graph(namespace, workspaceId))
+             if (!isDeepStrictEqual(current, nodeRouting(expected))) return false
+@@ -79,7 +104,7 @@
+             const previous = new Map(current.edges.map(e => [e.child, e.owner])), next = new Set(value.edges.map(e => e.child))
+             for (const edge of current.edges) if (!next.has(edge.child)) this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND child_id = ?').run(workspaceId, edge.child)
+             for (const edge of value.edges) if (previous.get(edge.child) !== edge.owner) this.db.query(`INSERT INTO node_edges VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, child_id)
+-                DO UPDATE SET owner_id = excluded.owner_id, created_at = excluded.created_at, created_by = excluded.created_by`).run(workspaceId, edge.child, edge.owner, Date.now(), 'user')
++                DO UPDATE SET owner_id = excluded.owner_id, created_at = excluded.created_at, created_by = excluded.created_by`).run(workspaceId, edge.child, edge.owner, Date.now(), createdBy)
+             this.db.query('DELETE FROM node_edge_routes WHERE workspace_id = ?').run(workspaceId)
+             this.db.query('DELETE FROM node_junctions WHERE workspace_id = ?').run(workspaceId)
+             for (const junction of value.junctions) this.db.query('INSERT INTO node_junctions VALUES (?, ?, ?)').run(workspaceId, junction.id, JSON.stringify(junction))
+@@ -90,8 +115,8 @@
+     }
+ 
+     /** Compare-and-swap avoids overwriting another window's note, including on undo. */
+-    annotation(namespace: string, workspaceId: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null): boolean {
+-        if (!this.workspace(namespace, workspaceId) || this.active(namespace) !== workspaceId) return false
++    annotation(namespace: string, workspaceId: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null, allowInactive = false): boolean {
++        if (!this.workspace(namespace, workspaceId) || (!allowInactive && this.active(namespace) !== workspaceId)) return false
+         return this.db.transaction(() => {
+             const row = this.db.query('SELECT data FROM node_annotations WHERE workspace_id = ? AND id = ?').get(workspaceId, id) as { data: string } | null
+             if (!isDeepStrictEqual(row ? JSON.parse(row.data) : null, expected)) return false
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -28,6 +28,24 @@
+     edges: z.array(z.object({ owner: z.string().min(1).max(100), child: z.string().min(1).max(100), via: z.string().min(1).max(96).optional() }).strict()).max(2000),
+ }).strict()
+ const routingEdit = z.object({ value: routing, expected: routing }).strict()
++
++const sessionId = z.string().min(1).max(100)
++const coordinate = z.number().finite().min(-1_000_000).max(1_000_000)
++const position = z.object({ x: coordinate, y: coordinate }).strict()
++const treeEdit = z.object({
++    version: z.string().regex(/^[a-f0-9]{64}$/), dryRun: z.boolean().optional(),
++    createdBy: sessionId.optional(),
++    changes: z.array(z.discriminatedUnion('action', [
++        z.object({ action: z.literal('add'), sessionId }).strict(),
++        z.object({ action: z.literal('remove'), ids: z.array(sessionId).min(1).max(1000) }).strict(),
++        z.object({ action: z.literal('layout'), positions: z.record(sessionId, position).refine(value => Object.keys(value).length <= 2000) }).strict(),
++        z.object({ action: z.literal('connect'), owner: sessionId, child: sessionId }).strict(),
++        z.object({ action: z.literal('disconnect'), child: sessionId }).strict(),
++        z.object({ action: z.literal('routing'), value: routing }).strict(),
++        z.object({ action: z.literal('annotation'), id: z.string().min(1).max(96).regex(/^[\w-]+$/), value: annotation.nullable() }).strict(),
++        z.object({ action: z.literal('rename'), name: z.string().trim().min(1).max(80) }).strict(),
++    ])).min(1).max(100),
++}).strict()
+ 
+ const name = (value: unknown): string | null => typeof value === 'string' && value.trim() && value.trim().length <= 80 ? value.trim() : null
+ 
+@@ -58,6 +76,74 @@
+         if (engine instanceof Response) return engine
+         c.header('Cache-Control', 'no-store')
+         return c.json(respond(engine, c.get('namespace')))
++    })
++    // Complete namespace-scoped inspection for the overseer, without activating any workspace.
++    app.get('/node-graph/tree', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), requested = c.req.query('workspaceId')
++        if (requested && !engine.nodeGraph.exists(namespace, requested)) return c.json({ error: 'Workspace not found' }, 404)
++        const root = overseer(namespace)
++        const workspaces = engine.nodeGraph.workspaces(namespace).filter(w => !requested || w.id === requested).map(w => engine.nodeGraph.snapshot(namespace, w.id))
++        c.header('Cache-Control', 'no-store')
++        return c.json({ activeWorkspaceId: engine.nodeGraph.active(namespace), overseer: root, workspaces,
++            pausedAt: Object.fromEntries([...new Set([...workspaces.flatMap(w => w.graph.nodes.map(n => n.sessionId)), ...(root ? [root] : [])])].flatMap(id => {
++                const at = engine.getManualPause(id); return at === null ? [] : [[id, at]]
++            })) })
++    })
++    app.post('/node-graph/workspaces/:id/edit', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), workspaceId = c.req.param('id'), root = overseer(namespace)
++        if (!engine.nodeGraph.exists(namespace, workspaceId)) return c.json({ error: 'Workspace not found' }, 404)
++        const parsed = treeEdit.safeParse(await c.req.json().catch(() => null))
++        if (!parsed.success) return c.json({ error: 'Invalid versioned node edit' }, 400)
++        const body = parsed.data, before = engine.nodeGraph.snapshot(namespace, workspaceId)
++        try {
++            const result = engine.nodeGraph.edit(namespace, workspaceId, body.version, () => {
++                for (const change of body.changes) {
++                    const current = () => engine.nodeGraph.graph(namespace, workspaceId)
++                    const members = () => new Set([...engine.nodeGraph.members(namespace, workspaceId), ...(root ? [root] : [])])
++                    switch (change.action) {
++                        case 'add':
++                            if (!engine.addSessionManagerEntry(change.sessionId, namespace, { workspaceId, notify: false })) throw new Error('Session not found in this namespace')
++                            break
++                        case 'remove': {
++                            if (change.ids.includes(root ?? '') || change.ids.some(id => !members().has(id))) throw new Error('Remove only non-root nodes in this workspace')
++                            const skipped = engine.dismissSessionManagerEntries(namespace, change.ids, { workspaceId, notify: false })
++                            if (skipped.length) throw new Error('Stop busy chats before removing nodes: ' + skipped.join(', '))
++                            break
++                        }
++                        case 'layout':
++                            if (Object.keys(change.positions).some(id => !engine.nodeGraph.members(namespace, workspaceId).includes(id))) throw new Error('Add a chat to this workspace before saving its position')
++                            engine.nodeGraph.layout(namespace, change.positions, workspaceId)
++                            break
++                        case 'connect':
++                            if (!known(engine, namespace, change.owner) || !known(engine, namespace, change.child)) throw new Error('Session not found in this namespace')
++                            engine.nodeGraph.setOwner(namespace, change.owner, change.child, body.createdBy ?? 'overseer', root, workspaceId)
++                            break
++                        case 'disconnect':
++                            if (!members().has(change.child)) throw new Error('Disconnect only nodes in this workspace')
++                            engine.nodeGraph.detach(namespace, change.child, workspaceId)
++                            break
++                        case 'routing':
++                            if (!engine.nodeGraph.routing(namespace, workspaceId, change.value, nodeRouting(current()), root, true, body.createdBy ?? 'overseer')) throw new Error('Routing changed')
++                            break
++                        case 'annotation': {
++                            if (change.value && change.value.id !== change.id) throw new Error('Annotation id does not match')
++                            const expected = current().annotations?.find(a => a.id === change.id) ?? null
++                            if (!engine.nodeGraph.annotation(namespace, workspaceId, change.id, change.value, expected, true)) throw new Error('Annotation changed')
++                            break
++                        }
++                        case 'rename': engine.nodeGraph.rename(namespace, workspaceId, change.name); break
++                    }
++                }
++            }, body.dryRun)
++            const topology = (graph: typeof result.graph) => JSON.stringify({ nodes: graph.nodes.map(n => n.sessionId).filter(id => id !== root).sort(), edges: graph.edges.map(e => [e.owner, e.child]).sort() })
++            const managementChanged = !result.dryRun && workspaceId === engine.nodeGraph.active(namespace) && topology(before.graph) !== topology(result.graph)
++            if (managementChanged) changed(engine, namespace)
++            return c.json({ ...result, activeWorkspaceId: engine.nodeGraph.active(namespace), overseer: root, managementChanged })
++        } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Could not edit node tree' }, 409) }
+     })
+     app.post('/node-graph/nodes', async (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+--- /dev/null
++++ b/hub/src/sync/nodeTree.test.ts
+@@ -0,0 +1,212 @@
++import { describe, expect, it, spyOn } from 'bun:test'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Hono } from 'hono'
++import { Store } from '../store'
++import { SyncEngine } from './syncEngine'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { createNodeGraphRoutes } from '../web/routes/nodeGraph'
++import type { WebAppEnv } from '../web/middleware/auth'
++
++function fixture(path = ':memory:') {
++    const store = new Store(path), engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++    engine.stop()
++    const create = (tag: string, namespace = 'default') => engine.getOrCreateSession(tag, { path: '/tmp', host: 'test', flavor: 'codex' }, {}, namespace)
++    const root = create('root'), a = create('a'), b = create('b'), foreign = create('foreign', 'other')
++    const ws = engine.nodeGraph.active('default')
++    let nudges = 0, notifications = 0
++    engine.onNodeGraphChanged(() => { notifications++ })
++    const app = (namespace: string) => {
++        const app = new Hono<WebAppEnv>()
++        app.use('*', async (c, next) => { c.set('namespace', namespace); return next() })
++        app.route('/', createNodeGraphRoutes(() => engine, { overseer: ns => ns === 'default' ? root.id : null, nudge: () => { nudges++ } }))
++        return app
++    }
++    const call = async (path: string, body?: unknown, namespace = 'default') => {
++        const response = await app(namespace).request(path, body === undefined ? undefined : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
++        return { status: response.status, json: await response.json() as any, cache: response.headers.get('Cache-Control') }
++    }
++    const snapshot = (id = ws) => engine.nodeGraph.snapshot('default', id)
++    const edit = (changes: unknown[], options: { workspace?: string; version?: string; dryRun?: boolean } = {}) => call('/node-graph/workspaces/' + (options.workspace ?? ws) + '/edit', { version: options.version ?? snapshot(options.workspace).version, changes, dryRun: options.dryRun ?? false, createdBy: root.id })
++    const controls = { abort: spyOn(engine, 'abortSession'), resume: spyOn(engine, 'resumeSession'), send: spyOn(engine, 'sendMessage') }
++    return { store, engine, create, root, a, b, foreign, ws, call, snapshot, edit, controls,
++        counts: () => ({ nudges, notifications }), close: () => { engine.stop(); store.close() } }
++}
++const note = { id: 'note', kind: 'text', text: 'GPU stays reserved\nDo not start work', color: 'amber', x: 20, y: 40, width: 280, height: 180 }
++const noControls = (f: ReturnType<typeof fixture>) => { for (const control of Object.values(f.controls)) expect(control).not.toHaveBeenCalled() }
++
++describe('overseer workspace tree API', () => {
++    it('reads every stored workspace without activation, histories, or native control', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default')
++            const preset = f.engine.nodeGraph.saveAs('default', 'Saved')
++            f.engine.pauseSession(f.a.id)
++            const before = f.snapshot(), counts = f.counts()
++            const response = await f.call('/node-graph/tree')
++            expect(response.status).toBe(200); expect(response.cache).toBe('no-store')
++            expect(response.json.activeWorkspaceId).toBe(f.ws)
++            expect(response.json.workspaces.map((w: any) => w.workspace.id)).toEqual([f.ws, preset.id])
++            expect(response.json.workspaces.every((w: any) => /^[a-f0-9]{64}$/.test(w.version))).toBe(true)
++            expect(response.json.pausedAt[f.a.id]).toBe(f.engine.getManualPause(f.a.id))
++            const selected = await f.call('/node-graph/tree?workspaceId=' + preset.id)
++            expect(selected.json.workspaces).toHaveLength(1)
++            expect((await f.call('/node-graph/tree?workspaceId=' + preset.id, undefined, 'other')).status).toBe(404)
++            expect(f.snapshot()).toEqual(before); expect(f.counts()).toEqual(counts); noControls(f)
++        } finally { f.close() }
++    })
++    it('atomically edits every graph object and credits the acting overseer without touching Stop or history', async () => {
++        const f = fixture()
++        try {
++            f.engine.pauseSession(f.b.id); const pause = f.engine.getManualPause(f.b.id)
++            f.store.messages.addMessage(f.b.id, { text: 'Preserved' }, 'history')
++            const session = structuredClone(f.engine.getSession(f.b.id)), beforeCounts = f.counts()
++            const result = await f.edit([
++                { action: 'connect', owner: f.root.id, child: f.a.id }, { action: 'connect', owner: f.a.id, child: f.b.id },
++                { action: 'add', sessionId: f.root.id },
++                { action: 'layout', positions: { [f.root.id]: { x: 10, y: 0 }, [f.a.id]: { x: 30, y: 100 } } },
++                { action: 'annotation', id: 'note', value: note },
++                { action: 'routing', value: { junctions: [{ id: 'dot', owner: f.a.id, x: 50, y: 250 }], edges: [{ owner: f.root.id, child: f.a.id }, { owner: f.a.id, child: f.b.id, via: 'dot' }] } },
++                { action: 'rename', name: 'Organized' },
++            ])
++            expect(result.status).toBe(200); expect(result.json.managementChanged).toBe(true)
++            expect(result.json.workspace.name).toBe('Organized')
++            expect(result.json.graph.annotations).toEqual([note])
++            expect(result.json.graph.junctions).toHaveLength(1)
++            expect(result.json.graph.edges.find((e: any) => e.child === f.b.id)).toMatchObject({ owner: f.a.id, via: 'dot', createdBy: f.root.id })
++            expect(result.json.graph.nodes.find((n: any) => n.sessionId === f.root.id)).toMatchObject({ x: 10, y: 0 })
++            expect(f.counts()).toEqual({ nudges: beforeCounts.nudges + 1, notifications: beforeCounts.notifications + 1 })
++            expect(f.engine.getManualPause(f.b.id)).toBe(pause)
++            expect(f.engine.getSession(f.b.id)).toEqual(session)
++            expect(f.store.messages.getMessages(f.b.id, 100)).toHaveLength(1); noControls(f)
++        } finally { f.close() }
++    })
++    it('rolls back an invalid later change including earlier removals and activity-ledger dismissal', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default')
++            const before = f.snapshot(), ledger = structuredClone(f.store.sessionManager.list('default', true)), counts = f.counts()
++            const result = await f.edit([{ action: 'remove', ids: [f.a.id] }, { action: 'add', sessionId: f.b.id },
++                { action: 'annotation', id: 'note', value: note }, { action: 'rename', name: 'Never committed' },
++                { action: 'connect', owner: f.b.id, child: f.a.id }, { action: 'connect', owner: f.a.id, child: f.b.id }])
++            expect(result.status).toBe(409); expect(result.json.error).toContain('cycle')
++            expect(f.snapshot()).toEqual(before); expect(f.store.sessionManager.list('default', true)).toEqual(ledger)
++            expect(f.counts()).toEqual(counts); noControls(f)
++        } finally { f.close() }
++    })
++    it('dry-runs a complete edit with no ledger, graph, management or native effects, then accepts the original version', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default')
++            const before = f.snapshot(), ledger = structuredClone(f.store.sessionManager.list('default', true)), counts = f.counts()
++            const changes = [{ action: 'remove', ids: [f.a.id] }, { action: 'connect', owner: f.root.id, child: f.b.id }, { action: 'annotation', id: 'note', value: note }]
++            const preview = await f.edit(changes, { dryRun: true })
++            expect(preview.status).toBe(200); expect(preview.json.dryRun).toBe(true)
++            expect(preview.json.version).toBe(before.version); expect(preview.json.managementChanged).toBe(false)
++            expect(preview.json.graph.nodes.some((n: any) => n.sessionId === f.b.id)).toBe(true)
++            expect(f.snapshot()).toEqual(before); expect(f.store.sessionManager.list('default', true)).toEqual(ledger); expect(f.counts()).toEqual(counts)
++            expect((await f.edit(changes, { version: before.version })).status).toBe(200); noControls(f)
++        } finally { f.close() }
++    })
++    it('refuses stale versions after concurrent placement or rename, without retrying', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default'); const version = f.snapshot().version
++            f.engine.nodeGraph.layout('default', { [f.a.id]: { x: 7, y: 8 } })
++            expect((await f.edit([{ action: 'rename', name: 'Stale' }], { version })).status).toBe(409)
++            const next = f.snapshot().version; f.engine.nodeGraph.rename('default', f.ws, 'UI renamed')
++            expect((await f.edit([{ action: 'annotation', id: 'note', value: note }], { version: next })).status).toBe(409)
++            expect(f.snapshot().workspace.name).toBe('UI renamed'); noControls(f)
++        } finally { f.close() }
++    })
++    it('rejects a stale edit when the user changed the active workspace after the read', async () => {
++        const f = fixture()
++        try {
++            const preset = f.engine.nodeGraph.saveAs('default', 'Next'), version = f.snapshot().version
++            f.engine.nodeGraph.activate('default', preset.id)
++            const before = f.snapshot(), counts = f.counts()
++            expect((await f.edit([{ action: 'rename', name: 'Stale context' }], { workspace: f.ws, version })).status).toBe(409)
++            expect(f.snapshot()).toEqual(before); expect(f.engine.nodeGraph.active('default')).toBe(preset.id)
++            expect(f.counts()).toEqual(counts); noControls(f)
++        } finally { f.close() }
++    })
++    it('edits an inactive slot without activating it, touching the active ledger, or reconciling management', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default'); const preset = f.engine.nodeGraph.saveAs('default', 'Inactive')
++            const before = f.snapshot(), ledger = structuredClone(f.store.sessionManager.list('default', true)), counts = f.counts()
++            const response = await f.edit([{ action: 'remove', ids: [f.a.id] }, { action: 'add', sessionId: f.b.id },
++                { action: 'connect', owner: f.root.id, child: f.b.id }, { action: 'annotation', id: 'note', value: note },
++                { action: 'routing', value: { junctions: [{ id: 'dot', owner: f.root.id, x: 20, y: 20 }], edges: [{ owner: f.root.id, child: f.b.id, via: 'dot' }] } }], { workspace: preset.id })
++            expect(response.status).toBe(200); expect(response.json.managementChanged).toBe(false)
++            expect(f.engine.nodeGraph.active('default')).toBe(f.ws)
++            expect(f.snapshot()).toEqual(before); expect(f.store.sessionManager.list('default', true)).toEqual(ledger); expect(f.counts()).toEqual(counts)
++            const ui = await f.call('/node-graph/workspaces/' + preset.id + '/annotations/note', { expected: note, value: null })
++            expect(ui.status).toBe(409) // Original UI still rejects stale edits after a workspace switch.
++            noControls(f)
++        } finally { f.close() }
++    })
++    it('keeps Stop-before-remove for busy chats and rolls back other changes', async () => {
++        const f = fixture()
++        try {
++            f.engine.addSessionManagerEntry(f.a.id, 'default'); f.engine.handleSessionAlive({ sid: f.a.id, time: Date.now(), thinking: true })
++            f.engine.pauseSession(f.a.id); const pause = f.engine.getManualPause(f.a.id), before = f.snapshot()
++            const response = await f.edit([{ action: 'rename', name: 'Not saved' }, { action: 'remove', ids: [f.a.id] }])
++            expect(response.status).toBe(409); expect(response.json.error).toContain('Stop busy chats')
++            expect(f.snapshot()).toEqual(before); expect(f.engine.getManualPause(f.a.id)).toBe(pause); noControls(f)
++        } finally { f.close() }
++    })
++    it('rejects root ownership/removal, foreign sessions/workspaces, malformed data and native-control actions', async () => {
++        const f = fixture()
++        try {
++            const version = f.snapshot().version
++            for (const changes of [[{ action: 'remove', ids: [f.root.id] }], [{ action: 'connect', owner: f.a.id, child: f.root.id }],
++                [{ action: 'add', sessionId: f.foreign.id }], [{ action: 'connect', owner: f.foreign.id, child: f.a.id }],
++                [{ action: 'layout', positions: { [f.a.id]: { x: Infinity, y: 0 } } }], [{ action: 'annotation', id: 'different', value: note }],
++                ...['stop', 'resume', 'send', 'activate'].map(action => [{ action }])]) {
++                const response = await f.edit(changes)
++                expect(response.status).not.toBe(200); expect(f.snapshot().version).toBe(version)
++            }
++            expect((await f.call('/node-graph/workspaces/' + f.ws + '/edit', { version, changes: [{ action: 'rename', name: 'Steal' }] }, 'other')).status).toBe(404)
++            expect((await f.call('/node-graph/workspaces/' + f.ws + '/edit', { changes: [{ action: 'rename', name: 'No version' }] })).status).toBe(400)
++            noControls(f)
++        } finally { f.close() }
++    })
++    it('never silently enrols the implicit overseer from layout; explicit root membership is visual only', async () => {
++        const f = fixture()
++        try {
++            const before = f.snapshot(), ledger = structuredClone(f.store.sessionManager.list('default', true)), counts = f.counts()
++            expect((await f.edit([{ action: 'layout', positions: { [f.root.id]: { x: 1, y: 2 } } }])).status).toBe(409)
++            expect(f.snapshot()).toEqual(before); expect(f.store.sessionManager.list('default', true)).toEqual(ledger)
++            const result = await f.edit([{ action: 'add', sessionId: f.root.id }, { action: 'layout', positions: { [f.root.id]: { x: 1, y: 2 } } }])
++            expect(result.status).toBe(200); expect(result.json.managementChanged).toBe(false)
++            expect(f.counts()).toEqual(counts); noControls(f)
++        } finally { f.close() }
++    })
++    it('does not nudge for visual-only changes and supports annotation deletion and disconnect', async () => {
++        const f = fixture()
++        try {
++            f.engine.nodeGraph.setOwner('default', f.root.id, f.a.id, 'user', f.root.id)
++            const counts = f.counts()
++            expect((await f.edit([{ action: 'layout', positions: { [f.a.id]: { x: 20, y: 80 } } }, { action: 'annotation', id: 'note', value: note }])).status).toBe(200)
++            expect(f.counts()).toEqual(counts)
++            const result = await f.edit([{ action: 'annotation', id: 'note', value: null }, { action: 'disconnect', child: f.a.id }])
++            expect(result.json.graph.annotations).toEqual([]); expect(result.json.graph.edges).toEqual([])
++            expect(result.json.managementChanged).toBe(true); noControls(f)
++        } finally { f.close() }
++    })
++    it('persists inactive edits and versions through hub reload while preserving Stop', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'node-tree-')), path = join(dir, 'db')
++        let f = fixture(path)
++        try {
++            f.engine.pauseSession(f.a.id); const pause = f.engine.getManualPause(f.a.id)
++            const preset = f.engine.nodeGraph.saveAs('default', 'Persistent')
++            const response = await f.edit([{ action: 'add', sessionId: f.a.id }, { action: 'annotation', id: 'note', value: note }], { workspace: preset.id })
++            expect(response.status).toBe(200); const saved = f.snapshot(preset.id)
++            f.close(); f = fixture(path)
++            expect(f.snapshot(preset.id)).toEqual(saved); expect(f.engine.getManualPause(f.a.id)).toBe(pause)
++            expect(f.engine.nodeGraph.active('default')).toBe(f.ws); noControls(f)
++        } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++})

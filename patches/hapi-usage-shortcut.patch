@@ -1,0 +1,64 @@
+--- a/web/src/components/AssistantChat/StatusBar.tsx
++++ b/web/src/components/AssistantChat/StatusBar.tsx
+@@ -8,6 +8,7 @@
+ import type { PermissionModeTone } from '@hapi/protocol'
+ import * as Popover from '@radix-ui/react-popover'
+ import { useMemo } from 'react'
++import { Link } from '@tanstack/react-router'
+ import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+ import type { ConversationStatus } from '@/realtime/types'
+ import { getContextBudgetTokens } from '@/chat/modelConfig'
+@@ -302,6 +303,14 @@
+                         {connectionStatus.text}
+                     </span>
+                 </div>
++                <Link
++                    to="/settings/usage"
++                    aria-label="Check usage"
++                    title="Check token usage and subscription limits"
++                    className="shrink-0 rounded px-1 text-xs text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline focus-visible:outline-2"
++                >
++                    Usage
++                </Link>
+                 {contextUsageLabel ? (
+                     <Popover.Root>
+                         <Popover.Trigger asChild>
+@@ -336,6 +345,12 @@
+                                 className="z-50 rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2 shadow-lg"
+                             >
+                                 <div className="flex max-w-[min(22rem,calc(100vw-1rem))] flex-col gap-1 text-xs leading-tight text-[var(--app-fg)]">
++                                    {props.contextWindow ? (
++                                        <span className="break-words text-[var(--app-hint)]">
++                                            Active runtime context: {props.contextWindow.toLocaleString()} tokens.
++                                            This can be smaller than the model’s advertised maximum.
++                                        </span>
++                                    ) : null}
+                                     {contextUsageDetails?.cacheRead ? (
+                                         <span className="break-words">
+                                             {t('misc.contextCache', { value: contextUsageDetails.cacheRead })}
+--- a/web/src/routes/settings/usage.tsx
++++ b/web/src/routes/settings/usage.tsx
+@@ -66,6 +66,23 @@
+ 
+     return (
+         <SettingsPageContent description={t('settings.usage.description')}>
++            <SettingsSection title="Subscription limits">
++                <div className="space-y-3 px-3 py-3 text-sm">
++                    <p className="text-[var(--app-hint)]">Check remaining allowance and reset times on your provider’s usage page. The token totals below cover messages recorded by this HAPI hub; they are not a subscription quota meter and may omit native subagents or other devices.</p>
++                    <div className="flex flex-wrap gap-4">
++                        <a className="text-[var(--app-link)] underline" href="https://claude.ai/settings/usage" target="_blank" rel="noopener noreferrer">Claude usage ↗</a>
++                        <a className="text-[var(--app-link)] underline" href="https://chatgpt.com/codex/settings/usage" target="_blank" rel="noopener noreferrer">Codex usage ↗</a>
++                    </div>
++                </div>
++            </SettingsSection>
++            <button
++                type="button"
++                onClick={() => void query.refetch()}
++                disabled={!api || query.isFetching}
++                className="rounded-lg border border-[var(--app-border)] px-3 py-2 text-sm text-[var(--app-link)] disabled:opacity-50"
++            >
++                {query.isFetching ? 'Refreshing…' : 'Refresh recorded usage'}
++            </button>
+             <div className="inline-flex overflow-hidden rounded-lg border border-[var(--app-border)]" role="radiogroup" aria-label={t('settings.usage.range.label')}>
+                 {(['7d', '30d', 'all'] as const).map((option) => (
+                     <button

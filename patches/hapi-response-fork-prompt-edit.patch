@@ -1,0 +1,542 @@
+--- a/web/src/components/AssistantChat/messages/UserMessage.tsx
++++ b/web/src/components/AssistantChat/messages/UserMessage.tsx
+@@ -81,27 +81,8 @@
+     const hasNativePoint = typeof localId === 'string'
+         && localId.length > 0
+         && ctx.metadata?.conversationHistoryPoints?.[localId] === true
+-    const isLatestBoundary = ctx.isLatestCompletedBoundary?.(messageId) === true
+-    const showCurrentFork = Boolean(
+-        history?.forkCurrent
+-        && isLatestBoundary
+-        && !ctx.disabled
+-        && ctx.onForkConversation
+-    )
+-    const showHistoricalFork = Boolean(
+-        history?.forkAtMessage
+-        && hasNativePoint
+-        && !isLatestBoundary
+-        && !ctx.disabled
+-        && ctx.onForkConversation
+-    )
+-    const showFork = showCurrentFork || showHistoricalFork
+-    const showRewind = Boolean(
+-        history?.rewindToMessage
+-        && hasNativePoint
+-        && !ctx.disabled
+-        && ctx.onRewindConversation
+-    )
++    const editMode = history?.rewindToMessage ? 'rewind' : history?.forkAtMessage ? 'fork' : undefined
++    const showEdit = Boolean(editMode && hasNativePoint && !ctx.disabled && ctx.onEditPrompt)
+ 
+     if (isCliOutput) {
+         return (
+@@ -155,16 +136,10 @@
+                 align="end"
+                 copyText={hasText ? text : undefined}
+                 messageElementId={elementId}
+-                showFork={showFork}
+-                showRewind={showRewind}
++                editMode={showEdit ? editMode : undefined}
+                 historyActionPending={ctx.historyActionPending}
+-                onFork={showCurrentFork
+-                    ? () => ctx.onForkConversation!()
+-                    : showHistoricalFork && localId
+-                        ? () => ctx.onForkConversation!(localId)
+-                        : undefined}
+-                onRewind={showRewind && localId
+-                    ? () => ctx.onRewindConversation!(localId)
++                onEditPrompt={showEdit && localId
++                    ? () => ctx.onEditPrompt!(localId, text, attachments)
+                     : undefined}
+             />
+         </MessagePrimitive.Root>
+--- a/web/src/components/AssistantChat/messages/AssistantMessage.tsx
++++ b/web/src/components/AssistantChat/messages/AssistantMessage.tsx
+@@ -68,6 +68,9 @@
+         && ctx.onForkConversation
+     )
+ 
++    const historicalBoundary = ctx.forkBoundaryAfter?.(messageId)
++    const showHistoricalFork = Boolean(history?.forkAtMessage && historicalBoundary && !ctx.disabled && ctx.onForkConversation)
++
+     const rootClass = toolOnly
+         ? 'py-1 min-w-0 max-w-full overflow-x-hidden'
+         : 'px-1 min-w-0 max-w-full overflow-x-hidden'
+@@ -88,9 +91,10 @@
+                 copyText={copyText || undefined}
+                 metadata={metadata}
+                 messageElementId={elementId}
+-                showFork={showForkCurrent}
++                showFork={showForkCurrent || showHistoricalFork}
+                 historyActionPending={ctx.historyActionPending}
+-                onFork={showForkCurrent ? () => ctx.onForkConversation!() : undefined}
++                onFork={showHistoricalFork ? () => ctx.onForkConversation!(historicalBoundary!)
++                    : showForkCurrent ? () => ctx.onForkConversation!() : undefined}
+             />
+         </MessagePrimitive.Root>
+     )
+--- a/web/src/components/AssistantChat/messages/MessageActions.tsx
++++ b/web/src/components/AssistantChat/messages/MessageActions.tsx
+@@ -23,6 +23,8 @@
+     messageElementId?: string
+     showFork?: boolean
+     showRewind?: boolean
++    editMode?: 'rewind' | 'fork'
++    onEditPrompt?: () => Promise<void>
+     historyActionPending?: boolean
+     onFork?: () => Promise<void>
+     onRewind?: () => Promise<void>
+@@ -52,6 +54,8 @@
+     messageElementId,
+     showFork = false,
+     showRewind = false,
++    editMode,
++    onEditPrompt,
+     historyActionPending = false,
+     onFork,
+     onRewind
+@@ -61,11 +65,13 @@
+     const threadIsRunning = useAuiState((state) => selectThreadIsRunning(state))
+     const canCopy = Boolean(copyText)
+     const hasMetadata = metadata ? buildMessageMetadataLabels(metadata).length > 0 : false
++    const [editOpen, setEditOpen] = useState(false)
++    const [editPending, setEditPending] = useState(false)
+     const [forkOpen, setForkOpen] = useState(false)
+     const [rewindOpen, setRewindOpen] = useState(false)
+     const [forkPending, setForkPending] = useState(false)
+     const [rewindPending, setRewindPending] = useState(false)
+-    const actionsLocked = historyActionPending || forkPending || rewindPending || threadIsRunning
++    const actionsLocked = historyActionPending || forkPending || rewindPending || editPending || threadIsRunning
+ 
+     const shareButton = messageElementId ? (
+         <ShareTurnButton
+@@ -76,6 +82,14 @@
+ 
+     const historyButtons = !actionsLocked ? (
+         <>
++            {editMode && onEditPrompt ? (
++                <MessageActionButton
++                    label={t(editMode === 'rewind' ? 'message.editRewind' : 'message.editBranch')}
++                    onClick={() => setEditOpen(true)}
++                >
++                    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6Z M14 5l5 5" /></svg>
++                </MessageActionButton>
++            ) : null}
+             {showRewind && onRewind ? (
+                 <MessageActionButton
+                     label={t('message.rewind')}
+@@ -125,6 +139,25 @@
+             </div>
+ 
+             <ConfirmDialog
++                isOpen={editOpen}
++                onClose={() => { if (!editPending) setEditOpen(false) }}
++                title={t(editMode === 'rewind' ? 'message.editRewind' : 'message.editBranch')}
++                description={t(editMode === 'rewind' ? 'message.editRewind.description' : 'message.editBranch.description')}
++                confirmLabel={t(editMode === 'rewind' ? 'message.editRewind' : 'message.editBranch')}
++                confirmingLabel={t('message.editRewind.pending')}
++                isPending={editPending}
++                destructive={editMode === 'rewind'}
++                onConfirm={async () => {
++                    if (!onEditPrompt || actionsLocked) throw new Error(t('message.historyBusy'))
++                    setEditPending(true)
++                    try {
++                        await onEditPrompt()
++                        setEditOpen(false)
++                    } finally { setEditPending(false) }
++                }}
++            />
++
++            <ConfirmDialog
+                 isOpen={forkOpen}
+                 onClose={() => {
+                     if (!forkPending) setForkOpen(false)
+@@ -135,7 +168,7 @@
+                 confirmingLabel={t('message.fork.confirming')}
+                 isPending={forkPending}
+                 onConfirm={async () => {
+-                    if (!onFork) return
++                    if (!onFork || actionsLocked) throw new Error(t('message.historyBusy'))
+                     setForkPending(true)
+                     try {
+                         await onFork()
+@@ -158,7 +191,7 @@
+                 isPending={rewindPending}
+                 destructive
+                 onConfirm={async () => {
+-                    if (!onRewind) return
++                    if (!onRewind || actionsLocked) throw new Error(t('message.historyBusy'))
+                     setRewindPending(true)
+                     try {
+                         await onRewind()
+--- a/web/src/components/AssistantChat/messages/MessageActions.test.tsx
++++ b/web/src/components/AssistantChat/messages/MessageActions.test.tsx
+@@ -433,3 +433,38 @@
+         expect(onRewind).toHaveBeenCalledTimes(1)
+     })
+ })
++
++
++describe('edit prompt history controls', () => {
++    beforeEach(() => { localStorage.clear(); auiState.thread.isRunning = false })
++    it('requires confirmation with the destructive context warning, then restores only once', async () => {
++        const edit = vi.fn().mockResolvedValue(undefined)
++        renderActions({ align: 'end', editMode: 'rewind', onEditPrompt: edit })
++        fireEvent.click(screen.getByRole('button', { name: 'Edit & rewind' }))
++        const dialog = screen.getByRole('dialog')
++        expect(dialog.textContent).toContain('delete this prompt and all later conversation context')
++        expect(edit).not.toHaveBeenCalled()
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Edit & rewind' }))
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++        expect(edit).toHaveBeenCalledTimes(1)
++    })
++    it('labels the safe branch fallback honestly and Cancel leaves history unchanged', () => {
++        const edit = vi.fn()
++        renderActions({ align: 'end', editMode: 'fork', onEditPrompt: edit })
++        fireEvent.click(screen.getByRole('button', { name: 'Edit in new branch' }))
++        const dialog = screen.getByRole('dialog')
++        expect(dialog.textContent).toContain('original chat stays unchanged')
++        expect(dialog.textContent).toContain('Later context is excluded')
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
++        expect(screen.queryByRole('dialog')).toBeNull()
++        expect(edit).not.toHaveBeenCalled()
++    })
++    it('does not offer editing during inference or another history action', () => {
++        auiState.thread.isRunning = true
++        const view = renderActions({ align: 'end', editMode: 'fork', onEditPrompt: vi.fn() })
++        expect(screen.queryByRole('button', { name: 'Edit in new branch' })).toBeNull()
++        view.unmount(); auiState.thread.isRunning = false
++        renderActions({ align: 'end', editMode: 'fork', historyActionPending: true, onEditPrompt: vi.fn() })
++        expect(screen.queryByRole('button', { name: 'Edit in new branch' })).toBeNull()
++    })
++})
+--- a/web/src/components/AssistantChat/context.tsx
++++ b/web/src/components/AssistantChat/context.tsx
+@@ -23,6 +23,8 @@
+     onForkConversation?: (messageLocalId?: string) => Promise<void>
+     onRewindConversation?: (messageLocalId: string) => Promise<void>
+     isLatestCompletedBoundary?: (messageId: string) => boolean
++    forkBoundaryAfter?: (messageId: string) => string | undefined
++    onEditPrompt?: (messageLocalId: string, text: string, attachments?: import('@/types/api').AttachmentMetadata[]) => Promise<void>
+     onShareTurn?: (
+         messageElement: HTMLElement | string | null,
+         clientY?: number,
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -538,6 +538,8 @@
+     onForkConversation?: (messageLocalId?: string) => Promise<void>
+     onRewindConversation?: (messageLocalId: string) => Promise<void>
+     isLatestCompletedBoundary?: (messageId: string) => boolean
++    forkBoundaryAfter?: (messageId: string) => string | undefined
++    onEditPrompt?: (messageLocalId: string, text: string, attachments?: import('@/types/api').AttachmentMetadata[]) => Promise<void>
+     onViewModeChange: (mode: 'tail' | 'history') => void
+     isSyncingTail: boolean
+     messagesWarning: string | null
+@@ -1711,6 +1713,8 @@
+             onForkConversation: props.onForkConversation,
+             onRewindConversation: props.onRewindConversation,
+             isLatestCompletedBoundary: props.isLatestCompletedBoundary,
++            forkBoundaryAfter: props.forkBoundaryAfter,
++            onEditPrompt: props.onEditPrompt,
+             onShareTurn: handleShareTurn,
+             hasMoreMessages: props.hasMoreMessages,
+             isSyncingTail: props.isSyncingTail,
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,3 +1,5 @@
++import { editHistoryPrompt } from '@/lib/history-prompt'
++import { saveDraft } from '@/lib/composer-drafts'
+ import { ManualPauseBanner } from '@/components/ManualPauseBanner'
+ import { NativeReadyMessages } from './AssistantChat/NativeReadyMessages'
+ import { resolveCodexModel } from '@/lib/codexModelCapabilities'
+@@ -58,7 +60,7 @@
+ import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
+ import { formatRelativeTime } from '@/lib/relativeTime'
+ import { ScratchlistMigrationBanner } from '@/components/AssistantChat/ScratchlistMigrationBanner'
+-import { findLatestCompletedBoundaryId, useHappyRuntime } from '@/lib/assistant-runtime'
++import { findAssistantForkBoundaries, findLatestCompletedBoundaryId, useHappyRuntime } from '@/lib/assistant-runtime'
+ import {
+     getRestoredComposerSendIntent,
+     resolveMessageDeliveryMode,
+@@ -85,11 +87,12 @@
+ import type { ScratchlistEntry } from '@/lib/scratchlist'
+ import { isHubScratchlistAttachmentPath } from '@hapi/protocol'
+ import {
++    saveDraftAttachments,
+     type AttachmentDraftInput,
+ } from '@/lib/composer-attachment-drafts'
+ import { useTranslation } from '@/lib/use-translation'
+ import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutations/useSendMessage'
+-import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
++import { handoffComposerDraft, setComposerDraftSnapshot, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+ import { ChatStatisticsButton } from '@/components/AssistantChat/ChatStatisticsButton'
+ import { SessionHeader } from '@/components/SessionHeader'
+ import { SessionActivityPanel } from '@/components/SessionActivityPanel'
+@@ -1509,6 +1512,11 @@
+         props.tailRevision
+     )
+ 
++    const assistantForkBoundaries = useMemo(() => findAssistantForkBoundaries(
++        visibleBlocks, props.session.metadata?.conversationHistoryPoints
++    ), [visibleBlocks, props.session.metadata?.conversationHistoryPoints])
++    const forkBoundaryAfter = useCallback((messageId: string) => assistantForkBoundaries.get(messageId), [assistantForkBoundaries])
++
+     const isLatestCompletedBoundary = useCallback((messageId: string) => {
+         return latestCompletedBoundaryId === messageId
+     }, [latestCompletedBoundaryId])
+@@ -1875,6 +1883,46 @@
+         pendingSendIntentRef,
+     })
+ 
++    const onEditPrompt = useCallback(async (messageLocalId: string, text: string, attachments?: AttachmentMetadata[]) => {
++        if (historyActionPending || props.session.thinking || hasRunningChildAgent || !props.session.active) {
++            throw new Error('Wait for this session to finish before editing its history.')
++        }
++        const history = props.session.metadata?.capabilities?.conversationHistory
++        const mode = history?.rewindToMessage ? 'rewind' : history?.forkAtMessage ? 'fork' : null
++        if (!mode || props.session.metadata?.conversationHistoryPoints?.[messageLocalId] !== true) {
++            throw new Error('This controller does not support editing at this prompt.')
++        }
++        if (mode === 'rewind') {
++            const draft = runtime.thread.composer.getState()
++            if (draft.text.trim() || draft.attachments.length) throw new Error('Save or clear your current draft before editing an earlier prompt.')
++        }
++        setHistoryActionPending(true)
++        try {
++            await editHistoryPrompt({
++                api: props.api, sessionId: props.session.id, messageLocalId, mode, attachments,
++                restore: async (targetId, files) => {
++                    const drafts = files.map((file) => ({ id: crypto.randomUUID(), file }))
++                    // Persist before navigation; preserve the source draft on forks.
++                    saveDraft(targetId, text)
++                    saveDraftAttachments(targetId, drafts)
++                    setComposerDraftSnapshot(targetId, text, drafts)
++                    if (mode === 'fork') {
++                        await navigate({ to: '/sessions/$sessionId', params: { sessionId: targetId }, ...PRESERVE_SESSION_SIDEBAR_SCROLL })
++                        return
++                    }
++                    rewindMessageWindow(targetId, messageLocalId)
++                    runtime.thread.composer.setText(text)
++                    for (const file of files) await runtime.thread.composer.addAttachment(file)
++                    setForceScrollToken(token => token + 1)
++                    focusComposerRef.current?.()
++                    // The rewind is already committed; a refresh failure must not
++                    // offer a destructive retry of the same prompt.
++                    void Promise.resolve().then(() => props.onRefresh()).catch(() => {})
++                }
++            })
++        } finally { setHistoryActionPending(false) }
++    }, [historyActionPending, props.api, props.session, props.onRefresh, hasRunningChildAgent, runtime, navigate])
++
+     const managedSessions = useManagedSessions(props.api)
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+@@ -1939,7 +1987,7 @@
+             <AssistantRuntimeProvider runtime={runtime}>
+                 <ShareSeedConsumer sessionId={props.session.id} sessionActive={props.session.active} />
+                 <AbortRestoreConsumer messages={normalizedMessages} onAbortRestore={props.onAbortRestore ?? (() => {})} />
+-                <DragDropZone disabled={(!props.session.active && !inactiveCanResume) || props.isSending || pendingSchedule != null || isScratchlistParking}>
++                <DragDropZone disabled={historyActionPending || (!props.session.active && !inactiveCanResume) || props.isSending || pendingSchedule != null || isScratchlistParking}>
+                     <div className="relative flex min-h-0 flex-1 flex-col">
+                         {canViewAgentTerminal && (
+                             // SessionChatInner is keyed by session.id, so switching sessions remounts this subtree.
+@@ -1970,6 +2018,8 @@
+                         onForkConversation={controlledByUser ? undefined : onForkConversation}
+                         onRewindConversation={controlledByUser ? undefined : onRewindConversation}
+                         isLatestCompletedBoundary={isLatestCompletedBoundary}
++                        forkBoundaryAfter={forkBoundaryAfter}
++                        onEditPrompt={controlledByUser ? undefined : onEditPrompt}
+                         onViewModeChange={props.onViewModeChange}
+                         isSyncingTail={props.isSyncingTail}
+                         messagesWarning={props.messagesWarning}
+@@ -2071,7 +2121,7 @@
+                         }}
+                         attachmentOrderRef={attachmentOrderRef}
+                         resolveSessionMentionTooltip={resolveSessionMentionTooltip}
+-                        disabled={props.isSending}
++                        disabled={props.isSending || historyActionPending}
+                         pendingSchedule={pendingSchedule}
+                         sendAcceptance={sendAcceptance}
+                         sendSettlement={props.sendSettlement}
+--- a/web/src/lib/assistant-runtime.ts
++++ b/web/src/lib/assistant-runtime.ts
+@@ -449,6 +449,32 @@
+         previousRole = role
+     }
+     return candidate
++}
++
++/** Native historical forks cut BEFORE a user prompt. Attach that boundary to
++ * the preceding rendered assistant response so its answer stays in the fork.
++ * Never skip an unsupported steer boundary or infer current from a history page.
++ */
++export function findAssistantForkBoundaries(
++    blocks: readonly VisibleChatBlock[],
++    nativePoints: Record<string, boolean> = {}
++): Map<string, string> {
++    const result = new Map<string, string>()
++    let assistantId: string | undefined
++    let previousRole: ReturnType<typeof visibleBlockRole> | null = null
++    for (const { block, threadMessageId } of assignThreadMessageIds(blocks)) {
++        const role = visibleBlockRole(block)
++        if (role === 'assistant' && previousRole !== 'assistant') assistantId = threadMessageId
++        if (role === 'user') {
++            const localId = 'localId' in block ? block.localId : null
++            if (assistantId && block.invokedAt != null && localId && nativePoints[localId] === true) {
++                result.set(assistantId, localId)
++            }
++            assistantId = undefined
++        }
++        previousRole = role
++    }
++    return result
+ }
+ 
+ function getAssistantBlockSignatures(blocks: readonly VisibleChatBlock[]): string[] {
+--- a/web/src/lib/assistant-runtime.test.ts
++++ b/web/src/lib/assistant-runtime.test.ts
+@@ -5,6 +5,7 @@
+     assignThreadMessageIds,
+     assignThreadMessageIdsWithStableWrappers,
+     findLatestCompletedBoundaryId,
++    findAssistantForkBoundaries,
+     getBlockPresentationTimestamp,
+     getResponseGroupTimestamps
+ } from './assistant-runtime'
+@@ -864,3 +865,25 @@
+         expect(aggregateResponseGroups(visible).get(group.id)?.roundSummary).toEqual(summary)
+     })
+ })
++
++
++describe('assistant reply fork boundaries', () => {
++    it('cuts before the NEXT prompt, preserving the selected answer and excluding later context', () => {
++        const blocks = [userText('u1', { localId: 'l1', invokedAt: 1 }), agentText('a1'),
++            userText('u2', { localId: 'l2', invokedAt: 2 }), agentText('a2')]
++        expect([...findAssistantForkBoundaries(blocks, { l1: true, l2: true })]).toEqual([['agent-text:a1', 'l2']])
++    })
++    it('uses the rendered group id for adjacent reasoning, tools and text', () => {
++        const blocks = [agentText('reason'), toolCall('tool'), agentText('answer'), userText('u', { localId: 'l', invokedAt: 1 })]
++        expect([...findAssistantForkBoundaries(blocks, { l: true })]).toEqual([['agent-text:reason', 'l']])
++    })
++    it('does not skip an unsupported mid-turn steer and include later output', () => {
++        const blocks = [agentText('a'), userText('steer', { localId: 'steer', invokedAt: 1 }),
++            agentText('after'), userText('u', { localId: 'l', invokedAt: 2 })]
++        expect([...findAssistantForkBoundaries(blocks, { l: true })]).toEqual([['agent-text:after', 'l']])
++    })
++    it('does not infer current from the end of a historical page or accept an uninvoked boundary', () => {
++        expect(findAssistantForkBoundaries([agentText('a')], {}).size).toBe(0)
++        expect(findAssistantForkBoundaries([agentText('a'), userText('queued', { localId: 'l' })], { l: true }).size).toBe(0)
++    })
++})
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -13,8 +13,14 @@
+   'message.info': 'Message details',
+   'message.fork': 'Fork',
+   'message.rewind': 'Rewind',
++  'message.editRewind': 'Edit & rewind',
++  'message.editBranch': 'Edit in new branch',
++  'message.editRewind.description': 'This will delete this prompt and all later conversation context from this chat. The prompt and its attachments will return to the composer for editing. Nothing is sent automatically.\nFiles and already-running jobs are not undone.',
++  'message.editBranch.description': 'This controller cannot safely rewind in place. Create a new chat ending before this prompt, with the prompt and attachments ready to edit?\nLater context is excluded from the new chat. The original chat stays unchanged. Nothing is sent automatically.',
++  'message.editRewind.pending': 'Preparing…',
++  'message.historyBusy': 'Wait for the current task and history action to finish, then try again.',
+   'message.fork.confirmTitle': 'Fork conversation',
+-  'message.fork.confirmDescription': 'Create a new session from this point?\nThe current session will not be changed.',
++  'message.fork.confirmDescription': 'Create a new session including this response and the context before it?\nThe current session will not be changed.',
+   'message.fork.confirming': 'Forking…',
+   'message.rewind.confirmTitle': 'Rewind conversation',
+   'message.rewind.confirmDescription': 'Rewind this session to this point?\nLater conversation history will be permanently removed. Files will not be changed.',
+--- /dev/null
++++ b/web/src/lib/history-prompt.ts
+@@ -0,0 +1,43 @@
++import type { ApiClient } from '@/api/client'
++import type { AttachmentMetadata } from '@/types/api'
++import { MAX_UPLOAD_BYTES } from '@/lib/attachmentAdapter'
++
++/** Fetch everything before destructive rewind. Missing files must not silently
++ * turn an attachment prompt into a different text-only request. Upload paths
++ * are never reused in the child; the normal composer uploads these fresh files.
++ */
++export async function loadHistoryPromptFiles(
++    api: Pick<ApiClient, 'readSessionFile'>,
++    sessionId: string,
++    attachments: readonly AttachmentMetadata[] = []
++): Promise<File[]> {
++    const files: File[] = []
++    for (const attachment of attachments) {
++        if (attachment.size > MAX_UPLOAD_BYTES) throw new Error(`Attachment too large to restore: ${attachment.filename}`)
++        const result = await api.readSessionFile(sessionId, attachment.path)
++        if (!result.success || result.content === undefined) {
++            throw new Error(`Cannot restore ${attachment.filename}: ${result.error ?? 'file unavailable'}. History was not changed.`)
++        }
++        const binary = atob(result.content)
++        if (binary.length !== attachment.size) throw new Error(`Attachment changed: ${attachment.filename}. History was not changed.`)
++        const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
++        files.push(new File([bytes], attachment.filename, { type: attachment.mimeType }))
++    }
++    return files
++}
++
++export async function editHistoryPrompt(options: {
++    api: Pick<ApiClient, 'readSessionFile' | 'forkConversation' | 'rewindConversation'>
++    sessionId: string
++    messageLocalId: string
++    mode: 'rewind' | 'fork'
++    attachments?: readonly AttachmentMetadata[]
++    /** Called only after native success, never on cancel or failed rewind. */
++    restore: (sessionId: string, files: File[]) => Promise<void>
++}): Promise<void> {
++    const files = await loadHistoryPromptFiles(options.api, options.sessionId, options.attachments)
++    const target = options.mode === 'fork'
++        ? (await options.api.forkConversation(options.sessionId, options.messageLocalId)).sessionId
++        : (await options.api.rewindConversation(options.sessionId, options.messageLocalId), options.sessionId)
++    await options.restore(target, files)
++}
+--- /dev/null
++++ b/web/src/lib/history-prompt.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it, vi } from 'vitest'
++import { editHistoryPrompt, loadHistoryPromptFiles } from './history-prompt'
++
++const attachment = { id: 'a', filename: 'note.txt', mimeType: 'text/plain', size: 3, path: '/original/note.txt' }
++function mocks() {
++    return {
++        readSessionFile: vi.fn().mockResolvedValue({ success: true, content: btoa('abc') }),
++        forkConversation: vi.fn().mockResolvedValue({ sessionId: 'child' }),
++        rewindConversation: vi.fn().mockResolvedValue({ success: true })
++    }
++}
++describe('historical prompt editing', () => {
++    it('branches before the selected prompt without modifying the source or auto-sending', async () => {
++        const api = mocks(), restore = vi.fn()
++        await editHistoryPrompt({ api, sessionId: 'source', messageLocalId: 'prompt', mode: 'fork', attachments: [attachment], restore })
++        expect(api.forkConversation).toHaveBeenCalledWith('source', 'prompt')
++        expect(api.rewindConversation).not.toHaveBeenCalled()
++        expect(restore).toHaveBeenCalledWith('child', [expect.any(File)])
++        expect(restore.mock.calls[0][1][0].name).toBe('note.txt')
++    })
++    it('rewinds native context before restoring the editable draft', async () => {
++        const api = mocks(), restore = vi.fn()
++        await editHistoryPrompt({ api, sessionId: 'source', messageLocalId: 'prompt', mode: 'rewind', restore })
++        expect(api.rewindConversation).toHaveBeenCalledWith('source', 'prompt')
++        expect(api.forkConversation).not.toHaveBeenCalled()
++        expect(restore).toHaveBeenCalledWith('source', [])
++        expect(api.rewindConversation.mock.invocationCallOrder[0]).toBeLessThan(restore.mock.invocationCallOrder[0])
++    })
++    it('does not change native history or the draft if any attachment is unavailable', async () => {
++        const api = mocks(), restore = vi.fn()
++        api.readSessionFile.mockResolvedValue({ success: false, error: 'missing' })
++        await expect(editHistoryPrompt({ api, sessionId: 'source', messageLocalId: 'prompt', mode: 'rewind', attachments: [attachment], restore })).rejects.toThrow('History was not changed')
++        expect(api.rewindConversation).not.toHaveBeenCalled(); expect(restore).not.toHaveBeenCalled()
++    })
++    it('does not clear messages or drafts after ambiguous or rejected native rewind', async () => {
++        const api = mocks(), restore = vi.fn()
++        api.rewindConversation.mockRejectedValue(new Error('ambiguous boundary'))
++        await expect(editHistoryPrompt({ api, sessionId: 'source', messageLocalId: 'prompt', mode: 'rewind', restore })).rejects.toThrow('ambiguous boundary')
++        expect(restore).not.toHaveBeenCalled(); expect(api.forkConversation).not.toHaveBeenCalled()
++    })
++    it('rejects changed attachment size before mutation', async () => {
++        await expect(loadHistoryPromptFiles(mocks(), 'source', [{ ...attachment, size: 4 }])).rejects.toThrow('Attachment changed')
++    })
++})

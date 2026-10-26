@@ -1,0 +1,507 @@
+--- a/hub/src/web/routes/managedSessions.ts
++++ b/hub/src/web/routes/managedSessions.ts
+@@ -3,7 +3,7 @@
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ 
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number } }
+ 
+ /** Chats an external manager supervises, published as JSON (HAPI_MANAGED_SESSIONS_FILE). */
+ export function readManagedSessions(path = process.env.HAPI_MANAGED_SESSIONS_FILE): Record<string, ManagedSession> {
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -79,7 +79,7 @@
+     const inner = raw && typeof raw === 'object' ? (raw as { graph?: unknown }).graph : undefined
+     return isGraph(inner) ? nodeGraphOf(inner) : null
+ }
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number } }
+ 
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+ export type SessionGoal = {
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -1,3 +1,6 @@
++import { SessionOversightBadge } from './SessionOversightBadge'
++import { sessionWorkEvidence } from '@/lib/sessionEvidence'
++import type { ManagedSession } from '@/api/client'
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+ import { useMemo } from 'react'
+ import type { SessionSummary } from '@/types/api'
+@@ -100,6 +103,7 @@
+     /** Recompute local unread attention when the session-list watermark changes. */
+     lastSeenVersion?: number
+     /** Run by the persistent manager: distinct running indicator. */
++    management?: ManagedSession
+     managed?: boolean
+     scheduleTooltipId?: string
+     className?: string
+@@ -123,6 +127,7 @@
+         attentionTooltipId: attentionTooltipIdProp,
+         lastSeenVersion,
+         managed = false,
++        management,
+         scheduleTooltipId: scheduleTooltipIdProp,
+         className,
+         inRunningSection = false,
+@@ -161,11 +166,12 @@
+     const timeLabel = getSessionTimeLabel(s, t)
+ 
+     const failure = sessionFailureLabel(s)
++    const workEvidence = sessionWorkEvidence(s)
+     const activity = (
+         failure ? <span aria-label={failure} title={s.lastFailure?.message} className="shrink-0 text-[11px] font-medium text-[var(--app-badge-error-text)]">{failure}</span> : s.active && (s.thinking || (s.backgroundTaskCount ?? 0) > 0) ? (
+-                        <span aria-label={s.thinking ? 'Running' : 'Background'} data-testid={s.thinking ? (managed ? 'managed-running' : 'activity-progress') : 'background-idle'}
++                        <span title={workEvidence.description} aria-label={workEvidence.label ?? 'Background'} data-testid={s.thinking ? (managed ? 'managed-running' : 'activity-progress') : 'background-idle'}
+                             className={`shrink-0 text-[11px] font-medium ${managed ? 'text-violet-500' : s.thinking ? 'text-green-500' : 'text-[var(--app-hint)]'}`}>
+-                            {s.thinking ? 'Running' : 'Background'}
++                            {workEvidence.label ?? 'Background'}
+                         </span>
+                     ) : managed ? (
+                         <span aria-label="Managed session" className="shrink-0 text-[11px] font-medium text-violet-500">Managed</span>
+@@ -183,8 +189,8 @@
+                     >
+                         {sessionName}
+                     </div>
+-                    {!alignActivityColumns ? activity : null}
+-                    {!s.thinking && (!s.active || failure) && (s.backgroundProcesses?.length ?? 0) > 0 ? <span className="shrink-0 text-[11px] text-[var(--app-hint)]" title="Verified background processes continue independently of the agent turn">Background · {s.backgroundProcesses!.length}</span> : null}
++                    {management && <SessionOversightBadge managed={management} interactive={false} />}{!alignActivityColumns ? activity : null}
++                    {!s.thinking && (!s.active || failure) && (s.backgroundProcesses?.length ?? 0) > 0 ? <span className="shrink-0 text-[11px] text-[var(--app-hint)]" title="Verified background processes continue independently of the agent turn">Processes · {s.backgroundProcesses!.length}</span> : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,3 +1,4 @@
++import { SessionOversightBadge } from './SessionOversightBadge'
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+@@ -92,9 +93,10 @@
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex h-8 min-w-0 flex-1 items-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath={false} singleLine alignActivityColumns managed={isManaged(session.id)} />
+                         </button>
+-                    <div className="w-14 shrink-0 overflow-hidden text-right"><SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} /></div>
+-                    <div className="grid shrink-0 grid-cols-[4.75rem_2rem] items-center gap-1">
+-                        {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" disabled={pending[session.id] || !props.api}
++                    <SessionOversightBadge managed={currentManaged[session.id]} />
++                    <div className="max-w-14 shrink-0 overflow-hidden text-right"><SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} /></div>
++                    <div className="grid shrink-0 grid-cols-[2rem_2rem] items-center gap-1">
++                        {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" aria-label="Unmanage" title="Stop managing this chat" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+                                 try {
+@@ -103,7 +105,7 @@
+                                     await client.invalidateQueries({ queryKey: ['managed-sessions'] })
+                                 } catch (error) { setErrors(old => ({ ...old, [session.id]: error instanceof Error ? error.message : 'Unmanage failed' })) }
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+-                            }} className="h-8 shrink-0 whitespace-nowrap rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Unmanage</button>}
++                            }} className="h-8 shrink-0 whitespace-nowrap rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40"><svg aria-hidden="true" viewBox="0 0 24 24" className="mx-auto h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="m9 15 6-6M7 17l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m4 8a4 4 0 0 0 6 0l4-4a4 4 0 0 0-6-6l-1 1M3 3l18 18"/></svg></button>}
+                         {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing || adding !== null} onClick={() => dismiss([session.id])} className="col-start-2 h-8 w-8 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                         : <button type="button" aria-label={`Stop ${getSessionTitle(session)}`} title="Stop" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -6,7 +6,7 @@
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import { SessionListScrollAnchor } from './SessionListScrollAnchor'
+ import type { SessionSummary } from '@/types/api'
+-import type { ApiClient } from '@/api/client'
++import type { ApiClient, ManagedSession } from '@/api/client'
+ import {
+     buildSessionSearchScoreIndex,
+     compareSessionsBySearchRelevance,
+@@ -926,6 +926,7 @@
+     machineLabel?: string
+     lastSeenVersion: number
+     onMoveToFolder?: (session: SessionSummary) => void
++    management?: ManagedSession
+     managed?: boolean
+     touchDrag?: TouchDragHandlers
+     onNativeDragStart?: React.DragEventHandler<HTMLButtonElement>
+@@ -1076,7 +1077,7 @@
+                     selected={selected}
+                     nestedTooltips
+                     attentionTooltipId={attentionId}
+-                    managed={props.managed}
++                    managed={props.managed} management={props.management}
+                     lastSeenVersion={lastSeenVersion}
+                     scheduleTooltipId={scheduleId}
+                     inRunningSection={inRunningSection}
+@@ -1608,7 +1609,7 @@
+                                             projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                                             machineLabel={resolveMachineLabel(s.metadata?.machineId ?? null)}
+                                             lastSeenVersion={lastSeenVersion}
+-                                            managed={Boolean(managedSessions[s.id])}
++                                            managed={Boolean(managedSessions[s.id])} management={managedSessions[s.id]}
+                                         />
+                                     ))}
+                                 </div>
+@@ -1641,7 +1642,7 @@
+                 projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                 machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
+                 lastSeenVersion={lastSeenVersion}
+-                managed={Boolean(managedSessions[s.id])}
++                managed={Boolean(managedSessions[s.id])} management={managedSessions[s.id]}
+                 onMoveToFolder={canMoveToFolder && ['codex', 'claude'].includes(getChatTab(s)) ? handleMoveToFolder : undefined}
+                 onNativeDragStart={() => setDraggedChat(s.id)}
+                 onNativeDragEnd={() => { setDraggedChat(null); setDropFolder(null) }}
+@@ -2057,7 +2058,7 @@
+                                             projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                                             machineLabel={resolveMachineLabel(s.metadata?.machineId ?? null)}
+                                             lastSeenVersion={lastSeenVersion}
+-                                            managed={Boolean(managedSessions[s.id])}
++                                            managed={Boolean(managedSessions[s.id])} management={managedSessions[s.id]}
+                                         />
+                                     ))}
+                                 </div>
+--- a/web/src/components/SessionActivityPanel.tsx
++++ b/web/src/components/SessionActivityPanel.tsx
+@@ -1,3 +1,5 @@
++import { oversightEvidence } from '@/lib/sessionEvidence'
++import type { ManagedSession } from '@/api/client'
+ import type { BackgroundProcess } from '@hapi/protocol/types'
+ import { useMemo, useState } from 'react'
+ import type { ApiClient } from '@/api/client'
+@@ -13,7 +15,7 @@
+ /** One activity entry point; live counts and loaded history have distinct labels. */
+ export function SessionActivityPanel(props: {
+     api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
+-    managed?: boolean;
++    managed?: boolean; management?: ManagedSession;
+     processes?: readonly BackgroundProcess[];
+     metadata: SessionMetadataSummary | null; active: boolean; thinking: boolean; count?: number; status: SessionStatusData | null;
+     viewedSubagentId: string | null; onViewSubagent: (id: string | null) => void;
+@@ -27,19 +29,21 @@
+     const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount), [props.blocks, props.messages, props.active, nativeCount])
+     const runningAgents = props.active ? agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length : 0
+     const runningTasks = props.active ? Math.max(props.count ?? 0, verified + tasks.filter(task => task.provider === 'codex' && task.state === 'running').length) : 0
+-    const summary = [runningTasks ? `Runtime reports ${runningTasks} background task${runningTasks === 1 ? '' : 's'}` : null, runningAgents ? `${runningAgents} subagent${runningAgents === 1 ? '' : 's'}` : null].filter(Boolean)
+-    const state = !props.active ? `Agent offline${verified ? ` · ${verified} verified background process${verified === 1 ? '' : 'es'}` : ''}` : `${props.thinking ? 'Agent working' : runningTasks > 0 || runningAgents > 0 ? 'Background' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
++    const summary = [verified ? `${verified} live local process${verified === 1 ? '' : 'es'}` : null, nativeCount ? `Runtime reports ${nativeCount} pending task${nativeCount === 1 ? '' : 's'}` : null, runningAgents ? `${runningAgents} subagent${runningAgents === 1 ? '' : 's'}` : null].filter(Boolean)
++    const state = !props.active ? `Agent offline${verified ? ` · ${verified} verified background process${verified === 1 ? '' : 'es'}` : ''}` : `${props.thinking ? 'Agent working' : (nativeCount ?? 0) > 0 || runningAgents > 0 ? 'Background' : verified ? 'Processes' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
++    const oversight = oversightEvidence(props.management ?? (props.managed ? { role: 'worker' } : undefined))
+     const todos = props.status?.tasks ?? []
+     const hasHistory = verified > 0 || agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
+-    return <ChatHeaderPopover label={`Activity · ${props.managed ? 'Managed · ' : ''}${state}`} title="Activity"
++    return <ChatHeaderPopover label={`Activity · ${oversight.label + ' · '}${state}`} title="Activity"
+         open={expanded} onOpenChange={setExpanded}
+         icon={<svg aria-hidden="true" viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4" /></svg>}
+         badge={runningTasks + runningAgents > 0 ? <span aria-hidden="true" className="absolute -right-0.5 -top-0.5 rounded-full bg-[var(--app-secondary-bg)] px-1 text-[9px] leading-3">{Math.min(99, runningTasks + runningAgents)}</span> : undefined}>
+         <section aria-label="Chat activity" className="space-y-3">
+             <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--app-hint)]">
+-                {props.managed ? <span title="Managed by Manager" className="shrink-0 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">Managed</span> : null}
++                <span className="shrink-0 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">{oversight.label}</span>
+                 <span className={props.active && props.thinking ? 'text-[var(--app-badge-success-text)]' : ''}>{state}</span>
+             </div>
++            <p className="text-xs text-[var(--app-hint)]">{oversight.description}</p>
+             {props.active && !props.thinking && (runningTasks > 0 || runningAgents > 0) ? <p className="text-xs text-[var(--app-hint)]">The agent's turn has finished. Runtime counts may lag task completion; individual records show the available evidence.</p> : null}
+             {props.status?.goal ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Goal · {props.status.goal.status}</h3><p className="break-words text-sm">{props.status.goal.objective}</p></div> : null}
+             {todos.length ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Checklist · {todos.filter(task => task.status === 'completed').length}/{todos.length}</h3>
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1951,7 +1951,7 @@
+                     <GoalBanner api={props.api} sessionId={props.session.id} running={Boolean(props.session.thinking)} />
+                     <SessionActivityPanel
+                         api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
+-                        metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])}
++                        metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])} management={managedSessions[props.session.id]}
+                         count={props.session.backgroundTaskCount} processes={props.session.backgroundProcesses} status={sessionStatus}
+                         viewedSubagentId={viewedSubagentId} onViewSubagent={setViewedSubagentId}
+                         viewedBackgroundId={viewedBackgroundId} onViewBackground={setViewedBackgroundId}
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,3 +1,6 @@
++import { sessionWorkEvidence } from '@/lib/sessionEvidence'
++import { SessionOversightBadge } from './SessionOversightBadge'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
+ import { FOLDER_GRAPH_DRAG_TYPE, readFolderGraphDrag, folderGraphMembers, folderGraphState, makeFolderGraphGroup, type FolderGraphDrag } from '@/lib/folderGraphDrop'
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+ import { fitNodeFrame, framePoints, frameMemberIds, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
+@@ -22,7 +25,7 @@
+ import { readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ import { openChatPopout } from '@/lib/popout'
+ 
+-export type NodeStatus = 'Running' | 'Background' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
++export type NodeStatus = 'Running' | 'Background' | 'Processes' | 'Unconfirmed' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+ type Mutate = ReturnType<typeof useNodeGraph>['mutate']
+ type Wire = NodeRouting['edges'][number] | { owner: null; child: string; via: string }
+@@ -62,11 +65,11 @@
+     if ((session as { manualPausedAt?: number | null }).manualPausedAt != null) return 'Stopped'
+     const failure = sessionFailureLabel(session)
+     if (failure) return failure
+-    if (!nodeIsIdle(session)) return session.thinking || session.pendingRequestsCount > 0 ? 'Running' : 'Background'
++    if (!nodeIsIdle(session)) return session.thinking || session.pendingRequestsCount > 0 ? 'Running' : (sessionWorkEvidence(session).label as NodeStatus ?? 'Background')
+     return session.active ? 'Idle' : 'Inactive'
+ }
+ const STATUS_DOT: Record<NodeStatus, string> = {
+-    Running: 'bg-emerald-500', Background: 'bg-sky-500', Capacity: 'bg-amber-500', Failed: 'bg-red-500', Idle: 'bg-[var(--app-hint)]', Stopped: 'bg-amber-500',
++    Processes: 'bg-slate-500', Unconfirmed: 'bg-amber-500', Running: 'bg-emerald-500', Background: 'bg-sky-500', Capacity: 'bg-amber-500', Failed: 'bg-red-500', Idle: 'bg-[var(--app-hint)]', Stopped: 'bg-amber-500',
+     Inactive: 'border border-[var(--app-hint)]', Unavailable: 'bg-[var(--app-badge-error-text)]', Loading: 'border border-dashed border-[var(--app-hint)]',
+ }
+ const errorText = (error: unknown, fallback: string) => error instanceof Error && error.message ? error.message : fallback
+@@ -83,6 +86,7 @@
+     respectChatPin?: boolean
+     headerTargets?: { center: HTMLElement | null; actions: HTMLElement | null }
+ }) {
++    const managedSessions = useManagedSessions(api ?? null)
+     const { data: activeGraph, error: activeError, isLoading: activeLoading, enabled, mutate } = useNodeGraph(api, visible)
+     const [previewId, setPreviewId] = useState<string | null>(() => readChatWindowPreference('node-preview-workspace'))
+     const previewing = Boolean(previewId && previewId !== activeGraph?.activeWorkspaceId)
+@@ -1130,6 +1134,7 @@
+                                 <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
+                             </span>
+                         </button>
++                        {managedSessions[id] && <span data-graph-ui className="absolute bottom-0 right-0"><SessionOversightBadge managed={managedSessions[id]} /></span>}
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+                             style={{ scale: Math.max(1, 0.85 / view.k) }}
+                             title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+--- a/web/src/components/BackgroundTasksPanel.tsx
++++ b/web/src/components/BackgroundTasksPanel.tsx
+@@ -84,8 +84,8 @@
+             {!tasks.length && !processes.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
+             {props.active && (props.count ?? 0) > tasks.length + processes.length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
+             {processes.map(process => <details key={process.id} className="rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-sm" data-verified-background-process={process.id}>
+-                <summary className="flex min-h-9 cursor-pointer items-center gap-2"><span className="min-w-0 flex-1"><code className="block truncate">{process.command}</code><span className="block text-xs text-[var(--app-hint)]">PID {process.pid}</span></span><span className="shrink-0 text-xs text-[var(--app-badge-success-text)]">Running (verified)</span></summary>
+-                <div className="mt-2 space-y-1"><CodeBlock code={process.command} language="bash" /><p className="text-xs text-[var(--app-hint)]">Verified locally at {new Date(process.checkedAt).toLocaleTimeString()}. This process can outlive the agent's turn or Stop.</p></div>
++                <summary className="flex min-h-9 cursor-pointer items-center gap-2"><span className="min-w-0 flex-1"><code className="block truncate">{process.command}</code><span className="block text-xs text-[var(--app-hint)]">PID {process.pid}</span></span><span className="shrink-0 text-xs text-[var(--app-badge-success-text)]">{Date.now() - process.checkedAt <= 15_000 ? 'Process alive' : 'Last seen (unconfirmed)'}</span></summary>
++                <div className="mt-2 space-y-1"><CodeBlock code={process.command} language="bash" /><p className="text-xs text-[var(--app-hint)]">Observed locally at {new Date(process.checkedAt).toLocaleTimeString()}. Liveness does not verify useful work, progress or success; browser helpers and servers may remain alive while idle. This process can outlive the agent's turn or Stop.</p></div>
+             </details>)}
+             {tasks.map(task => <button type="button" key={task.id} onClick={() => props.onView(task.id)} aria-label={`View background task: ${task.id}`}
+                 className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
+--- a/web/src/components/SessionActivityPanel.test.tsx
++++ b/web/src/components/SessionActivityPanel.test.tsx
+@@ -28,7 +28,7 @@
+         render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
+         expect(screen.getAllByRole('button')).toHaveLength(1)
+         expect(screen.queryByRole('dialog', { name: 'Activity' })).toBeNull()
+-        expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toHaveAttribute('aria-expanded', 'false')
++        expect(screen.getByRole('button', { name: /Activity.*Background.*1 pending task/ })).toHaveAttribute('aria-expanded', 'false')
+         expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+         expect(screen.queryByText(/Subagents/)).not.toBeInTheDocument()
+@@ -40,7 +40,7 @@
+     })
+     it('keeps working agent turns distinct from their background tasks', () => {
+         render(<Harness thinking />)
+-        expect(screen.getByRole('button', { name: /Activity.*Agent working.*1 background task/ })).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: /Activity.*Agent working.*1 pending task/ })).toBeInTheDocument()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+         expect(screen.queryByText(/The agent's turn has finished/)).not.toBeInTheDocument()
+     })
+@@ -64,14 +64,14 @@
+ 
+ 
+ describe('verified detached background processes', () => {
+-    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: 1000 }]
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: Date.now() }]
+     it('shows verified process details despite native goal blocked and no native task receipt', () => {
+         const getBackgroundTaskOutput = vi.fn()
+         render(<Harness empty count={1} processes={processes} blocked api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
+-        expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: /Activity.*Processes.*1 live local process/ })).toBeInTheDocument()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+         expect(screen.getByText('Goal · blocked')).toBeInTheDocument()
+-        expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++        expect(screen.getByText('Process alive')).toBeInTheDocument()
+         expect(screen.getByText('PID 123')).toBeInTheDocument()
+         expect(screen.getAllByText('render beach.blend').length).toBeGreaterThan(0)
+         expect(screen.queryByText(/no command details/)).toBeNull()
+@@ -81,21 +81,21 @@
+         const view = render(<Harness empty active={false} count={0} processes={processes} />)
+         expect(screen.getByRole('button', { name: /Agent offline.*1 verified background process/ })).toBeInTheDocument()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+-        expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++        expect(screen.getByText('Process alive')).toBeInTheDocument()
+         view.rerender(<Harness empty active={false} count={0} processes={[]} />)
+-        expect(screen.queryByText('Running (verified)')).toBeNull()
++        expect(screen.queryByText('Process alive')).toBeNull()
+         expect(screen.getByRole('button', { name: /Activity.*Agent offline$/ })).toBeInTheDocument()
+     })
+ })
+ 
+ 
+ it('counts verified jobs once without promoting old native receipts or inventing terminal details', () => {
+-    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: 1000 }]
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: Date.now() }]
+     render(<Harness count={1} processes={processes} />)
+-    expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: /Activity.*Processes.*1 live local process/ })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: /2 background tasks/ })).toBeNull()
+     fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+-    expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++    expect(screen.getByText('Process alive')).toBeInTheDocument()
+     expect(screen.queryByText('Last reported running')).toBeNull()
+     expect(screen.queryByText(/no command details/)).toBeNull()
+ })
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -207,22 +207,22 @@
+ 
+ 
+ it('shows verified detached work as Background without claiming active inference', () => {
+-    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: Date.now() }]
+     const view = render(<I18nProvider><SessionRowSummary session={makeSummary({ thinking: false, backgroundTaskCount: 1, backgroundProcesses: processes })} /></I18nProvider>)
+-    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(screen.getByText('Processes')).toBeInTheDocument()
+     expect(screen.queryByText('Running')).toBeNull()
+     view.rerender(<I18nProvider><SessionRowSummary session={makeSummary({ active: false, backgroundTaskCount: 0, backgroundProcesses: processes })} /></I18nProvider>)
+-    expect(screen.getByText('Background · 1')).toHaveAttribute('title', 'Verified background processes continue independently of the agent turn')
++    expect(screen.getByText('Processes · 1')).toHaveAttribute('title', 'Verified background processes continue independently of the agent turn')
+ })
+ 
+ 
+ it('shows failure and verified background work together while a turn is idle', () => {
+     const failure = { kind: 'capacity' as const, message: 'Capacity', at: 10 }
+-    const session = makeSummary({ lastFailure: failure, backgroundTaskCount: 1, backgroundProcesses: [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }] })
++    const session = makeSummary({ lastFailure: failure, backgroundTaskCount: 1, backgroundProcesses: [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: Date.now() }] })
+     const view = render(<I18nProvider><SessionRowSummary session={session} /></I18nProvider>)
+     expect(screen.getByText('Capacity')).toBeInTheDocument()
+-    expect(screen.getByText('Background · 1')).toBeInTheDocument()
++    expect(screen.getByText('Processes · 1')).toBeInTheDocument()
+     view.rerender(<I18nProvider><SessionRowSummary session={{ ...session, thinking: true }} /></I18nProvider>)
+     expect(screen.getByText('Running')).toBeInTheDocument()
+-    expect(screen.queryByText('Background · 1')).toBeNull()
+-})
++    expect(screen.queryByText('Processes · 1')).toBeNull()
++})
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -438,10 +438,10 @@
+ 
+ it('retains verified background work in Active without conflicting idle status or resuming it', async () => {
+     const client = new QueryClient()
+-    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: Date.now() }]
+     render(fixture(client, [{ ...session('Codex', true, false), backgroundTaskCount: 1, backgroundProcesses: processes }]))
+     open(); await screen.findByRole('button', { name: 'Open Codex' })
+-    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(screen.getByText('Processes')).toBeInTheDocument()
+     expect(screen.queryByText('Idle', { selector: 'p' })).toBeNull()
+     chooseFilter('Active')
+     expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
+@@ -452,11 +452,11 @@
+     const client = new QueryClient()
+     const getManualPause = vi.fn(async () => ({ pausedAt: 123 }))
+     const localApi = { ...controls, getManualPause } as unknown as ApiClient
+-    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: Date.now() }]
+     render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={localApi} sessions={[{ ...session('Codex', true, false), backgroundTaskCount: 1, backgroundProcesses: processes }]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
+     open()
+     expect(await screen.findByText('Stopped', { selector: 'p' })).toBeInTheDocument()
+-    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(screen.getByText('Processes')).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
+--- a/web/src/hooks/useManagedSessions.ts
++++ b/web/src/hooks/useManagedSessions.ts
+@@ -14,5 +14,8 @@
+         refetchInterval: 30_000,
+         retry: false,
+     })
++    // Re-evaluate heartbeat age even when a stalled publisher returns identical data.
++    void query.dataUpdatedAt
++    void query.errorUpdatedAt
+     return query.data ?? NONE
+ }
+--- /dev/null
++++ b/web/src/lib/sessionEvidence.ts
+@@ -0,0 +1,28 @@
++import type { ManagedSession } from '@/api/client'
++import type { SessionSummary } from '@/types/api'
++
++/** Process identity verifies liveness, never task purpose, health or progress. */
++export function sessionWorkEvidence(session: Pick<SessionSummary, 'thinking' | 'backgroundTaskCount' | 'backgroundProcesses'>, now = Date.now()) {
++    const processes = session.backgroundProcesses ?? []
++    const reported = Math.max(0, (session.backgroundTaskCount ?? 0) - processes.length)
++    const fresh = processes.filter(p => now >= p.checkedAt && now - p.checkedAt <= 15_000)
++    const label = session.thinking ? 'Running' : reported > 0 ? 'Background' : fresh.length ? 'Processes' : processes.length ? 'Unconfirmed' : null
++    return { label, reported, processes: fresh.length, description: session.thinking ? 'The agent is working.' : reported > 0
++        ? `Runtime reports ${reported} pending task${reported === 1 ? '' : 's'}. Counts may lag completion; this does not verify progress.`
++        : fresh.length ? `${fresh.length} live local process${fresh.length === 1 ? '' : 'es'}. These may be renders, browser helpers or servers; liveness does not prove useful work or progress.`
++        : processes.length ? 'Local process evidence is stale. Current work is unconfirmed.' : 'No background work detected. Detached or remote work may not be visible.' }
++}
++export function oversightEvidence(managed?: ManagedSession, now = Date.now()) {
++    if (!managed) return { label: 'Not watched', description: 'No manager oversight is configured for this chat. Background work can continue without manager follow-up.' }
++    if (managed.role === 'manager') return { label: 'Manager', description: 'This is the manager conversation.' }
++    const state = managed.oversight
++    if (!state || now / 1000 - state.publishedAt > 120 || state.publishedAt > now / 1000 + 5) return { label: 'Watch unconfirmed', description: 'Management is configured, but a recent observer heartbeat is unavailable.' }
++    const label = state.state === 'held' ? 'Watch held' : state.ownerState === 'paused' ? 'Manager paused' : state.ownerState === 'offline' ? 'Manager offline'
++        : state.state === 'quiet' ? 'Reports off' : state.state === 'idle' ? 'Watch idle' : state.state === 'attention' ? 'Watch error'
++        : state.state === 'watching' && state.ownerState === 'available' && state.observedAt && now / 1000 - state.observedAt <= 120 ? 'Watching' : 'Watch unconfirmed'
++    const last = state.observedAt ? `Last chat observation: ${new Date(state.observedAt * 1000).toLocaleTimeString()}. ` : 'No successful chat observation recorded yet. '
++    return { label, description: last + (state.pendingUpdates ? `${state.pendingUpdates} update${state.pendingUpdates === 1 ? '' : 's'} awaiting manager handling. ` : '') + (state.state === 'idle' ? 'Idle chat: detailed scans sleep until activity resumes. ' : state.state === 'held' ? 'Management is on hold. ' : '')
++        + (state.ownerState === 'paused' || state.ownerState === 'offline' ? 'Observations may continue, but the manager cannot act until available. ' : '')
++        + (state.notifications ? `Important changes, completion and input requests can notify the manager; routine updates during work use ${state.fallbackMinutes} minutes. ` : 'User-facing progress notifications are disabled. ')
++        + 'Observes chat events and reported process liveness, not continuous render-log or output-quality validation. A follow-up still needs the manager to handle the event.' }
++}
+--- /dev/null
++++ b/web/src/lib/sessionEvidence.test.ts
+@@ -0,0 +1,27 @@
++import { expect, it } from 'vitest'
++import { oversightEvidence, sessionWorkEvidence } from './sessionEvidence'
++import type { ManagedSession } from '@/api/client'
++const now = 1000000
++const process = { id: 'boot:1:start', pid: 1, command: 'browser.mjs', checkedAt: now }
++it('separates unclassified local processes, native pending tasks, inference and stale evidence', () => {
++    expect(sessionWorkEvidence({ thinking: false, backgroundTaskCount: 3, backgroundProcesses: [process, process, process] }, now).label).toBe('Processes')
++    expect(sessionWorkEvidence({ thinking: false, backgroundTaskCount: 2, backgroundProcesses: [process] }, now).label).toBe('Background')
++    expect(sessionWorkEvidence({ thinking: true, backgroundTaskCount: 1, backgroundProcesses: [process] }, now).label).toBe('Running')
++    expect(sessionWorkEvidence({ thinking: false, backgroundTaskCount: 1, backgroundProcesses: [process] }, now + 16000).label).toBe('Unconfirmed')
++    expect(sessionWorkEvidence({ thinking: false, backgroundTaskCount: 0, backgroundProcesses: [] }, now).description).toContain('remote work may not be visible')
++})
++const managed = (): ManagedSession => ({ role: 'worker', oversight: { state: 'watching', observedAt: now / 1000, publishedAt: now / 1000, ownerState: 'available', notifications: true, fallbackMinutes: 30 } })
++it('never equates configured management with verified observation or an available manager', () => {
++    expect(oversightEvidence(undefined, now).label).toBe('Not watched')
++    expect(oversightEvidence({ role: 'worker' }, now).label).toBe('Watch unconfirmed')
++    expect(oversightEvidence(managed(), now).label).toBe('Watching')
++    expect(oversightEvidence(managed(), now + 121000).label).toBe('Watch unconfirmed')
++    const m = managed();m.oversight!.ownerState = 'paused'
++    expect(oversightEvidence(m, now).label).toBe('Manager paused')
++    expect(oversightEvidence(m, now).description).toContain('cannot act')
++    m.oversight!.ownerState = 'offline';expect(oversightEvidence(m, now).label).toBe('Manager offline')
++    m.oversight!.ownerState = 'available';m.oversight!.state = 'idle';expect(oversightEvidence(m, now).label).toBe('Watch idle')
++    m.oversight!.state = 'held';expect(oversightEvidence(m, now).label).toBe('Watch held')
++    m.oversight!.state = 'attention';expect(oversightEvidence(m, now).label).toBe('Watch error')
++    m.oversight!.state = 'quiet';expect(oversightEvidence(m, now).label).toBe('Reports off')
++})
+--- /dev/null
++++ b/web/src/components/SessionOversightBadge.tsx
+@@ -0,0 +1,12 @@
++import * as Popover from '@radix-ui/react-popover'
++import type { ManagedSession } from '@/api/client'
++import { oversightEvidence } from '@/lib/sessionEvidence'
++/** Separate from execution status; tap works on phones, title works on desktop. */
++export function SessionOversightBadge({ managed, interactive = true }: { managed?: ManagedSession; interactive?: boolean }) {
++    const evidence = oversightEvidence(managed)
++    if (!interactive) return <span aria-label={`Oversight: ${evidence.label}`} title={`${evidence.label}. ${evidence.description}`} className={`shrink-0 text-[11px] ${evidence.label === 'Watching' ? 'text-violet-500' : 'text-[var(--app-hint)]'}`}>{evidence.label === 'Watching' ? '◉' : '◌'}</span>
++    return <Popover.Root><Popover.Trigger asChild><button type="button" aria-label={`Oversight: ${evidence.label}`} title={`${evidence.label}. ${evidence.description}`} onClick={event => event.stopPropagation()}
++        className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] ${evidence.label === 'Watching' ? 'text-violet-500' : 'text-[var(--app-hint)]'}`}>
++        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{evidence.label !== 'Watching' && <path d="m3 3 18 18"/>}</svg>
++    </button></Popover.Trigger><Popover.Portal><Popover.Content side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] max-w-72 rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl"><p className="mb-1 font-medium">{evidence.label}</p><p className="text-[var(--app-hint)]">{evidence.description}</p></Popover.Content></Popover.Portal></Popover.Root>
++}
+--- /dev/null
++++ b/web/src/components/SessionOversightBadge.test.tsx
+@@ -0,0 +1,18 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++import { SessionOversightBadge } from './SessionOversightBadge'
++afterEach(cleanup)
++it('opens readable oversight details on tap without opening a chat', () => {
++    const select = vi.fn()
++    render(<div onClick={select}><SessionOversightBadge /></div>)
++    fireEvent.click(screen.getByRole('button', { name: 'Oversight: Not watched' }))
++    expect(screen.getByText(/Background work can continue without manager follow-up/)).toBeInTheDocument()
++    expect(select).not.toHaveBeenCalled()
++})
++it('distinguishes watching from process liveness and shows pending manager handling', () => {
++    const now = Date.now() / 1000
++    render(<SessionOversightBadge managed={{ role: 'worker', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, pendingUpdates: 2, notifications: true, fallbackMinutes: 30 } }} />)
++    fireEvent.click(screen.getByRole('button', { name: 'Oversight: Watching' }))
++    expect(screen.getByText(/2 updates awaiting manager handling/)).toBeInTheDocument()
++    expect(screen.getByText(/not continuous render-log/)).toBeInTheDocument()
++})

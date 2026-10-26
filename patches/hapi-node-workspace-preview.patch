@@ -1,0 +1,572 @@
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -58,12 +58,12 @@
+     const overseer = options.overseer ?? ((namespace: string) => readOverseer(namespace))
+     // Management follows edges; ask the supervisor to reconcile now instead of on its next cycle.
+     const nudge = options.nudge ?? (() => { void requestManagerControl({ op: 'node_sync' }, { timeoutMs: 5_000 }).catch(() => undefined) })
+-    const respond = (engine: SyncEngine, namespace: string): NodeGraphResponse => ({
++    const respond = (engine: SyncEngine, namespace: string, workspaceId = engine.nodeGraph.active(namespace)): NodeGraphResponse => ({
+         activeWorkspaceId: engine.nodeGraph.active(namespace),
+         workspaces: engine.nodeGraph.workspaces(namespace),
+-        graph: engine.nodeGraph.graph(namespace),
++        graph: engine.nodeGraph.graph(namespace, workspaceId),
+         overseer: overseer(namespace),
+-        pausedAt: Object.fromEntries([...engine.nodeGraph.members(namespace), overseer(namespace)].flatMap(id => {
++        pausedAt: Object.fromEntries([...engine.nodeGraph.members(namespace, workspaceId), overseer(namespace)].flatMap(id => {
+             const at = id ? engine.getManualPause(id) : null
+             return at === null || !id ? [] : [[id, at]]
+         })),
+@@ -76,7 +76,9 @@
+         const engine = requireSyncEngine(c, getSyncEngine)
+         if (engine instanceof Response) return engine
+         c.header('Cache-Control', 'no-store')
+-        return c.json(respond(engine, c.get('namespace')))
++        const namespace = c.get('namespace'), requested = c.req.query('workspaceId')
++        if (requested && !engine.nodeGraph.exists(namespace, requested)) return c.json({ error: 'Workspace not found' }, 404)
++        return c.json(respond(engine, namespace, requested))
+     })
+     // Complete namespace-scoped inspection for the overseer, without activating any workspace.
+     app.get('/node-graph/tree', (c) => {
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -451,3 +451,24 @@
+         expect(f.engine.nodeGraph.graph('default', workspace).annotations?.find(a => a.id === 'outer')?.members).toEqual([])
+     } finally { f.close() }
+ })
++
++it('reads a namespace-scoped inactive workspace preview without activation, manager nudges or pause changes', async () => {
++    const f = fixture()
++    try {
++        const worker = f.create('preview-worker'); f.alive(worker.id, true)
++        const active = f.engine.nodeGraph.active('default'), preset = f.engine.nodeGraph.saveAs('default', 'Preview slot')
++        f.engine.nodeGraph.layout('default', { [worker.id]: { x: 123, y: 456 } }, preset.id)
++        f.engine.pauseSession(worker.id)
++        const pause = f.engine.getManualPause(worker.id), nudges = f.nudges()
++        const response = await f.call(`/node-graph?workspaceId=${encodeURIComponent(preset.id)}`)
++        expect(response.status).toBe(200)
++        expect(response.json.activeWorkspaceId).toBe(active)
++        expect(response.json.graph.workspaceId).toBe(preset.id)
++        expect(response.json.graph.nodes.find(n => n.sessionId === worker.id)?.x).toBe(123)
++        expect(f.engine.nodeGraph.active('default')).toBe(active)
++        expect(f.engine.getManualPause(worker.id)).toBe(pause)
++        expect(f.nudges()).toBe(nudges)
++        expect((await f.call(`/node-graph?workspaceId=${preset.id}`, undefined, 'foreign')).status).toBe(404)
++        expect((await f.call('/node-graph?workspaceId=missing')).status).toBe(404)
++    } finally { f.close() }
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -884,8 +884,8 @@
+         return (await this.request<{ sessions: Record<string, ManagedSession> }>('/api/managed-sessions')).sessions
+     }
+ 
+-    async getNodeGraph(): Promise<NodeGraphResponse> {
+-        const graph = nodeGraphOf(await this.request<unknown>('/api/node-graph'))
++    async getNodeGraph(workspaceId?: string): Promise<NodeGraphResponse> {
++        const graph = nodeGraphOf(await this.request<unknown>('/api/node-graph' + (workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : '')))
+         if (!graph) throw new Error('Invalid node graph response')
+         return graph
+     }
+--- a/web/src/api/nodeGraphClient.test.ts
++++ b/web/src/api/nodeGraphClient.test.ts
+@@ -146,3 +146,10 @@
+     expect(call(1).body).toMatchObject({ version: f.version, preserveConnections: false })
+     expect(fetchMock.mock.calls).toHaveLength(2)
+ })
++
++it('previews a workspace using only a scoped GET, never an activation mutation', async () => {
++    const api = new ApiClient('token')
++    await api.getNodeGraph('p 1')
++    expect(call(0)).toEqual({ url: '/api/node-graph?workspaceId=p%201', method: 'GET', body: undefined })
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++})
+--- a/web/src/hooks/useNodeGraph.ts
++++ b/web/src/hooks/useNodeGraph.ts
+@@ -37,3 +37,12 @@
+ export function activeWorkspaceName(graph: NodeGraphResponse | undefined): string | null {
+     return graph?.workspaces.find(workspace => workspace.id === graph.activeWorkspaceId)?.name ?? null
+ }
++
++/** Read-only previews never populate the authoritative active graph cache. */
++export function useNodeGraphPreview(api: ApiClient | null | undefined, workspaceId: string | null, visible: boolean) {
++    return useQuery<NodeGraphResponse>({
++        queryKey: ['node-graph-preview', workspaceId],
++        queryFn: api && workspaceId ? () => api.getNodeGraph(workspaceId) : skipToken,
++        enabled: Boolean(api && workspaceId), refetchInterval: visible && workspaceId ? 5000 : false, retry: false,
++    })
++}
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -9,7 +9,7 @@
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+-import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import { activeWorkspaceName, useNodeGraph, useNodeGraphPreview } from '@/hooks/useNodeGraph'
+ import { clampZoom, DEFAULT_NODE_GRID_SIZE, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+@@ -37,7 +37,7 @@
+     | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
+     | { kind: 'junction-move'; editLabel?: boolean; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'annotation'; editLabel?: boolean; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+-    | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
++    | { kind: 'pan'; previewNode?: string; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint; frames: NodeAnnotation[]; origins: NodeLayoutPositions; positions: NodeLayoutPositions }
+     | { kind: 'link'; pointer: number; from: string }
+@@ -69,7 +69,21 @@
+     respectChatPin?: boolean
+     headerTargets?: { center: HTMLElement | null; actions: HTMLElement | null }
+ }) {
+-    const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
++    const { data: activeGraph, error: activeError, isLoading: activeLoading, enabled, mutate } = useNodeGraph(api, visible)
++    const [previewId, setPreviewId] = useState<string | null>(() => readChatWindowPreference('node-preview-workspace'))
++    const previewing = Boolean(previewId && previewId !== activeGraph?.activeWorkspaceId)
++    const preview = useNodeGraphPreview(api, previewing ? previewId : null, visible)
++    const graph = previewing ? preview.data : activeGraph
++    const loadError = previewing ? preview.error?.message : activeError
++    const isLoading = activeLoading || (previewing && preview.isLoading)
++    const previewRef = useRef(previewing); previewRef.current = previewing
++    const choosePreview = async (id: string) => {
++        if (pending || mutationBusy.current) return
++        await dropInFlight.current; await flushRef.current()
++        const next = id === activeGraph?.activeWorkspaceId ? null : id
++        writeChatWindowPreference('node-preview-workspace', next ?? '')
++        setPreviewId(next)
++    }
+     const canvas = useRef<HTMLDivElement>(null)
+     const [editingJunction, setEditingJunction] = useState<{ workspace: string; before: NodeJunction; label: string } | null>(null)
+     const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
+@@ -96,7 +110,7 @@
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
+     const [addMenu, setAddMenu] = useState<{ x: number; y: number; point: GraphPoint; workspace: string } | null>(null)
+     const [addQuery, setAddQuery] = useState('')
+-    useEffect(() => { setAddMenu(null) }, [graph?.activeWorkspaceId])
++    useEffect(() => { setAddMenu(null) }, [graph?.graph.workspaceId])
+     const [dropActive, setDropActive] = useState(false)
+     const dropInFlight = useRef<Promise<void> | null>(null)
+     const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null; movingChild?: string } | null>(null)
+@@ -104,7 +118,7 @@
+     const historyRef = useRef(history); historyRef.current = history
+     const [redoHistory, setRedoHistory] = useState<GraphEdit[]>([])
+     const redoHistoryRef = useRef(redoHistory); redoHistoryRef.current = redoHistory
+-    const workspaceRef = useRef(graph?.activeWorkspaceId); workspaceRef.current = graph?.activeWorkspaceId
++    const workspaceRef = useRef(graph?.graph.workspaceId); workspaceRef.current = graph?.graph.workspaceId
+     const redoRef = useRef<() => void>(() => {})
+     const undoRef = useRef<() => void>(() => {})
+     const mutationBusy = useRef(false)
+@@ -190,22 +204,22 @@
+         const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
+         setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
+     }
+-    useEffect(() => {
+-        if (!graph || !layout || !visible || fittedWorkspace.current === graph.activeWorkspaceId) return
+-        fittedWorkspace.current = graph.activeWorkspaceId; skipViewWrite.current = true
++    useLayoutEffect(() => {
++        if (!graph || !layout || !visible || fittedWorkspace.current === graph.graph.workspaceId) return
++        fittedWorkspace.current = graph.graph.workspaceId; skipViewWrite.current = true
+         setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null)
+         let saved: View | null = null
+-        try { const value = JSON.parse(readChatWindowPreference('node-view:' + graph.activeWorkspaceId) ?? 'null'); if (value && [value.x, value.y, value.k].every(Number.isFinite) && value.k > 0 && value.k <= 2.5) saved = value } catch { /* First view fits. */ }
++        try { const value = JSON.parse(readChatWindowPreference('node-view:' + graph.graph.workspaceId) ?? 'null'); if (value && [value.x, value.y, value.k].every(Number.isFinite) && value.k > 0 && value.k <= 2.5) saved = value } catch { /* First view fits. */ }
+         if (saved) setView(saved); else fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+-    }, [graph?.activeWorkspaceId, layout, visible])
++    }, [graph?.graph.workspaceId, layout, visible])
+ 
+     useEffect(() => {
+         if (skipViewWrite.current) { skipViewWrite.current = false; return }
+-        if (graph && visible && fittedWorkspace.current === graph.activeWorkspaceId)
+-            writeChatWindowPreference('node-view:' + graph.activeWorkspaceId, JSON.stringify(view))
+-    }, [view, graph?.activeWorkspaceId, visible])
++        if (graph && visible && fittedWorkspace.current === graph.graph.workspaceId)
++            writeChatWindowPreference('node-view:' + graph.graph.workspaceId, JSON.stringify(view))
++    }, [view, graph?.graph.workspaceId, visible])
+ 
+     const flushSave = async () => {
+         if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
+@@ -342,6 +356,14 @@
+         cancelTouchMenu()
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+         if (pointers.current.size >= 2) { pinchStart(); return }
++        if (previewing) {
++            const node = target.closest('[data-node-id]')?.getAttribute('data-node-id') ?? undefined
++            const annotation = target.closest('[data-annotation-id]')?.getAttribute('data-annotation-id') ?? null
++            setSelectedAnnotation(annotation); setSelectedJunction(null); setMenu(null)
++            gesture.current = { kind: 'pan', previewNode: node, pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
++            if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
++            return
++        }
+         const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
+         const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
+         if (!annotation) setSelectedAnnotation(null)
+@@ -495,13 +517,14 @@
+         if (g.pointer !== event.pointerId) return
+         gesture.current = null
+         const cancelled = event.type === 'pointercancel'
++        if (g.kind === 'pan' && g.previewNode && !cancelled && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) { selectNode(g.previewNode); return }
+         if (g.kind === 'junction-move') {
+             if (g.moved && !cancelled) void changeRouting(routing => {
+                 const current = routing.junctions.find(j => j.id === g.id)
+                 if (!current || current.x !== g.origin.x || current.y !== g.origin.y) throw new Error('The junction moved elsewhere. Try again.')
+                 return { ...routing, junctions: routing.junctions.map(j => j.id === g.id ? { ...j, ...g.last } : j) }
+             }).finally(() => { setJunctionDrafts({}); setMovingJunction(null) })
+-            else { setJunctionDrafts({}); if (!cancelled && g.editLabel) { const dot = graph?.graph.junctions?.find(j => j.id === g.id); if (dot && graph) setEditingJunction({ workspace: graph.activeWorkspaceId, before: dot, label: dot.label ?? '' }) } }
++            else { setJunctionDrafts({}); if (!cancelled && g.editLabel) { const dot = graph?.graph.junctions?.find(j => j.id === g.id); if (dot && graph) setEditingJunction({ workspace: graph.graph.workspaceId, before: dot, label: dot.label ?? '' }) } }
+         } else if (g.kind === 'annotation') {
+             const clear = () => {
+                 setAnnotationDrafts({}); setJunctionDrafts({})
+@@ -537,7 +560,7 @@
+                     void changeVisual({ positions: { [g.id]: g.origin }, annotations: g.frames }, { positions: { [g.id]: g.last }, annotations: frames })
+                         .finally(() => setOverrides(old => { const next = { ...old }; delete next[g.id]; return next }))
+                 } else {
+-                    remember({ kind: 'move', workspace: graph!.activeWorkspaceId, id: g.id, before: g.origin, after: g.last })
++                    remember({ kind: 'move', workspace: graph!.graph.workspaceId, id: g.id, before: g.origin, after: g.last })
+                     if (g.id !== overseer || graph?.graph.nodes.some(n => n.sessionId === g.id)) queueSave(g.id, g.last)
+                 }
+             }
+@@ -581,6 +604,7 @@
+         }
+     }
+     const openMenu = (id: string, at?: GraphPoint, mode: 'actions' | 'owner' = 'actions') => {
++        if (previewRef.current) { selectNode(id); return }
+         const rect = canvas.current?.getBoundingClientRect()
+         const node = canvas.current?.querySelector(`[data-node-id="${CSS.escape(id)}"]`)?.getBoundingClientRect()
+         setObjectMenu(null); setSelectedNode(id); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddMenu(null)
+@@ -594,6 +618,7 @@
+         redoHistoryRef.current = []; setRedoHistory([])
+     }
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
++        if (previewRef.current) { setError('Switch to this workspace before editing it.'); return null }
+         if (mutationBusy.current || dropInFlight.current) return null
+         mutationBusy.current = true
+         setPending(key); setError(null)
+@@ -605,7 +630,7 @@
+         if (!graph) return null
+         return act('routing', async client => {
+             const fresh = await client.getNodeGraph()
+-            if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try again.')
++            if (fresh.activeWorkspaceId !== graph.graph.workspaceId) throw new Error('Workspace changed. Try again.')
+             const before = nodeRouting(fresh.graph), after = transform(before), invalid = nodeRoutingError(after, fresh.overseer)
+             if (invalid) throw new Error(invalid)
+             if (JSON.stringify(nodeRouting(before)) === JSON.stringify(nodeRouting(after))) return fresh
+@@ -631,12 +656,13 @@
+         if (!graph) return null
+         return act('visual', async client => {
+             await flushSave()
+-            const result = await client.editNodeVisual(graph.activeWorkspaceId, after, before)
+-            remember({ kind: 'visual', workspace: graph.activeWorkspaceId, before, after })
++            const result = await client.editNodeVisual(graph.graph.workspaceId, after, before)
++            remember({ kind: 'visual', workspace: graph.graph.workspaceId, before, after })
+             return result
+         })
+     }
+     const adjustAnnotation = (value: NodeAnnotation) => {
++        if (previewRef.current) return
+         const before = annotations.find(a => a.id === value.id)
+         if (!before) return
+         const members = before.kind === 'frame' ? frameMemberIds(before, annotations) : []
+@@ -662,7 +688,7 @@
+         setMenu(null); setSelectedAnnotation(null)
+         void changeRouting(r => ({ ...r, junctions: [...r.junctions, { id, ...point, owner: null }] })).then(result => { if (result) setSelectedJunction(id) })
+     }
+-    const saveAnnotation = async (value: NodeAnnotation | null, before: NodeAnnotation | null, workspace = graph?.activeWorkspaceId) => {
++    const saveAnnotation = async (value: NodeAnnotation | null, before: NodeAnnotation | null, workspace = graph?.graph.workspaceId) => {
+         const id = value?.id ?? before?.id
+         if (!workspace || !id) return null
+         const current = graph?.graph.annotations ?? []
+@@ -691,19 +717,19 @@
+         const centre = toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2)
+         const width = kind === 'frame' ? 480 : 280, height = kind === 'frame' ? 320 : 180
+         setMenu(null); setSelectedJunction(null); setMovingJunction(null); setError(null)
+-        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...snap(at ?? { x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
++        setEditingAnnotation({ workspace: graph.graph.workspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...snap(at ?? { x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
+     }
+     const editAnnotation = (value: NodeAnnotation) => {
+         if (!graph || pending) return
+         setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(value.id); setMenu(null); setError(null)
+-        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: value, value })
++        setEditingAnnotation({ workspace: graph.graph.workspaceId, before: value, value })
+     }
+     const changeOwner = (child: string, owner: string | null) => {
+         if (!graph) return Promise.resolve(null)
+         return act(`owner:${child}`, async client => {
+             // Another window may have changed the connection since this view polled.
+             const fresh = await client.getNodeGraph()
+-            if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try the edit again.')
++            if (fresh.activeWorkspaceId !== graph.graph.workspaceId) throw new Error('Workspace changed. Try the edit again.')
+             const edge = fresh.graph.edges.find(edge => edge.child === child)
+             const before = edge?.owner ?? null
+             if (edge?.via) {
+@@ -727,7 +753,7 @@
+         let inverse: Extract<GraphEdit, { kind: 'remove' }> | undefined
+         const result = await act('remove', async client => {
+             const fresh = await client.getNodeGraph()
+-            if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try removal again.')
++            if (fresh.activeWorkspaceId !== graph.graph.workspaceId) throw new Error('Workspace changed. Try removal again.')
+             const point = layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions[id]
+             if (point) inverse = { kind: 'remove', workspace: fresh.activeWorkspaceId, id, point, edges: fresh.graph.edges.filter(edge => edge.owner === id || edge.child === id) }
+             const removed = await client.removeNodes([id])
+@@ -745,7 +771,7 @@
+     const replayHistory = (direction: 'undo' | 'redo') => {
+         const source = direction === 'undo' ? historyRef : redoHistoryRef
+         if (gesture.current || pending || mutationBusy.current || dropInFlight.current || !graph || (!source.current.length && !Object.keys(pendingSave.current).length)) return
+-        const workspace = graph.activeWorkspaceId
++        const workspace = graph.graph.workspaceId
+         let replayedEdit: GraphEdit | undefined
+         void act(direction, async client => {
+             await flushSave()
+@@ -781,13 +807,14 @@
+ 
+     if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
+     const dragOver = (event: DragEvent<HTMLDivElement>) => {
+-        if (!hasSessionDrag(event.dataTransfer)) return
++        if (previewing || !hasSessionDrag(event.dataTransfer)) return
+         event.preventDefault()
+         if (!graph || pending || dropInFlight.current) { event.dataTransfer.dropEffect = 'none'; return }
+         event.dataTransfer.dropEffect = 'copy'
+         setDropActive(true)
+     }
+     const drop = (event: DragEvent<HTMLDivElement>) => {
++        if (previewing) return
+         event.preventDefault()
+         setDropActive(false)
+         const id = readSessionDrag(event.dataTransfer)
+@@ -804,12 +831,12 @@
+             try {
+                 await flushSave()
+                 const fresh = await api!.getNodeGraph()
+-                if (fresh.activeWorkspaceId !== graph.activeWorkspaceId) throw new Error('Workspace changed. Try the drop again.')
++                if (fresh.activeWorkspaceId !== graph.graph.workspaceId) throw new Error('Workspace changed. Try the drop again.')
+                 const exists = fresh.graph.nodes.some(n => n.sessionId === id)
+                 const before = exists ? layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions[id] : undefined
+                 if (!exists) await mutate(client => client.addNode(id))
+                 await mutate(client => client.saveNodeLayout({ [id]: point }))
+-                remember(exists && before ? { kind: 'move', workspace: graph.activeWorkspaceId, id, before, after: point } : { kind: 'add', workspace: graph.activeWorkspaceId, id, point })
++                remember(exists && before ? { kind: 'move', workspace: graph.graph.workspaceId, id, before, after: point } : { kind: 'add', workspace: graph.graph.workspaceId, id, point })
+                 const latest = await api!.getNodeGraph(), annotations = latest.graph.annotations ?? []
+                 const framed = placeInFrame(annotations, id, framePoints({ ...positionsRef.current, [id]: point }, annotations, junctionsRef.current))
+                 if (JSON.stringify(framed) !== JSON.stringify(annotations)) {
+@@ -822,10 +849,11 @@
+         })()
+     }
+     const showAddMenu = (clientX: number, clientY: number) => {
++        if (previewRef.current) return
+         if (!graph || pending || mutationBusy.current || dropInFlight.current) return
+         const rect = canvas.current?.getBoundingClientRect()
+         setMenu(null); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddQuery(''); setError(null)
+-        setAddMenu({ x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0), point: round(toGraph(clientX, clientY)), workspace: graph.activeWorkspaceId })
++        setAddMenu({ x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0), point: round(toGraph(clientX, clientY)), workspace: graph.graph.workspaceId })
+     }
+     const menuSession = menu ? sessionsById.get(menu.id) : undefined
+     const menuOwner = menu ? layout?.parent[menu.id] : undefined
+@@ -833,7 +861,7 @@
+     const closeMenu = () => { setMenu(null); setError(null) }
+     const menuKeys = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu() } }
+ 
+-    const workspaceControl = graph ? <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /> : null
++    const workspaceControl = activeGraph ? <WorkspaceBar graph={activeGraph} viewedWorkspaceId={previewing ? previewId : null} onPreview={id => void choosePreview(id)} onActivated={() => { setPreviewId(null); writeChatWindowPreference('node-preview-workspace', '') }} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /> : null
+     const gridControl = graph ? <div data-graph-ui className="flex shrink-0 items-center">
+         <Popover.Root><Popover.Trigger asChild><button type="button" aria-label="Grid settings" title="Grid and snapping" aria-pressed={grid.enabled} className={`${iconButton} ${grid.enabled ? 'text-[var(--app-link)]' : ''}`}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="1.5" /><path d="M9 3v18M15 3v18M3 9h18M3 15h18" /></svg></button></Popover.Trigger>
+             <Popover.Portal><Popover.Content data-graph-ui aria-label="Grid settings" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="end" collisionPadding={8} className="z-[110] w-60 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-sm shadow-xl">
+@@ -852,7 +880,7 @@
+         }))
+     ].filter(option => option.search.toLowerCase().includes(addQuery.trim().toLowerCase())).slice(0, 53)
+     const chooseAdd = (run: () => void) => {
+-        if (!addMenu || addMenu.workspace !== graph?.activeWorkspaceId) return
++        if (!addMenu || addMenu.workspace !== graph?.graph.workspaceId) return
+         run(); setAddMenu(null)
+     }
+     const addMenuKeys = (event: KeyboardEvent<HTMLDivElement>) => {
+@@ -890,6 +918,7 @@
+             }}
+             onKeyDown={event => {
+                 const target = event.target instanceof Element ? event.target : null
++                if (previewing && ['Delete', 'Backspace'].includes(event.key)) { event.preventDefault(); return }
+                 if (event.key === 'Escape' && (gesture.current?.kind === 'box' || gesture.current?.kind === 'node')) { event.preventDefault(); event.stopPropagation(); cancelSelectionGesture(); return }
+                 if ((event.key === 'Delete' || event.key === 'Backspace') && !event.ctrlKey && !event.metaKey && !target?.closest('input, textarea, select, [contenteditable], [data-graph-ui]') && selectedNode) { event.preventDefault(); event.stopPropagation(); void removeNode(selectedNode); return }
+                 if (event.shiftKey && event.key.toLowerCase() === 'a' && event.target === event.currentTarget) {
+@@ -921,7 +950,7 @@
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+                 <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
+-                    onAdjust={adjustAnnotation} onContextMenu={(id, x, y) => { const a = annotations.find(a => a.id === id); if (a) openObjectMenu(a.kind + ':' + id, x, y) }} />
++                    onAdjust={adjustAnnotation} onContextMenu={(id, x, y) => { if (previewing) return; const a = annotations.find(a => a.id === id); if (a) openObjectMenu(a.kind + ':' + id, x, y) }} />
+                 <svg className="pointer-events-none absolute left-0 top-0 overflow-visible z-[1]" width="1" height="1" aria-hidden="true">
+                     <defs>
+                         <marker id="node-edge-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-link)" /></marker>
+@@ -1000,8 +1029,8 @@
+                 <button type="button" aria-label="Undo graph edit" title="Undo graph edit (Ctrl+Z)" disabled={!history.length || pending !== null} onClick={() => undoRef.current()} className={`${iconButton} border-l border-[var(--app-divider)]`}>↶</button>
+                 <button type="button" aria-label="Redo graph edit" title="Redo graph edit (Ctrl+Shift+Z)" disabled={!redoHistory.length || pending !== null} onClick={() => redoRef.current()} className={iconButton}>↷</button>
+             </div>
+-            {selectedDot && !menu && <section data-graph-ui aria-label="Junction actions" className="absolute bottom-16 right-2 z-20 w-64 max-w-[calc(100%_-_16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow">
+-                <div className="flex items-center gap-1"><button type="button" aria-label="Edit junction label" onClick={() => setEditingJunction({ workspace: graph!.activeWorkspaceId, before: selectedDot, label: selectedDot.label ?? '' })} className="min-w-0 flex-1 truncate px-1 text-left text-xs font-medium">{selectedDot.label || 'Label…'}</button>
++            {selectedDot && !menu && !previewing && <section data-graph-ui aria-label="Junction actions" className="absolute bottom-16 right-2 z-20 w-64 max-w-[calc(100%_-_16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow">
++                <div className="flex items-center gap-1"><button type="button" aria-label="Edit junction label" onClick={() => setEditingJunction({ workspace: graph!.graph.workspaceId, before: selectedDot, label: selectedDot.label ?? '' })} className="min-w-0 flex-1 truncate px-1 text-left text-xs font-medium">{selectedDot.label || 'Label…'}</button>
+                     <button type="button" aria-label="Move junction" aria-pressed={movingJunction === selectedDot.id} disabled={pending !== null} onClick={() => setMovingJunction(old => old === selectedDot.id ? null : selectedDot.id)} className={`min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)] ${movingJunction === selectedDot.id ? 'text-[var(--app-link)]' : ''}`}>Move</button>
+                     <button type="button" aria-label="Delete junction" disabled={pending !== null} onClick={async () => { if (await changeRouting(r => removeJunction(r, selectedDot.id))) setSelectedJunction(null) }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)]">Delete</button>
+                 </div>
+@@ -1013,14 +1042,14 @@
+                     <option value="">{selectedDot.owner ? 'Add branch…' : 'Connect input first'}</option>{ids.filter(id => id !== overseer && id !== selectedDot.owner).map(id => <option key={id} value={id}>{title(id)}</option>)}
+                 </select></label>
+             </section>}
+-            {selected && !menu && <div ref={annotationActions} data-graph-ui data-annotation-toolbar aria-label="Annotation actions" style={annotationActionPoint} className="absolute z-20 flex w-max max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++            {selected && !menu && !previewing && <div ref={annotationActions} data-graph-ui data-annotation-toolbar aria-label="Annotation actions" style={annotationActionPoint} className="absolute z-20 flex w-max max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                 <button type="button" disabled={pending !== null} onClick={() => editAnnotation(selected)} className="min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)]">Edit</button>
+                 {annotations.some(a => a.members?.includes(selected.kind + ':' + selected.id)) && <button type="button" onClick={() => removeFromFrame(selected.kind + ':' + selected.id)} className={menuItem}>Remove from frame</button>}
+                 <button type="button" aria-label="Delete annotation" disabled={pending !== null} onClick={() => void saveAnnotation(null, selected)} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>
+             </div>}
+             {editingJunction && <Dialog open onOpenChange={open => { if (!open && !pending) setEditingJunction(null) }}><DialogContent data-graph-ui aria-describedby={undefined}>
+                 <DialogHeader><DialogTitle>Junction label</DialogTitle></DialogHeader>
+-                <form onSubmit={async event => { event.preventDefault(); const edit = editingJunction; if (edit.workspace !== graph?.activeWorkspaceId) { setEditingJunction(null); return }
++                <form onSubmit={async event => { event.preventDefault(); const edit = editingJunction; if (edit.workspace !== graph?.graph.workspaceId) { setEditingJunction(null); return }
+                     if (await changeRouting(r => { const dot = r.junctions.find(j => j.id === edit.before.id); if (!dot || dot.x !== edit.before.x || dot.y !== edit.before.y || dot.owner !== edit.before.owner || (dot.label ?? '') !== (edit.before.label ?? '')) throw new Error('Junction changed elsewhere. Reopen the label.'); return { ...r, junctions: r.junctions.map(j => j.id === dot.id ? { ...j, label: edit.label.trim() } : j) } })) setEditingJunction(null) }}>
+                     <input autoFocus aria-label="Junction label" maxLength={120} value={editingJunction.label} onChange={event => setEditingJunction({ ...editingJunction, label: event.target.value })} className="my-3 min-h-11 w-full rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-3" />
+                     {error && <p role="alert">{error}</p>}<div className="flex justify-end gap-2"><button type="button" disabled={pending !== null} onClick={() => setEditingJunction(null)} className={iconButton}>Cancel</button><button type="submit" disabled={pending !== null} className={iconButton}>Save</button></div>
+@@ -1029,7 +1058,7 @@
+                 onSave={async value => { if (await saveAnnotation(value, editingAnnotation.before, editingAnnotation.workspace)) { setEditingAnnotation(null); setSelectedAnnotation(value.id) } }} />}
+             <Popover.Root open={Boolean(objectMenu)} onOpenChange={open => { if (!open) setObjectMenu(null) }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: objectMenu?.x ?? 0, top: objectMenu?.y ?? 0 }} /></Popover.Anchor>
+-                {objectMenu && <Popover.Portal><Popover.Content data-graph-ui aria-label="Object actions" side="bottom" align="start" collisionPadding={8} className="z-[110] w-52 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 text-sm shadow-xl">
++                {objectMenu && !previewing && <Popover.Portal><Popover.Content data-graph-ui aria-label="Object actions" side="bottom" align="start" collisionPadding={8} className="z-[110] w-52 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 text-sm shadow-xl">
+                     {annotations.some(a => a.members?.includes(objectMenu.id)) ? <button type="button" className={menuItem} onClick={() => removeFromFrame(objectMenu.id)}>Remove from frame</button> : <p className="px-3 py-2 text-[var(--app-hint)]">Not in a frame</p>}
+                 </Popover.Content></Popover.Portal>}
+             </Popover.Root>
+@@ -1082,7 +1111,7 @@
+     Number(b.kind === 'default') - Number(a.kind === 'default') || a.createdAt - b.createdAt || a.name.localeCompare(b.name))
+ 
+ /** Current slot, slot list, save/rename/delete presets, and confirmed switching. */
+-export function WorkspaceBar({ graph, title, mutate, beforeSwitch }: { graph: NodeGraphResponse; title: (id: string) => string; mutate: Mutate; beforeSwitch?: () => Promise<void> }) {
++export function WorkspaceBar({ graph, title, mutate, beforeSwitch, viewedWorkspaceId, onPreview, onActivated }: { graph: NodeGraphResponse; title: (id: string) => string; mutate: Mutate; beforeSwitch?: () => Promise<void>; viewedWorkspaceId?: string | null; onPreview?: (id: string) => void; onActivated?: () => void }) {
+     const [open, setOpen] = useState(false)
+     const [presetName, setPresetName] = useState('')
+     const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null)
+@@ -1092,6 +1121,8 @@
+     const [pending, setPending] = useState(false)
+     const [error, setError] = useState<string | null>(null)
+     const current = activeWorkspaceName(graph) ?? 'Default'
++    const viewed = graph.workspaces.find(w => w.id === viewedWorkspaceId)
++    const isPreview = Boolean(viewed && viewed.id !== graph.activeWorkspaceId)
+     const leaving = graph.graph.nodes.map(node => node.sessionId).filter(id => id !== graph.overseer)
+     const run = async (work: () => Promise<unknown>) => {
+         setPending(true); setError(null)
+@@ -1100,10 +1131,10 @@
+         finally { setPending(false) }
+     }
+     const closeSwitch = () => { if (!pending) { setTarget(null); setResult(null); setError(null) } }
+-    return <Popover.Root open={open} onOpenChange={value => { setOpen(value); setError(null) }}>
++    return <div className="flex min-w-0 items-center gap-1"><Popover.Root open={open} onOpenChange={value => { setOpen(value); setError(null) }}>
+         <Popover.Trigger asChild><button type="button" aria-label="Workspaces" aria-expanded={open}
+             className="pointer-events-auto flex h-8 min-w-0 max-w-full items-center gap-1 rounded-md px-2 text-xs hover:bg-[var(--app-subtle-bg)]">
+-            <span className="truncate font-medium">{current}</span><span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
++            <span className="truncate font-medium">{isPreview ? viewed!.name : current}</span>{isPreview && <span className="text-[10px] text-[var(--app-hint)]">Preview</span>}<span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
+         </button></Popover.Trigger>
+         <Popover.Portal><Popover.Content data-graph-ui role="group" aria-label="Workspace slots" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="start" collisionPadding={8} className="pointer-events-auto z-[110] w-80 max-w-[calc(100vw-16px)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
+             <ul className="max-h-72 overflow-y-auto overscroll-contain">
+@@ -1119,13 +1150,13 @@
+                             <button type="submit" disabled={pending || !renaming.name.trim()} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] disabled:opacity-40">Save</button>
+                             <button type="button" onClick={() => setRenaming(null)} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-hint)]">Cancel</button>
+                         </form> : <>
+-                            <span className="min-w-0 flex-1 truncate px-1 text-sm">{workspace.name}
++                            <button type="button" aria-label={`Preview ${workspace.name}`} disabled={pending} onClick={() => { onPreview?.(workspace.id); setOpen(false) }} className="min-h-10 min-w-0 flex-1 truncate rounded px-1 text-left text-sm hover:bg-[var(--app-subtle-bg)]">{workspace.name}
+                                 {workspace.kind === 'default' && <span className="ml-1.5 text-[11px] text-[var(--app-hint)]">default</span>}
+-                                {active && <span className="ml-1.5 rounded bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[11px] text-[var(--app-fg)]">active</span>}</span>
++                                {active && <span className="ml-1.5 rounded bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[11px] text-[var(--app-fg)]">active</span>}</button>
+                             {!active && <button type="button" aria-label={`Switch to ${workspace.name}`} disabled={pending} onClick={() => { setOpen(false); setTarget(workspace); setResult(null); setError(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Switch</button>}
+                             {editable && <button type="button" aria-label={`Rename ${workspace.name}`} disabled={pending} onClick={() => { setRenaming({ id: workspace.id, name: workspace.name }); setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">Rename</button>}
+                             {editable && (deleting === workspace.id
+-                                ? <button type="button" aria-label={`Confirm delete ${workspace.name}`} disabled={pending} onClick={async () => { if (await run(() => mutate(client => client.deleteWorkspace(workspace.id)))) setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm font-medium text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete?</button>
++                                ? <button type="button" aria-label={`Confirm delete ${workspace.name}`} disabled={pending} onClick={async () => { if (await run(() => mutate(client => client.deleteWorkspace(workspace.id)))) { setDeleting(null); if (workspace.id === viewedWorkspaceId) onPreview?.(graph.activeWorkspaceId) } }} className="min-h-10 rounded-lg px-2 text-sm font-medium text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete?</button>
+                                 : <button type="button" aria-label={`Delete ${workspace.name}`} disabled={pending} onClick={() => setDeleting(workspace.id)} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>)}
+                         </>}
+                     </li>
+@@ -1134,10 +1165,10 @@
+             <form className="mt-2 flex items-center gap-1" onSubmit={async event => {
+                 event.preventDefault()
+                 const name = presetName.trim()
+-                if (name && await run(() => mutate(client => client.saveWorkspace(name)))) setPresetName('')
++                if (!isPreview && name && await run(() => mutate(client => client.saveWorkspace(name)))) setPresetName('')
+             }}>
+                 <input aria-label="Preset name" placeholder="Preset name" value={presetName} onChange={event => setPresetName(event.target.value)} className="min-h-10 min-w-0 flex-1 rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
+-                <button type="submit" disabled={pending || !presetName.trim()} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Save as preset</button>
++                <button type="submit" disabled={pending || isPreview || !presetName.trim()} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Save as preset</button>
+             </form>
+             {error && !target && <p role="alert" className="px-1 pt-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
+         </Popover.Content></Popover.Portal>
+@@ -1164,12 +1195,12 @@
+                             const id = target!.id
+                             // Layout edits belong to the slot being left.
+                             await beforeSwitch?.()
+-                            setResult(await mutate(client => client.activateWorkspace(id)))
++                            setResult(await mutate(client => client.activateWorkspace(id))); onActivated?.()
+                             setOpen(false)
+                         })} className="min-h-10 rounded-lg bg-[var(--app-badge-error-text)] px-4 text-sm font-medium text-white disabled:opacity-50">{pending ? 'Switching…' : 'Stop and switch'}</button>
+                     </>}
+                 </div>
+             </DialogContent>
+         </Dialog>
+-    </Popover.Root>
++    </Popover.Root>{isPreview && <button type="button" aria-label={`Switch to ${viewed!.name}`} disabled={pending} onClick={() => { setTarget(viewed!); setResult(null); setError(null) }} className="h-8 shrink-0 rounded-md px-2 text-xs text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">Switch</button>}</div>
+ }
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -52,7 +52,7 @@
+     ] },
+ })
+ 
+-function makeApi(options: { skip?: string[]; graph?: NodeGraphResponse } = {}) {
++function makeApi(options: { skip?: string[]; graph?: NodeGraphResponse; previews?: Record<string, NodeGraphResponse['graph']> } = {}) {
+     let state = structuredClone(options.graph ?? initial())
+     const copy = () => structuredClone(state)
+     const setEdges = (child: string, owner?: string) => {
+@@ -60,7 +60,7 @@
+         if (owner) state.graph.edges.push({ owner, child, createdAt: 2, createdBy: 'user' })
+     }
+     const api = {
+-        getNodeGraph: vi.fn(async () => copy()),
++        getNodeGraph: vi.fn(async (workspaceId?: string) => workspaceId && workspaceId !== state.activeWorkspaceId ? { ...copy(), graph: structuredClone(options.previews?.[workspaceId] ?? { workspaceId, nodes: [], edges: [] }) } : copy()),
+         editNodeRouting: vi.fn(async (workspace: string, value: NodeRouting, expected: NodeRouting) => {
+             if (workspace !== state.activeWorkspaceId || JSON.stringify(nodeRouting(state.graph)) !== JSON.stringify(nodeRouting(expected))) throw new Error('Graph changed elsewhere')
+             const error = nodeRoutingError(value, state.overseer); if (error) throw new Error(error)
+@@ -1650,3 +1650,39 @@
+     const [, , y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
+     expect(parseFloat(toolbar.style.top)).toBeCloseTo(y! + 200 * k! + 8)
+ })
++it('previews another workspace without changing the active cache, editing it or stopping sessions, and switches only on explicit confirmation', async () => {
++    const api = makeApi({ previews: { p1: { workspaceId: 'p1', nodes: [{ sessionId: 'N', x: 200, y: 100, addedAt: 1 }], edges: [] } } })
++    const { client } = setup(api)
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++    const original = document.querySelector('[data-node-id="A"]')!.parentElement!.style.transform
++    fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Preview Research' }))
++    const previewNode = await screen.findByRole('button', { name: 'Node New chat' })
++    expect(screen.queryByRole('button', { name: 'Node Alpha' })).toBeNull()
++    expect((client.getQueryData(['node-graph']) as NodeGraphResponse).activeWorkspaceId).toBe('default')
++    expect((client.getQueryData(['node-graph']) as NodeGraphResponse).graph.workspaceId).toBe('default')
++    expect(screen.getByRole('button', { name: 'Workspaces' })).toHaveTextContent('ResearchPreview')
++    const canvas = screen.getByRole('application')
++    fireEvent.pointerDown(previewNode, { pointerId: 41, button: 0, clientX: 100, clientY: 100 })
++    fireEvent.pointerMove(canvas, { pointerId: 41, clientX: 150, clientY: 140 })
++    fireEvent.pointerUp(canvas, { pointerId: 41, clientX: 150, clientY: 140 })
++    fireEvent.keyDown(canvas, { key: 'Delete' }); fireEvent.doubleClick(canvas)
++    expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++    expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(api.removeNodes).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled(); expect(api.activateWorkspace).not.toHaveBeenCalled()
++    fireEvent.click(screen.getByRole('button', { name: 'Workspaces' })); fireEvent.click(screen.getByRole('button', { name: 'Preview Default' }))
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    expect(document.querySelector('[data-node-id="A"]')!.parentElement!.style.transform).toBe(original)
++    fireEvent.click(screen.getByRole('button', { name: 'Workspaces' })); fireEvent.click(screen.getByRole('button', { name: 'Preview Research' }))
++    await screen.findByRole('button', { name: 'Node New chat' })
++    fireEvent.click(screen.getByRole('button', { name: 'Switch to Research' }))
++    const dialog = await screen.findByRole('dialog', { name: 'Switch to Research?' })
++    expect(dialog).toHaveTextContent('Switching stops 4 sessions in Default')
++    expect(api.activateWorkspace).not.toHaveBeenCalled()
++    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
++    expect(api.activateWorkspace).not.toHaveBeenCalled()
++    fireEvent.click(screen.getByRole('button', { name: 'Switch to Research' }))
++    fireEvent.click(within(await screen.findByRole('dialog', { name: 'Switch to Research?' })).getByRole('button', { name: 'Stop and switch' }))
++    await waitFor(() => expect(api.activateWorkspace).toHaveBeenCalledTimes(1))
++    expect(api.activateWorkspace).toHaveBeenCalledWith('p1')
++})

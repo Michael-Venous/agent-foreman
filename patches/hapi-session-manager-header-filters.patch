@@ -1,0 +1,588 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -75,8 +75,8 @@
+ }
+ 
+ /** A movable, resizable window or draggable bubble on desktop and mobile. */
+-export function FloatingWindow({ config, title, children, count = 0, bodyClassName = 'flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7' }: {
+-    config: FloatingWindowConfig; title?: ReactNode; children: ReactNode; count?: number; bodyClassName?: string
++export function FloatingWindow({ config, title, children, count = 0, headerActions, bodyClassName = 'flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7' }: {
++    config: FloatingWindowConfig; title?: ReactNode; children: ReactNode; count?: number; headerActions?: ReactNode; bodyClassName?: string
+ }) {
+     const { name, unit, icon, size } = config
+     const { open, collapsed, bounds, bubble, setBounds, setBubble, setOpen, setCollapsed } = useFloatingWindow(config)
+@@ -201,8 +201,8 @@
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
+             </button>
++            {headerActions}
+             <button type="button" aria-label={`Collapse ${name}`} title="Collapse to bubble" onClick={() => setCollapsed(true)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">−</button>
+-            {close}
+         </header>
+         <div className={bodyClassName}>{children}</div>
+         <button type="button" aria-label={`Resize ${name}`} title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
+diff --git a/web/src/components/SessionManagerWindow.tsx b/web/src/components/SessionManagerWindow.tsx
+--- a/web/src/components/SessionManagerWindow.tsx
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -12,6 +12,6 @@
+     return useFloatingWindow(SESSION_MANAGER_WINDOW)
+ }
+ 
+-export function SessionManagerWindow({ children, count = 0, title }: { children: ReactNode; count?: number; title?: ReactNode }) {
+-    return <FloatingWindow config={SESSION_MANAGER_WINDOW} title={title} count={count}>{children}</FloatingWindow>
++export function SessionManagerWindow({ children, count = 0, title, headerActions }: { children: ReactNode; count?: number; title?: ReactNode; headerActions?: ReactNode }) {
++    return <FloatingWindow config={SESSION_MANAGER_WINDOW} title={title} count={count} headerActions={headerActions} bodyClassName="flex min-h-0 flex-1 flex-col gap-1 overflow-auto px-3 pt-1 pb-7">{children}</FloatingWindow>
+ }
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -6,7 +6,7 @@
+ import { SessionManagerWindow, useSessionManagerWindow } from './SessionManagerWindow'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+-import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import * as Popover from '@radix-ui/react-popover'
+ import { sessionHasWork } from '@/lib/sessionManager'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { canPopout, openPopout } from '@/lib/popout'
+@@ -51,8 +51,6 @@
+     const [showAdd, setShowAdd] = useState(false)
+     const [addQuery, setAddQuery] = useState('')
+     const { entries, dismiss, add, adding, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api, props.embedded || (open && !collapsed))
+-    // Session Manager lists the active workspace's nodes when the hub has a node graph.
+-    const workspace = activeWorkspaceName(useNodeGraph(props.api).data)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -69,22 +67,13 @@
+     const Frame = props.embedded ? EmbeddedFrame : SessionManagerWindow
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+-        {(props.embedded || open) && <Frame count={rows.length} title={workspace ? `Session Manager · ${workspace}` : undefined}>
+-            <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+-                <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+-                    {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+-                        onClick={() => setActivityFilter(value)} className={`min-h-9 rounded-md px-3 text-sm ${activityFilter === value ? 'bg-[var(--app-bg)] font-medium text-[var(--app-fg)] shadow-sm' : 'text-[var(--app-hint)]'}`}>
+-                        {value === 'all' ? 'All' : value === 'active' ? 'Active' : 'Inactive'}
+-                    </button>)}
+-                </div>
+-                <button type="button" aria-pressed={managedOnly} onClick={() => setManagedOnly(value => !value)}
+-                    className={`min-h-10 rounded-lg border px-3 text-sm ${managedOnly ? 'border-violet-500 bg-violet-500/15 text-[var(--app-fg)]' : 'border-[var(--app-border)] text-[var(--app-hint)]'}`}>Managed</button>
++        {(props.embedded || open) && <Frame count={rows.length} title="Session Manager" headerActions={<SessionManagerFilters activity={activityFilter} managed={managedOnly} onActivity={setActivityFilter} onManaged={setManagedOnly} />}>
++            <div className="flex shrink-0 items-center gap-2 text-xs text-[var(--app-hint)]">
++                <span className="min-w-0 flex-1 truncate">{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
++                {props.api?.addSessionManager && <button type="button" aria-expanded={showAdd} onClick={() => setShowAdd(value => !value)} className="min-h-8 shrink-0 text-[var(--app-link)]">{showAdd ? 'Done' : '+ Add chats'}</button>}
++                <button type="button" disabled={clearing || adding !== null || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-8 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+             </div>
+-            <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+-                <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
+-                {props.api?.addSessionManager && <button type="button" aria-expanded={showAdd} onClick={() => setShowAdd(value => !value)} className="min-h-9 shrink-0 text-[var(--app-link)]">{showAdd ? 'Done' : '+ Add chats'}</button>}
+-                <button type="button" disabled={clearing || adding !== null || !clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+-            </div>
++            <div role="separator" aria-label="Session list" className="h-px shrink-0 bg-[var(--app-border)]" />
+             {showAdd && <div role="group" aria-label="Add chats to Session Manager" className="shrink-0 rounded-lg border border-[var(--app-border)] p-2">
+                 <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)}
+                     className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
+@@ -147,15 +136,59 @@
+     </>
+ }
+ 
++/** Filters live in the window header; closing the transient menu never closes the window. */
++function SessionManagerFilters({ activity, managed, onActivity, onManaged }: {
++    activity: 'all' | 'active' | 'inactive'; managed: boolean;
++    onActivity: (value: 'all' | 'active' | 'inactive') => void; onManaged: (value: boolean) => void;
++}) {
++    const [open, setOpen] = useState(false)
++    const filtered = activity !== 'all' || managed
++    return <Popover.Root open={open} onOpenChange={setOpen}>
++        <Popover.Trigger asChild>
++            <button type="button" aria-label="Session Manager filters" aria-pressed={filtered} title={`Activity: ${activity}${managed ? ' · Managed only' : ''}`}
++                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg hover:bg-[var(--app-subtle-bg)] ${filtered ? 'text-violet-500' : 'text-[var(--app-hint)]'}`}>
++                <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><path d="M3 4h14l-5.5 6v5l-3 1v-6z" /></svg>
++                <span aria-hidden="true" className="ml-0.5 text-[10px]">▾</span>
++            </button>
++        </Popover.Trigger>
++        <Popover.Portal>
++            <Popover.Content aria-label="Session filters" align="end" sideOffset={4} collisionPadding={8}
++                onEscapeKeyDown={event => { event.stopPropagation(); setOpen(false) }}
++                onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false) } }}
++                className="z-[60] w-44 rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 text-sm text-[var(--app-fg)] shadow-xl">
++                <div role="group" aria-label="Session filters">
++                    <div role="group" aria-label="Activity filter" className="flex flex-col">
++                        {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activity === value}
++                            onClick={() => { onActivity(value); setOpen(false) }}
++                            className={`flex min-h-9 w-full items-center justify-between rounded-md px-3 text-left hover:bg-[var(--app-subtle-bg)] ${activity === value ? 'font-medium text-[var(--app-link)]' : ''}`}>
++                            {value === 'all' ? 'All' : value === 'active' ? 'Active' : 'Inactive'}
++                            {activity === value && <span aria-hidden="true">✓</span>}
++                        </button>)}
++                    </div>
++                    <div className="my-1 h-px bg-[var(--app-border)]" />
++                    <button type="button" aria-pressed={managed} onClick={() => { onManaged(!managed); setOpen(false) }}
++                        className={`flex min-h-9 w-full items-center justify-between rounded-md px-3 text-left hover:bg-[var(--app-subtle-bg)] ${managed ? 'font-medium text-violet-500' : ''}`}>
++                        Managed{managed && <span aria-hidden="true">✓</span>}
++                    </button>
++                </div>
++            </Popover.Content>
++        </Popover.Portal>
++    </Popover.Root>
++}
++
+ /** Popup-window page body: edge to edge, no window chrome of its own. */
+-function EmbeddedFrame({ children, title }: { children: ReactNode; count?: number; title?: ReactNode }) {
+-    return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome truncate text-sm font-semibold">{title ?? 'Session Manager'}</header><div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3">{children}</div></div>
++function EmbeddedFrame({ children, title, headerActions }: { children: ReactNode; count?: number; title?: ReactNode; headerActions?: ReactNode }) {
++    return <div className="flex h-full min-h-0 flex-col"><header className="app-section-header app-window-chrome text-sm font-semibold"><span className="min-w-0 flex-1 truncate">{title ?? 'Session Manager'}</span>{headerActions}</header><div className="flex min-h-0 flex-1 flex-col gap-1 overflow-auto px-3 py-1">{children}</div></div>
+ }
+ 
+ export function SessionManagerLauncher({ count }: { count: number }) {
+-    const { open, toggleOpen } = useSessionManagerWindow()
++    const { open, collapsed, setOpen, setCollapsed } = useSessionManagerWindow()
+     // Desktop: a real browser popup window; phones (or a blocked popup) keep the in-page window.
+-    return (<button type="button" onClick={() => { if (open || !canPopout() || !openPopout('session-manager')) toggleOpen() }} aria-label="Session Manager" aria-expanded={open}
++    return (<button type="button" onClick={() => {
++            if (open) { setCollapsed(!collapsed); return }
++            if (canPopout() && openPopout('session-manager')) return
++            setOpen(true)
++        }} aria-label="Session Manager" aria-expanded={open && !collapsed}
+             className="mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg px-5 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+             <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{count}</span>
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -1,5 +1,5 @@
+ import type { ApiClient, ManagedSession } from '@/api/client'
+-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import type { SessionSummary } from '@/types/api'
+@@ -21,6 +21,25 @@
+     return <QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={sessions} onSelect={select} /></I18nProvider></QueryClientProvider>
+ }
+ const open = () => fireEvent.click(screen.getByRole('button', { name: 'Session Manager' }))
++const openFilters = () => {
++    if (!screen.queryByRole('group', { name: 'Session filters' })) fireEvent.click(screen.getByRole('button', { name: 'Session Manager filters' }))
++}
++const chooseFilter = (name: 'All' | 'Active' | 'Inactive' | 'Managed') => {
++    openFilters()
++    fireEvent.click(screen.getByRole('button', { name }))
++}
++const expectSelectedFilter = (name: 'All' | 'Active' | 'Inactive' | 'Managed') => {
++    openFilters()
++    const button = screen.getByRole('button', { name, pressed: true })
++    expect(button).toBeInTheDocument()
++    fireEvent.keyDown(button, { key: 'Escape' })
++}
++const closeWindow = async () => {
++    fireEvent.click(screen.getByRole('button', { name: 'Collapse Session Manager' }))
++    fireEvent.click(await screen.findByRole('button', { name: 'Close Session Manager' }))
++    await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
++}
++
+ describe('Session Manager UI', () => {
+     it('shows both providers and retains finished rows; clear only dismisses', async () => {
+         const client = new QueryClient(); const select = vi.fn()
+@@ -42,7 +61,7 @@
+         await screen.findByRole('button', { name: 'Open Codex' }); first.unmount()
+         const second = render(fixture(client, [session('Codex', false, false)]))
+         // Window open state persists in the page cache; the launcher toggles, so only open when closed.
+-        if (!screen.queryByRole('dialog')) open()
++        if (!screen.queryByRole('dialog', { name: 'Session Manager' })) open()
+         await screen.findByText('Inactive', { selector: 'p' }); second.unmount()
+         render(fixture(new QueryClient(), [session('Codex', false, false)])); open()
+         await screen.findByText(/No sessions\./)
+@@ -52,9 +71,9 @@
+         const row = await screen.findByRole('button', { name: 'Open Codex' })
+         rerender(fixture(client, undefined, select)); expect(screen.queryByText(/^Inactive$/, { selector: 'p' })).toBeNull()
+         fireEvent.click(row); expect(select).toHaveBeenCalledWith('Codex')
+-        expect(screen.getByRole('dialog')).toBeInTheDocument()
+-        fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+-        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++        expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
++        await closeWindow()
++        await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull())
+     })
+ })
+ 
+@@ -65,19 +84,20 @@
+         const { rerender } = render(view([session('Codex'), session('Claude')]))
+         expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
+         open(); await screen.findByRole('button', { name: 'Open Codex' })
+-        expect(screen.getByRole('group', { name: 'Session filters' }).closest('[role=dialog]')).toBeTruthy()
+-        expect(screen.getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
++        expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Session Manager filters' }).closest('[role=dialog]')).toBeTruthy()
++        expectSelectedFilter('All')
+         rerender(view([session('Codex', true, false), session('Claude')]))
+         await screen.findByText('Idle')
+-        fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++        chooseFilter('Active')
+         expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+-        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        chooseFilter('Managed')
+         await screen.findByText(/No matching sessions/)
+-        fireEvent.click(screen.getByRole('button', { name: 'Inactive' }))
++        chooseFilter('Inactive')
+         expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
+-        fireEvent.click(screen.getByRole('button', { name: 'All' }))
+-        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        chooseFilter('All')
++        chooseFilter('Managed')
+         expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+         expect(select).not.toHaveBeenCalled()
+@@ -89,11 +109,11 @@
+         open(); await screen.findByRole('button', { name: 'Open Codex' })
+         rerender(view([session('Codex', false, false), session('Claude', true, false)]))
+         await screen.findByText('Inactive', { selector: 'p' })
+-        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        chooseFilter('Managed')
+         await screen.findByRole('button', { name: 'Dismiss Codex from Session Manager' })
+         fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+         await screen.findByText(/No matching sessions/)
+-        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        chooseFilter('Managed')
+         expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+     })
+@@ -131,13 +151,13 @@
+     expect(screen.getByText('On hold')).toBeInTheDocument()
+     expect(screen.getByText('Inactive', { selector: 'p' })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: 'Open Unmanaged idle' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+-    expect(screen.getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
++    chooseFilter('Managed')
++    expectSelectedFilter('All')
+     expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: 'Open Unmanaged active' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    chooseFilter('Active')
+     await screen.findByText('No matching sessions.')
+-    fireEvent.click(screen.getByRole('button', { name: 'Inactive' }))
++    chooseFilter('Inactive')
+     expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Open Offline' })).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled(); expect(select).not.toHaveBeenCalled()
+@@ -147,7 +167,7 @@
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     rerender(view({ ...managed }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull())
+-    fireEvent.click(screen.getByRole('button', { name: 'All' })); fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    chooseFilter('All'); chooseFilter('Managed')
+     expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull()
+ })
+ 
+@@ -160,7 +180,7 @@
+     expect(getManualPause).not.toHaveBeenCalled()
+     open(); await screen.findByText('Stopped')
+     expect(screen.getByText('Management held')).toBeInTheDocument()
+-    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    chooseFilter('Active')
+     expect(screen.getByRole('button', { name: 'Open Background held' })).toBeInTheDocument()
+     expect(screen.queryByRole('button', { name: 'Open Stopped' })).toBeNull()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+@@ -174,9 +194,9 @@
+     fireEvent.click(screen.getByRole('button', { name: 'Unmanage' }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Unmanage' })).toBeNull())
+     expect(screen.getByRole('button', { name: 'Open Idle roster' })).toBeInTheDocument()
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    chooseFilter('Managed')
+     expect(screen.queryByRole('button', { name: 'Open Idle roster' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    chooseFilter('Managed')
+     expect(screen.getByRole('button', { name: 'Open Idle roster' })).toBeInTheDocument()
+     expect(controls.unmanageSession).toHaveBeenCalledExactlyOnceWith('Idle roster')
+     expect(controls.abortSession).not.toHaveBeenCalled()
+@@ -208,7 +228,7 @@
+         client.setQueryData(queryKeys.sessions, { sessions: [{ ...terrain, updatedAt }] })
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument())
+     }
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    chooseFilter('Managed')
+     expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
+@@ -258,9 +278,9 @@
+     const order = () => Array.from(screen.getByLabelText('Session Manager sessions').querySelectorAll('button[aria-label^="Open "]')).map(button => button.getAttribute('aria-label'))
+     await waitFor(() => expect(order()).toEqual(['Open Global pin', 'Open Local pin', 'Open Unpinned']))
+     expect(screen.getByRole('separator', { name: 'Pinned sessions' }).nextElementSibling).toContainElement(screen.getByRole('button', { name: 'Open Unpinned' }))
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+-    expect(order()).toEqual(['Open Local pin']); expect(screen.queryByRole('separator')).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    chooseFilter('Managed')
++    expect(order()).toEqual(['Open Local pin']); expect(screen.queryByRole('separator', { name: 'Pinned sessions' })).toBeNull()
++    chooseFilter('Managed')
+     rerender(view(false))
+     await waitFor(() => expect(order()).toEqual(['Open Global pin', 'Open Unpinned', 'Open Local pin']))
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+@@ -274,16 +294,16 @@
+         const client = new QueryClient(), select = vi.fn()
+         render(fixture(client, [session('Codex'), session('Claude')], select)); open()
+         await screen.findByRole('button', { name: 'Open Codex' })
+-        fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++        chooseFilter('Active')
+         fireEvent.click(screen.getByRole('button', { name: 'Open Codex' }))
+         expect(select).toHaveBeenCalledWith('Codex')
+-        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
+         expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+         expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
+-        expect(screen.getByRole('button', { name: 'Active', pressed: true })).toBeInTheDocument()
++        expectSelectedFilter('Active')
+         fireEvent.click(screen.getByRole('button', { name: 'Open Claude' }))
+         expect(select).toHaveBeenLastCalledWith('Claude')
+-        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
+         expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+         expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+     } finally { window.matchMedia = original }
+@@ -303,8 +323,8 @@
+     expect(screen.getByRole('button', { name: 'Open Other task' })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
+     expect(screen.getByRole('separator', { name: 'Pinned sessions' })).toBeInTheDocument()
+-    fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); open()
+-    expect(screen.getByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
++    await closeWindow(); open()
++    expect(await screen.findByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
+     fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
+     expect(await screen.findByRole('button', { name: 'Open Pinned task' })).toBeInTheDocument()
+     fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
+@@ -325,9 +345,9 @@
+     fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Other task' })).toBeNull())
+     expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('1')
+-    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    chooseFilter('Active')
+     expect(screen.queryByRole('button', { name: 'Pinned sessions' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'All' }))
++    chooseFilter('All')
+     expect(screen.getByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
+     expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
+     fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
+@@ -363,26 +383,33 @@
+ })
+ 
+ 
+-it('the launcher toggles both the window and bubble closed without stopping sessions', async () => {
++it('the launcher minimizes and restores the window; only explicit bubble close dismisses it', async () => {
+     const client = new QueryClient()
+     render(fixture(client, [session('Codex')]))
+-    open(); await screen.findByRole('dialog')
+-    open(); await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+-    open(); await screen.findByRole('dialog')
++    open(); await screen.findByRole('dialog', { name: 'Session Manager' })
++    expect(screen.queryByRole('button', { name: 'Close Session Manager' })).toBeNull()
++    open(); await screen.findByLabelText('Session Manager bubble')
++    expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
++    open(); await screen.findByRole('dialog', { name: 'Session Manager' })
++    expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
+     fireEvent.click(screen.getByRole('button', { name: 'Collapse Session Manager' }))
+     await screen.findByLabelText('Session Manager bubble')
+-    open(); await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
+-    open(); await screen.findByRole('dialog')
++    open(); await screen.findByRole('dialog', { name: 'Session Manager' })
++    expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++    await closeWindow()
++    expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
++    expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++    open(); await screen.findByRole('dialog', { name: 'Session Manager' })
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
+ 
+-it('titles the panel with the active workspace when the hub has a node graph', async () => {
++it('keeps the plain Session Manager title even when the hub has a named workspace', async () => {
+     const graphApi = { ...controls, getNodeGraph: vi.fn(async () => ({ activeWorkspaceId: 'p1', overseer: null, graph: { workspaceId: 'p1', nodes: [], edges: [] },
+         workspaces: [{ id: 'default', name: 'Default', kind: 'default', createdAt: 1, updatedAt: 1 }, { id: 'p1', name: 'Research', kind: 'preset', createdAt: 2, updatedAt: 2 }] })) } as unknown as ApiClient
+     render(<QueryClientProvider client={new QueryClient()}><I18nProvider><SessionManagerButton api={graphApi} sessions={[]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
+     open()
+-    expect(await screen.findByRole('dialog', { name: 'Session Manager · Research' })).toBeInTheDocument()
++    expect(await screen.findByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Move Session Manager' })).toBeInTheDocument()
+ })
+ 
+@@ -408,7 +435,7 @@
+     open(); await screen.findByRole('button', { name: 'Open Codex' })
+     expect(screen.getByText('Background')).toBeInTheDocument()
+     expect(screen.queryByText('Idle', { selector: 'p' })).toBeNull()
+-    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    chooseFilter('Active')
+     expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
+     expect(controls.abortSession).not.toHaveBeenCalled()
+ })
+@@ -425,3 +452,60 @@
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++
++it('keeps filters in the header popover, preserves selection and closes only the popover on Escape', async () => {
++    const client = new QueryClient(), select = vi.fn()
++    const view = render(fixture(client, [session('Codex'), session('Claude')], select)); open()
++    await screen.findByRole('button', { name: 'Open Codex' })
++    view.rerender(fixture(client, [session('Codex'), session('Claude', true, false)], select))
++    await screen.findByRole('button', { name: 'Dismiss Claude from Session Manager' })
++    const window = screen.getByRole('dialog', { name: 'Session Manager' })
++    const trigger = within(window).getByRole('button', { name: 'Session Manager filters' })
++    expect(trigger.closest('.app-section-header')).toBeTruthy()
++    expect(trigger).toHaveAttribute('aria-pressed', 'false')
++    expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++    expect(screen.queryByRole('button', { name: 'Active' })).toBeNull()
++    expect(screen.getByRole('separator', { name: 'Session list' })).toBeInTheDocument()
++    openFilters()
++    const filters = screen.getByRole('group', { name: 'Session filters' })
++    expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBe(window)
++    expect(screen.getByRole('dialog', { name: 'Session filters' })).toContainElement(filters)
++    expect(within(filters).getByRole('group', { name: 'Activity filter' })).toBeInTheDocument()
++    expect(within(filters).getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
++    fireEvent.keyDown(filters, { key: 'Escape' })
++    await waitFor(() => expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull())
++    expect(screen.queryByRole('dialog', { name: 'Session filters' })).toBeNull()
++    expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBe(window)
++    expect(screen.queryByLabelText('Session Manager bubble')).toBeNull()
++    chooseFilter('Active')
++    expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++    expect(trigger).toHaveAttribute('aria-pressed', 'true')
++    expect(screen.queryByRole('button', { name: 'Open Claude' })).toBeNull()
++    expectSelectedFilter('Active')
++    await closeWindow(); open()
++    await screen.findByRole('dialog', { name: 'Session Manager' })
++    expectSelectedFilter('Active')
++    chooseFilter('All')
++    expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Session Manager filters' })).toHaveAttribute('aria-pressed', 'false')
++    expect(select).not.toHaveBeenCalled()
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
++
++it('provides the same header filter popover in the embedded Session Manager', async () => {
++    const select = vi.fn()
++    render(<QueryClientProvider client={new QueryClient()}><I18nProvider><SessionManagerButton api={api} sessions={[session('Codex')]} onSelect={select} embedded hideTrigger /></I18nProvider></QueryClientProvider>)
++    await screen.findByRole('button', { name: 'Open Codex' })
++    const trigger = screen.getByRole('button', { name: 'Session Manager filters' })
++    expect(trigger.closest('.app-section-header')).toBeTruthy()
++    expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++    chooseFilter('Active')
++    expect(trigger).toHaveAttribute('aria-pressed', 'true')
++    expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++    expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
++    expect(select).not.toHaveBeenCalled()
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
+diff --git a/web/src/components/SessionManagerWindow.test.tsx b/web/src/components/SessionManagerWindow.test.tsx
+--- a/web/src/components/SessionManagerWindow.test.tsx
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -23,19 +23,20 @@
+     return <><button onClick={() => setOpen(true)}>Open window</button><input aria-label="Page composer"/><SessionManagerWindow><p>Sessions</p></SessionManagerWindow></>
+ }
+ const setup = (client = new QueryClient()) => render(<QueryClientProvider client={client}><Fixture/></QueryClientProvider>)
+-const open = async () => { fireEvent.click(screen.getByRole('button', { name: 'Open window' })); await screen.findByRole('dialog') }
++const open = async () => { fireEvent.click(screen.getByRole('button', { name: 'Open window' })); await screen.findByRole('dialog', { name: 'Session Manager' }) }
+ const geometry = () => {
+-    const panel = screen.getByRole('dialog')
++    const panel = screen.getByRole('dialog', { name: 'Session Manager' })
+     return { x: parseFloat(panel.style.left), y: parseFloat(panel.style.top), width: parseFloat(panel.style.width), height: parseFloat(panel.style.height) }
+ }
+-it('floats outside the page, allows background interaction, and only closes explicitly', async () => {
++it('floats outside the page, permits background interaction and minimizes on its own Escape', async () => {
+     const { container } = setup(); await open()
+     expect(container.querySelector('[role=dialog]')).toBeNull()
+-    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'false')
++    expect(screen.getByRole('dialog', { name: 'Session Manager' })).toHaveAttribute('aria-modal', 'false')
+     fireEvent.click(screen.getByLabelText('Page composer')); fireEvent.change(screen.getByLabelText('Page composer'), { target: { value: 'Still usable' } })
+-    expect(screen.getByLabelText('Page composer')).toHaveValue('Still usable'); expect(screen.getByRole('dialog')).toBeInTheDocument()
+-    fireEvent.keyDown(screen.getByLabelText('Page composer'), { key: 'Escape' }); expect(screen.getByRole('dialog')).toBeInTheDocument()
+-    fireEvent.keyDown(screen.getByRole('button', { name: 'Move Session Manager' }), { key: 'Escape' }); await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++    expect(screen.getByLabelText('Page composer')).toHaveValue('Still usable'); expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
++    fireEvent.keyDown(screen.getByLabelText('Page composer'), { key: 'Escape' }); expect(screen.getByRole('dialog', { name: 'Session Manager' })).toBeInTheDocument()
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Move Session Manager' }), { key: 'Escape' }); await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull())
++    expect(screen.getByLabelText('Session Manager bubble')).toBeInTheDocument()
+ })
+ it('supports pointer dragging, touch resizing and cancelling a gesture', async () => {
+     setup(); await open(); const first = geometry(), title = screen.getByRole('button', { name: 'Move Session Manager' })
+@@ -56,7 +57,7 @@
+     await waitFor(() => expect(geometry().x).toBe(664))
+     fireEvent.keyDown(screen.getByRole('button', { name: 'Resize Session Manager' }), { key: 'ArrowUp' })
+     await waitFor(() => expect(geometry().height).toBe(550))
+-    const before = geometry(); fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); await open(); expect(geometry()).toEqual(before)
++    const before = geometry(); await collapse(); fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); await open(); expect(geometry()).toEqual(before)
+     first.unmount(); setup(client); expect(geometry()).toEqual(before)
+     act(() => { vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 400); window.dispatchEvent(new Event('resize')); mediaListeners.forEach(listener => listener()) })
+     await waitFor(() => expect(geometry().width).toBeLessThanOrEqual(374))
+@@ -86,17 +87,17 @@
+ const bubblePosition = () => { const bubble = screen.getByLabelText('Session Manager bubble'); return { x: parseFloat(bubble.style.left), y: parseFloat(bubble.style.top) } }
+ it('collapses, drags without expanding, expands on tap and closes from the bubble', async () => {
+     setup(); await open(); const original = geometry(); await collapse()
+-    expect(screen.queryByRole('dialog')).toBeNull()
++    expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+     expect(bubblePosition()).toEqual({ x: original.x, y: original.y })
+     const handle = screen.getByRole('button', { name: 'Expand Session Manager' }), before = bubblePosition()
+     fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 1100, clientY: 750 })
+     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 900, clientY: 650 })
+     await waitFor(() => expect(bubblePosition()).toEqual({ x: before.x - 200, y: before.y - 100 }))
+     fireEvent.pointerUp(handle, { pointerId: 1 }); fireEvent.click(handle, { detail: 1 })
+-    expect(screen.queryByRole('dialog')).toBeNull()
++    expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
+     fireEvent.pointerDown(handle, { pointerId: 2, button: 0, clientX: 900, clientY: 650 })
+     fireEvent.pointerUp(handle, { pointerId: 2 }); fireEvent.click(handle, { detail: 1 })
+-    await screen.findByRole('dialog'); expect(geometry()).toEqual({ ...original, x: before.x - 200, y: 8 })
++    await screen.findByRole('dialog', { name: 'Session Manager' }); expect(geometry()).toEqual({ ...original, x: before.x - 200, y: 8 })
+     await collapse(); expect(bubblePosition()).toEqual({ x: before.x - 200, y: 8 })
+     fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+     await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
+@@ -107,7 +108,7 @@
+     const client = new QueryClient(), first = setup(client); await open()
+     const original = geometry()
+     expect(original.width).toBeLessThan(390)
+-    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'false')
++    expect(screen.getByRole('dialog', { name: 'Session Manager' })).toHaveAttribute('aria-modal', 'false')
+     expect(screen.getByRole('button', { name: 'Move Session Manager' })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Resize Session Manager' })).toBeInTheDocument()
+     fireEvent.keyDown(screen.getByRole('button', { name: 'Resize Session Manager' }), { key: 'ArrowUp' })
+@@ -119,7 +120,7 @@
+     await waitFor(() => expect(bubblePosition().x).toBe(initial.x - 40))
+     first.unmount(); setup(client); expect(bubblePosition().x).toBe(initial.x - 40)
+     fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
+-    await screen.findByRole('dialog'); expect(geometry()).toEqual({ ...resized, x: 8 })
++    await screen.findByRole('dialog', { name: 'Session Manager' }); expect(geometry()).toEqual({ ...resized, x: 8 })
+     const edge = fitSessionBubble({ x: -100, y: 900 }, { x: 0, y: 0, width: 390, height: 844 })
+     expect(edge.x).toBeCloseTo(-96 * .95); expect(edge.y).toBeCloseTo(844 - 44 * .05)
+ })
+@@ -129,7 +130,7 @@
+     client.setQueryData(['session-manager-window'], { open: true, collapsed: true, bubble: { x: 1170, y: 870 }, bounds: { x: 20, y: 20, width: 480, height: 560 } })
+     setup(client)
+     fireEvent.click(screen.getByRole('button', { name: 'Expand Session Manager' }))
+-    await screen.findByRole('dialog')
++    await screen.findByRole('dialog', { name: 'Session Manager' })
+     expect(geometry()).toEqual({ x: 712, y: 332, width: 480, height: 560 })
+     const title = screen.getByRole('button', { name: 'Move Session Manager' })
+     fireEvent.pointerDown(title, { pointerId: 1, button: 0, clientX: 720, clientY: 340 })
+@@ -137,6 +138,7 @@
+     fireEvent.pointerUp(title, { pointerId: 1 })
+     await waitFor(() => expect(geometry().x).toBe(-456))
+     expect(geometry().y).toBe(-532)
++    await collapse()
+     fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+     await open()
+     expect(geometry()).toEqual({ x: 8, y: 8, width: 480, height: 560 })
+@@ -151,3 +153,15 @@
+         expect(fitSessionWindow({ ...fitted, x: -1000 }, view).x).toBeLessThan(view.x)
+     }
+ })
++
++
++it('offers close only after minimizing, preserving the expanded window for background work', async () => {
++    setup(); await open()
++    expect(screen.queryByRole('button', { name: 'Close Session Manager' })).toBeNull()
++    expect(screen.getByRole('button', { name: 'Collapse Session Manager' })).toBeInTheDocument()
++    await collapse()
++    expect(screen.getByRole('button', { name: 'Close Session Manager' })).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
++    await waitFor(() => expect(screen.queryByLabelText('Session Manager bubble')).toBeNull())
++    expect(screen.queryByRole('dialog', { name: 'Session Manager' })).toBeNull()
++})

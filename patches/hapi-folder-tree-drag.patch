@@ -1,0 +1,528 @@
+--- a/hub/src/codexFolders.ts
++++ b/hub/src/codexFolders.ts
+@@ -9,7 +9,7 @@
+  * field, so changes made here or there show up in both. Assignments the app has
+  * not yet migrated from its own global state are read (never written) as a fallback.
+  */
+-export type CodexFolder = { id: string; name: string; position: number }
++export type CodexFolder = { id: string; name: string; position: number; parentId?: string }
+ export type CodexFolderAssignment = { folderId: string | null; source: 'app-server' | 'chatgpt-pending' }
+ export type CodexFoldersResponse = { folders: CodexFolder[]; assignments: Record<string, CodexFolderAssignment> }
+ export type Rpc = (method: string, params: unknown) => Promise<Record<string, unknown>>
+@@ -96,8 +96,8 @@
+     let cursor: string | null = null
+     do {
+         const page = await call('project/list', { cursor, limit: 100 })
+-        for (const project of (page.data as Array<{ id: string; name: string; position: number }>) ?? []) {
+-            folders.push({ id: project.id, name: project.name, position: project.position })
++        for (const project of (page.data as Array<{ id: string; name: string; position: number; metadata?: Record<string, string> }>) ?? []) {
++            folders.push({ id: project.id, name: project.name, position: project.position, ...(project.metadata?.['hapi.folderParentId'] ? { parentId: project.metadata['hapi.folderParentId'] } : {}) })
+         }
+         cursor = (page.nextCursor as string | null) ?? null
+     } while (cursor)
+@@ -147,11 +147,12 @@
+     return name
+ }
+ 
+-export async function createFolder(server: CodexAppServer, name: string, idempotencyKey: string): Promise<CodexFolder> {
++export async function createFolder(server: CodexAppServer, name: string, idempotencyKey: string, parentId?: string): Promise<CodexFolder> {
+     if (!THREAD_ID.test(idempotencyKey)) throw new Error('Invalid idempotency key')
+     return server(async (call) => {
+-        const project = (await call('project/create', { idempotencyKey, name, roots: [] })).project as CodexFolder
+-        return { id: project.id, name: project.name, position: project.position }
++        if (parentId && !(await listFolders(call)).some(f => f.id === parentId)) throw new Error('Folder not found')
++        const project = (await call('project/create', { idempotencyKey, name, roots: [], ...(parentId ? { metadata: { 'hapi.folderParentId': parentId } } : {}) })).project as CodexFolder
++        return { id: project.id, name: project.name, position: project.position, ...(parentId ? { parentId } : {}) }
+     })
+ }
+ 
+@@ -167,6 +168,44 @@
+     if (!folderId || folderId.length > 256) throw new Error('Invalid folder ID')
+     await server(async call => {
+         // Idempotent retry also repairs local memberships after an earlier partial response.
+-        if ((await listFolders(call)).some(folder => folder.id === folderId)) await call('project/delete', { projectId: folderId })
+-    })
+-}
++        const folders = await listFolders(call), removed = folders.find(folder => folder.id === folderId)
++        if (!removed) return
++        for (const child of folders.filter(folder => folder.parentId === folderId)) {
++            const current = (await call('project/read', { projectId: child.id })).project as { metadata?: Record<string, string> }
++            const metadata = { ...current.metadata }; delete metadata['hapi.folderParentId']
++            if (removed.parentId) metadata['hapi.folderParentId'] = removed.parentId
++            await call('project/update', { projectId: child.id, metadata })
++        }
++        await call('project/delete', { projectId: folderId })
++    })
++}
++
++export type FolderPlacement = 'before' | 'after' | 'inside' | 'root'
++/** Reorder through the native API; hierarchy lives in each shared project's metadata. */
++export async function moveFolder(server: CodexAppServer, folderId: string, targetId: string | null, placement: FolderPlacement): Promise<void> {
++    if (!['before', 'after', 'inside', 'root'].includes(placement)) throw new Error('Invalid folder placement')
++    await server(async call => {
++        const folders = await listFolders(call), folder = folders.find(f => f.id === folderId), target = folders.find(f => f.id === targetId)
++        if (!folder || (placement !== 'root' && !target)) throw new Error('Folder not found')
++        if (targetId === folderId) throw new Error('Invalid folder move: cannot move into itself')
++        const parentId = placement === 'root' ? null : placement === 'inside' ? targetId : target?.parentId ?? null
++        const seen = new Set([folderId]); let ancestor = parentId
++        while (ancestor) {
++            if (seen.has(ancestor)) throw new Error('Invalid folder move: folders cannot form a cycle')
++            seen.add(ancestor); ancestor = folders.find(f => f.id === ancestor)?.parentId ?? null
++        }
++        let beforeId: string | null = placement === 'before' ? targetId : null
++        if (placement === 'after') {
++            const siblings = folders.filter(f => f.id !== folderId && (f.parentId ?? null) === parentId)
++            beforeId = siblings[siblings.findIndex(f => f.id === targetId) + 1]?.id ?? null
++        }
++        // Do not overwrite unrelated project metadata when changing parent.
++        if ((folder.parentId ?? null) !== parentId) {
++            const current = (await call('project/read', { projectId: folderId })).project as { metadata?: Record<string, string> }
++            const metadata = { ...current.metadata }; delete metadata['hapi.folderParentId']
++            if (parentId) metadata['hapi.folderParentId'] = parentId
++            await call('project/update', { projectId: folderId, metadata })
++        }
++        await call('project/move', { projectId: folderId, beforeProjectId: beforeId })
++    })
++}
+--- a/hub/src/web/routes/codexFolders.ts
++++ b/hub/src/web/routes/codexFolders.ts
+@@ -3,7 +3,7 @@
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ import {
+-    assignFolder, createFolder, deleteFolder, createStdioAppServer, folderName, readFolders, readLegacyState, renameFolder, validThreadIds,
++    assignFolder, createFolder, deleteFolder, moveFolder, createStdioAppServer, folderName, readFolders, readLegacyState, renameFolder, validThreadIds,
+     type CodexAppServer
+ } from '../../codexFolders'
+ 
+@@ -53,15 +53,24 @@
+         } catch (error) { return failure(c, error) }
+     })
+     app.post('/codex-folders', async (c) => {
+-        const body = await c.req.json().catch(() => null) as { name?: unknown; idempotencyKey?: unknown } | null
++        const body = await c.req.json().catch(() => null) as { name?: unknown; idempotencyKey?: unknown; parentId?: unknown } | null
+         try {
+-            return c.json({ folder: await createFolder(server, folderName(body?.name), String(body?.idempotencyKey ?? '')) })
++            if (body?.parentId !== undefined && typeof body.parentId !== 'string') return c.json({ error: 'Invalid parent folder' }, 400)
++            return c.json({ folder: await createFolder(server, folderName(body?.name), String(body?.idempotencyKey ?? ''), body?.parentId as string | undefined) })
+         } catch (error) { return failure(c, error) }
+     })
+     app.patch('/codex-folders/:id', async (c) => {
+         const body = await c.req.json().catch(() => null) as { name?: unknown } | null
+         try {
+             return c.json({ folder: await renameFolder(server, c.req.param('id'), folderName(body?.name)) })
++        } catch (error) { return failure(c, error) }
++    })
++    app.post('/codex-folders/:id/move', async c => {
++        const body = await c.req.json().catch(() => null) as { targetId?: unknown; placement?: unknown } | null
++        if (!body || (body.targetId !== null && typeof body.targetId !== 'string') || !['before', 'after', 'inside', 'root'].includes(String(body.placement))) return c.json({ error: 'Invalid folder move' }, 400)
++        try {
++            await moveFolder(server, c.req.param('id'), body.targetId as string | null, body.placement as 'before' | 'after' | 'inside' | 'root')
++            return c.json({ ok: true })
+         } catch (error) { return failure(c, error) }
+     })
+     app.delete('/codex-folders/:id', async c => {
+--- a/hub/src/web/routes/codexFolders.test.ts
++++ b/hub/src/web/routes/codexFolders.test.ts
+@@ -14,29 +14,36 @@
+ const T3 = '8bcf7a45-dd96-56fe-83ac-c6d77ec19c09'
+ 
+ function fakeServer() {
+-    const projects = [
++    const projects: Array<{ id: string; name: string; position: number; metadata?: Record<string, string> }> = [
+         { id: 'p-blender', name: 'Blender', position: 1 },
+         { id: 'p-school', name: 'Internships/School', position: 6 },
+     ]
+     const threads: Record<string, string | null> = { [T1]: 'p-school', [T2]: null, [T3]: null }
+     const calls: string[] = []
+     const call: Rpc = async (method, raw) => {
+-        const params = raw as Record<string, string>
++        const params = raw as Record<string, any>
+         calls.push(method)
++        if (method === 'project/read') return { project: projects.find(p => p.id === params.projectId) }
++        if (method === 'project/move') {
++            const moved = projects.splice(projects.findIndex(p => p.id === params.projectId), 1)[0]!
++            const at = projects.findIndex(p => p.id === params.beforeProjectId)
++            projects.splice(at < 0 ? projects.length : at, 0, moved); projects.forEach((p, i) => { p.position = i })
++            return {}
++        }
+         if (method === 'project/list') return { data: projects, nextCursor: null }
+         if (method === 'thread/read') {
+             if (!(params.threadId in threads)) throw new Error('thread not found')
+             return { thread: { id: params.threadId, projectId: threads[params.threadId] } }
+         }
+         if (method === 'thread/metadata/update') { threads[params.threadId] = params.projectId || null; return { thread: {} } }
+-        if (method === 'project/create') { const p = { id: 'p-new', name: params.name, position: 7 }; projects.push(p); return { project: p } }
++        if (method === 'project/create') { const p = { id: 'p-new', name: params.name, position: 7, ...(params.metadata ? { metadata: params.metadata } : {}) }; projects.push(p); return { project: p } }
+         if (method === 'project/delete') {
+             const index = projects.findIndex(p => p.id === params.projectId)
+             if (index >= 0) projects.splice(index, 1)
+             for (const id of Object.keys(threads)) if (threads[id] === params.projectId) threads[id] = null
+             return {}
+         }
+-        if (method === 'project/update') { const p = projects.find(x => x.id === params.projectId)!; p.name = params.name; return { project: p } }
++        if (method === 'project/update') { const p = projects.find(x => x.id === params.projectId)!; if (params.name !== undefined) p.name = params.name; if (params.metadata !== undefined) p.metadata = params.metadata; return { project: p } }
+         throw new Error('unexpected ' + method)
+     }
+     const server: CodexAppServer = (work) => work(call)
+@@ -196,3 +203,42 @@
+         expect(local.read()['claude-id']).toBe('p-school')
+     })
+ })
++
++
++describe('folder hierarchy and reordering', () => {
++    it('nests and orders folders through native APIs, preserves metadata, and rejects cycles', async () => {
++        const { root, fake } = app(); fake.projects[0]!.metadata = { unrelated: 'preserve' }
++        const move = (id: string, targetId: string | null, placement: string) => root.request('/api/codex-folders/' + id + '/move', { method: 'POST', body: JSON.stringify({ targetId, placement }) })
++        expect((await move('p-school', 'p-blender', 'before')).status).toBe(200)
++        expect(fake.projects.map(p => p.id)).toEqual(['p-school', 'p-blender'])
++        expect((await move('p-blender', 'p-school', 'inside')).status).toBe(200)
++        expect(fake.projects.find(p => p.id === 'p-blender')?.metadata).toEqual({ unrelated: 'preserve', 'hapi.folderParentId': 'p-school' })
++        const listing = await (await root.request('/api/codex-folders')).json() as any
++        expect(listing.folders.find((f: any) => f.id === 'p-blender').parentId).toBe('p-school')
++        const before = JSON.stringify(fake.projects), count = fake.calls.length
++        expect((await move('p-school', 'p-blender', 'inside')).status).toBe(400)
++        expect((await move('p-school', 'p-school', 'inside')).status).toBe(400)
++        expect(JSON.stringify(fake.projects)).toBe(before)
++        expect(fake.calls.slice(count).every(m => m === 'project/list')).toBe(true)
++        expect((await move('p-blender', null, 'root')).status).toBe(200)
++        expect(fake.projects.find(p => p.id === 'p-blender')?.metadata).toEqual({ unrelated: 'preserve' })
++        expect(Object.keys(fake.threads)).toEqual([T1, T2, T3])
++    })
++    it('creates a subfolder and promotes it when its parent is deleted, without deleting child chats', async () => {
++        const { root, fake } = app()
++        const result = await root.request('/api/codex-folders', { method: 'POST', body: JSON.stringify({ name: 'Child', idempotencyKey: T1, parentId: 'p-blender' }) })
++        expect(result.status).toBe(200); expect((await result.json() as any).folder.parentId).toBe('p-blender')
++        fake.threads[T2] = 'p-new'
++        expect((await root.request('/api/codex-folders/p-blender', { method: 'DELETE' })).status).toBe(200)
++        expect(fake.projects.find(p => p.id === 'p-new')?.metadata).toEqual({})
++        expect(fake.threads[T2]).toBe('p-new')
++    })
++    it('rejects missing destinations and cross-namespace moves without native writes', async () => {
++        const { root, fake } = app('tenant')
++        expect((await root.request('/api/codex-folders/p-school/move', { method: 'POST', body: JSON.stringify({ targetId: 'p-blender', placement: 'inside' }) })).status).toBe(403)
++        expect(fake.calls).toEqual([])
++        const owner = app()
++        expect((await owner.root.request('/api/codex-folders/p-school/move', { method: 'POST', body: JSON.stringify({ targetId: 'missing', placement: 'inside' }) })).status).toBe(400)
++        expect(owner.fake.calls).toEqual(['project/list'])
++    })
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -93,7 +93,7 @@
+ /** ChatGPT desktop folders (Codex app-server projects), shared two-way with that app. */
+ export type ProviderHandoffDraft = { sessionId: string; sourceId: string; destination: 'codex' | 'claude'; context: string; capturedAt: number; title: string }
+ 
+-export type CodexFolder = { id: string; name: string; position: number }
++export type CodexFolder = { id: string; name: string; position: number; parentId?: string }
+ export type CodexFoldersResponse = {
+     folders: CodexFolder[]
+     assignments: Record<string, { folderId: string | null; source: 'app-server' | 'chatgpt-pending' | 'hapi' }>
+@@ -987,12 +987,16 @@
+         await this.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId, folderId, provider }) })
+     }
+ 
+-    async createCodexFolder(name: string, idempotencyKey: string): Promise<CodexFolder> {
+-        return (await this.request<{ folder: CodexFolder }>('/api/codex-folders', { method: 'POST', body: JSON.stringify({ name, idempotencyKey }) })).folder
++    async createCodexFolder(name: string, idempotencyKey: string, parentId?: string): Promise<CodexFolder> {
++        return (await this.request<{ folder: CodexFolder }>('/api/codex-folders', { method: 'POST', body: JSON.stringify({ name, idempotencyKey, ...(parentId ? { parentId } : {}) }) })).folder
+     }
+ 
+     async renameCodexFolder(folderId: string, name: string): Promise<CodexFolder> {
+         return (await this.request<{ folder: CodexFolder }>(`/api/codex-folders/${encodeURIComponent(folderId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })).folder
++    }
++
++    async moveCodexFolder(folderId: string, targetId: string | null, placement: 'before' | 'after' | 'inside' | 'root'): Promise<void> {
++        await this.request(`/api/codex-folders/${encodeURIComponent(folderId)}/move`, { method: 'POST', body: JSON.stringify({ targetId, placement }) })
+     }
+ 
+     async deleteCodexFolder(folderId: string): Promise<void> {
+--- a/web/src/components/CodexFolders.tsx
++++ b/web/src/components/CodexFolders.tsx
+@@ -65,7 +65,7 @@
+ }
+ 
+ /** Create (no folder given) or rename a ChatGPT folder. */
+-export function CodexFolderNameDialog(props: { api: ApiClient; folder: CodexFolder | null; isOpen: boolean; onClose: () => void; onSaved?: (folder: CodexFolder) => void }) {
++export function CodexFolderNameDialog(props: { api: ApiClient; folder: CodexFolder | null; isOpen: boolean; onClose: () => void; onSaved?: (folder: CodexFolder) => void; parentId?: string; onNewSubfolder?: (parentId: string) => void }) {
+     const { t } = useTranslation()
+     const invalidate = useInvalidateCodexFolders()
+     const [confirmDelete, setConfirmDelete] = useState(false)
+@@ -77,7 +77,7 @@
+             <DialogContent className="max-w-sm">
+                 <DialogHeader className="pr-0">
+                     <DialogTitle className="min-h-6 px-10 text-center leading-6">
+-                        {t(confirmDelete ? 'folders.delete' : props.folder ? 'folders.rename' : 'folders.new')}
++                        {props.parentId && !props.folder ? 'New subfolder' : t(confirmDelete ? 'folders.delete' : props.folder ? 'folders.rename' : 'folders.new')}
+                     </DialogTitle>
+                 </DialogHeader>
+                 {confirmDelete ? <div className="mt-4 space-y-4">
+@@ -94,14 +94,14 @@
+                     </div>
+                 </div> : props.isOpen ? (
+                     <div className="mt-4">
+-                        <FolderNameForm
++                        <FolderNameForm key={props.folder ? 'edit:' + props.folder.id : 'new:' + (props.parentId ?? '')}
+                             initial={props.folder?.name ?? ''}
+                             submitLabel={t(props.folder ? 'folders.save' : 'folders.create')}
+                             onCancel={props.onClose}
+                             onSubmit={async (name) => {
+                                 const saved = props.folder
+                                     ? await props.api.renameCodexFolder(props.folder.id, name)
+-                                    : await props.api.createCodexFolder(name, crypto.randomUUID())
++                                    : props.parentId ? await props.api.createCodexFolder(name, crypto.randomUUID(), props.parentId) : await props.api.createCodexFolder(name, crypto.randomUUID())
+                                 await invalidate()
+                                 props.onSaved?.(saved)
+                                 props.onClose()
+@@ -109,6 +109,11 @@
+                         />
+                     </div>
+                 ) : null}
++                {props.folder && !confirmDelete && props.onNewSubfolder && <button type="button" className="mt-2 rounded-lg px-3 py-2 text-sm text-[var(--app-link)]" onClick={() => props.onNewSubfolder?.(props.folder!.id)}>New subfolder</button>}
++                {props.folder?.parentId && !confirmDelete && <button type="button" className="mt-2 rounded-lg px-3 py-2 text-sm" onClick={async () => {
++                    try { await props.api.moveCodexFolder(props.folder!.id, null, 'root'); await invalidate(); props.onClose() } catch { setDeleteError(true) }
++                }}>Move to top level</button>}
++                {deleteError && !confirmDelete && <p role="alert" className="text-sm text-red-600">{t('folders.error')}</p>}
+                 {props.folder && !confirmDelete && <button type="button" className="mt-2 rounded-lg px-3 py-2 text-sm text-red-600 hover:bg-[var(--app-subtle-bg)]" onClick={() => setConfirmDelete(true)}>{t('folders.delete')}</button>}
+             </DialogContent>
+         </Dialog>
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1,3 +1,5 @@
++import { ChatFolderDragButton } from './ChatFolderDragButton'
++import { chatFolderTree, folderDropAt, FOLDER_DRAG_TYPE, type FolderDrop } from '@/lib/chatFolderTree'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { NodesButton } from '@/components/NodeGraphWindow'
+ import { SessionManagerLauncher } from '@/components/SessionManagerButton'
+@@ -320,7 +322,7 @@
+         byFolder.set(key, [...(byFolder.get(key) ?? []), session])
+     }
+     return [
+-        ...folders.map(folder => ({ folder, sessions: byFolder.get(folder.id) ?? [] })),
++        ...chatFolderTree(folders).map(({ folder }) => ({ folder, sessions: byFolder.get(folder.id) ?? [] })),
+         ...(byFolder.has(null) || includeEmptyUnfiled ? [{ folder: null, sessions: byFolder.get(null) ?? [] }] : []),
+     ]
+ }
+@@ -1479,6 +1481,21 @@
+         return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
+     }
+     const invalidateFolders = useInvalidateCodexFolders()
++    const [draggedFolder, setDraggedFolder] = useState<string | null>(null)
++    const draggedFolderRef = useRef<string | null>(null)
++    const [folderDrop, setFolderDrop] = useState<FolderDrop | null>(null)
++    const folderMoveBusy = useRef(false)
++    const endFolderDrag = () => { draggedFolderRef.current = null; setDraggedFolder(null); setFolderDrop(null) }
++    const startFolderDrag = (id: string) => { draggedFolderRef.current = id; setDraggedFolder(id) }
++    const moveFolder = async (id: string, drop: FolderDrop) => {
++        endFolderDrag()
++        if (!api || folderMoveBusy.current || id === drop.targetId) return
++        folderMoveBusy.current = true; setMoveError('')
++        try { await api.moveCodexFolder(id, drop.targetId, drop.placement) }
++        catch { setMoveError('Could not move folder. A folder cannot contain itself or its parents.') }
++        finally { await invalidateFolders(); folderMoveBusy.current = false }
++    }
++    const touchFolderTarget = (point: { x: number; y: number }) => folderDropAt(document.elementFromPoint(point.x, point.y), point.y)
+     const [draggedChat, setDraggedChat] = useState<string | null>(null)
+     const [dropFolder, setDropFolder] = useState<string | null>(null)
+     const [moveError, setMoveError] = useState('')
+@@ -1496,7 +1513,7 @@
+         finally { moveInFlight.current = false }
+     }
+     const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null)
+-    const [folderDialog, setFolderDialog] = useState<{ folder: CodexFolder | null } | null>(null)
++    const [folderDialog, setFolderDialog] = useState<{ folder: CodexFolder | null; parentId?: string } | null>(null)
+     const canMoveToFolder = Boolean(api && codexFolders.data)
+     const handleMoveToFolder = (session: SessionSummary) => {
+         if (getChatTab(session) === 'claude' || (session.metadata?.flavor === 'codex' && session.metadata?.agentSessionId)) setMoveTarget(session)
+@@ -1656,9 +1673,10 @@
+             return null
+         }
+         const tabSessions = chatSessions.filter(session => getChatTab(session) === activeTab)
++        const tree = chatFolderTree(codexFolders.data?.folders ?? []), treeById = new Map(tree.map(row => [row.folder.id, row]))
+         const sections = ['codex', 'claude'].includes(activeTab) && codexFolders.data
+             ? groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf, Boolean(draggedChat))
+-                .filter(section => !isFiltering || Boolean(draggedChat) || section.sessions.length > 0)
++                .filter(section => (isFiltering || !(treeById.get(section.folder?.id ?? '')?.ancestors ?? []).some(id => collapsedFolders[folderKey(id)])) && (!isFiltering || Boolean(draggedChat) || Boolean(draggedFolder) || section.sessions.length > 0))
+             : [{ folder: undefined, sessions: tabSessions }]
+         return (
+             <div key="chats-section" data-testid="session-chat-list">
+@@ -1695,7 +1713,9 @@
+                 <div id="chat-tab-panel" role="tabpanel" aria-labelledby={`chat-tab-${activeTab}`} className="flex flex-col gap-0.5 py-1">
+                     {['codex', 'claude'].includes(activeTab) && api ? (
+                         <div className="flex items-center justify-between px-2 pb-1 text-[11px] text-[var(--app-hint)]">
+-                            <span>{codexFolders.isError ? t('folders.unavailable') : null}</span>
++                            <span data-folder-root onDragOver={event => { if (draggedFolder) { event.preventDefault(); setFolderDrop({ targetId: null, placement: 'root' }) } }}
++                                onDrop={event => { if (draggedFolder) { event.preventDefault(); event.stopPropagation(); void moveFolder(draggedFolder, { targetId: null, placement: 'root' }) } }} className={draggedFolder ? 'min-h-8 flex-1 rounded border border-dashed border-[var(--app-link)] px-2 py-1' : ''}>
++                                {draggedFolder ? 'Top level' : codexFolders.isError ? t('folders.unavailable') : null}</span>
+                             {codexFolders.data ? (
+                                 <button type="button" onClick={() => setFolderDialog({ folder: null })} className="rounded-md px-2 py-1 text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">
+                                     + {t('folders.new')}
+@@ -1705,10 +1725,11 @@
+                     ) : null}
+                     {moveError && <div role="alert" className="px-2 text-sm text-red-600">{moveError}</div>}
+                     {sections.map(({ folder, sessions }) => (
+-                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} data-hapi-chat-folder={folder === undefined ? undefined : folder?.id ?? ''} className={`flex flex-col gap-0.5 ${dropFolder === (folder?.id ?? 'none') ? 'rounded ring-2 ring-[var(--app-link)]' : ''}`}
+-                            onDragOver={event => { if (folder !== undefined && draggedChat) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropFolder(folder?.id ?? 'none') } }}
++                        <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} data-hapi-chat-folder={folder === undefined ? undefined : folder?.id ?? ''} style={{ marginLeft: (treeById.get(folder?.id ?? '')?.depth ?? 0) * 12, ...(folder && folderDrop?.targetId === folder.id ? { boxShadow: folderDrop.placement === 'before' ? 'inset 0 2px var(--app-link)' : folderDrop.placement === 'after' ? 'inset 0 -2px var(--app-link)' : 'inset 0 0 0 1px var(--app-link)' } : {}) }} className={`flex flex-col gap-0.5 ${dropFolder === (folder?.id ?? 'none') ? 'rounded ring-2 ring-[var(--app-link)]' : ''}`}
++                            onDragOver={event => { if (folder && draggedFolder) { event.preventDefault(); event.stopPropagation(); setFolderDrop(folderDropAt(event.currentTarget.querySelector('[data-folder-header]'), event.clientY)); return } if (folder !== undefined && draggedChat) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropFolder(folder?.id ?? 'none') } }}
+                             onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropFolder(null) }}
+                             onDrop={event => {
++                                if (folder && draggedFolder) { event.preventDefault(); event.stopPropagation(); const drop = folderDropAt(event.currentTarget.querySelector('[data-folder-header]'), event.clientY); if (drop && event.dataTransfer.getData(FOLDER_DRAG_TYPE) === draggedFolder) void moveFolder(draggedFolder, drop); return }
+                                 if (folder === undefined || !draggedChat) return
+                                 event.preventDefault(); event.stopPropagation()
+                                 const id = event.dataTransfer.getData(SESSION_DRAG_TYPE)
+@@ -1716,16 +1737,17 @@
+                                 setDraggedChat(null); setDropFolder(null)
+                             }}>
+                             {folder !== undefined ? (
+-                                <div className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
+-                                    <button type="button" aria-expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
+-                                        onClick={() => toggleFolder(folder?.id ?? null)} className="flex min-w-0 flex-1 items-center gap-2 text-left"
+-                                        aria-label={`${folder?.name ?? t('folders.none')} folder`}>
++                                <div data-folder-header={folder?.id} className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
++                                    <ChatFolderDragButton id={folder?.id ?? ''} label={`${folder?.name ?? t('folders.none')} folder`} expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
++                                        disabled={Boolean(folderDialog)} onClick={() => toggleFolder(folder?.id ?? null)} onEdit={() => folder && setFolderDialog({ folder })}
++                                        onStart={startFolderDrag} onEnd={endFolderDrag} onMove={point => setFolderDrop(touchFolderTarget(point))}
++                                        onDrop={point => { const id = draggedFolderRef.current, drop = touchFolderTarget(point); if (id && drop) void moveFolder(id, drop); else endFolderDrag() }}>
+                                     <ChevronIcon className="h-3 w-3" collapsed={Boolean(collapsedFolders[folderKey(folder?.id ?? null)]) && !isFiltering} />
+                                     <FolderGlyph className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]" />
+                                     <span className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
+                                         {folder ? folder.name : t('folders.none')}
+                                     </span>
+-                                    </button>
++                                    </ChatFolderDragButton>
+                                     {folder ? (
+                                         <button
+                                             type="button"
+@@ -1757,7 +1779,7 @@
+                     />
+                 ) : null}
+                 {api && folderDialog ? (
+-                    <CodexFolderNameDialog api={api} folder={folderDialog.folder} isOpen onClose={() => setFolderDialog(null)} />
++                    <CodexFolderNameDialog api={api} folder={folderDialog.folder} parentId={folderDialog.parentId} onNewSubfolder={id => { setCollapsedFolders(previous => { const next = { ...previous, [folderKey(id)]: false }; try { localStorage.setItem('hapi:collapsed-chat-folders', JSON.stringify(next)) } catch {} return next }); setFolderDialog({ folder: null, parentId: id }) }} isOpen onClose={() => setFolderDialog(null)} />
+                 ) : null}
+             </div>
+         )
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -386,3 +386,65 @@
+     expect(screen.getByRole('button', { name: 'Blender folder', hidden: true })).toBeInTheDocument()
+     expect(screen.getByRole('button', { name: 'Delete folder' })).toBeEnabled()
+ })
++
++
++it.each(['codex', 'claude'] as const)('drags folders into a parent and hides descendants when collapsed for %s', async provider => {
++    localStorage.setItem('hapi-chat-tab', provider)
++    let nested = false
++    const api = folderApi({ getCodexFolders: vi.fn(async () => ({ ...folders, folders: folders.folders.map(f => f.id === 'f-school' && nested ? { ...f, parentId: 'f-blender' } : f) })), moveCodexFolder: vi.fn(async () => { nested = true }) })
++    renderList({ api })
++    const source = await screen.findByRole('button', { name: 'Internships/School folder' }), target = screen.getByRole('button', { name: 'Blender folder' }).closest('[data-testid="chat-folder"]')!
++    const values = new Map<string,string>(), transfer = { setData: (k:string,v:string)=>values.set(k,v), getData:(k:string)=>values.get(k)??'', effectAllowed:'',dropEffect:'' }
++    fireEvent.dragStart(source, { dataTransfer: transfer })
++    fireEvent.dragOver(target, { dataTransfer: transfer }); fireEvent.drop(target, { dataTransfer: transfer })
++    await waitFor(() => expect(api.moveCodexFolder).toHaveBeenCalledWith('f-school', 'f-blender', 'inside'))
++    await waitFor(() => expect(screen.getByRole('button', { name: 'Internships/School folder' }).closest('[data-testid="chat-folder"]')).toHaveStyle({ marginLeft: '12px' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Blender folder' }))
++    expect(screen.queryByRole('button', { name: 'Internships/School folder' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Blender folder' }))
++    expect(screen.getByRole('button', { name: 'Internships/School folder' })).toBeInTheDocument()
++    expect(api.assignCodexFolder).not.toHaveBeenCalled()
++})
++it.each(['before','after'] as const)('reorders native folder drops %s another folder', async placement => {
++    const api = folderApi({ moveCodexFolder: vi.fn().mockResolvedValue(undefined) }); renderList({ api })
++    const source = await screen.findByRole('button', { name: 'Internships/School folder' }), target = screen.getByRole('button', { name: 'Blender folder' }).closest('[data-testid="chat-folder"]')!
++    vi.spyOn(target.querySelector('[data-folder-header]')!, 'getBoundingClientRect').mockReturnValue({ top:100,height:40 } as DOMRect)
++    const values = new Map<string,string>(), transfer = { setData:(k:string,v:string)=>values.set(k,v),getData:(k:string)=>values.get(k)??'',effectAllowed:'',dropEffect:'' }
++    fireEvent.dragStart(source,{dataTransfer:transfer});const drop = new MouseEvent('drop',{bubbles:true,cancelable:true,clientY:placement==='before'?101:139});Object.defineProperty(drop,'dataTransfer',{value:transfer});fireEvent(target,drop)
++    await waitFor(()=>expect(api.moveCodexFolder).toHaveBeenCalledWith('f-school','f-blender',placement))
++})
++it('creates a subfolder from the parent edit dialog with a fresh name', async () => {
++    const api=folderApi();renderList({api});fireEvent.click(await screen.findByRole('button',{name:'Rename folder Blender'}))
++    fireEvent.click(screen.getByRole('button',{name:'New subfolder'}))
++    expect(screen.getByRole('textbox',{name:'Folder name'})).toHaveValue('')
++    fireEvent.change(screen.getByRole('textbox',{name:'Folder name'}),{target:{value:'Child'}})
++    fireEvent.click(screen.getByRole('button',{name:'Create'}))
++    await waitFor(()=>expect(api.createCodexFolder).toHaveBeenCalledWith('Child',expect.any(String),'f-blender'))
++})
++
++it.each(['codex','claude'] as const)('moves %s folders with short-hold touch dragging, without opening edit', async provider => {
++    localStorage.setItem('hapi-chat-tab',provider)
++    const api=folderApi({moveCodexFolder:vi.fn().mockResolvedValue(undefined)});renderList({api})
++    const source=await screen.findByRole('button',{name:'Internships/School folder'}), target=screen.getByRole('button',{name:'Blender folder'})
++    const original=document.elementFromPoint;document.elementFromPoint=()=>target
++    vi.useFakeTimers()
++    try {
++        fireEvent.touchStart(source,{touches:[{clientX:20,clientY:80}]});act(()=>vi.advanceTimersByTime(200))
++        fireEvent.touchMove(source,{cancelable:true,touches:[{clientX:20,clientY:120}]})
++        act(()=>vi.advanceTimersByTime(600));expect(screen.queryByRole('dialog')).toBeNull()
++        fireEvent.touchEnd(source,{changedTouches:[{clientX:20,clientY:120}]})
++    } finally {vi.useRealTimers();document.elementFromPoint=original}
++    await waitFor(()=>expect(api.moveCodexFolder).toHaveBeenCalledExactlyOnceWith('f-school','f-blender','inside'))
++})
++
++it('keeps native folder drags from opening the hold menu and supports a root drop', async () => {
++    const api=folderApi({moveCodexFolder:vi.fn().mockResolvedValue(undefined)});renderList({api})
++    const source=await screen.findByRole('button',{name:'Blender folder'}),values=new Map<string,string>(),transfer={setData:(k:string,v:string)=>values.set(k,v),getData:(k:string)=>values.get(k)??'',effectAllowed:'',dropEffect:''}
++    vi.useFakeTimers()
++    try {
++        fireEvent.mouseDown(source,{button:0});fireEvent.dragStart(source,{dataTransfer:transfer})
++        act(()=>vi.advanceTimersByTime(600));expect(screen.queryByRole('dialog')).toBeNull()
++        fireEvent.drop(screen.getByText('Top level'),{dataTransfer:transfer})
++    } finally {vi.useRealTimers()}
++    await waitFor(()=>expect(api.moveCodexFolder).toHaveBeenCalledExactlyOnceWith('f-blender',null,'root'))
++})
+--- /dev/null
++++ b/web/src/lib/chatFolderTree.ts
+@@ -0,0 +1,23 @@
++import type { CodexFolder } from '@/api/client'
++export type FolderRow = { folder: CodexFolder; depth: number; ancestors: string[] }
++/** Missing parents and malformed external cycles stay visible, without recursing forever. */
++export function chatFolderTree(folders: readonly CodexFolder[]): FolderRow[] {
++    const sorted = [...folders].sort((a, b) => a.position - b.position), known = new Set(sorted.map(f => f.id)), seen = new Set<string>(), result: FolderRow[] = []
++    const visit = (folder: CodexFolder, ancestors: string[]) => {
++        if (seen.has(folder.id)) return
++        seen.add(folder.id); result.push({ folder, depth: ancestors.length, ancestors })
++        for (const child of sorted) if (child.parentId === folder.id) visit(child, [...ancestors, folder.id])
++    }
++    for (const folder of sorted) if (!folder.parentId || !known.has(folder.parentId)) visit(folder, [])
++    for (const folder of sorted) visit(folder, [])
++    return result
++}
++export type FolderDrop = { targetId: string | null; placement: 'before' | 'after' | 'inside' | 'root' }
++export const FOLDER_DRAG_TYPE = 'application/x-hapi-chat-folder'
++export function folderDropAt(element: Element | null, y: number): FolderDrop | null {
++    const target = element?.closest('[data-folder-header], [data-folder-root]')
++    if (!target) return null
++    if (target.hasAttribute('data-folder-root')) return { targetId: null, placement: 'root' }
++    const rect = target.getBoundingClientRect(), part = rect.height ? (y - rect.top) / rect.height : 0.5
++    return { targetId: target.getAttribute('data-folder-header'), placement: part < 0.25 ? 'before' : part > 0.75 ? 'after' : 'inside' }
++}
+--- /dev/null
++++ b/web/src/lib/chatFolderTree.test.ts
+@@ -0,0 +1,7 @@
++import { expect, it } from 'vitest'
++import { chatFolderTree } from './chatFolderTree'
++it('orders siblings, flattens nested descendants and keeps malformed external trees visible', () => {
++    const folders = [{ id:'a',name:'A',position:2 },{ id:'b',name:'B',position:0,parentId:'a' },{ id:'c',name:'C',position:1,parentId:'b' },{ id:'d',name:'D',position:3,parentId:'missing' }]
++    expect(chatFolderTree(folders).map(r=>[r.folder.id,r.depth,r.ancestors])).toEqual([['a',0,[]],['b',1,['a']],['c',2,['a','b']],['d',0,[]]])
++    expect(chatFolderTree([{...folders[0],parentId:'b'},folders[1]]).map(r=>r.folder.id).sort()).toEqual(['a','b'])
++})
+--- /dev/null
++++ b/web/src/components/ChatFolderDragButton.tsx
+@@ -0,0 +1,15 @@
++import type { ReactNode } from 'react'
++import { useLongPress } from '@/hooks/useLongPress'
++import { FOLDER_DRAG_TYPE } from '@/lib/chatFolderTree'
++export function ChatFolderDragButton(props: {
++    id: string; label: string; expanded: boolean; disabled?: boolean; onClick: () => void; onEdit: () => void; children: ReactNode
++    onStart: (id: string) => void; onMove: (point: { x: number; y: number }) => void; onDrop: (point: { x: number; y: number }) => void; onEnd: () => void
++}) {
++    const press = useLongPress({ disabled: props.disabled, onClick: props.onClick, onLongPress: props.onEdit, touchDrag: props.id ? {
++        onStart: () => props.onStart(props.id), onMove: props.onMove, onEnd: props.onDrop, onCancel: props.onEnd,
++    } : undefined })
++    return <div {...press} role="button" tabIndex={0} aria-label={props.label} aria-expanded={props.expanded}
++        draggable={Boolean(props.id) && !props.disabled} className="flex min-w-0 flex-1 select-none cursor-grab items-center gap-2 text-left active:cursor-grabbing"
++        onDragStart={event => { press.onMouseLeave(event); event.dataTransfer.setData(FOLDER_DRAG_TYPE, props.id); event.dataTransfer.effectAllowed = 'move'; props.onStart(props.id) }}
++        onClick={event => { if (event.detail === 0) props.onClick() }} onDragEnd={props.onEnd}>{props.children}</div>
++}

@@ -1,0 +1,833 @@
+diff --git a/cli/src/claude/claudeRemote.test.ts b/cli/src/claude/claudeRemote.test.ts
+index 6667f73..167bd12 100644
+--- a/cli/src/claude/claudeRemote.test.ts
++++ b/cli/src/claude/claudeRemote.test.ts
+@@ -539,3 +539,29 @@ describe('Claude mid-turn native input', () => {
+         } finally { gate.resolve(); querySpy.mockRestore(); }
+     });
+ });
++
++it.each([true, false])('gates named send-now on native lifecycle capabilities (%s)', async supported => {
++    const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query)
++    const { claudeRemote } = await import('./claudeRemote')
++    const sendWaitingMessageNow = vi.fn(async () => 'delivering' as const)
++    queryMock.mockReturnValueOnce(Object.assign(createAsyncStream([
++        { type: 'system', subtype: 'init', capabilities: supported ? ['interrupt_send_now_v1', 'msg_lifecycle_v1'] : ['interrupt_send_now_v1'] },
++        { type: 'result', subtype: 'success' }
++    ]), { sendWaitingMessageNow }))
++    const callbacks: Array<((uuid: string) => Promise<unknown>) | null> = []
++    let calls = 0
++    try {
++        await claudeRemote({
++            sessionId: 'session-1', path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/hook.json',
++            nextMessage: async () => calls++ === 0 ? { message: 'hello', mode: { permissionMode: 'default' } } : null,
++            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), onReady: () => {}, isAborted: () => false,
++            onSessionFound: () => {}, onMessage: () => {}, onReadyDelivery: fn => { callbacks.push(fn) }
++        })
++        if (supported) {
++            expect(typeof callbacks[0]).toBe('function')
++            await callbacks[0]?.('native-uuid')
++            expect(sendWaitingMessageNow).toHaveBeenCalledExactlyOnceWith('native-uuid')
++        } else { expect(callbacks.every(fn => fn === null)).toBe(true); expect(sendWaitingMessageNow).not.toHaveBeenCalled() }
++        expect(callbacks.at(-1)).toBeNull()
++    } finally { queryMock.mockReset(); querySpy.mockRestore() }
++})
+diff --git a/cli/src/claude/claudeRemote.ts b/cli/src/claude/claudeRemote.ts
+index 06f2a33..d12fc89 100644
+--- a/cli/src/claude/claudeRemote.ts
++++ b/cli/src/claude/claudeRemote.ts
+@@ -35,7 +35,8 @@ export async function claudeRemote(opts: {
+     isAborted: (toolCallId: string) => boolean,
+ 
+     // Callbacks
+-    onPriorityInput?: (send: ((message: string, priority: 'now' | 'next') => Promise<void>) | null) => void,
++    onPriorityInput?: (send: ((message: string, priority: 'now' | 'next', uuid?: string) => Promise<void>) | null) => void,
++    onReadyDelivery?: (sendNow: ((uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>) | null) => void,
+     onSessionFound: (id: string, extras?: { forkedFrom?: string }) => void,
+     onThinkingChange?: (thinking: boolean) => void,
+     onMessage: (message: SDKMessage) => void,
+@@ -214,9 +215,9 @@ export async function claudeRemote(opts: {
+     const updateThinking = (newThinking: boolean) => {
+         if (thinking !== newThinking) {
+             thinking = newThinking;
+-            opts.onPriorityInput?.(newThinking ? async (content, priority) => {
++            opts.onPriorityInput?.(newThinking ? async (content, priority, uuid) => {
+                 if (!thinking || inputEnded || opts.signal?.aborted) throw new Error('No active Claude turn');
+-                await response.sendUserMessage({ type: 'user', uuid: randomUUID(), priority, message: { role: 'user', content } });
++                await response.sendUserMessage({ type: 'user', uuid: uuid ?? randomUUID(), priority, message: { role: 'user', content } });
+             } : null);
+             logger.debug(`[claudeRemote] Thinking state changed to: ${thinking}`);
+             if (opts.onThinkingChange) {
+@@ -324,6 +325,9 @@ export async function claudeRemote(opts: {
+                 updateThinking(true);
+ 
+                 const systemInit = message as SDKSystemMessage;
++                const capabilities = message.capabilities;
++                opts.onReadyDelivery?.(Array.isArray(capabilities) && capabilities.includes('interrupt_send_now_v1') && capabilities.includes('msg_lifecycle_v1')
++                    ? (uuid) => response.sendWaitingMessageNow(uuid) : null);
+ 
+                 // Session id is still in memory, wait until session file is written to disk
+                 // Start a watcher for to detect the session id
+@@ -424,6 +428,7 @@ export async function claudeRemote(opts: {
+             `${debugPrefix} finally ` +
+             `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
+         );
++        opts.onReadyDelivery?.(null);
+         opts.onPriorityInput?.(null);
+         updateThinking(false);
+     }
+diff --git a/cli/src/claude/claudeRemoteLauncher.modeGate.test.ts b/cli/src/claude/claudeRemoteLauncher.modeGate.test.ts
+index 5b893e1..37baa01 100644
+--- a/cli/src/claude/claudeRemoteLauncher.modeGate.test.ts
++++ b/cli/src/claude/claudeRemoteLauncher.modeGate.test.ts
+@@ -93,6 +93,7 @@ function createClientStub() {
+         },
+         rpcHandlers,
+         keepAlive: () => {},
++        updateAgentState: (mutator: (state: any) => any) => { mutator({}) },
+         updateMetadata: (mutator: (metadata: any) => any) => { mutator({}) },
+         emitMessagesConsumed: () => {},
+         sendClaudeSessionMessage: () => {},
+diff --git a/cli/src/claude/claudeRemoteLauncher.test.ts b/cli/src/claude/claudeRemoteLauncher.test.ts
+index ec8f641..4f3143a 100644
+--- a/cli/src/claude/claudeRemoteLauncher.test.ts
++++ b/cli/src/claude/claudeRemoteLauncher.test.ts
+@@ -99,6 +99,7 @@ function createClientStub() {
+         },
+         rpcHandlers,
+         keepAlive: () => {},
++        updateAgentState: (mutator: (state: any) => any) => { mutator({}) },
+         updateMetadata: (mutator: (metadata: any) => any) => { mutator({}) },
+         emitMessagesConsumed: () => {},
+         sendClaudeSessionMessage: () => {},
+diff --git a/cli/src/claude/claudeRemoteLauncher.ts b/cli/src/claude/claudeRemoteLauncher.ts
+index 57c33b5..3eec7b2 100644
+--- a/cli/src/claude/claudeRemoteLauncher.ts
++++ b/cli/src/claude/claudeRemoteLauncher.ts
+@@ -1,3 +1,4 @@
++import { ClaudeReadyMessages } from './readyMessages';
+ import React from "react";
+ import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
+ import { deliverClaudePriority } from './priorityInput';
+@@ -49,7 +50,9 @@ function getRespawnBackoffMs(): number {
+ 
+ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+     private readonly session: Session;
+-    private prioritySender: { send: (text: string, priority: 'now' | 'next') => Promise<void>; modeHash: string } | null = null;
++    private prioritySender: { send: (text: string, priority: 'now' | 'next', uuid?: string) => Promise<void>; modeHash: string } | null = null;
++    private readyMessages: ClaudeReadyMessages;
++    private readySendNow: ((uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>) | null = null;
+     private abortController: AbortController | null = null;
+     private abortFuture: Future<void> | null = null;
+     private permissionHandler: PermissionHandler | null = null;
+@@ -58,6 +61,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+     constructor(session: Session) {
+         super(process.env.DEBUG ? session.logPath : undefined);
+         this.session = session;
++        this.readyMessages = new ClaudeReadyMessages(messages => session.client.updateAgentState(state => ({ ...state, claudeReadyMessages: messages })));
+     }
+ 
+     protected createDisplay(context: RemoteLauncherDisplayContext): React.ReactElement {
+@@ -136,12 +140,19 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+             onSwitch: () => this.handleSwitchRequest()
+         });
+ 
+-        session.client.rpcHandlerManager.registerHandler(RPC_METHODS.SteerQueuedMessage, (payload: unknown) => deliverClaudePriority({
+-            payload, queue: session.queue, client: session.client,
+-            getSender: () => this.prioritySender,
+-            expand: (text) => session.expandSkillReference(text),
+-        }));
+-        session.client.updateMetadata((metadata) => ({ ...metadata, capabilities: { ...metadata.capabilities, claudeInputPriorities: true } }));
++        session.client.rpcHandlerManager.registerHandler(RPC_METHODS.SteerQueuedMessage, (payload: unknown) => {
++            const request = payload as { localId?: unknown; priority?: unknown } | null;
++            if (typeof request?.localId === 'string' && (request.priority === undefined || request.priority === 'now') && this.readySendNow && this.readyMessages.known(request.localId)) {
++                return this.readyMessages.promote(request.localId, this.readySendNow);
++            }
++            return deliverClaudePriority({
++                payload, queue: session.queue, client: session.client,
++                getSender: () => this.prioritySender, expand: text => session.expandSkillReference(text),
++                ready: this.readySendNow ? this.readyMessages : undefined,
++            });
++        });
++        this.readyMessages.clear();
++        session.client.updateMetadata(metadata => ({ ...metadata, capabilities: { ...metadata.capabilities, claudeInputPriorities: true, claudeReadyMessages: false } }));
+         const permissionHandler = new PermissionHandler(session);
+         this.permissionHandler = permissionHandler;
+ 
+@@ -169,7 +180,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+         let planModeToolCalls = new Set<string>();
+         let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
+ 
++        const readyMessages = this.readyMessages;
+         function onMessage(message: SDKMessage) {
++            readyMessages.lifecycle(message);
+             formatClaudeMessageForInk(message, messageBuffer);
+             permissionHandler.onMessage(message);
+ 
+@@ -494,6 +507,11 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+                             // launch attempt can still resume the original session.
+                             session.consumeOneTimeFlags();
+                         },
++                        onReadyDelivery: (sendNow) => {
++                            this.readySendNow = sendNow;
++                            if (!sendNow) this.readyMessages.clear();
++                            session.client.updateMetadata(metadata => ({ ...metadata, capabilities: { ...metadata.capabilities, claudeReadyMessages: Boolean(sendNow) } }));
++                        },
+                         onPriorityInput: (send) => {
+                             this.prioritySender = send && modeHash ? { send, modeHash } : null;
+                         },
+diff --git a/cli/src/claude/priorityInput.test.ts b/cli/src/claude/priorityInput.test.ts
+index 4efe7cf..a9bbe0f 100644
+--- a/cli/src/claude/priorityInput.test.ts
++++ b/cli/src/claude/priorityInput.test.ts
+@@ -48,3 +48,16 @@ describe('Claude native priority dispatch', () => {
+         expect(queue.size()).toBe(2);
+     });
+ });
++
++it('writes a next-boundary message once with a stable UUID for later promotion', async () => {
++    const { ClaudeReadyMessages } = await import('./readyMessages')
++    const { input, send, client } = setup()
++    const publish = vi.fn(); const ready = new ClaudeReadyMessages(publish)
++    expect(await deliverClaudePriority({ ...input, ready, payload: { localId: 'target', priority: 'next' } })).toEqual({ steered: true })
++    expect(send).toHaveBeenCalledTimes(1)
++    expect(send.mock.calls[0]?.slice(0, 2)).toEqual(['correction', 'next'])
++    expect(publish).not.toHaveBeenCalled()
++    ready.lifecycle({ type: 'command_lifecycle', command_uuid: (send.mock.calls[0] as unknown as unknown[])[2], state: 'queued' })
++    expect(publish).toHaveBeenLastCalledWith([{ localId: 'target', text: 'correction', state: 'waiting' }])
++    expect(client.emitMessagesConsumed).toHaveBeenCalledTimes(1)
++})
+diff --git a/cli/src/claude/priorityInput.ts b/cli/src/claude/priorityInput.ts
+index 233fe0a..6171491 100644
+--- a/cli/src/claude/priorityInput.ts
++++ b/cli/src/claude/priorityInput.ts
+@@ -1,4 +1,5 @@
+ import type { MessageQueue2 } from '@/utils/MessageQueue2';
++import type { ClaudeReadyMessages } from './readyMessages';
+ import type { EnhancedMode } from './loop';
+ 
+ type Client = {
+@@ -12,8 +13,9 @@ export async function deliverClaudePriority(input: {
+     payload: unknown;
+     queue: MessageQueue2<EnhancedMode>;
+     client: Client;
+-    getSender: () => { send: (text: string, priority: 'now' | 'next') => Promise<void>; modeHash: string } | null;
++    getSender: () => { send: (text: string, priority: 'now' | 'next', uuid?: string) => Promise<void>; modeHash: string } | null;
+     expand: (text: string) => string;
++    ready?: ClaudeReadyMessages;
+ }): Promise<{ steered: boolean; error?: string }> {
+     const payload = input.payload as { localId?: unknown; priority?: unknown } | null;
+     if (typeof payload?.localId !== 'string' || !payload.localId) return { steered: false, error: 'Missing localId' };
+@@ -48,7 +50,11 @@ export async function deliverClaudePriority(input: {
+     try {
+         const text = input.expand(taken.item.message);
+         input.client.notePendingHubPromptEcho(text, [localId]);
+-        await target.send(text, payload.priority === 'next' ? 'next' : 'now');
++        if (payload.priority === 'next' && input.ready) {
++            const uuid = input.ready.prepare(localId, taken.item.message);
++            try { await target.send(text, 'next', uuid); }
++            catch (error) { input.ready.remove(localId); throw error; }
++        } else await target.send(text, payload.priority === 'next' ? 'next' : 'now');
+     } catch { return unknown(); }
+     input.queue.commitReservation(taken);
+     input.client.emitMessagesConsumed([localId], { steered: true });
+diff --git a/cli/src/claude/readyMessages.test.ts b/cli/src/claude/readyMessages.test.ts
+new file mode 100644
+index 0000000..96bf064
+--- /dev/null
++++ b/cli/src/claude/readyMessages.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it, vi } from 'vitest'
++import { ClaudeReadyMessages } from './readyMessages'
++describe('Claude ready message lifecycle', () => {
++    it('publishes native waiting separately from admission and removes it at actual consumption', () => {
++        const publish = vi.fn(); const ready = new ClaudeReadyMessages(publish)
++        const uuid = ready.prepare('local', 'correction')
++        expect(publish).not.toHaveBeenCalled()
++        ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state: 'queued' })
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'local', text: 'correction', state: 'waiting' }])
++        ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state: 'started' })
++        ready.admitted('local')
++        expect(publish).toHaveBeenLastCalledWith([])
++    })
++    it('promotes the same uuid once, without sending its content again or interrupting a consumed message', async () => {
++        const ready = new ClaudeReadyMessages(vi.fn()); const uuid = ready.prepare('local', 'correction'); ready.admitted('local')
++        let finish!: (value: 'delivering') => void
++        const sendNow = vi.fn(() => new Promise<'delivering'>(resolve => { finish = resolve }))
++        const first = ready.promote('local', sendNow); const second = ready.promote('local', sendNow)
++        expect(sendNow).toHaveBeenCalledExactlyOnceWith(uuid)
++        finish('delivering'); await Promise.all([first, second])
++        await ready.promote('local', sendNow)
++        expect(sendNow).toHaveBeenCalledTimes(1)
++        ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state: 'started' })
++        await ready.promote('local', sendNow)
++        expect(sendNow).toHaveBeenCalledTimes(1)
++    })
++    it('retains uncertain outcomes without retrying, and treats nothing-waiting as a no-op', async () => {
++        const publish = vi.fn(); const ready = new ClaudeReadyMessages(publish)
++        ready.prepare('one', 'one'); ready.admitted('one')
++        const fail = vi.fn().mockRejectedValue(new Error('pipe lost'))
++        expect((await ready.promote('one', fail)).steered).toBe(false)
++        await ready.promote('one', fail); expect(fail).toHaveBeenCalledTimes(1)
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'uncertain' }])
++        ready.prepare('two', 'two'); ready.admitted('two')
++        await ready.promote('two', async () => 'nothing_waiting')
++        expect(publish.mock.calls.at(-1)?.[0]).toHaveLength(1)
++    })
++    it.each(['completed', 'cancelled', 'discarded', 'refused'])('retires %s and ignores unrelated lifecycle frames', state => {
++        const publish = vi.fn(); const ready = new ClaudeReadyMessages(publish); const uuid = ready.prepare('one', 'one'); ready.admitted('one')
++        ready.lifecycle({ type: 'command_lifecycle', command_uuid: 'unrelated', state: 'started' })
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'waiting' }])
++        ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state })
++        expect(publish).toHaveBeenLastCalledWith([])
++        ready.clear(); expect(ready.known('one')).toBe(false)
++    })
++})
+diff --git a/cli/src/claude/readyMessages.ts b/cli/src/claude/readyMessages.ts
+new file mode 100644
+index 0000000..e19f5f7
+--- /dev/null
++++ b/cli/src/claude/readyMessages.ts
+@@ -0,0 +1,46 @@
++import { randomUUID } from 'node:crypto'
++export type ReadyMessage = { localId: string; text: string; state: 'waiting' | 'sending' | 'uncertain' }
++type Entry = ReadyMessage & { uuid: string; published: boolean; pending?: Promise<{ steered: boolean; error?: string }> }
++
++/** Tracks SDK admission separately from actual model consumption. No automatic replays. */
++export class ClaudeReadyMessages {
++    private knownIds = new Set<string>()
++    private entries = new Map<string, Entry>()
++    constructor(private publish: (messages: ReadyMessage[]) => void) {}
++    private emit() { this.publish([...this.entries.values()].filter(e => e.published).map(({ localId, text, state }) => ({ localId, text, state }))) }
++    prepare(localId: string, text: string): string {
++        this.knownIds.add(localId)
++        const uuid = randomUUID()
++        this.entries.set(localId, { uuid, localId, text: text.slice(0, 1000), state: 'waiting', published: false })
++        return uuid
++    }
++    admitted(localId: string) { const entry = this.entries.get(localId); if (entry) { entry.published = true; this.emit() } }
++    remove(localId: string) { if (this.entries.delete(localId)) this.emit() }
++    clear() { this.entries.clear(); this.knownIds.clear(); this.emit() }
++    known(localId: string) { return this.knownIds.has(localId) }
++    lifecycle(message: { type?: unknown; command_uuid?: unknown; state?: unknown }) {
++        if (message.type !== 'command_lifecycle' || typeof message.command_uuid !== 'string') return
++        const entry = [...this.entries.values()].find(item => item.uuid === message.command_uuid)
++        if (!entry) return
++        if (message.state === 'queued') this.admitted(entry.localId)
++        if (['started', 'completed', 'cancelled', 'discarded', 'refused'].includes(String(message.state))) this.remove(entry.localId)
++    }
++    promote(localId: string, sendNow: (uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>): Promise<{ steered: boolean; error?: string }> {
++        const entry = this.entries.get(localId)
++        if (!entry) return Promise.resolve({ steered: true }) // already consumed: never stop an unrelated turn
++        if (entry.pending) return entry.pending
++        if (entry.state === 'uncertain') return Promise.resolve({ steered: false, error: 'Delivery unconfirmed; not automatically retried' })
++        entry.state = 'sending'; this.emit()
++        entry.pending = (async () => {
++            try {
++                const result = await sendNow(entry.uuid)
++                if (result === 'nothing_waiting') this.remove(localId)
++                return { steered: true }
++            } catch {
++                if (this.entries.get(localId) === entry) { entry.state = 'uncertain'; this.emit() }
++                return { steered: false, error: 'Native send-now outcome is unconfirmed; no message was resent' }
++            }
++        })()
++        return entry.pending
++    }
++}
+diff --git a/cli/src/claude/sdk/query.test.ts b/cli/src/claude/sdk/query.test.ts
+index 62d40a1..fdc08da 100644
+--- a/cli/src/claude/sdk/query.test.ts
++++ b/cli/src/claude/sdk/query.test.ts
+@@ -133,3 +133,20 @@ describe('native priority stdin', () => {
+         await expect(query.sendUserMessage({ type: 'user', priority: 'next', message: { role: 'user', content: 'late' } })).rejects.toThrow('closed');
+     });
+ });
++
++it('promotes only the named queued message using native send-now semantics', async () => {
++    const { Query } = await import('./query')
++    const stdout = new PassThrough(); const stdin = new PassThrough()
++    const written: string[] = []
++    stdin.on('data', data => {
++        const request = JSON.parse(data.toString()); written.push(data.toString())
++        stdout.write(JSON.stringify({ type: 'control_response', response: { request_id: request.request_id, subtype: 'success', response: { send_now: 'delivering' } } }) + '\n')
++    })
++    const query = new Query(stdin, stdout, Promise.resolve())
++    expect(await query.sendWaitingMessageNow('native-uuid')).toBe('delivering')
++    const request = JSON.parse(written[0]!).request
++    expect(request).toEqual({ subtype: 'interrupt', send_now: true, message_uuid: 'native-uuid' })
++    expect(written).toHaveLength(1)
++    expect(written[0]).not.toContain('correction')
++    stdout.end()
++})
+diff --git a/cli/src/claude/sdk/query.ts b/cli/src/claude/sdk/query.ts
+index c5ca3b6..c49befa 100644
+--- a/cli/src/claude/sdk/query.ts
++++ b/cli/src/claude/sdk/query.ts
+@@ -192,6 +192,18 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
+         }, this.childStdin)
+     }
+ 
++    /** Promote an existing native message; never re-send its content or issue a plain Stop. */
++    async sendWaitingMessageNow(uuid: string): Promise<'stopped' | 'delivering' | 'nothing_waiting'> {
++        if (!uuid || !this.childStdin) throw new Error('No native message target')
++        const request: ControlRequest & { send_now: true; message_uuid: string } = {
++            subtype: 'interrupt', send_now: true, message_uuid: uuid
++        }
++        const result = await this.request(request, this.childStdin)
++        const status = result.response?.send_now
++        if (!status || !['stopped', 'delivering', 'nothing_waiting'].includes(status)) throw new Error('Native send-now receipt missing')
++        return status
++    }
++
+     /**
+      * Send control request to Claude process
+      */
+diff --git a/cli/src/claude/sdk/types.ts b/cli/src/claude/sdk/types.ts
+index a05bbf6..8afb160 100644
+--- a/cli/src/claude/sdk/types.ts
++++ b/cli/src/claude/sdk/types.ts
+@@ -104,6 +104,7 @@ export interface SDKControlResponse extends SDKMessage {
+         request_id: string
+         subtype: 'success' | 'error'
+         error?: string
++        response?: { send_now?: 'stopped' | 'delivering' | 'nothing_waiting' }
+     }
+ }
+ 
+diff --git a/hub/src/sync/steerQueuedMessage.test.ts b/hub/src/sync/steerQueuedMessage.test.ts
+index cd4840f..1b41626 100644
+--- a/hub/src/sync/steerQueuedMessage.test.ts
++++ b/hub/src/sync/steerQueuedMessage.test.ts
+@@ -183,3 +183,48 @@ describe('updated Claude native delivery', () => {
+         } finally { engine.stop() }
+     })
+ })
++
++describe('native ready-message promotion after SDK admission', () => {
++    function setup(state: 'waiting' | 'sending' | 'uncertain' = 'waiting') {
++        const { store, engine } = createEngine()
++        const session = engine.getOrCreateSession('ready-promote', { path: '/tmp', host: 'localhost', flavor: 'claude', capabilities: { claudeInputPriorities: true, claudeReadyMessages: true } }, {
++            claudeReadyMessages: [{ localId: 'ready-local', text: 'correction', state }]
++        }, 'default')
++        engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true, mode: 'remote' })
++        const message = store.messages.addMessage(session.id, { text: 'correction' }, 'ready-local')
++        store.messages.markMessagesInvoked(session.id, ['ready-local'], Date.now())
++        const gateway = (engine as unknown as { rpcGateway: { steerQueuedMessage: (sessionId: string, localId: string, priority: string) => Promise<{ steered: boolean }> } }).rpcGateway
++        const promote = spyOn(gateway, 'steerQueuedMessage').mockResolvedValue({ steered: true })
++        const abort = spyOn(engine, 'abortSession').mockResolvedValue()
++        return { store, engine, session, message, promote, abort }
++    }
++    it('promotes an admitted but still waiting native message without re-saving or plain abort', async () => {
++        const { store, engine, session, message, promote, abort } = setup()
++        try {
++            expect(await engine.steerQueuedMessage(session.id, message.id)).toEqual({ status: 'steered', localId: 'ready-local' })
++            expect(promote).toHaveBeenCalledWith(session.id, 'ready-local', 'now')
++            expect(abort).not.toHaveBeenCalled()
++            expect(store.messages.getMessages(session.id, 10)).toHaveLength(1)
++        } finally { engine.stop() }
++    })
++    it('does nothing once Claude consumed it, when offline, or for next-boundary requests', async () => {
++        const { engine, session, message, promote, abort } = setup()
++        try {
++            expect((await engine.steerQueuedMessage(session.id, message.id, 'next')).status).toBe('invoked')
++            session.active = false
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('invoked')
++            session.active = true; session.agentState = { claudeReadyMessages: [] }
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('invoked')
++            expect(promote).not.toHaveBeenCalled(); expect(abort).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++    it('refuses uncertain delivery and scheduled or mismatched rows', async () => {
++        const { store, engine, session, message, promote } = setup('uncertain')
++        try {
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('failed')
++            session.agentState = { claudeReadyMessages: [{ localId: 'different', text: 'other', state: 'waiting' }] }
++            expect((await engine.steerQueuedMessage(session.id, message.id)).status).toBe('invoked')
++            expect(promote).not.toHaveBeenCalled()
++        } finally { engine.stop() }
++    })
++})
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index 402feac..25b10a9 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1094,6 +1094,19 @@ export class SyncEngine {
+         }
+         if (lookup.status === 'invoked') {
+             const message = lookup.message
++            const ready = session.agentState?.claudeReadyMessages?.find(entry => entry.localId === message.localId)
++            if (priority === 'now' && session.active && session.metadata?.flavor === 'claude'
++                && session.metadata.capabilities?.claudeReadyMessages === true && ready && message.scheduledAt == null) {
++                if (ready.state === 'uncertain') return { status: 'failed', error: 'Native delivery is unconfirmed; inspect before retrying', localId: message.localId }
++                try {
++                    const result = await this.rpcGateway.steerQueuedMessage(sessionId, ready.localId, 'now')
++                    return result.steered ? { status: 'steered', localId: ready.localId }
++                        : { status: 'failed', error: result.error ?? 'Native send now failed', localId: ready.localId }
++                } catch (error) {
++                    return { status: 'failed', error: error instanceof Error ? error.message : 'Native send now failed', localId: ready.localId }
++                }
++            }
++
+             return {
+                 status: 'invoked',
+                 message: {
+diff --git a/shared/src/apiTypes.test.ts b/shared/src/apiTypes.test.ts
+index 95eaca2..96cb9ef 100644
+--- a/shared/src/apiTypes.test.ts
++++ b/shared/src/apiTypes.test.ts
+@@ -130,18 +130,18 @@ describe('SendMessageRequestSchema deliveryMode', () => {
+         expect(SendMessageRequestSchema.parse({ text: 'queue', deliveryMode: 'queue' }).deliveryMode).toBe('queue')
+     })
+ 
+-    it('rejects scheduled steer delivery', () => {
++    it.each(['steer', 'next'] as const)('rejects scheduled %s delivery', deliveryMode => {
+         const parsed = SendMessageRequestSchema.safeParse({
+             text: 'later',
+-            localId: 'scheduled-steer',
++            localId: 'scheduled-priority',
+             scheduledAt: Date.now() + 60_000,
+-            deliveryMode: 'steer'
++            deliveryMode
+         })
+ 
+         expect(parsed.success).toBe(false)
+         if (!parsed.success) {
+             expect(parsed.error.issues.some((issue) => issue.path[0] === 'deliveryMode')).toBe(true)
+-            expect(parsed.error.issues.some((issue) => issue.message.includes('cannot use steer'))).toBe(true)
++            expect(parsed.error.issues.some((issue) => issue.message.includes('cannot use turn-scoped delivery'))).toBe(true)
+         }
+     })
+ })
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+index fe4279b..d26c0ad 100644
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -37,6 +37,7 @@ export type OpencodeClearOperation = z.infer<typeof OpencodeClearOperationSchema
+ const SessionCapabilitiesSchema = z.object({
+     concurrentClients: z.boolean().optional(),
+     claudeInputPriorities: z.boolean().optional(),
++    claudeReadyMessages: z.boolean().optional(),
+     terminal: z.boolean().optional(),
+     conversationHistory: ConversationHistoryCapabilitiesSchema.optional()
+ })
+@@ -204,6 +205,9 @@ export const AgentStateSchema = z.object({
+     // True while the CLI is delivering a queued message into the active turn
+     // (Steer). Surfaced so the web can reflect the inject in progress.
+     steeringActive: z.boolean().nullish(),
++    claudeReadyMessages: z.array(z.object({
++        localId: z.string(), text: z.string(), state: z.enum(['waiting', 'sending', 'uncertain'])
++    })).nullish(),
+     // The mode the session was started in. Persisted so reopen/resume can
+     // re-spawn in the same mode — notably 'pty', which has no agent terminal
+     // otherwise (a reopened PTY session would silently fall back to 'remote').
+diff --git a/web/src/components/AssistantChat/ComposerButtons.test.tsx b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+index c9be96e..209fd02 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.test.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+@@ -263,3 +263,28 @@ describe('ComposerButtons responsive toolbar', () => {
+         expect(getComposerToolbarJustifyContent('split')).toBe('flex-start')
+     })
+ })
++
++describe('Claude send-when-ready and second tap', () => {
++    it('first sends the draft, then promotes the waiting message on the same button after admission', () => {
++        const onSend = vi.fn(); const onInterruptReady = vi.fn(); const onVoiceToggle = vi.fn()
++        const props = { canSend: true, sendWhenReady: true, readyToInterrupt: false, voiceStatus: 'disconnected' as const,
++            voiceEnabled: false, controlsDisabled: false, onSend, onInterruptReady, onVoiceToggle }
++        const view = renderInProviders(<UnifiedButton {...props} />)
++        fireEvent.click(screen.getByRole('button', { name: 'Send when ready' }))
++        expect(onSend).toHaveBeenCalledExactlyOnceWith('default')
++        expect(onInterruptReady).not.toHaveBeenCalled()
++        view.rerender(<I18nProvider><UnifiedButton {...props} canSend={false} readyToInterrupt /></I18nProvider>)
++        fireEvent.click(screen.getByRole('button', { name: 'Interrupt & send waiting message' }))
++        expect(onSend).toHaveBeenCalledTimes(1)
++        expect(onInterruptReady).toHaveBeenCalledTimes(1)
++        view.rerender(<I18nProvider><UnifiedButton {...props} canSend={false} /></I18nProvider>)
++        expect(screen.getByRole('button')).toBeDisabled()
++    })
++    it('sends a new draft rather than interrupting a previously waiting message', () => {
++        const onSend = vi.fn(); const onInterruptReady = vi.fn()
++        renderInProviders(<UnifiedButton canSend sendWhenReady readyToInterrupt voiceStatus="disconnected" voiceEnabled={false}
++            controlsDisabled={false} onSend={onSend} onInterruptReady={onInterruptReady} onVoiceToggle={vi.fn()} />)
++        fireEvent.click(screen.getByRole('button', { name: 'Send when ready' }))
++        expect(onSend).toHaveBeenCalledTimes(1); expect(onInterruptReady).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index 1b6ea48..a38ce07 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -472,6 +472,9 @@ function LoadingIcon() {
+ }
+ 
+ export function UnifiedButton(props: {
++    sendWhenReady?: boolean
++    readyToInterrupt?: boolean
++    onInterruptReady?: () => void
+     canSend: boolean
+     voiceStatus: ConversationStatus
+     voiceEnabled: boolean
+@@ -505,6 +508,8 @@ export function UnifiedButton(props: {
+             props.onVoiceToggle() // Stop voice
+         } else if (hasText) {
+             props.onSend('default') // Send message (or scratchlist add — wrapper decides)
++        } else if (props.readyToInterrupt && !routesToScratchlist) {
++            props.onInterruptReady?.()
+         } else if (props.voiceEnabled && !routesToScratchlist) {
+             props.onVoiceToggle() // Start voice (suppressed in scratchlist mode)
+         }
+@@ -532,7 +537,11 @@ export function UnifiedButton(props: {
+     } else if (hasText) {
+         icon = <SendIcon />
+         className = 'bg-black text-white'
+-        ariaLabel = t('composer.send')
++        ariaLabel = props.sendWhenReady && !routesToScratchlist ? 'Send when ready' : t('composer.send')
++    } else if (props.readyToInterrupt && !routesToScratchlist) {
++        icon = <SendIcon />
++        className = 'bg-orange-600 text-white'
++        ariaLabel = 'Interrupt & send waiting message'
+     } else if (props.voiceEnabled) {
+         icon = <VoiceAssistantIcon />
+         className = 'bg-black text-white'
+@@ -551,7 +560,7 @@ export function UnifiedButton(props: {
+     const isDisabled = props.controlsDisabled || (
+         routesToScratchlist
+             ? !hasText
+-            : !hasText && !props.voiceEnabled && !isVoiceActive
++            : !hasText && !props.readyToInterrupt && !props.voiceEnabled && !isVoiceActive
+     )
+ 
+     return (
+@@ -600,6 +609,9 @@ export function DictationButton(props: {
+ }
+ 
+ export function ComposerButtons(props: {
++    sendWhenReady?: boolean
++    readyToInterrupt?: boolean
++    onInterruptReady?: () => void
+     canSend: boolean
+     controlsDisabled: boolean
+     nativePriorityFlavor?: 'claude' | 'codex'
+@@ -895,7 +907,7 @@ export function ComposerButtons(props: {
+                             {props.nativePriorityFlavor === 'claude' ? <Popover.Close asChild>
+                                 <button type="button" onClick={() => props.onSend('next')} disabled={props.controlsDisabled || !props.nativePriorityAvailable}
+                                     className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)] disabled:opacity-40">
+-                                    <span className="block font-medium">During current turn</span><span className="text-xs text-[var(--app-hint)]">Deliver at Claude’s next tool boundary.</span>
++                                    <span className="block font-medium">When ready</span><span className="text-xs text-[var(--app-hint)]">Deliver at Claude’s next tool boundary.</span>
+                                 </button>
+                             </Popover.Close> : null}
+                             <Popover.Close asChild>
+@@ -910,6 +922,9 @@ export function ComposerButtons(props: {
+             ) : null}
+ 
+             <UnifiedButton
++                sendWhenReady={props.sendWhenReady}
++                readyToInterrupt={props.readyToInterrupt}
++                onInterruptReady={props.onInterruptReady}
+                 canSend={props.canSend}
+                 voiceStatus={props.voiceStatus}
+                 voiceEnabled={props.voiceEnabled}
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index e468568..3116141 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -158,7 +158,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+     }
+     it.each([
+         ['After current turn', 'queue'],
+-        ['During current turn', 'next'],
++        ['When ready', 'next'],
+         ['Send immediately', 'steer'],
+     ])('sends Claude with explicit %s intent', async (label, intent) => {
+         draft()
+@@ -171,7 +171,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         draft()
+         renderComposer('codex', { active: true, thinking: true, supportsNativePriority: true })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        expect(screen.queryByRole('button', { name: /During current turn/ })).toBeNull()
++        expect(screen.queryByRole('button', { name: /When ready/ })).toBeNull()
+         expect(screen.getByRole('button', { name: /After current turn/ })).toBeTruthy()
+         await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Send immediately/ })) })
+         expect(runtime.sentIntents).toEqual(['steer'])
+@@ -203,7 +203,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         draft()
+         renderComposer('claude', { active: true, thinking: true, supportsNativePriority: false })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        expect(screen.getByRole('button', { name: /During current turn/ })).toBeDisabled()
++        expect(screen.getByRole('button', { name: /When ready/ })).toBeDisabled()
+         const sendNow = screen.getByRole('button', { name: /Stop & send now/ })
+         expect(sendNow).not.toBeDisabled()
+         await act(async () => { fireEvent.click(sendNow) })
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index 565a082..1214b54 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -284,6 +284,9 @@ export function ModelEffortSettingsSection(props: {
+ }
+ 
+ export function HappyComposer(props: {
++    sendWhenReady?: boolean
++    readyToInterrupt?: boolean
++    onInterruptReady?: () => void
+     supportsNativePriority?: boolean
+     statisticsButton?: ReactNode
+     sessionId?: string
+@@ -2363,6 +2366,9 @@ export function HappyComposer(props: {
+                                     onReasoning={agentFlavor === 'codex' ? handleModelReasoningEffortChange : handleEffortChange}
+                                 />
+                             </> : undefined}
++                            sendWhenReady={props.sendWhenReady}
++                            readyToInterrupt={props.readyToInterrupt && !pendingSchedule && !props.scratchlistMode}
++                            onInterruptReady={props.onInterruptReady}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
+                             nativePriorityFlavor={active && thinking && !controlledByUser && (agentFlavor === 'claude' || agentFlavor === 'codex') ? agentFlavor : undefined}
+diff --git a/web/src/components/AssistantChat/NativeReadyMessages.test.tsx b/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
+new file mode 100644
+index 0000000..f7b5a73
+--- /dev/null
++++ b/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
+@@ -0,0 +1,22 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { NativeReadyMessages } from './NativeReadyMessages'
++afterEach(cleanup)
++describe('native waiting messages', () => {
++    it('offers promotion for the same local id and removes the action after consumption', () => {
++        const onInterrupt = vi.fn()
++        const view = render(<NativeReadyMessages messages={[{ localId: 'local', text: 'adjust the result', state: 'waiting' }]} busy={false} onInterrupt={onInterrupt} />)
++        expect(screen.getByText(/When Claude is ready/)).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Interrupt & send' }))
++        expect(onInterrupt).toHaveBeenCalledExactlyOnceWith('local')
++        view.rerender(<NativeReadyMessages messages={[]} busy={false} onInterrupt={onInterrupt} />)
++        expect(screen.queryByRole('button')).toBeNull()
++    })
++    it('holds uncertain or in-progress delivery without offering a resend', () => {
++        const onInterrupt = vi.fn()
++        render(<NativeReadyMessages messages={[{ localId: 'one', text: 'one', state: 'sending' }, { localId: 'two', text: 'two', state: 'uncertain' }]} busy={false} onInterrupt={onInterrupt} />)
++        expect(screen.queryByRole('button')).toBeNull()
++        expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument()
++        expect(onInterrupt).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/components/AssistantChat/NativeReadyMessages.tsx b/web/src/components/AssistantChat/NativeReadyMessages.tsx
+new file mode 100644
+index 0000000..e338573
+--- /dev/null
++++ b/web/src/components/AssistantChat/NativeReadyMessages.tsx
+@@ -0,0 +1,14 @@
++import type { AgentState } from '@/types/api'
++export function NativeReadyMessages(props: { messages: NonNullable<AgentState['claudeReadyMessages']>; busy: boolean; onInterrupt: (localId: string) => void }) {
++    if (!props.messages.length) return null
++    return <div aria-label="Messages waiting for Claude" className="mx-auto w-full max-h-40 max-w-content space-y-1 overflow-y-auto px-3 pt-2">
++        {props.messages.map(message => <div key={message.localId} className="rounded-lg bg-[var(--app-secondary-bg)] px-3 py-2 text-xs">
++            <p className="line-clamp-2 whitespace-pre-wrap break-words">{message.text}</p>
++            <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
++                <span className="text-[var(--app-hint)]">{message.state === 'waiting' ? 'When Claude is ready · tap again to interrupt' : message.state === 'sending' ? 'Sending now…' : 'Delivery unconfirmed · check the conversation before retrying'}</span>
++                {message.state === 'waiting' ? <button type="button" title="Send now; Claude may also process other waiting messages." disabled={props.busy} onClick={() => props.onInterrupt(message.localId)}
++                    className="min-h-8 rounded-md px-2 text-[var(--app-link)] disabled:opacity-40">Interrupt & send</button> : null}
++            </div>
++        </div>)}
++    </div>
++}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index 74da0a4..b60e8e6 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,3 +1,5 @@
++import { NativeReadyMessages } from './AssistantChat/NativeReadyMessages'
++import { useSteerQueuedMessage } from '@/hooks/mutations/useSteerQueuedMessage'
+ import { QuickApproval } from './QuickApproval'
+ import { GoalBanner } from './GoalBanner'
+ import { RunningBar } from './RunningBar'
+@@ -974,6 +976,13 @@ function SessionChatInner(props: SessionChatProps) {
+         void queryClient.resetQueries({ queryKey: effortInvalidationKey, exact: true })
+     }, [agentFlavor, sessionId, sessionModel, queryClient])
+     const controlledByUser = props.session.agentState?.controlledByUser === true && !props.session.metadata?.capabilities?.concurrentClients
++    const promoteReady = useSteerQueuedMessage(props.api)
++    const nativeReady = props.session.active && !controlledByUser && props.session.metadata?.flavor === 'claude'
++        && props.session.metadata.capabilities?.claudeReadyMessages === true
++    const readyMessages = nativeReady ? props.session.agentState?.claudeReadyMessages ?? [] : []
++    const waitingReady = readyMessages.filter(message => message.state === 'waiting').at(-1)
++    const interruptReady = (localId: string) => { if (!promoteReady.isPending) promoteReady.mutate({ sessionId: props.session.id, messageId: localId }) }
++
+     const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
+     const claudeCatalog = useQuery({
+         queryKey: ['local-claude-models', props.session.metadata?.machineId],
+@@ -1776,6 +1785,8 @@ function SessionChatInner(props: SessionChatProps) {
+             // Do not use assistant-ui's broader `isRunning` here: a
+             // child-agent run is not the Pi main session's steer target.
+             isSessionThinking: props.session.thinking,
++            nativeReady,
++            text,
+             intent,
+             scheduledAt,
+             routesToScratchlist: routedToScratchlist,
+@@ -1794,7 +1805,7 @@ function SessionChatInner(props: SessionChatProps) {
+             updatePendingSchedule(null)
+             setForceScrollToken((token) => token + 1)
+         }
+-    }, [agentFlavor, onSendForComposer, props.session.thinking, scratchlistMode, updatePendingSchedule])
++    }, [agentFlavor, onSendForComposer, props.session.thinking, nativeReady, scratchlistMode, updatePendingSchedule])
+ 
+     const attachmentAdapter = useMemo(() => {
+         if (props.session.active && scratchlistMode) {
+@@ -2019,6 +2030,7 @@ function SessionChatInner(props: SessionChatProps) {
+                                     disabled={props.isSending || isScratchlistParking}
+                                 />
+                             ) : null}
++                            <NativeReadyMessages messages={readyMessages} busy={promoteReady.isPending} onInterrupt={interruptReady} />
+                             <QueuedMessagesBar
+                                 sessionId={props.session.id}
+                                 api={props.api}
+@@ -2042,6 +2054,9 @@ function SessionChatInner(props: SessionChatProps) {
+                         <HappyComposer
+                         focusInputRef={focusComposerRef}
+                         key={`composer-${props.session.id}`}
++                        sendWhenReady={Boolean(nativeReady && props.session.thinking)}
++                        readyToInterrupt={Boolean(waitingReady) && !promoteReady.isPending}
++                        onInterruptReady={() => { if (waitingReady) interruptReady(waitingReady.localId) }}
+                         supportsNativePriority={agentFlavor === 'codex' || (agentFlavor === 'claude' && props.session.metadata?.capabilities?.claudeInputPriorities === true)}
+                         statisticsButton={<ChatStatisticsButton api={props.api} sessionId={props.session.id}
+                             flavor={props.session.metadata?.flavor ?? null}
+diff --git a/web/src/lib/messageDelivery.test.ts b/web/src/lib/messageDelivery.test.ts
+index cf7abd7..b01a736 100644
+--- a/web/src/lib/messageDelivery.test.ts
++++ b/web/src/lib/messageDelivery.test.ts
+@@ -78,3 +78,15 @@ describe('explicit native delivery', () => {
+         expect(getRetryDeliveryMode('next')).toBe('queue');
+     });
+ });
++
++it('uses Claude next-boundary delivery by default only when native waiting-message tracking is available', () => {
++    const input = { agentFlavor: 'claude', isSessionThinking: true, nativeReady: true, intent: 'default' as const }
++    expect(resolveMessageDeliveryMode(input)).toBe('next')
++    expect(resolveMessageDeliveryMode({ ...input, nativeReady: false })).toBe('queue')
++    expect(resolveMessageDeliveryMode({ ...input, text: '/goal clear' })).toBe('queue')
++    expect(resolveMessageDeliveryMode({ ...input, intent: 'queue' })).toBe('queue')
++    expect(resolveMessageDeliveryMode({ ...input, intent: 'steer' })).toBe('steer')
++    expect(resolveMessageDeliveryMode({ ...input, scheduledAt: 123 })).toBe('queue')
++    expect(resolveMessageDeliveryMode({ ...input, routesToScratchlist: true })).toBe('queue')
++    expect(resolveMessageDeliveryMode({ ...input, agentFlavor: 'codex' })).toBe('queue')
++})
+diff --git a/web/src/lib/messageDelivery.ts b/web/src/lib/messageDelivery.ts
+index bbd7b66..963268d 100644
+--- a/web/src/lib/messageDelivery.ts
++++ b/web/src/lib/messageDelivery.ts
+@@ -44,11 +44,15 @@ export function getRestoredComposerSendIntent(
+ export function resolveMessageDeliveryMode(input: {
+     agentFlavor: string | null | undefined
+     isSessionThinking: boolean
++    nativeReady?: boolean
++    text?: string
+     intent: ComposerSendIntent
+     scheduledAt?: number | null
+     routesToScratchlist?: boolean
+ }): MessageDeliveryMode {
++    if (input.text?.trimStart().startsWith('/')) return 'queue'
+     if (!input.isSessionThinking || input.scheduledAt != null || input.routesToScratchlist) return 'queue'
++    if (input.intent === 'default' && input.agentFlavor === 'claude' && input.nativeReady) return 'next'
+     if (input.intent === 'steer' && (input.agentFlavor === 'codex' || input.agentFlavor === 'claude')) return 'steer'
+     if (input.intent === 'next' && input.agentFlavor === 'claude') return 'next'
+     return 'queue'

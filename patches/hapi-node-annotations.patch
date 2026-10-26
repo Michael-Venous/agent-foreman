@@ -1,0 +1,661 @@
+--- a/shared/src/nodeGraph.ts
++++ b/shared/src/nodeGraph.ts
+@@ -29,8 +29,21 @@
+     createdBy: string
+ }
+ 
++/** Visual canvas organization only; never a session, owner or management edge. */
++export type NodeAnnotation = {
++    id: string
++    kind: 'frame' | 'text'
++    text: string
++    color: 'slate' | 'blue' | 'violet' | 'green' | 'amber'
++    x: number
++    y: number
++    width: number
++    height: number
++}
++
+ export type NodeGraph = {
+     workspaceId: string
++    annotations?: NodeAnnotation[]
+     nodes: NodeGraphNode[]
+     edges: NodeGraphEdge[]
+ }
+--- a/hub/src/store/nodeGraph.ts
++++ b/hub/src/store/nodeGraph.ts
+@@ -1,6 +1,7 @@
+ import type { Database } from 'bun:sqlite'
++import { isDeepStrictEqual } from 'node:util'
+ import { randomUUID } from 'node:crypto'
+-import { createsCycle, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import { createsCycle, type NodeAnnotation, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ 
+ type WorkspaceRow = { id: string; namespace: string; name: string; kind: 'default' | 'preset'; created_at: number; updated_at: number }
+ type MemberRow = { workspace_id: string; session_id: string; x: number | null; y: number | null; added_at: number }
+@@ -17,6 +18,7 @@
+         db.exec(`CREATE TABLE IF NOT EXISTS node_members (
+             workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, x REAL, y REAL, added_at INTEGER NOT NULL,
+             PRIMARY KEY (workspace_id, session_id))`)
++        db.exec('CREATE TABLE IF NOT EXISTS node_annotations (workspace_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (workspace_id, id))')
+         db.exec(`CREATE TABLE IF NOT EXISTS node_edges (
+             workspace_id TEXT NOT NULL, child_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+             created_at INTEGER NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY (workspace_id, child_id))`)
+@@ -53,9 +55,25 @@
+         const edges = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? ORDER BY created_at, child_id').all(workspaceId) as EdgeRow[]
+         return {
+             workspaceId,
++            annotations: (this.db.query('SELECT data FROM node_annotations WHERE workspace_id = ? ORDER BY rowid').all(workspaceId) as { data: string }[]).map(row => JSON.parse(row.data) as NodeAnnotation),
+             nodes: members.map(m => ({ sessionId: m.session_id, x: m.x, y: m.y, addedAt: m.added_at })),
+             edges: edges.map(e => ({ owner: e.owner_id, child: e.child_id, createdAt: e.created_at, createdBy: e.created_by })),
+         }
++    }
++
++    /** Compare-and-swap avoids overwriting another window's note, including on undo. */
++    annotation(namespace: string, workspaceId: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null): boolean {
++        if (!this.workspace(namespace, workspaceId) || this.active(namespace) !== workspaceId) return false
++        return this.db.transaction(() => {
++            const row = this.db.query('SELECT data FROM node_annotations WHERE workspace_id = ? AND id = ?').get(workspaceId, id) as { data: string } | null
++            if (!isDeepStrictEqual(row ? JSON.parse(row.data) : null, expected)) return false
++            if (value) {
++                if (!row && (this.db.query('SELECT COUNT(*) AS count FROM node_annotations WHERE workspace_id = ?').get(workspaceId) as { count: number }).count >= 200) throw new Error('This workspace already has 200 frames and text boxes')
++                this.db.query('INSERT INTO node_annotations VALUES (?, ?, ?) ON CONFLICT(workspace_id, id) DO UPDATE SET data = excluded.data').run(workspaceId, id, JSON.stringify(value))
++            } else this.db.query('DELETE FROM node_annotations WHERE workspace_id = ? AND id = ?').run(workspaceId, id)
++            this.touch(workspaceId)
++            return true
++        })()
+     }
+ 
+     members(namespace: string, workspaceId = this.active(namespace)): string[] {
+@@ -121,6 +139,7 @@
+         const source = this.active(namespace), now = Date.now(), id = randomUUID()
+         this.db.transaction(() => {
+             this.db.query('INSERT INTO node_workspaces VALUES (?, ?, ?, ?, ?, ?)').run(id, namespace, name, 'preset', now, now)
++            this.db.query('INSERT INTO node_annotations SELECT ?, id, data FROM node_annotations WHERE workspace_id = ?').run(id, source)
+             this.db.query('INSERT INTO node_members SELECT ?, session_id, x, y, added_at FROM node_members WHERE workspace_id = ?').run(id, source)
+             this.db.query('INSERT INTO node_edges SELECT ?, child_id, owner_id, created_at, created_by FROM node_edges WHERE workspace_id = ?').run(id, source)
+         })()
+@@ -139,6 +158,7 @@
+         this.db.transaction(() => {
+             this.db.query('DELETE FROM node_members WHERE workspace_id = ?').run(id)
+             this.db.query('DELETE FROM node_edges WHERE workspace_id = ?').run(id)
++            this.db.query('DELETE FROM node_annotations WHERE workspace_id = ?').run(id)
+             this.db.query('DELETE FROM node_workspaces WHERE id = ?').run(id)
+         })()
+     }
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -1,4 +1,5 @@
+ import { Hono } from 'hono'
++import { z } from 'zod'
+ import type { NodeGraphResponse, NodeLayoutPositions } from '@hapi/protocol/nodeGraph'
+ import { requestManagerControl } from '../../managerControl'
+ import type { SyncEngine } from '../../sync/syncEngine'
+@@ -12,6 +13,14 @@
+     const entry = Object.entries(read()).find(([, managed]) => managed.role === 'manager')
+     return entry?.[0] ?? process.env.HAPI_OVERSEER_SESSION_ID ?? null
+ }
++
++const annotation = z.object({
++    id: z.string().min(1).max(96).regex(/^[\w-]+$/), kind: z.enum(['frame', 'text']),
++    text: z.string().max(10_000), color: z.enum(['slate', 'blue', 'violet', 'green', 'amber']),
++    x: z.number().finite().min(-1_000_000).max(1_000_000), y: z.number().finite().min(-1_000_000).max(1_000_000),
++    width: z.number().finite().min(180).max(8000), height: z.number().finite().min(100).max(8000),
++}).strict()
++const annotationEdit = z.object({ value: annotation.nullable(), expected: annotation.nullable() }).strict()
+ 
+ const name = (value: unknown): string | null => typeof value === 'string' && value.trim() && value.trim().length <= 80 ? value.trim() : null
+ 
+@@ -68,6 +77,19 @@
+         if (!positions || typeof positions !== 'object' || Object.keys(positions).length > 2000) return c.json({ error: 'Expected positions' }, 400)
+         engine.nodeGraph.layout(namespace, positions as NodeLayoutPositions)
+         return c.json({ ok: true })
++    })
++    app.post('/node-graph/workspaces/:workspace/annotations/:id', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), workspace = c.req.param('workspace'), id = c.req.param('id')
++        if (!engine.nodeGraph.exists(namespace, workspace)) return c.json({ error: 'Workspace not found' }, 404)
++        const edit = annotationEdit.safeParse(await c.req.json().catch(() => null))
++        if (!edit.success || (!edit.data.value && !edit.data.expected) || (edit.data.value && edit.data.value.id !== id) || (edit.data.expected && edit.data.expected.id !== id)) return c.json({ error: 'Invalid frame or text box' }, 400)
++        try {
++            if (!engine.nodeGraph.annotation(namespace, workspace, id, edit.data.value, edit.data.expected)) return c.json({ error: 'The workspace or annotation changed elsewhere. Refresh and try again.' }, 409)
++        } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Could not save annotation' }, 409) }
++        // Pure presentation: no supervisor wake, session activity or management reconciliation.
++        return c.json(respond(engine, namespace))
+     })
+     app.post('/node-graph/edges', async (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+--- a/hub/src/sync/nodeGraph.test.ts
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -189,3 +189,69 @@
+         }
+     } finally { f.close() }
+ })
++
++const decoration = (id = 'frame-one') => ({ id, kind: 'frame' as const, text: 'Render queue', color: 'blue' as const, x: -200, y: 100, width: 480, height: 320 })
++const annotationPath = (workspace: string, id = 'frame-one') => `/node-graph/workspaces/${workspace}/annotations/${id}`
++describe('workspace frames and text boxes', () => {
++    it('creates, updates and deletes visual annotations without touching chats, ownership, Stop or manager wakes', async () => {
++        const f = fixture()
++        try {
++            const worker = f.create('Running'); f.alive(worker.id, true); f.engine.pauseSession(worker.id)
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: worker.id })
++            const before = (await f.call('/node-graph')).json, wakes = f.nudges(), pause = f.engine.getManualPause(worker.id)
++            const path = annotationPath(before.activeWorkspaceId), value = decoration()
++            const added = await f.call(path, { value, expected: null })
++            expect(added.status).toBe(200); expect(added.json.graph.annotations).toEqual([value])
++            const note = { ...value, kind: 'text' as const, text: 'Next steps\nKeep GPU free' }
++            const edited = await f.call(path, { value: note, expected: value })
++            expect(edited.status).toBe(200); expect(edited.json.graph.annotations).toEqual([note])
++            const removed = await f.call(path, { value: null, expected: note })
++            expect(removed.status).toBe(200); expect(removed.json.graph.annotations).toEqual([])
++            expect(removed.json.graph.nodes).toEqual(before.graph.nodes); expect(removed.json.graph.edges).toEqual(before.graph.edges)
++            expect(f.engine.getSession(worker.id)?.thinking).toBe(true); expect(f.engine.getManualPause(worker.id)).toBe(pause)
++            expect(f.nudges()).toBe(wakes)
++        } finally { f.close() }
++    })
++    it('rejects stale edit/delete/undo expectations rather than overwriting another window', async () => {
++        const f = fixture()
++        try {
++            const workspace = (await f.call('/node-graph')).json.activeWorkspaceId, path = annotationPath(workspace), a = decoration()
++            await f.call(path, { value: a, expected: null })
++            const b = { ...a, text: 'Newer note', x: 321 }
++            await f.call(path, { value: b, expected: a })
++            for (const value of [a, null]) expect((await f.call(path, { value, expected: a })).status).toBe(409)
++            expect((await f.call(path, { value: a, expected: null })).status).toBe(409)
++            expect((await f.call('/node-graph')).json.graph.annotations).toEqual([b])
++        } finally { f.close() }
++    })
++    it('validates shapes and namespaces and refuses late writes after workspace switch', async () => {
++        const f = fixture()
++        try {
++            const workspace = (await f.call('/node-graph')).json.activeWorkspaceId, path = annotationPath(workspace), value = decoration()
++            expect((await f.call(path, { value, expected: null }, 'other')).status).toBe(404)
++            for (const invalid of [{ ...value, width: -1 }, { ...value, x: 1e10 }, { ...value, kind: 'session' }, { ...value, id: 'other' }, { ...value, text: 'a'.repeat(10001) }]) expect((await f.call(path, { value: invalid, expected: null })).status).toBe(400)
++            const next = f.engine.nodeGraph.saveAs('default', 'Other')
++            f.engine.nodeGraph.activate('default', next.id)
++            expect((await f.call(path, { value, expected: null })).status).toBe(409)
++            expect(f.engine.nodeGraph.graph('default', workspace).annotations).toEqual([])
++        } finally { f.close() }
++    })
++    it('persists across restart, copies into presets independently and deletes with its workspace', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-annotations-')), path = join(dir, 'hub.db')
++        let f = fixture(path)
++        try {
++            const workspace = (await f.call('/node-graph')).json.activeWorkspaceId, value = decoration()
++            await f.call(annotationPath(workspace), { value, expected: null })
++            const preset = f.engine.nodeGraph.saveAs('default', 'Copy')
++            f.close(); f = fixture(path)
++            expect(f.engine.nodeGraph.graph('default', workspace).annotations).toEqual([value])
++            expect(f.engine.nodeGraph.graph('default', preset.id).annotations).toEqual([value])
++            f.engine.nodeGraph.activate('default', preset.id)
++            await f.call(annotationPath(preset.id), { value: { ...value, text: 'Copy edit' }, expected: value })
++            expect(f.engine.nodeGraph.graph('default', workspace).annotations).toEqual([value])
++            f.engine.nodeGraph.activate('default', workspace)
++            f.engine.nodeGraph.delete('default', preset.id)
++            expect(f.engine.nodeGraph.graph('default', preset.id).annotations).toEqual([])
++        } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,5 +1,5 @@
+ import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+-import type { NodeGraphResponse, NodeLayoutPositions, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
++import type { NodeAnnotation, NodeGraphResponse, NodeLayoutPositions, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
+ import type {
+     AttachmentMetadata,
+     AuthResponse,
+@@ -902,6 +902,10 @@
+         return nodeGraphOf(await this.nodeGraphPost('/layout', { positions }))
+     }
+ 
++    async editNodeAnnotation(workspace: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.request(`/api/node-graph/workspaces/${encodeURIComponent(workspace)}/annotations/${encodeURIComponent(id)}`, { method: 'POST', body: JSON.stringify({ value, expected }) }))
++    }
++
+     async setNodeOwner(owner: string, child: string): Promise<NodeGraphResponse | null> {
+         return nodeGraphOf(await this.nodeGraphPost('/edges', { owner, child, createdBy: 'user' }))
+     }
+--- a/web/src/api/nodeGraphClient.test.ts
++++ b/web/src/api/nodeGraphClient.test.ts
+@@ -51,3 +51,11 @@
+     expect(nodeGraphOf({ ok: true })).toBeNull()
+     expect(nodeGraphOf(null)).toBeNull()
+ })
++
++it('scopes annotation changes to a workspace and includes expected state', async () => {
++    const api = new ApiClient('token')
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(graph), { status: 200 }))
++    const value = { id: 'note', kind: 'text' as const, color: 'blue' as const, text: 'Plan\nNext step', x: 0, y: 0, width: 280, height: 180 }
++    await expect(api.editNodeAnnotation('p 1', 'note', value, null)).resolves.toEqual(graph)
++    expect(call(0)).toEqual({ url: '/api/node-graph/workspaces/p%201/annotations/note', method: 'POST', body: { value, expected: null } })
++})
+--- a/web/src/lib/nodeGraphUndo.ts
++++ b/web/src/lib/nodeGraphUndo.ts
+@@ -1,9 +1,10 @@
+-import { createsCycle, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import { createsCycle, type NodeAnnotation, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { GraphPoint } from './nodeGraphLayout'
+ 
+ type Base = { workspace: string }
+ export type GraphEdit = Base & (
++    | { kind: 'annotation'; id: string; before: NodeAnnotation | null; after: NodeAnnotation | null }
+     | { kind: 'move'; id: string; before: GraphPoint; after: GraphPoint }
+     | { kind: 'owner'; child: string; before: string | null; after: string | null }
+     | { kind: 'add'; id: string; point: GraphPoint }
+@@ -20,6 +21,7 @@
+     if (graph.activeWorkspaceId !== edit.workspace) throw changed()
+     const node = 'id' in edit ? graph.graph.nodes.find(n => n.sessionId === edit.id) : undefined
+     switch (edit.kind) {
++        case 'annotation': return client.editNodeAnnotation(edit.workspace, edit.id, edit.before, edit.after)
+         case 'move':
+             if (!node || node.x !== edit.after.x || node.y !== edit.after.y) throw changed()
+             return client.saveNodeLayout({ [edit.id]: edit.before })
+--- a/web/src/lib/nodeGraphUndo.test.ts
++++ b/web/src/lib/nodeGraphUndo.test.ts
+@@ -96,3 +96,14 @@
+         expect(api.detachNode).not.toHaveBeenCalled()
+     })
+ })
++
++it('undoes note edits through the atomic expected-value API and propagates conflicts', async () => {
++    const { client } = setup()
++    const after = { id: 'note', kind: 'text' as const, color: 'blue' as const, text: 'New', x: 0, y: 0, width: 200, height: 100 }
++    const before = { ...after, text: 'Old' }
++    client.editNodeAnnotation = vi.fn(async () => null)
++    await undoGraphEdit(client, { kind: 'annotation', workspace: 'w', id: 'note', before, after })
++    expect(client.editNodeAnnotation).toHaveBeenCalledWith('w', 'note', before, after)
++    vi.mocked(client.editNodeAnnotation).mockRejectedValueOnce(new Error('changed elsewhere'))
++    await expect(undoGraphEdit(client, { kind: 'annotation', workspace: 'w', id: 'note', before: null, after })).rejects.toThrow('changed elsewhere')
++})
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+-import { createsCycle, edgeAsleep, nodeIsIdle, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import { createsCycle, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+@@ -7,12 +7,14 @@
+ import { clampZoom, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
++import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
+ import { undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+ type Mutate = ReturnType<typeof useNodeGraph>['mutate']
+ type Gesture =
++    | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean }
+     | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint }
+@@ -45,6 +47,9 @@
+     const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
+     const viewRef = useRef(view); viewRef.current = view
+     const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
++    const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
++    const [selectedAnnotation, setSelectedAnnotation] = useState<string | null>(null)
++    const [editingAnnotation, setEditingAnnotation] = useState<{ workspace: string; before: NodeAnnotation | null; value: NodeAnnotation } | null>(null)
+     const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner' } | null>(null)
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+@@ -75,6 +80,10 @@
+     const edges = useMemo(() => Object.entries(layout?.parent ?? {}).map(([child, owner]) => ({ owner, child })), [layout])
+     const positionsRef = useRef(positions); positionsRef.current = positions
+ 
++    const annotations = (graph?.graph.annotations ?? []).map(a => annotationDrafts[a.id] ?? a)
++    const annotationsRef = useRef(annotations); annotationsRef.current = annotations
++    const selected = annotations.find(a => a.id === selectedAnnotation)
++
+     // Overrides last only until the hub echoes the saved position back.
+     useEffect(() => {
+         if (!graph) return
+@@ -87,12 +96,15 @@
+     const fit = () => {
+         if (!layout) return
+         const element = canvas.current
+-        setView(fitTransform(layout.bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
++        const rectangles = [layout.bounds, ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
++        const x = Math.min(...rectangles.map(r => r.x)), y = Math.min(...rectangles.map(r => r.y))
++        const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
++        setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
+     }
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setHistory([]); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -171,6 +183,8 @@
+     const pinchStart = () => {
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
++        const previous = gesture.current
++        if (previous?.kind === 'annotation') setAnnotationDrafts(old => { const next = { ...old }; delete next[previous.origin.id]; return next })
+         gesture.current = { kind: 'pinch', distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, view: viewRef.current }
+         setLink(null)
+     }
+@@ -183,10 +197,14 @@
+         event.currentTarget.focus({ preventScroll: true })
+         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+         if (pointers.current.size >= 2) { pinchStart(); return }
++        const annotationId = target.closest('[data-annotation-move], [data-annotation-resize]')
++        const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
++        if (!annotation) setSelectedAnnotation(null)
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+         const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
+-        if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, x: event.clientX, y: event.clientY, moved: false } }
++        if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize') } }
++        else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
+         else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
+@@ -216,6 +234,14 @@
+             const to = toGraph(event.clientX, event.clientY)
+             setLink({ fixed: g.child, direction: 'owner', to, target: linkTarget(g.child, to, 'owner') })
+         }
++        else if (g.kind === 'annotation') {
++            const dx = (event.clientX - g.x) / viewRef.current.k, dy = (event.clientY - g.y) / viewRef.current.k
++            if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
++            g.moved = true
++            g.last = g.resize ? { ...g.origin, width: Math.max(180, Math.min(8000, Math.round(g.origin.width + dx))), height: Math.max(100, Math.min(8000, Math.round(g.origin.height + dy))) }
++                : { ...g.origin, ...round({ x: g.origin.x + dx, y: g.origin.y + dy }) }
++            setAnnotationDrafts(old => ({ ...old, [g.origin.id]: g.last }))
++        }
+         else {
+             const dx = event.clientX - g.x, dy = event.clientY - g.y
+             if (!g.moved && Math.hypot(dx, dy) < 6) return
+@@ -234,7 +260,10 @@
+         if (g.pointer !== event.pointerId) return
+         gesture.current = null
+         const cancelled = event.type === 'pointercancel'
+-        if (g.kind === 'node') {
++        if (g.kind === 'annotation') {
++            if (g.moved && !cancelled) void saveAnnotation(g.last, g.origin)
++            else setAnnotationDrafts(old => { const next = { ...old }; delete next[g.origin.id]; return next })
++        } else if (g.kind === 'node') {
+             // pointercancel coordinates are unreliable; keep the last moved position.
+             if (g.moved) {
+                 remember({ kind: 'move', workspace: graph!.activeWorkspaceId, id: g.id, before: g.origin, after: g.last })
+@@ -264,6 +293,30 @@
+         catch (cause) { setError(errorText(cause, 'Action failed')); return null }
+         finally { mutationBusy.current = false; setPending(null) }
+     }
++    const saveAnnotation = async (value: NodeAnnotation | null, before: NodeAnnotation | null, workspace = graph?.activeWorkspaceId) => {
++        const id = value?.id ?? before?.id
++        if (!workspace || !id) return null
++        const result = await act(`annotation:${id}`, client => client.editNodeAnnotation(workspace, id, value, before))
++        setAnnotationDrafts(old => { const next = { ...old }; delete next[id]; return next })
++        if (result) {
++            remember({ kind: 'annotation', workspace, id, before, after: value })
++            if (!value) setSelectedAnnotation(null)
++        }
++        return result
++    }
++    const addAnnotation = (kind: NodeAnnotation['kind']) => {
++        if (!graph) return
++        const rect = canvas.current?.getBoundingClientRect()
++        const centre = toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2)
++        const width = kind === 'frame' ? 480 : 280, height = kind === 'frame' ? 320 : 180
++        setMenu(null); setError(null)
++        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...round({ x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
++    }
++    const editAnnotation = (value: NodeAnnotation) => {
++        if (!graph || pending) return
++        setSelectedAnnotation(value.id); setMenu(null); setError(null)
++        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: value, value })
++    }
+     const changeOwner = (child: string, owner: string | null) => {
+         if (!graph) return Promise.resolve(null)
+         return act(`owner:${child}`, async client => {
+@@ -279,7 +332,7 @@
+     }
+     undoRef.current = () => {
+         const edit = historyRef.current.at(-1)
+-        if (!edit || pending || mutationBusy.current || dropInFlight.current || !graph || edit.workspace !== graph.activeWorkspaceId) return
++        if (!edit || gesture.current || pending || mutationBusy.current || dropInFlight.current || !graph || edit.workspace !== graph.activeWorkspaceId) return
+         void act('undo', async client => {
+             await flushSave()
+             if (edit.kind === 'move' && edit.id === overseer && !graph.graph.nodes.some(n => n.sessionId === edit.id)) {
+@@ -329,7 +382,7 @@
+     const menuKeys = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu() } }
+ 
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
+-        {(loadError || (error && !menu)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
++        {(loadError || (error && !menu && !editingAnnotation)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+         <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+             onKeyDown={event => { if (event.key === 'Escape' && (link || gesture.current?.kind === 'input')) { event.preventDefault(); event.stopPropagation(); gesture.current = null; pointers.current.clear(); setLink(null) } }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+@@ -337,11 +390,17 @@
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab outline-none active:cursor-grabbing">
+             {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
+-                <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} />
++                <div className="flex items-start gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
++                <div className="pointer-events-auto flex shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++                    <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
++                    <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
++                </div></div>
+             </div>}
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+-                <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width="1" height="1" aria-hidden="true">
++                <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
++                    onAdjust={value => { const before = annotations.find(a => a.id === value.id); if (before) void saveAnnotation(value, before) }} />
++                <svg className="pointer-events-none absolute left-0 top-0 overflow-visible z-[1]" width="1" height="1" aria-hidden="true">
+                     <defs>
+                         <marker id="node-edge-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-link)" /></marker>
+                         <marker id="node-edge-asleep" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-hint)" /></marker>
+@@ -365,7 +424,7 @@
+                 {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+-                    return <div key={id} data-node-id={id} className="absolute" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
++                    return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+                         <button type="button" aria-label={`Node ${name}`} aria-haspopup="dialog" aria-expanded={menu?.id === id}
+                             onClick={event => { if (event.detail === 0) openMenu(id) }}
+                             className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : menu?.id === id ? 'border-[var(--app-link)]' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
+@@ -391,7 +450,7 @@
+                     </div>
+                 })}
+             </div>}
+-            {graph && ids.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-20 text-center text-sm text-[var(--app-hint)]">Drag chats here from the sidebar.</p>}
++            {graph && ids.length === 0 && annotations.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-20 text-center text-sm text-[var(--app-hint)]">Drag chats here from the sidebar.</p>}
+             {dropActive && <div aria-hidden="true" className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--app-link)] bg-[var(--app-bg)]/70">
+                 <span className="rounded-lg bg-[var(--app-dialog-bg)] px-3 py-2 text-sm text-[var(--app-link)]">Drop chat here</span>
+             </div>}
+@@ -401,6 +460,13 @@
+                 <button type="button" aria-label="Fit graph to view" onClick={fit} className={`${iconButton} w-auto px-2 text-xs`}>Fit</button>
+                 <button type="button" aria-label="Undo graph edit" title="Undo graph edit (Ctrl+Z)" disabled={!history.length || pending !== null} onClick={() => undoRef.current()} className={`${iconButton} border-l border-[var(--app-divider)]`}>↶</button>
+             </div>
++            {selected && !menu && <div data-graph-ui className="absolute bottom-16 right-2 z-20 flex max-w-[calc(100%_-_16px)] items-center gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++                <span className="max-w-32 truncate px-2 text-xs text-[var(--app-hint)]">{selected.kind === 'frame' ? selected.text || 'Frame' : 'Text box'}</span>
++                <button type="button" disabled={pending !== null} onClick={() => editAnnotation(selected)} className="min-h-10 rounded-lg px-3 text-sm hover:bg-[var(--app-subtle-bg)]">Edit</button>
++                <button type="button" aria-label="Delete annotation" disabled={pending !== null} onClick={() => void saveAnnotation(null, selected)} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>
++            </div>}
++            {editingAnnotation && <GraphAnnotationEditor key={editingAnnotation.value.id} initial={editingAnnotation.value} pending={pending !== null} error={error} onClose={() => setEditingAnnotation(null)}
++                onSave={async value => { if (await saveAnnotation(value, editingAnnotation.before, editingAnnotation.workspace)) { setEditingAnnotation(null); setSelectedAnnotation(value.id) } }} />}
+             {menu && graph && <section data-graph-ui data-node-menu role="dialog" aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
+                 className="absolute inset-x-2 bottom-2 z-20 mx-auto flex max-h-[80%] max-w-sm flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl">
+                 <header className="flex shrink-0 items-center gap-2 border-b border-[var(--app-divider)] py-1 pl-3 pr-1">
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1,7 +1,7 @@
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import type { NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { NodeAnnotation, NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { I18nProvider } from '@/lib/i18n-context'
+@@ -55,6 +55,12 @@
+     }
+     const api = {
+         getNodeGraph: vi.fn(async () => copy()),
++        editNodeAnnotation: vi.fn(async (workspace: string, id: string, value: NodeAnnotation | null, expected: NodeAnnotation | null) => {
++            const current = state.graph.annotations?.find(a => a.id === id) ?? null
++            if (workspace !== state.activeWorkspaceId || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error('Annotation changed elsewhere')
++            state.graph.annotations = [...(state.graph.annotations ?? []).filter(a => a.id !== id), ...(value ? [value] : [])]
++            return copy()
++        }),
+         setNodeOwner: vi.fn(async (owner: string, child: string) => { setEdges(child, owner); return copy() }),
+         detachNode: vi.fn(async (child: string) => { setEdges(child); return copy() }),
+         removeNodes: vi.fn(async (ids: string[]) => {
+@@ -540,3 +546,79 @@
+         expect(screen.queryByText('Workspace', { exact: true })).toBeNull()
+     })
+ })
++
++const addDecoration = async (kind: 'frame' | 'text', text: string) => {
++    fireEvent.click(await screen.findByRole('button', { name: kind === 'frame' ? 'Add frame' : 'Add text box' }))
++    const dialog = await screen.findByRole('dialog', { name: kind === 'frame' ? 'Frame' : 'Text box' })
++    fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: text } })
++    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
++    await waitFor(() => expect(screen.queryByRole('dialog', { name: kind === 'frame' ? 'Frame' : 'Text box' })).toBeNull())
++    return screen.getByRole('region', { name: `${kind === 'frame' ? 'Frame' : 'Text box'}: ${text.split('\n')[0]}` })
++}
++
++describe('graph organization', () => {
++    it('creates/edit/deletes and undoes a multiline text box without invoking chat controls', async () => {
++        const { api } = setup()
++        await addDecoration('text', 'Next steps\nKeep GPU free')
++        expect(screen.getByText('Next steps Keep GPU free')).toBeInTheDocument()
++        const added = api.editNodeAnnotation.mock.calls[0][2]!
++        fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Text box' })
++        fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'Updated\nSecond line' } })
++        fireEvent.click(within(dialog).getByRole('button', { name: 'violet' }))
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
++        await screen.findByRole('region', { name: 'Text box: Updated' })
++        expect(api.editNodeAnnotation.mock.calls.at(-1)?.[2]).toMatchObject({ color: 'violet', text: 'Updated\nSecond line' })
++        fireEvent.click(screen.getByRole('button', { name: 'Delete annotation' }))
++        await waitFor(() => expect(screen.queryByRole('region', { name: 'Text box: Updated' })).toBeNull())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await screen.findByRole('region', { name: 'Text box: Updated' })
++        expect(added.kind).toBe('text')
++        expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled(); expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
++    it('drags/resizes a frame with mouse or touch and undoes each edit', async () => {
++        const { api } = setup()
++        const frame = await addDecoration('frame', 'Rendering')
++        const initial = api.editNodeAnnotation.mock.calls[0][2]!, canvas = screen.getByRole('application')
++        const world = frame.parentElement!, k = Number(/scale\(([-\d.e]+)\)/.exec(world.style.transform)![1])
++        fireEvent.pointerDown(screen.getByRole('button', { name: 'Move frame: Rendering' }), { pointerId: 1, button: 0, clientX: 200, clientY: 200 })
++        fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 200 + 40 * k, clientY: 200 + 20 * k })
++        fireEvent.pointerUp(canvas, { pointerId: 1, clientX: 200 + 40 * k, clientY: 200 + 20 * k })
++        await waitFor(() => expect(api.editNodeAnnotation).toHaveBeenCalledTimes(2))
++        expect(api.editNodeAnnotation.mock.calls[1][2]).toMatchObject({ x: initial.x + 40, y: initial.y + 20 })
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(frame.style.left).toBe(`${initial.x}px`))
++        fireEvent.pointerDown(screen.getByRole('button', { name: 'Resize frame: Rendering' }), { pointerType: 'touch', pointerId: 3, button: 0, clientX: 200, clientY: 200 })
++        fireEvent.pointerMove(canvas, { pointerType: 'touch', pointerId: 3, clientX: 200 + 100 * k, clientY: 200 + 60 * k })
++        fireEvent.pointerUp(canvas, { pointerType: 'touch', pointerId: 3, clientX: 200 + 100 * k, clientY: 200 + 60 * k })
++        await waitFor(() => expect(frame.style.width).toBe(`${initial.width + 100}px`))
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(frame.style.width).toBe(`${initial.width}px`))
++    })
++    it('cancels drafts and cancelled pointer drags without saving, and deselects on blank canvas', async () => {
++        const { api } = setup()
++        fireEvent.click(await screen.findByRole('button', { name: 'Add frame' }))
++        fireEvent.click(within(await screen.findByRole('dialog', { name: 'Frame' })).getByRole('button', { name: 'Cancel' }))
++        expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++        const frame = await addDecoration('frame', 'Draft')
++        const before = frame.style.left, canvas = screen.getByRole('application')
++        fireEvent.pointerDown(screen.getByRole('button', { name: 'Move frame: Draft' }), { pointerId: 1, button: 0, clientX: 100, clientY: 100 })
++        fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 200, clientY: 180 })
++        fireEvent.pointerCancel(canvas, { pointerId: 1 })
++        expect(frame.style.left).toBe(before); expect(api.editNodeAnnotation).toHaveBeenCalledTimes(1)
++        fireEvent.pointerDown(canvas, { pointerId: 2, button: 0, clientX: -1000, clientY: -1000 })
++        fireEvent.pointerUp(canvas, { pointerId: 2, clientX: -1000, clientY: -1000 })
++        expect(screen.queryByRole('button', { name: 'Delete annotation' })).toBeNull()
++    })
++    it('keeps unsaved edits when a concurrent note change rejects the write', async () => {
++        const { api } = setup()
++        await addDecoration('text', 'Original')
++        api.editNodeAnnotation.mockRejectedValueOnce(new Error('Annotation changed elsewhere'))
++        fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Text box' })
++        fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'My unsaved edit' } })
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
++        expect(await within(dialog).findByRole('alert')).toHaveTextContent('changed elsewhere')
++        expect(within(dialog).getByRole('textbox')).toHaveValue('My unsaved edit')
++    })
++})
+--- /dev/null
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -0,0 +1,65 @@
++import { useState, type KeyboardEvent } from 'react'
++import type { NodeAnnotation } from '@hapi/protocol/nodeGraph'
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++
++const COLORS = { slate: '#64748b', blue: '#3b82f6', violet: '#8b5cf6', green: '#16a34a', amber: '#d97706' } as const
++const label = (a: NodeAnnotation) => a.kind === 'frame' ? a.text || 'Untitled frame' : a.text.split('\n')[0] || 'Text box'
++
++/** Frames sit behind connections/cards; only their header and resize grip capture pointers. */
++export function GraphAnnotationLayer({ annotations, selected, zoom, onSelect, onEdit, onAdjust }: {
++    annotations: readonly NodeAnnotation[]; selected: string | null; zoom: number;
++    onSelect: (id: string) => void; onEdit: (annotation: NodeAnnotation) => void;
++    onAdjust: (annotation: NodeAnnotation) => void
++}) {
++    const keys = (event: KeyboardEvent, a: NodeAnnotation, resize = false) => {
++        const step = event.shiftKey ? 100 : 20
++        const dx = event.key === 'ArrowRight' ? step : event.key === 'ArrowLeft' ? -step : 0
++        const dy = event.key === 'ArrowDown' ? step : event.key === 'ArrowUp' ? -step : 0
++        if (!dx && !dy) return
++        event.preventDefault(); event.stopPropagation()
++        onAdjust(resize ? { ...a, width: Math.max(180, Math.min(8000, a.width + dx)), height: Math.max(100, Math.min(8000, a.height + dy)) } : { ...a, x: a.x + dx, y: a.y + dy })
++    }
++    return <>{annotations.map(a => <section key={a.id} data-annotation-id={a.id} data-annotation-kind={a.kind} aria-label={`${a.kind === 'frame' ? 'Frame' : 'Text box'}: ${label(a)}`}
++        className="pointer-events-none absolute rounded-xl border text-[var(--app-fg)]"
++        style={{ left: a.x, top: a.y, width: a.width, height: a.height, zIndex: a.kind === 'frame' ? 'auto' : 3,
++            borderColor: COLORS[a.color], borderWidth: selected === a.id ? 2 : 1,
++            background: `color-mix(in srgb, ${COLORS[a.color]} ${a.kind === 'frame' ? 7 : 12}%, var(--app-bg))` }}>
++        <button type="button" data-annotation-move={a.id} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
++            style={{ zIndex: a.kind === 'frame' && selected === a.id ? 4 : undefined }}
++            onClick={event => { if (event.detail === 0) onSelect(a.id) }} onDoubleClick={() => onEdit(a)} onKeyDown={event => keys(event, a)}
++            className={`pointer-events-auto absolute inset-x-0 top-0 min-h-10 min-w-0 cursor-move rounded-t-xl px-3 py-2 text-left text-sm focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'font-semibold' : 'h-full overflow-hidden rounded-b-xl'}`}>
++            {a.kind === 'frame' ? <span className="block truncate">{label(a)}</span> : <span className="block h-full whitespace-pre-wrap break-words leading-relaxed">{a.text || 'Text box'}</span>}
++        </button>
++        {selected === a.id && <button type="button" data-annotation-resize={a.id} aria-label={`Resize ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
++            onKeyDown={event => keys(event, a, true)}
++            style={{ zIndex: 4, scale: Math.max(1, 0.85 / zoom), transformOrigin: 'bottom right' }}
++            className="pointer-events-auto absolute bottom-0 right-0 flex h-9 w-9 cursor-nwse-resize items-center justify-center rounded-br-xl text-[var(--app-hint)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">◢</button>}
++    </section>)}</>
++}
++
++export function GraphAnnotationEditor({ initial, pending, error, onSave, onClose }: {
++    initial: NodeAnnotation; pending: boolean; error: string | null;
++    onSave: (value: NodeAnnotation) => void; onClose: () => void
++}) {
++    const [text, setText] = useState(initial.text)
++    const [color, setColor] = useState(initial.color)
++    return <Dialog open onOpenChange={open => { if (!open && !pending) onClose() }}>
++        <DialogContent data-graph-ui aria-describedby={undefined} className="max-h-[90dvh] overflow-y-auto">
++            <DialogHeader><DialogTitle>{initial.kind === 'frame' ? 'Frame' : 'Text box'}</DialogTitle></DialogHeader>
++            <form className="mt-4 space-y-4" onSubmit={event => { event.preventDefault(); onSave({ ...initial, text, color }) }}>
++                <label className="block text-sm">{initial.kind === 'frame' ? 'Title' : 'Text'}
++                    {initial.kind === 'frame'
++                        ? <input autoFocus aria-label="Frame title" maxLength={120} value={text} onChange={event => setText(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] px-3" />
++                        : <textarea autoFocus aria-label="Text box content" rows={7} maxLength={10000} value={text} onChange={event => setText(event.target.value)} className="mt-1 max-h-[45dvh] min-h-32 w-full resize-y rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-3 leading-relaxed" />}
++                </label>
++                <div role="group" aria-label="Color" className="flex gap-2">{(Object.keys(COLORS) as NodeAnnotation['color'][]).map(value => <button type="button" key={value} aria-label={value} aria-pressed={color === value} disabled={pending} onClick={() => setColor(value)}
++                    className={`flex h-10 w-10 items-center justify-center rounded-full border-2 ${color === value ? 'border-[var(--app-fg)]' : 'border-transparent'}`}><span className="h-7 w-7 rounded-full" style={{ backgroundColor: COLORS[value] }} /></button>)}</div>
++                {error && <p role="alert" className="text-sm text-[var(--app-badge-error-text)]">{error}</p>}
++                <div className="flex justify-end gap-2">
++                    <button type="button" disabled={pending} onClick={onClose} className="min-h-11 rounded-lg px-4 text-sm hover:bg-[var(--app-subtle-bg)]">Cancel</button>
++                    <button type="submit" disabled={pending} className="min-h-11 rounded-lg bg-[var(--app-link)] px-4 text-sm font-medium text-white disabled:opacity-40">{pending ? 'Saving…' : 'Save'}</button>
++                </div>
++            </form>
++        </DialogContent>
++    </Dialog>
++}

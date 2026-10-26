@@ -1,0 +1,286 @@
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index ee6d79b..e9004e3 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -87,6 +87,7 @@ import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutat
+ import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+ import { ChatStatisticsButton } from '@/components/AssistantChat/ChatStatisticsButton'
+ import { SessionHeader } from '@/components/SessionHeader'
++import { SubagentsPanel } from '@/components/SubagentsPanel'
+ import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
+ import { TeamPanel } from '@/components/TeamPanel'
+ import { SessionStatusPanel } from '@/components/SessionStatusPanel'
+@@ -638,6 +639,7 @@ function SessionChatInner(props: SessionChatProps) {
+     const { codexExplorationCollapsed } = useCodexExplorationCollapse()
+     const navigate = useNavigate()
+     const [historyActionPending, setHistoryActionPending] = useState(false)
++    const [viewedSubagentId, setViewedSubagentId] = useState<string | null>(null)
+     const [rewindForkFallback, setRewindForkFallback] = useState<string | null>(null)
+ 
+     const onForkConversation = useCallback(async (messageLocalId?: string) => {
+@@ -1900,7 +1902,11 @@ function SessionChatInner(props: SessionChatProps) {
+ 
+             <CursorMigrationBanner metadata={props.session.metadata} />
+ 
+-            {sessionStatus ? <SessionStatusPanel data={sessionStatus} /> : null}
++            {agentFlavor === 'claude' || agentFlavor === 'codex' ? <SubagentsPanel
++                blocks={reconciled.blocks} metadata={props.session.metadata} viewedId={viewedSubagentId} onView={setViewedSubagentId}
++                hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
++            /> : null}
++            {sessionStatus ? <SessionStatusPanel data={sessionStatus} onViewSubagent={setViewedSubagentId} /> : null}
+ 
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+diff --git a/web/src/components/SessionStatusPanel.tsx b/web/src/components/SessionStatusPanel.tsx
+index 75f42b9..0f5e05e 100644
+--- a/web/src/components/SessionStatusPanel.tsx
++++ b/web/src/components/SessionStatusPanel.tsx
+@@ -26,7 +26,7 @@ function elapsedSince(startedAt: number | null, now: number): string | null {
+     return formatDuration(Math.max(0, now - startedAt))
+ }
+ 
+-export function SessionStatusPanel({ data }: { data: SessionStatusData }) {
++export function SessionStatusPanel({ data, onViewSubagent }: { data: SessionStatusData; onViewSubagent?: (id: string) => void }) {
+     const { t } = useTranslation()
+     const completedTasks = data.tasks.filter((task) => task.status === 'completed').length
+     const hasLiveElapsed = data.terminals.length > 0
+@@ -75,7 +75,7 @@ export function SessionStatusPanel({ data }: { data: SessionStatusData }) {
+                                     <div key={subagent.id} className="min-w-0 text-sm">
+                                         <div className="flex min-w-0 items-baseline gap-1.5">
+                                             <span className={`shrink-0 text-xs ${subagentTone(subagent.state)}`}>●</span>
+-                                            <span className="min-w-0 break-words text-[var(--app-fg)]">{subagent.title}</span>
++                                            <button type="button" disabled={!onViewSubagent} onClick={() => onViewSubagent?.(subagent.id)} className="min-w-0 break-words text-left text-[var(--app-link)] disabled:text-[var(--app-fg)]">{subagent.title}</button>
+                                             <span className={`ml-auto shrink-0 text-xs ${subagentTone(subagent.state)}`}>
+                                                 {t(`session.status.subagent.${subagent.state}`)}
+                                                 {elapsed ? ` · ${elapsed}` : ''}
+diff --git a/web/src/components/SubagentsPanel.test.tsx b/web/src/components/SubagentsPanel.test.tsx
+new file mode 100644
+index 0000000..b4b7bbf
+--- /dev/null
++++ b/web/src/components/SubagentsPanel.test.tsx
+@@ -0,0 +1,57 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { useState } from 'react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { ChatBlock, ToolCallBlock } from '@/chat/types'
++import { I18nProvider } from '@/lib/i18n-context'
++import { collectSubagents, SubagentsPanel } from './SubagentsPanel'
++
++// The existing tool detail/trace tests cover rendering provider payloads. Here
++// exercise selecting an agent and following the same ID through live updates.
++vi.mock('@/components/ToolCard/ToolCard', () => ({
++    getSubagentModel: () => 'Test model',
++    ToolDetailDialogContent: ({ block }: { block: ToolCallBlock }) => <div>{String(block.tool.result ?? 'Working…')}</div>,
++}))
++afterEach(() => cleanup())
++function agent(id: string, name = 'Agent', state: ToolCallBlock['tool']['state'] = 'running', children: ChatBlock[] = []): ToolCallBlock {
++    return { kind: 'tool-call', id, localId: null, createdAt: 1, children,
++        tool: { id, name, state, input: { description: id, prompt: `Task ${id}` }, createdAt: 1, startedAt: 1,
++            completedAt: null, execStartedAt: null, execCompletedAt: null, description: null, result: null } }
++}
++function Harness({ blocks, more = false, load = vi.fn() }: { blocks: ChatBlock[]; more?: boolean; load?: () => void }) {
++    const [viewed, setViewed] = useState<string | null>(null)
++    return <I18nProvider><SubagentsPanel blocks={blocks} metadata={null} viewedId={viewed} onView={setViewed}
++        hasMore={more} loadingMore={false} onLoadEarlier={load} /></I18nProvider>
++}
++describe('SubagentsPanel', () => {
++    it('collects Claude and Codex agents, includes completed runs, and preserves nested agents without ordinary tools', () => {
++        const nested = agent('nested', 'Task', 'completed')
++        const root = agent('claude', 'Agent', 'running', [agent('bash', 'Bash'), nested])
++        const codex = agent('codex', 'CodexAgent', 'completed')
++        const collected = collectSubagents([root, codex, codex])
++        expect(collected.map(({ block, depth }) => [block.tool.id, depth])).toEqual([['claude', 0], ['nested', 1], ['codex', 0]])
++    })
++    it('opens an agent and follows its activity through completion without dispatching work', () => {
++        const block = agent('reviewer')
++        const view = render(<Harness blocks={[block]} />)
++        fireEvent.click(screen.getByRole('button', { name: /Subagents \(1\)/ }))
++        expect(screen.getByText('1 running')).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'View subagent: reviewer' }))
++        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        expect(screen.getByText('Working…')).toBeInTheDocument()
++        const completed = { ...block, tool: { ...block.tool, state: 'completed' as const, result: 'Finished reviewing' } }
++        view.rerender(<Harness blocks={[completed]} />)
++        expect(screen.getByText('Finished reviewing')).toBeInTheDocument()
++        expect(screen.getByRole('dialog')).toHaveTextContent('Completed')
++        fireEvent.click(screen.getByRole('button', { name: 'Close' }))
++        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++    })
++    it('makes older recorded activity available by explicit user action', () => {
++        const load = vi.fn()
++        render(<Harness blocks={[]} more load={load} />)
++        expect(load).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: /Subagents \(0\)/ }))
++        expect(screen.getByText('No subagents in the loaded chat history.')).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Load earlier activity' }))
++        expect(load).toHaveBeenCalledTimes(1)
++    })
++})
+diff --git a/web/src/components/SubagentsPanel.tsx b/web/src/components/SubagentsPanel.tsx
+new file mode 100644
+index 0000000..f1aaa16
+--- /dev/null
++++ b/web/src/components/SubagentsPanel.tsx
+@@ -0,0 +1,76 @@
++import { useMemo, useState } from 'react'
++import type { ChatBlock, ToolCallBlock } from '@/chat/types'
++import type { SessionMetadataSummary } from '@/types/api'
++import { isSubagentToolName } from '@/chat/subagentTool'
++import { getInputStringAny } from '@/lib/toolInputUtils'
++import { getCodexAgentSummary } from '@/components/ToolCard/codexAgents'
++import { ToolDetailDialogContent, getSubagentModel } from '@/components/ToolCard/ToolCard'
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++
++export function collectSubagents(blocks: readonly ChatBlock[]): Array<{ block: ToolCallBlock; depth: number }> {
++    const found = new Map<string, { block: ToolCallBlock; depth: number }>()
++    const visit = (items: readonly ChatBlock[], depth: number) => {
++        for (const block of items) {
++            if (block.kind !== 'tool-call') continue
++            const agent = block.tool.name === 'CodexAgent' || isSubagentToolName(block.tool.name)
++            if (agent) found.set(block.tool.id, { block, depth })
++            visit(block.children, depth + (agent ? 1 : 0))
++        }
++    }
++    visit(blocks, 0)
++    return [...found.values()]
++}
++function title(block: ToolCallBlock): string {
++    const value = getCodexAgentSummary(block.tool.input)
++        ?? getInputStringAny(block.tool.input, ['name', 'task_name', 'subagent_type', 'agent_type', 'prompt']) ?? 'Subagent'
++    return value.replace(/\s+/g, ' ').slice(0, 120)
++}
++function stateLabel(block: ToolCallBlock): string {
++    return block.tool.state === 'completed' ? 'Completed' : block.tool.state === 'error' ? 'Failed' : block.tool.state === 'pending' ? 'Waiting' : 'Running'
++}
++export function SubagentsPanel(props: {
++    blocks: readonly ChatBlock[]
++    metadata: SessionMetadataSummary | null
++    viewedId: string | null
++    onView: (id: string | null) => void
++    hasMore: boolean
++    loadingMore: boolean
++    onLoadEarlier: () => void
++}) {
++    const [expanded, setExpanded] = useState(false)
++    const agents = useMemo(() => collectSubagents(props.blocks), [props.blocks])
++    const selected = agents.find(({ block }) => block.tool.id === props.viewedId)?.block
++    const running = agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length
++    return <div className="shrink-0 border-b border-[var(--app-border)] px-3 py-1">
++        <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
++            className="flex min-h-8 w-full items-center gap-2 text-left text-sm text-[var(--app-hint)]">
++            <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>Subagents ({agents.length})</span>
++            {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">{running} running</span> : null}
++        </button>
++        {expanded ? <div className="max-h-52 space-y-1 overflow-y-auto pb-2">
++            {!agents.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No subagents in the loaded chat history.</p> : null}
++            {agents.map(({ block, depth }) => {
++                const model = getSubagentModel(block.children, getInputStringAny(block.tool.input, ['model']))
++                return <button type="button" key={block.tool.id} onClick={() => props.onView(block.tool.id)}
++                    aria-label={`View subagent: ${title(block)}`}
++                    style={{ marginLeft: `${Math.min(depth, 4) * 12}px`, maxWidth: `calc(100% - ${Math.min(depth, 4) * 12}px)` }}
++                    className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
++                    <span className="min-w-0 flex-1"><span className="block truncate">{title(block)}</span>{model ? <span className="block text-xs text-[var(--app-hint)]">{model}</span> : null}</span>
++                    <span className="shrink-0 text-xs text-[var(--app-hint)]">{stateLabel(block)}</span><span aria-hidden="true">›</span>
++                </button>
++            })}
++            {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
++                className="min-h-9 px-2 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
++        </div> : null}
++        <Dialog open={Boolean(selected)} onOpenChange={open => { if (!open) props.onView(null) }}>
++            <DialogContent className="max-h-[90dvh] overflow-y-auto">
++                <DialogHeader><DialogTitle>{selected ? title(selected) : 'Subagent'}</DialogTitle>
++                    <DialogDescription>{selected ? stateLabel(selected) : ''} · Live view of the activity recorded in this chat.</DialogDescription></DialogHeader>
++                {selected ? <>
++                    {!selected.children.length ? <p className="mt-2 text-sm text-[var(--app-hint)]">No detailed activity has been recorded for this subagent yet. Available prompt and result are shown below.</p> : null}
++                    <ToolDetailDialogContent block={selected} metadata={props.metadata} showAgentConversation />
++                </> : null}
++            </DialogContent>
++        </Dialog>
++    </div>
++}
+diff --git a/web/src/components/ToolCard/ToolCard.tsx b/web/src/components/ToolCard/ToolCard.tsx
+index d2c398d..8181f4a 100644
+--- a/web/src/components/ToolCard/ToolCard.tsx
++++ b/web/src/components/ToolCard/ToolCard.tsx
+@@ -369,6 +369,7 @@ type ToolCardProps = {
+ export function ToolDetailDialogContent(props: {
+     block: ToolCallBlock
+     metadata: SessionMetadataSummary | null
++    showAgentConversation?: boolean
+ }) {
+     const { t } = useTranslation()
+     const toolName = props.block.tool.name
+@@ -394,7 +395,7 @@ export function ToolDetailDialogContent(props: {
+                     renderToolInput(props.block, 'dialog')
+                 )}
+             </div>
+-            <TraceSection block={props.block} metadata={props.metadata} />
++            <TraceSection block={props.block} metadata={props.metadata} initiallyOpen={props.showAgentConversation} />
+             {!isQuestionToolWithAnswers ? (
+                 <div>
+                     <div className="mb-1 text-xs font-medium text-[var(--app-hint)]">{t('tool.result')}</div>
+diff --git a/web/src/components/ToolCard/trace.test.tsx b/web/src/components/ToolCard/trace.test.tsx
+index f9ea045..a0a3e7e 100644
+--- a/web/src/components/ToolCard/trace.test.tsx
++++ b/web/src/components/ToolCard/trace.test.tsx
+@@ -392,3 +392,16 @@ describe('TraceSection', () => {
+         expect(container.querySelector('.border-l')).not.toBeNull()
+     })
+ })
++
++
++describe('Claude subagent messages', () => {
++    it('shows the recorded conversation alongside tools without counting messages as calls', () => {
++        const block = makeTaskBlock([makeChild('read-one', 'Read')], 'completed')
++        block.children.push({ kind: 'agent-text', id: 'reply', localId: null, createdAt: 1200, text: 'The subagent found the cause. Full explanation follows.' })
++        render(<TraceSection block={block} metadata={null} initiallyOpen />)
++        expect(screen.getByText(/1 calls/)).toBeInTheDocument()
++        const message = screen.getByRole('button', { name: /Message.*The subagent found the cause/ })
++        fireEvent.click(message)
++        expect(screen.getAllByText(/The subagent found the cause/).length).toBeGreaterThan(1)
++    })
++})
+diff --git a/web/src/components/ToolCard/trace.tsx b/web/src/components/ToolCard/trace.tsx
+index 207cbe5..2c59330 100644
+--- a/web/src/components/ToolCard/trace.tsx
++++ b/web/src/components/ToolCard/trace.tsx
+@@ -60,10 +60,10 @@ export function getTaskTraceChildren(block: ToolCallBlock): ToolCallBlock[] | nu
+ }
+ 
+ function getTraceChildren(block: ToolCallBlock): ChatBlock[] | null {
+-    if (block.tool.name === 'CodexAgent') {
++    if (block.tool.name === 'CodexAgent' || isSubagentToolName(block.tool.name)) {
+         return block.children.length === 0 ? null : block.children
+     }
+-    return getTaskTraceChildren(block)
++    return null
+ }
+ 
+ /**
+@@ -97,22 +97,23 @@ export function getTraceSummaryText(
+ type TraceSectionProps = {
+     block: ToolCallBlock
+     metadata: SessionMetadataSummary | null
++    initiallyOpen?: boolean
+ }
+ 
+-export function TraceSection({ block, metadata }: TraceSectionProps) {
++export function TraceSection({ block, metadata, initiallyOpen }: TraceSectionProps) {
+     const { t } = useTranslation()
+     const children = getTraceChildren(block)
+     if (!children) return null
+ 
+     const state = block.tool.state
+     const isCodexAgentTrace = block.tool.name === 'CodexAgent'
+-    const defaultOpen = isCodexAgentTrace || state === 'running' || state === 'error' || state === 'pending'
++    const defaultOpen = initiallyOpen ?? (isCodexAgentTrace || state === 'running' || state === 'error' || state === 'pending')
+     const fixedHeight = isCodexAgentTrace
+     const mode = isCodexAgentTrace ? 'session' : 'trace'
+ 
+     // Extract summary metadata from result using typed helper
+     const { totalTokens, totalDurationMs, totalToolUseCount } = readSummaryFields(block.tool.result)
+-    const callCount = totalToolUseCount !== null ? totalToolUseCount : children.length
++    const callCount = totalToolUseCount !== null ? totalToolUseCount : children.filter(child => child.kind === 'tool-call').length
+ 
+     const summaryText = getTraceSummaryText(callCount, totalTokens, totalDurationMs, t('tool.trace.callsSuffix'))
+ 

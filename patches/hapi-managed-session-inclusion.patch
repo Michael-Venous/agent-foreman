@@ -1,0 +1,227 @@
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -9,7 +9,7 @@
+ }
+ 
+ /** UI-only retention. Never writes to a session, controller, goal or history. */
+-export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[]): SessionManagerState {
++export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[], managedIds?: ReadonlySet<string>): SessionManagerState {
+     let next = previous
+     const set = (id: string, entry: ManagedListEntry) => {
+         if (next === previous) next = { ...previous }
+@@ -18,7 +18,7 @@
+     const present = new Set(sessions.map(s => s.id))
+     for (const session of sessions) {
+         const old = previous[session.id]
+-        if (!old && !sessionHasWork(session)) continue
++        if (!old && !sessionHasWork(session) && !managedIds?.has(session.id)) continue
+         const newWork = old && sessionHasWork(session) && (!sessionHasWork(old.session) || (!old.session.thinking && session.thinking))
+         const dismissed = old?.dismissed === true && !newWork
+         if (!old || old.session !== session || old.missing || old.dismissed !== dismissed) set(session.id, { session, dismissed, missing: false, stopped: newWork ? false : old?.stopped })
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -4,15 +4,15 @@
+ import { dismissSessions, markSessionStopped, observeSessions, SESSION_MANAGER_KEY, type SessionManagerState } from '@/lib/sessionManager'
+ 
+ /** Query-cache lifetime: survives navigation, cleared on reload/hub cache reset. */
+-export function useSessionManager(sessions?: readonly SessionSummary[]) {
++export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>) {
+     const client = useQueryClient()
+     const { data: entries = {} } = useQuery<SessionManagerState>({
+         queryKey: SESSION_MANAGER_KEY, queryFn: skipToken, initialData: {}, enabled: false, gcTime: Infinity,
+     })
+     useEffect(() => {
+         // Undefined means data not loaded; do not mistake loading for disconnect.
+-        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions))
+-    }, [client, sessions])
++        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, new Set(Object.keys(managed ?? {}))))
++    }, [client, sessions, managed])
+     return {
+         entries,
+         markStopped: (id: string) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => markSessionStopped(old ?? {}, id)),
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,4 +1,4 @@
+-import { useQueryClient } from '@tanstack/react-query'
++import { useQuery, useQueryClient } from '@tanstack/react-query'
+ import { useEffect, useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+@@ -7,6 +7,23 @@
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { sessionHasWork } from '@/lib/sessionManager'
+ import { getSessionTitle } from '@/lib/sessionTitle'
++
++
++/** Pause evidence is read only, and fetched only for visible panel rows. */
++function SessionManagerStateLabel({ session, missing, managed, api }: {
++    session: SessionSummary; missing: boolean; managed?: ManagedSession; api?: ApiClient | null;
++}) {
++    const pause = useQuery({
++        queryKey: ['manual-pause', session.id], queryFn: () => api!.getManualPause(session.id),
++        enabled: !missing && Boolean(api?.getManualPause), refetchInterval: 5000, retry: false,
++    })
++    const hasWork = sessionHasWork(session)
++    const managementPaused = managed?.projectStatus === 'paused' || managed?.manualHold
++    const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Paused'
++        : managementPaused ? (hasWork ? 'Management paused' : 'Paused')
++        : hasWork ? null : session.active ? 'Idle' : 'Inactive'
++    return label ? <p className="px-2 pb-1 text-xs text-[var(--app-hint)]">{label}</p> : null
++}
+ 
+ export function SessionManagerButton(props: {
+     api?: ApiClient | null; sessions?: readonly SessionSummary[]; onSelect: (id: string) => void;
+@@ -21,7 +38,7 @@
+     const [open, setOpen] = useState(false)
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+-    const { entries, dismiss, markStopped } = useSessionManager(props.sessions)
++    const { entries, dismiss, markStopped } = useSessionManager(props.sessions, props.managed)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -57,7 +74,7 @@
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); setOpen(false) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+-                        {!sessionHasWork(session) && <p className="px-2 pb-1 text-xs text-[var(--app-hint)]">{missing ? 'Unavailable' : session.active ? 'Idle' : 'Inactive'}</p>}
++                        <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+                     </div>
+                     <div className="ml-auto flex shrink-0 items-center gap-1">
+                         {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" disabled={pending[session.id] || !props.api}
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -65,7 +65,7 @@
+ 
+ 
+ /** A chat the persistent manager runs (worker) or the manager chat itself. */
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean }
+ 
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+ export type SessionGoal = {
+--- a/hub/src/web/routes/managedSessions.ts
++++ b/hub/src/web/routes/managedSessions.ts
+@@ -3,7 +3,7 @@
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ 
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean }
+ 
+ /** Chats an external manager supervises, published as JSON (HAPI_MANAGED_SESSIONS_FILE). */
+ export function readManagedSessions(path = process.env.HAPI_MANAGED_SESSIONS_FILE): Record<string, ManagedSession> {
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -51,3 +51,29 @@
+     const idle = observeSessions(stopped, [session({ thinking: false })])
+     expect(observeSessions(idle, [session()]).s?.stopped).toBe(false)
+ })
++
++
++it('seeds exact managed idle/offline chats even when membership arrives after activity data', () => {
++    const idle = session({ id: 'managed-idle', thinking: false })
++    const offline = session({ id: 'managed-offline', active: false, thinking: false })
++    const ordinary = session({ id: 'ordinary', thinking: false })
++    const initial = observeSessions({}, [idle, offline, ordinary])
++    expect(Object.keys(initial)).toEqual([])
++    const managed = new Set([idle.id, offline.id, 'missing-record'])
++    const entries = observeSessions(initial, [idle, offline, ordinary], managed)
++    expect(Object.keys(entries)).toEqual([idle.id, offline.id])
++    expect(entries[idle.id]?.stopped).not.toBe(true)
++    expect(observeSessions(entries, [idle, offline, ordinary], managed)).toBe(entries)
++})
++
++it('managed membership never reverses dismissal; new work still does', () => {
++    const s = session({ thinking: false }); const managed = new Set([s.id])
++    const entries = observeSessions({}, [s], managed)
++    const hidden = dismissSessions(markSessionStopped(entries, s.id), [s.id])
++    expect(observeSessions(hidden, [{ ...s, updatedAt: 2 }], managed).s?.dismissed).toBe(true)
++    expect(observeSessions(hidden, [s], new Set()).s?.dismissed).toBe(true)
++    const active = observeSessions(hidden, [session()], managed)
++    expect(active.s?.dismissed).toBe(false); expect(active.s?.stopped).toBe(false)
++    // Reload drops the old dismissal but includes still-managed idle chats.
++    expect(observeSessions({}, [s], managed).s?.dismissed).toBe(false)
++})
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -1,4 +1,4 @@
+-import type { ApiClient } from '@/api/client'
++import type { ApiClient, ManagedSession } from '@/api/client'
+ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+@@ -109,3 +109,55 @@
+     await screen.findByRole('alert')
+     expect(screen.queryByRole('button', { name: 'Dismiss Codex from Session Manager' })).toBeNull()
+ })
++
++
++it('includes managed paused/idle/offline sessions on a fresh page and preserves combined filters', async () => {
++    const client = new QueryClient()
++    const terrain = session('Terrain', true, false), offline = session('Offline', false, false)
++    const select = vi.fn()
++    const sessions = [terrain, offline, session('Unmanaged active'), session('Unmanaged idle', true, false)]
++    const managed: Record<string, ManagedSession> = { Terrain: { role: 'worker', worker: 'terrain-worker', projectStatus: 'paused' }, Offline: { role: 'worker', worker: 'offline-worker', projectStatus: 'running' } }
++    const view = (mapping: Record<string, ManagedSession>) => <QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={sessions} managed={mapping} onSelect={select}/></I18nProvider></QueryClientProvider>
++    const { rerender } = render(view({})); open()
++    await screen.findByRole('button', { name: 'Open Unmanaged active' })
++    expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull()
++    rerender(view(managed))
++    await screen.findByRole('button', { name: 'Open Terrain' })
++    expect(screen.getByText('Paused')).toBeInTheDocument()
++    expect(screen.getByText('Inactive', { selector: 'p' })).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: 'Open Unmanaged idle' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(screen.getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: 'Open Unmanaged active' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    await screen.findByText('No matching sessions.')
++    fireEvent.click(screen.getByRole('button', { name: 'Inactive' }))
++    expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Open Offline' })).toBeInTheDocument()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled(); expect(select).not.toHaveBeenCalled()
++    // Stop-before-clear remains required even when the project is already paused.
++    expect(screen.getByRole('button', { name: 'Stop Terrain' })).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: 'Dismiss Terrain from Session Manager' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Stop Terrain' }))
++    fireEvent.click(await screen.findByRole('button', { name: 'Dismiss Terrain from Session Manager' }))
++    rerender(view({ ...managed }))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull())
++    fireEvent.click(screen.getByRole('button', { name: 'All' })); fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(screen.queryByRole('button', { name: 'Open Terrain' })).toBeNull()
++})
++
++it('labels manual pauses and project holds without hiding actual background activity; reads only while open', async () => {
++    const client = new QueryClient()
++    const getManualPause = vi.fn(async (id: string) => ({ pausedAt: id === 'Stopped' ? 123 : null }))
++    const idle = session('Stopped', true, false), background = { ...session('Background held', true, false), backgroundTaskCount: 1 }
++    const localApi = { ...controls, getManualPause } as unknown as ApiClient
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={localApi} sessions={[idle, background]} managed={{ Stopped: { role: 'worker' }, 'Background held': { role: 'worker', manualHold: true } }} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>)
++    expect(getManualPause).not.toHaveBeenCalled()
++    open(); await screen.findByText('Paused')
++    expect(screen.getByText('Management paused')).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    expect(screen.getByRole('button', { name: 'Open Background held' })).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: 'Open Stopped' })).toBeNull()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
+--- a/hub/src/web/routes/managedSessions.test.ts
++++ b/hub/src/web/routes/managedSessions.test.ts
+@@ -45,3 +45,15 @@
+     expect((await app().request('/managed-sessions/already-unmanaged/unmanage', { method: 'POST' })).status).toBe(200)
+     expect(commands).toHaveLength(1)
+ })
++
++
++it('preserves pause/hold metadata through the read-only owner snapshot', async () => {
++    const file = join(dir, 'paused.json')
++    const sessions = { terrain: { role: 'worker' as const, worker: 'w', projectStatus: 'paused', manualHold: false } }
++    writeFileSync(file, JSON.stringify({ sessions }))
++    const commands: unknown[] = []
++    const root = new Hono<WebAppEnv>(); root.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++    root.route('/', createManagedSessionsRoutes(() => readManagedSessions(file), async command => { commands.push(command); return {} }))
++    expect(await (await root.request('/managed-sessions')).json()).toEqual({ sessions })
++    expect(commands).toEqual([])
++})

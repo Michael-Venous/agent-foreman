@@ -1,0 +1,188 @@
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1001,7 +1001,7 @@
+         api: props.api,
+         sessionId: props.session.id,
+         machineId: props.session.metadata?.machineId ?? null,
+-        enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
++        enabled: agentFlavor === 'codex' && (!props.session.active || !controlledByUser)
+     })
+     const effectiveCodexServiceTier = agentFlavor === 'codex'
+         ? getEffectiveCodexServiceTier(
+@@ -2184,7 +2184,7 @@
+                         }
+                         onModelChange={
+                             agentFlavor === 'codex'
+-                                ? (props.session.active && !controlledByUser && !codexModelsState.error ? handleModelChange : undefined)
++                                ? ((!props.session.active || !controlledByUser) && !codexModelsState.error ? handleModelChange : undefined)
+                                 : agentFlavor === 'cursor'
+                                     ? (props.session.active
+                                         && !controlledByUser
+@@ -2217,8 +2217,8 @@
+                         }
+                         onModelReasoningEffortChange={
+                             (agentFlavor === 'codex' || agentFlavor === 'opencode')
+-                                && props.session.active
+-                                && !controlledByUser
++                                && (agentFlavor === 'codex' || props.session.active)
++                                && (!props.session.active || !controlledByUser)
+                                 && (agentFlavor !== 'opencode' || opencodeReasoningEffortState.options.length > 0)
+                                 ? handleModelReasoningEffortChange
+                                 : undefined
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -691,7 +691,7 @@
+             return engine
+         }
+ 
+-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
++        const sessionResult = requireSessionFromParam(c, engine)
+         if (sessionResult instanceof Response) {
+             return sessionResult
+         }
+@@ -706,7 +706,7 @@
+         if (!supportsModelChange(flavor)) {
+             return c.json({ error: 'Model selection is not supported for this session' }, 400)
+         }
+-        if (sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
++        if (sessionResult.session.active && sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
+             if (flavor === 'codex') {
+                 return c.json({ error: 'Model selection can only be changed for remote Codex sessions' }, 409)
+             }
+@@ -733,7 +733,7 @@
+             return engine
+         }
+ 
+-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
++        const sessionResult = requireSessionFromParam(c, engine)
+         if (sessionResult instanceof Response) {
+             return sessionResult
+         }
+@@ -742,7 +742,7 @@
+         if (flavor !== 'codex' && flavor !== 'opencode') {
+             return c.json({ error: 'Model reasoning effort is only supported for Codex and OpenCode sessions' }, 400)
+         }
+-        if (sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
++        if (sessionResult.session.active && sessionResult.session.agentState?.controlledByUser === true && !sessionResult.session.metadata?.capabilities?.concurrentClients) {
+             return c.json({ error: 'Model reasoning effort can only be changed for remote sessions' }, 409)
+         }
+ 
+--- a/hub/src/web/routes/sessions.test.ts
++++ b/hub/src/web/routes/sessions.test.ts
+@@ -721,6 +721,15 @@
+         expect(applySessionConfigCalls).toEqual([])
+     })
+ 
++    it('persists model and effort choices for inactive Codex sessions without a live controller', async () => {
++        const { app, applySessionConfigCalls } = createApp(createSession({ active: false, agentState: { controlledByUser: true, requests: {}, completedRequests: {} } }))
++        for (const [path, body] of [['model', { model: 'gpt-6-astra' }], ['model-reasoning-effort', { modelReasoningEffort: 'xhigh' }]] as const) {
++            const response = await app.request(`/api/sessions/session-1/${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
++            expect(response.status).toBe(200)
++        }
++        expect(applySessionConfigCalls).toEqual([['session-1', { model: 'gpt-6-astra' }], ['session-1', { modelReasoningEffort: 'xhigh' }]])
++    })
++
+     it('applies model changes for remote Codex sessions', async () => {
+         const { app, applySessionConfigCalls } = createApp(createSession())
+ 
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -537,8 +537,8 @@
+         onScratchlistParkingChange?.(isParkingScratchlist)
+     }, [isParkingScratchlist, onScratchlistParkingChange])
+ 
+-    const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
+-    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
++    const configurationControlsDisabled = (!active && !allowSendWhenInactive && agentFlavor !== 'codex') || isParkingScratchlist
++    const controlsDisabled = disabled || threadIsDisabled || (!active && !allowSendWhenInactive) || isParkingScratchlist
+     const trimmed = composerText.trim()
+     const hasText = trimmed.length > 0
+     const hasAttachments = attachments.length > 0
+@@ -1585,11 +1585,11 @@
+     }, [onCopilotAgentModeChange, controlsDisabled, haptic, dismissSettings])
+ 
+     const handleModelReasoningEffortChange = useCallback((nextModelReasoningEffort: string | null) => {
+-        if (!onModelReasoningEffortChange || controlsDisabled) return
++        if (!onModelReasoningEffortChange || configurationControlsDisabled) return
+         onModelReasoningEffortChange(nextModelReasoningEffort)
+         dismissSettings()
+         haptic('light')
+-    }, [onModelReasoningEffortChange, controlsDisabled, haptic, dismissSettings])
++    }, [onModelReasoningEffortChange, configurationControlsDisabled, haptic, dismissSettings])
+ 
+     const handleEffortChange = useCallback((nextEffort: string | null) => {
+         if (!onEffortChange || configurationControlsDisabled) return
+@@ -1659,7 +1659,7 @@
+     // Pi turns run for minutes with thread.isDisabled set the whole time, so
+     // Pi keeps its model/effort controls live mid-turn (#1442) — the generic
+     // disable rule (controlsDisabled) would lock them for the entire turn.
+-    const modelEffortControlsDisabled = agentFlavor === 'pi' ? configurationControlsDisabled : controlsDisabled
++    const modelEffortControlsDisabled = (agentFlavor === 'pi' || agentFlavor === 'codex') ? configurationControlsDisabled : controlsDisabled
+     const modelValueLabel = useMemo(() => {
+         if (!onModelChange || !supportsModelChange(agentFlavor)) return undefined
+         // Pi models come from the dynamic piModels catalog; show the
+@@ -1864,9 +1864,9 @@
+                                     <button
+                                         key={option.value ?? 'default'}
+                                         type="button"
+-                                        disabled={controlsDisabled}
++                                        disabled={modelEffortControlsDisabled}
+                                         className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+-                                            controlsDisabled
++                                            modelEffortControlsDisabled
+                                                 ? 'cursor-not-allowed opacity-50'
+                                                 : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
+                                         }`}
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -539,6 +539,22 @@
+         fireEvent.change(screen.getByRole('combobox', {name:'Reasoning'}), {target:{value:'high'}})
+         expect(onModelReasoningEffortChange).toHaveBeenCalledWith('high')
+     })
++    it.each([true, false])('changes Codex model and reasoning with active=%s', (active) => {
++        const onModelChange = vi.fn()
++        const onModelReasoningEffortChange = vi.fn()
++        renderComposer('codex', {compactModelControls:true, active, allowSendWhenInactive:false,
++            model:'gpt-6.1-sol', modelReasoningEffort:'medium', onModelChange, onModelReasoningEffortChange,
++            availableModelOptions:[{value:'gpt-6.1-sol',label:'Sol'}, {value:'gpt-6-astra',label:'Astra'}],
++            availableModelReasoningEffortOptions:[{value:'medium'},{value:'xhigh'}],
++        })
++        const trigger = screen.getByRole('button', {name:/Model and reasoning:/})
++        expect(trigger).toBeEnabled()
++        fireEvent.click(trigger)
++        fireEvent.change(screen.getByRole('combobox', {name:'Model'}), {target:{value:'gpt-6-astra'}})
++        fireEvent.change(screen.getByRole('combobox', {name:'Reasoning'}), {target:{value:'xhigh'}})
++        expect(onModelChange).toHaveBeenCalledWith('gpt-6-astra')
++        expect(onModelReasoningEffortChange).toHaveBeenCalledWith('xhigh')
++    })
+     it('keeps model controls usable during a running turn and says they apply next turn', () => {
+         const onModelChange = vi.fn()
+         renderComposer('claude', {compactModelControls:true, thinking:true, onModelChange,
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -394,6 +394,11 @@
+                 developer_instructions: null
+             } } } : {})
+         };
++        // Native suppresses notifications for no-op updates. A previously
++        // observed matching snapshot already confirms this selection.
++        if (this.client.isInitialized() && !this.reconnecting && settingsMatch(this.settingsNative, params)) {
++            this.alive(); return { applied: this.settings };
++        }
+         let changed!: () => void;
+         let timer: ReturnType<typeof setTimeout> | undefined;
+         const accepted = new Promise<void>((resolve, reject) => {
+--- a/cli/src/codex/shared/root.test.ts
++++ b/cli/src/codex/shared/root.test.ts
+@@ -292,3 +292,11 @@
+         await vi.waitFor(() => expect(f.state().steeringActive).toBe(false));
+     });
+ });
++
++ it('accepts an already observed model without waiting for a no-op native notification', async () => {
++    const f = await fixture();
++    const request = vi.spyOn(f.root.client, 'request');
++    const result = await f.root.applySettings({ model: 'mock' });
++    expect(result.applied.model).toBe('mock');
++    expect(request).not.toHaveBeenCalledWith('thread/settings/update', expect.anything());
++ });

@@ -1,0 +1,2846 @@
+diff --git a/hub/src/managerControl.ts b/hub/src/managerControl.ts
+index 0edd4c4..7aed419 100644
+--- a/hub/src/managerControl.ts
++++ b/hub/src/managerControl.ts
+@@ -3,7 +3,7 @@ import { dirname, resolve, join } from 'node:path'
+ import { randomUUID } from 'node:crypto'
+ 
+ /** The same durable request protocol as managerctl; never spawn a model/shell. */
+-export async function requestManagerControl(command: { op: 'unmanage'; worker: string; session: string }, options?: { directory?: string; timeoutMs?: number }): Promise<unknown> {
++export async function requestManagerControl(command: { op: 'unmanage'; worker: string; session: string } | { op: 'node_sync' }, options?: { directory?: string; timeoutMs?: number }): Promise<unknown> {
+     const directory = options?.directory ?? process.env.HAPI_MANAGER_CONTROL_DIR
+         ?? (process.env.HAPI_MANAGED_SESSIONS_FILE ? resolve(dirname(process.env.HAPI_MANAGED_SESSIONS_FILE), '../manager/control') : undefined)
+     if (!directory) throw new Error('Manager control is unavailable')
+diff --git a/hub/src/store/index.ts b/hub/src/store/index.ts
+index 7aab7b3..d19fcb8 100644
+--- a/hub/src/store/index.ts
++++ b/hub/src/store/index.ts
+@@ -1,4 +1,5 @@
+ import { SessionManagerStore } from './sessionManager'
++import { NodeGraphStore } from './nodeGraph'
+ import { Database } from 'bun:sqlite'
+ import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs'
+ import { dirname } from 'node:path'
+@@ -65,6 +66,7 @@ export class Store {
+     private closed: boolean = false
+ 
+     readonly sessionManager: SessionManagerStore
++    readonly nodeGraph: NodeGraphStore
+     readonly sessions: SessionStore
+     readonly machines: MachineStore
+     readonly messages: MessageStore
+@@ -130,6 +132,7 @@ export class Store {
+         }
+ 
+         this.sessionManager = new SessionManagerStore(this.db)
++        this.nodeGraph = new NodeGraphStore(this.db)
+         this.sessions = new SessionStore(this.db)
+         this.machines = new MachineStore(this.db)
+         this.messages = new MessageStore(this.db)
+diff --git a/hub/src/store/nodeGraph.ts b/hub/src/store/nodeGraph.ts
+new file mode 100644
+index 0000000..5cd7b54
+--- /dev/null
++++ b/hub/src/store/nodeGraph.ts
+@@ -0,0 +1,169 @@
++import type { Database } from 'bun:sqlite'
++import { randomUUID } from 'node:crypto'
++import { createsCycle, type NodeGraph, type NodeGraphEdge, type NodeLayoutPositions, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++
++type WorkspaceRow = { id: string; namespace: string; name: string; kind: 'default' | 'preset'; created_at: number; updated_at: number }
++type MemberRow = { workspace_id: string; session_id: string; x: number | null; y: number | null; added_at: number }
++type EdgeRow = { workspace_id: string; child_id: string; owner_id: string; created_at: number; created_by: string }
++
++/** Graph data only: membership, ownership edges and layout per workspace slot. */
++export class NodeGraphStore {
++    constructor(private db: Database) {
++        db.exec(`CREATE TABLE IF NOT EXISTS node_workspaces (
++            id TEXT PRIMARY KEY, namespace TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
++            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`)
++        db.exec('CREATE INDEX IF NOT EXISTS node_workspaces_namespace ON node_workspaces(namespace)')
++        db.exec('CREATE TABLE IF NOT EXISTS node_graph_state (namespace TEXT PRIMARY KEY, active_workspace_id TEXT NOT NULL)')
++        db.exec(`CREATE TABLE IF NOT EXISTS node_members (
++            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, x REAL, y REAL, added_at INTEGER NOT NULL,
++            PRIMARY KEY (workspace_id, session_id))`)
++        db.exec(`CREATE TABLE IF NOT EXISTS node_edges (
++            workspace_id TEXT NOT NULL, child_id TEXT NOT NULL, owner_id TEXT NOT NULL,
++            created_at INTEGER NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY (workspace_id, child_id))`)
++    }
++
++    /** Creates the default slot once, seeded from the pre-graph Session Manager list. */
++    active(namespace: string): string {
++        const state = this.db.query('SELECT active_workspace_id FROM node_graph_state WHERE namespace = ?').get(namespace) as { active_workspace_id: string } | null
++        if (state) return state.active_workspace_id
++        return this.db.transaction(() => {
++            const now = Date.now(), id = randomUUID()
++            this.db.query('INSERT INTO node_workspaces VALUES (?, ?, ?, ?, ?, ?)').run(id, namespace, 'Default', 'default', now, now)
++            this.db.query('INSERT INTO node_graph_state VALUES (?, ?)').run(namespace, id)
++            const legacy = this.db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_manager_entries'`).get()
++            if (legacy) this.db.query(`INSERT OR IGNORE INTO node_members (workspace_id, session_id, x, y, added_at)
++                SELECT ?, session_id, NULL, NULL, activity_at FROM session_manager_entries
++                WHERE namespace = ? AND (dismissed_at IS NULL OR dismissed_at < activity_at)`).run(id, namespace)
++            return id
++        })()
++    }
++
++    workspaces(namespace: string): NodeWorkspace[] {
++        this.active(namespace)
++        const rows = this.db.query(`SELECT * FROM node_workspaces WHERE namespace = ? ORDER BY kind = 'preset', created_at`).all(namespace) as WorkspaceRow[]
++        return rows.map(row => ({ id: row.id, name: row.name, kind: row.kind, createdAt: row.created_at, updatedAt: row.updated_at }))
++    }
++
++    private workspace(namespace: string, id: string): WorkspaceRow | null {
++        return this.db.query('SELECT * FROM node_workspaces WHERE id = ? AND namespace = ?').get(id, namespace) as WorkspaceRow | null
++    }
++
++    graph(namespace: string, workspaceId = this.active(namespace)): NodeGraph {
++        const members = this.db.query('SELECT * FROM node_members WHERE workspace_id = ? ORDER BY added_at, session_id').all(workspaceId) as MemberRow[]
++        const edges = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? ORDER BY created_at, child_id').all(workspaceId) as EdgeRow[]
++        return {
++            workspaceId,
++            nodes: members.map(m => ({ sessionId: m.session_id, x: m.x, y: m.y, addedAt: m.added_at })),
++            edges: edges.map(e => ({ owner: e.owner_id, child: e.child_id, createdAt: e.created_at, createdBy: e.created_by })),
++        }
++    }
++
++    members(namespace: string, workspaceId = this.active(namespace)): string[] {
++        return (this.db.query('SELECT session_id FROM node_members WHERE workspace_id = ?').all(workspaceId) as { session_id: string }[]).map(r => r.session_id)
++    }
++
++    private touch(workspaceId: string): void {
++        this.db.query('UPDATE node_workspaces SET updated_at = ? WHERE id = ?').run(Date.now(), workspaceId)
++    }
++
++    /** Add a lone node (no-op when present). Returns true when newly added. */
++    addNode(namespace: string, sessionId: string, workspaceId = this.active(namespace)): boolean {
++        const result = this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, sessionId, Date.now())
++        if (result.changes) this.touch(workspaceId)
++        return result.changes > 0
++    }
++
++    /** Removing a node cuts its edges; its children become lone nodes. */
++    removeNodes(namespace: string, ids: readonly string[], workspaceId = this.active(namespace)): void {
++        this.db.transaction(() => {
++            for (const id of ids) {
++                this.db.query('DELETE FROM node_members WHERE workspace_id = ? AND session_id = ?').run(workspaceId, id)
++                this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND (child_id = ? OR owner_id = ?)').run(workspaceId, id, id)
++            }
++            this.touch(workspaceId)
++        })()
++    }
++
++    setOwner(namespace: string, owner: string, child: string, createdBy: string, overseer: string | null, workspaceId = this.active(namespace)): NodeGraphEdge {
++        if (child === overseer) throw new Error('The overseer is the root and cannot have an owner')
++        const edges = this.graph(namespace, workspaceId).edges.filter(edge => edge.child !== child)
++        if (createsCycle(edges, owner, child)) throw new Error('That owner would create a cycle')
++        return this.db.transaction(() => {
++            const now = Date.now()
++            if (owner !== overseer) this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, owner, now)
++            this.db.query('INSERT OR IGNORE INTO node_members VALUES (?, ?, NULL, NULL, ?)').run(workspaceId, child, now)
++            const existing = this.db.query('SELECT * FROM node_edges WHERE workspace_id = ? AND child_id = ?').get(workspaceId, child) as EdgeRow | null
++            if (existing?.owner_id === owner) return { owner, child, createdAt: existing.created_at, createdBy: existing.created_by }
++            this.db.query(`INSERT INTO node_edges VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_id, child_id)
++                DO UPDATE SET owner_id = excluded.owner_id, created_at = excluded.created_at, created_by = excluded.created_by`).run(workspaceId, child, owner, now, createdBy)
++            this.touch(workspaceId)
++            return { owner, child, createdAt: now, createdBy }
++        })()
++    }
++
++    detach(namespace: string, child: string, workspaceId = this.active(namespace)): boolean {
++        const result = this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND child_id = ?').run(workspaceId, child)
++        if (result.changes) this.touch(workspaceId)
++        return result.changes > 0
++    }
++
++    layout(namespace: string, positions: NodeLayoutPositions, workspaceId = this.active(namespace)): void {
++        this.db.transaction(() => {
++            for (const [id, { x, y }] of Object.entries(positions)) {
++                if (!Number.isFinite(x) || !Number.isFinite(y)) continue
++                this.db.query('UPDATE node_members SET x = ?, y = ? WHERE workspace_id = ? AND session_id = ?').run(x, y, workspaceId, id)
++            }
++        })()
++    }
++
++    /** Copy the active slot (nodes, edges, layout) into a new preset slot. */
++    saveAs(namespace: string, name: string): NodeWorkspace {
++        const source = this.active(namespace), now = Date.now(), id = randomUUID()
++        this.db.transaction(() => {
++            this.db.query('INSERT INTO node_workspaces VALUES (?, ?, ?, ?, ?, ?)').run(id, namespace, name, 'preset', now, now)
++            this.db.query('INSERT INTO node_members SELECT ?, session_id, x, y, added_at FROM node_members WHERE workspace_id = ?').run(id, source)
++            this.db.query('INSERT INTO node_edges SELECT ?, child_id, owner_id, created_at, created_by FROM node_edges WHERE workspace_id = ?').run(id, source)
++        })()
++        return { id, name, kind: 'preset', createdAt: now, updatedAt: now }
++    }
++
++    rename(namespace: string, id: string, name: string): boolean {
++        return this.db.query('UPDATE node_workspaces SET name = ?, updated_at = ? WHERE id = ? AND namespace = ?').run(name, Date.now(), id, namespace).changes > 0
++    }
++
++    delete(namespace: string, id: string): void {
++        const row = this.workspace(namespace, id)
++        if (!row) throw new Error('Workspace not found')
++        if (row.kind === 'default') throw new Error('The default slot cannot be deleted')
++        if (this.active(namespace) === id) throw new Error('Switch to another slot before deleting this one')
++        this.db.transaction(() => {
++            this.db.query('DELETE FROM node_members WHERE workspace_id = ?').run(id)
++            this.db.query('DELETE FROM node_edges WHERE workspace_id = ?').run(id)
++            this.db.query('DELETE FROM node_workspaces WHERE id = ?').run(id)
++        })()
++    }
++
++    activate(namespace: string, id: string): void {
++        if (!this.workspace(namespace, id)) throw new Error('Workspace not found')
++        this.active(namespace)
++        this.db.query('UPDATE node_graph_state SET active_workspace_id = ? WHERE namespace = ?').run(id, namespace)
++    }
++
++    exists(namespace: string, id: string): boolean {
++        return this.workspace(namespace, id) !== null
++    }
++
++    /** A destructive session-id merge moves nodes and edges in every slot of the namespace. */
++    merge(sourceId: string, targetId: string, namespace: string): void {
++        if (sourceId === targetId) return
++        this.db.transaction(() => {
++            for (const { id } of this.db.query('SELECT id FROM node_workspaces WHERE namespace = ?').all(namespace) as { id: string }[]) {
++                this.db.query('UPDATE OR IGNORE node_members SET session_id = ? WHERE workspace_id = ? AND session_id = ?').run(targetId, id, sourceId)
++                this.db.query('DELETE FROM node_members WHERE workspace_id = ? AND session_id = ?').run(id, sourceId)
++                this.db.query('UPDATE node_edges SET owner_id = ? WHERE workspace_id = ? AND owner_id = ?').run(targetId, id, sourceId)
++                this.db.query('UPDATE OR IGNORE node_edges SET child_id = ? WHERE workspace_id = ? AND child_id = ?').run(targetId, id, sourceId)
++                this.db.query('DELETE FROM node_edges WHERE workspace_id = ? AND (child_id = ? OR owner_id = child_id)').run(id, sourceId)
++            }
++        })()
++    }
++}
+diff --git a/hub/src/store/sessionManager.ts b/hub/src/store/sessionManager.ts
+index 2fc19b1..7dc96e4 100644
+--- a/hub/src/store/sessionManager.ts
++++ b/hub/src/store/sessionManager.ts
+@@ -13,21 +13,24 @@ export class SessionManagerStore {
+         )`)
+         db.exec('CREATE INDEX IF NOT EXISTS session_manager_namespace ON session_manager_entries(namespace)')
+     }
+-    observe(session: SessionSummary, namespace: string, invokedAt = 0, retain = false, completionAt = 0, allowStart = true): void {
++    observe(session: SessionSummary, namespace: string, invokedAt = 0, retain = false, completionAt = 0, allowStart = true): boolean {
+         const old = this.db.query('SELECT * FROM session_manager_entries WHERE session_id = ? AND namespace = ?').get(session.id, namespace) as Row | null
+         const busy = Number(session.active && (session.thinking || session.backgroundTaskCount > 0 || session.pendingRequestsCount > 0))
+         const thinking = Number(session.active && session.thinking)
+-        if (!old && !busy && !invokedAt && !retain && !completionAt) return
++        if (!old && !busy && !invokedAt && !retain && !completionAt) return false
+         // Aggregate background counts (including a delayed reconnect snapshot)
+         // do not prove a new invocation. Fresh task receipts/ACKs pass invokedAt.
+         const started = (!old || allowStart) && Boolean(thinking && !old?.thinking || !old && busy)
+         const activityAt = Math.max(old?.activity_at ?? 0, invokedAt, !old ? completionAt : 0,
+             started ? Math.max(Date.now(), (old?.dismissed_at ?? 0) + 1) : 0)
+         const summary = JSON.stringify({ ...session, pendingRequests: [] })
+-        if (old && old.activity_at === activityAt && old.busy === busy && old.thinking === thinking && stableSummary(old.summary) === stableSummary(summary)) return
++        if (old && old.activity_at === activityAt && old.busy === busy && old.thinking === thinking && stableSummary(old.summary) === stableSummary(summary)) return false
+         this.db.query(`INSERT INTO session_manager_entries VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, activity_at=excluded.activity_at,
+             busy=excluded.busy, thinking=excluded.thinking WHERE session_manager_entries.namespace=excluded.namespace`).run(session.id, namespace, summary, activityAt, old?.dismissed_at ?? null, busy, thinking)
++        // Persisted new activity evidence (a genuine run) enrols the chat as a graph node.
++        // Replayed evidence older than a manual removal never re-enrols it.
++        return activityAt > (old?.activity_at ?? 0) && activityAt > (old?.dismissed_at ?? -1)
+     }
+     add(session: SessionSummary, namespace: string): void {
+         this.db.transaction(() => {
+diff --git a/hub/src/sync/nodeGraph.test.ts b/hub/src/sync/nodeGraph.test.ts
+new file mode 100644
+index 0000000..384e389
+--- /dev/null
++++ b/hub/src/sync/nodeGraph.test.ts
+@@ -0,0 +1,169 @@
++import { describe, expect, it } from 'bun:test'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Hono } from 'hono'
++import { Store } from '../store'
++import { SyncEngine } from './syncEngine'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { createNodeGraphRoutes } from '../web/routes/nodeGraph'
++import { createSessionsRoutes } from '../web/routes/sessions'
++import type { WebAppEnv } from '../web/middleware/auth'
++import type { NodeGraphResponse, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
++
++function fixture(path = ':memory:') {
++    const store = new Store(path)
++    const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++    const create = (tag: string, namespace = 'default') => engine.getOrCreateSession(tag, { path: '/tmp/work', host: 'test', flavor: 'codex' }, {}, namespace)
++    const alive = (id: string, thinking: boolean) => engine.handleSessionAlive({ sid: id, time: Date.now(), thinking })
++    const overseer = create('Overseer')
++    let nudges = 0
++    const app = (namespace = 'default') => {
++        const app = new Hono<WebAppEnv>()
++        app.use('*', async (c, next) => { c.set('namespace', namespace); return next() })
++        app.route('/', createNodeGraphRoutes(() => engine, { overseer: ns => ns === 'default' ? overseer.id : null, nudge: () => { nudges++ } }))
++        app.route('/', createSessionsRoutes(() => engine))
++        return app
++    }
++    const call = async <T = NodeGraphResponse>(path: string, body?: unknown, namespace = 'default'): Promise<{ status: number; json: T }> => {
++        const response = await app(namespace).request(path, body === undefined ? undefined : { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } })
++        return { status: response.status, json: await response.json() as T }
++    }
++    return { store, engine, create, alive, call, overseer, nudges: () => nudges, close: () => { engine.stop(); store.close() } }
++}
++const edges = (graph: NodeGraphResponse) => graph.graph.edges.map(e => `${e.owner}>${e.child}`).sort()
++const nodes = (graph: NodeGraphResponse) => graph.graph.nodes.map(n => n.sessionId).sort()
++
++describe('node graph', () => {
++    it('enrols a manually started chat as a lone node in the active workspace only', async () => {
++        const f = fixture()
++        try {
++            const first = await f.call('/node-graph')
++            expect(first.json.workspaces.map(w => w.kind)).toEqual(['default'])
++            await f.call('/node-graph/workspaces', { name: 'Render' })
++            const manual = f.create('Manual'); f.alive(manual.id, true)
++            const graph = (await f.call('/node-graph')).json
++            expect(nodes(graph)).toEqual([manual.id]); expect(graph.graph.edges).toEqual([])
++            const preset = graph.workspaces.find(w => w.kind === 'preset')!
++            expect(f.engine.nodeGraph.members('default', preset.id)).toEqual([])
++        } finally { f.close() }
++    })
++
++    it('keeps a strict single-owner tree and makes children lone when an owner is removed', async () => {
++        const f = fixture()
++        try {
++            const mid = f.create('Mid'), leaf = f.create('Leaf'), other = f.create('Other')
++            expect((await f.call('/node-graph/edges', { owner: f.overseer.id, child: mid.id })).status).toBe(200)
++            expect((await f.call('/node-graph/edges', { owner: mid.id, child: leaf.id })).status).toBe(200)
++            expect((await f.call('/node-graph/edges', { owner: leaf.id, child: mid.id })).status).toBe(409)
++            expect((await f.call('/node-graph/edges', { owner: mid.id, child: f.overseer.id })).status).toBe(409)
++            expect((await f.call('/node-graph/edges', { owner: leaf.id, child: leaf.id })).status).toBe(409)
++            // Re-owning replaces the single owner edge.
++            const moved = (await f.call('/node-graph/edges', { owner: other.id, child: leaf.id })).json
++            expect(edges(moved)).toEqual([`${f.overseer.id}>${mid.id}`, `${other.id}>${leaf.id}`].sort())
++            const removed = (await f.call<NodeGraphResponse & { skippedIds: string[] }>('/node-graph/nodes/remove', { ids: [other.id] })).json
++            expect(removed.skippedIds).toEqual([])
++            expect(edges(removed)).toEqual([`${f.overseer.id}>${mid.id}`])
++            expect(nodes(removed)).toContain(leaf.id); expect(nodes(removed)).not.toContain(other.id)
++            expect(f.nudges()).toBeGreaterThan(0)
++        } finally { f.close() }
++    })
++
++    it('refuses to remove a busy node and never removes the overseer', async () => {
++        const f = fixture()
++        try {
++            const busy = f.create('Busy'); f.alive(busy.id, true)
++            const result = (await f.call<NodeGraphResponse & { skippedIds: string[] }>('/node-graph/nodes/remove', { ids: [busy.id, f.overseer.id] })).json
++            expect(result.skippedIds).toEqual([busy.id]); expect(nodes(result)).toContain(busy.id)
++            f.alive(busy.id, false)
++            expect(nodes((await f.call('/node-graph/nodes/remove', { ids: [busy.id] })).json)).not.toContain(busy.id)
++        } finally { f.close() }
++    })
++
++    it('Session Manager list is the active workspace and removal there removes the node', async () => {
++        const f = fixture()
++        try {
++            const s = f.create('Listed'); f.alive(s.id, true); f.alive(s.id, false)
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: s.id })
++            const listed = await f.call<{ entries: Record<string, unknown> }>('/session-manager')
++            expect(Object.keys(listed.json.entries)).toContain(s.id)
++            await f.call('/session-manager/dismiss', { ids: [s.id] })
++            const graph = (await f.call('/node-graph')).json
++            expect(nodes(graph)).not.toContain(s.id); expect(graph.graph.edges).toEqual([])
++            // Explicit Add restores it as a lone node.
++            await f.call('/session-manager/' + s.id + '/add', {})
++            expect(nodes((await f.call('/node-graph')).json)).toContain(s.id)
++        } finally { f.close() }
++    })
++
++    it('saves presets as copies, autosaves the active slot, and switching stops only the old slot (not the overseer)', async () => {
++        const f = fixture()
++        const aborted: string[] = [], paused: string[] = []
++        f.engine.abortSession = (async (id: string) => { aborted.push(id) }) as never
++        f.engine.pauseSession = ((id: string) => { paused.push(id) }) as never
++        try {
++            const running = f.create('Running'), idle = f.create('Idle')
++            f.alive(running.id, true); f.alive(idle.id, true); f.alive(idle.id, false)
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: running.id })
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: idle.id })
++            await f.call('/node-graph/nodes', { sessionId: f.overseer.id })
++            const saved = (await f.call('/node-graph/workspaces', { name: 'Snapshot' })).json
++            const preset = saved.workspaces.find(w => w.name === 'Snapshot')!
++            await f.call('/node-graph/edges/remove', { child: idle.id })
++            const defaultId = saved.activeWorkspaceId
++            expect(edges((await f.call('/node-graph')).json)).toEqual([`${f.overseer.id}>${running.id}`])
++            expect(f.engine.nodeGraph.graph('default', preset.id).edges).toHaveLength(2)
++            expect((await f.call(`/node-graph/workspaces/${preset.id}/activate`, {})).status).toBe(400)
++            const switched = (await f.call<NodeSwitchResult>(`/node-graph/workspaces/${preset.id}/activate`, { confirm: true })).json
++            expect(switched.activeWorkspaceId).toBe(preset.id)
++            expect(switched.stopped.sort()).toEqual([running.id, idle.id].sort())
++            // Connected sessions get the durable Stop (abort + manual pause).
++            expect(aborted.sort()).toEqual([running.id, idle.id].sort()); expect(paused).toEqual([])
++            expect([...aborted, ...paused]).not.toContain(f.overseer.id)
++            // Default slot is preserved, not overwritten by the preset.
++            expect(f.engine.nodeGraph.graph('default', defaultId).edges).toHaveLength(1)
++            expect((await f.call(`/node-graph/workspaces/${preset.id}/delete`, {})).status).toBe(409)
++            expect((await f.call(`/node-graph/workspaces/${defaultId}/delete`, {})).status).toBe(409)
++        } finally { f.close() }
++    })
++
++    it('persists workspaces, edges and layout across a hub restart and isolates namespaces', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-nodes-')), path = join(dir, 'hub.db')
++        let f = fixture(path)
++        try {
++            const child = f.create('Child'), foreign = f.create('Foreign', 'other')
++            await f.call('/node-graph/edges', { owner: f.overseer.id, child: child.id })
++            await f.call('/node-graph/layout', { positions: { [child.id]: { x: 12, y: 34 }, bogus: { x: 1, y: 1 } } })
++            expect((await f.call('/node-graph/edges', { owner: f.overseer.id, child: foreign.id })).status).toBe(404)
++            expect((await f.call('/node-graph', undefined, 'other')).json.graph.nodes).toEqual([])
++            f.close(); f = fixture(path)
++            const graph = (await f.call('/node-graph')).json
++            expect(graph.graph.nodes.find(n => n.sessionId === child.id)).toMatchObject({ x: 12, y: 34 })
++            expect(graph.graph.edges).toHaveLength(1)
++        } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++
++    it('seeds the default slot from the pre-graph Session Manager list', () => {
++        const store = new Store(':memory:')
++        try {
++            store.sessionManager.observe({ id: 'kept', active: true, thinking: true, backgroundTaskCount: 0, pendingRequestsCount: 0 } as never, 'default')
++            store.sessionManager.observe({ id: 'gone', active: true, thinking: true, backgroundTaskCount: 0, pendingRequestsCount: 0 } as never, 'default')
++            store.sessionManager.observe({ id: 'gone', active: true, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } as never, 'default')
++            store.sessionManager.dismiss('default', ['gone'])
++            expect(store.nodeGraph.members('default')).toEqual(['kept'])
++        } finally { store.close() }
++    })
++
++    it('moves nodes and edges in every slot on a destructive session-id merge', () => {
++        const store = new Store(':memory:')
++        try {
++            store.nodeGraph.setOwner('default', 'root', 'old', 'user', 'root')
++            const preset = store.nodeGraph.saveAs('default', 'P')
++            store.nodeGraph.merge('old', 'new', 'default')
++            for (const id of [store.nodeGraph.active('default'), preset.id]) {
++                expect(store.nodeGraph.members('default', id)).toEqual(['new'])
++                expect(store.nodeGraph.graph('default', id).edges.map(e => e.child)).toEqual(['new'])
++            }
++        } finally { store.close() }
++    })
++})
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+index 2e6789b..67e3d0b 100644
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -1382,6 +1382,7 @@ export class SessionCache {
+                 throw new Error('Failed to delete old session during merge')
+             }
+             if (target) this.store.sessionManager.merge(oldSessionId, toSessionSummary(target), namespace)
++            this.store.nodeGraph.merge(oldSessionId, newSessionId, namespace)
+ 
+             this.backgroundTasks.delete(oldSessionId)
+             this.nativeTaskReaders.delete(oldSessionId)
+diff --git a/hub/src/sync/sessionManager.test.ts b/hub/src/sync/sessionManager.test.ts
+index 3087c3a..db015d7 100644
+--- a/hub/src/sync/sessionManager.test.ts
++++ b/hub/src/sync/sessionManager.test.ts
+@@ -64,7 +64,9 @@ describe('durable Session Manager membership', () => {
+             f.alive(cleared.id, false)
+             expect(f.engine.getSessionManager('default')[cleared.id].dismissedAt).not.toBeNull()
+             f.alive(cleared.id, true)
+-            const renewed = f.engine.getSessionManager('default')[cleared.id]
++            // A genuine new run re-enrols the removed chat as a node; the ledger records why.
++            expect(f.engine.getSessionManager('default')[cleared.id].dismissedAt).toBeNull()
++            const renewed = f.store.sessionManager.list('default')[cleared.id]
+             expect(renewed.activityAt).toBeGreaterThan(renewed.dismissedAt!)
+         } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
+     })
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index 90803c5..ddb2a96 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1,6 +1,8 @@
+ import { extractBackgroundTaskDelta } from './backgroundTasks'
+ import { toSessionSummary } from '@hapi/protocol'
+ import { sessionManagerActivityTime, type SessionManagerRecords } from '@hapi/protocol/sessionManager'
++import { nodeIsIdle } from '@hapi/protocol/nodeGraph'
++import type { NodeGraphStore } from '../store/nodeGraph'
+ /**
+  * Sync Engine for HAPI Telegram Bot (Direct Connect)
+  *
+@@ -229,7 +231,7 @@ export class SyncEngine {
+                         const result = this.store.messages.lookupQueuedMessage(event.sessionId, id)
+                         return result.status === 'invoked' ? Math.max(latest, result.message.invokedAt ?? 0) : latest
+                     }, 0) : 0
+-                    this.store.sessionManager.observe(toSessionSummary(session), session.namespace, invokedAt, false, 0, event.type !== 'session-added')
++                    if (this.store.sessionManager.observe(toSessionSummary(session), session.namespace, invokedAt, false, 0, event.type !== 'session-added')) this.enrolNode(session.id, session.namespace)
+                 }
+             }
+ 
+@@ -237,12 +239,12 @@ export class SyncEngine {
+                 const completedAt = sessionManagerActivityTime(event)
+                 const current = this.sessionCache.getSession(event.sessionId)
+                 if (current && event.message.createdAt >= membershipStartedAt && extractBackgroundTaskDelta(event.message.content)?.started) {
+-                    this.store.sessionManager.observe(toSessionSummary(current), current.namespace, event.message.createdAt, false, 0, false)
++                    if (this.store.sessionManager.observe(toSessionSummary(current), current.namespace, event.message.createdAt, false, 0, false)) this.enrolNode(current.id, current.namespace)
+                 }
+                 if (current && completedAt !== null && completedAt >= membershipStartedAt) {
+                     // Catch a short completed turn even if no busy heartbeat arrived.
+                     // A late/replayed result must never undo an existing dismissal.
+-                    this.store.sessionManager.observe(toSessionSummary(current), current.namespace, 0, false, completedAt)
++                    if (this.store.sessionManager.observe(toSessionSummary(current), current.namespace, 0, false, completedAt)) this.enrolNode(current.id, current.namespace)
+                 }
+ 
+                 if (!this.sessionCache.getSession(event.sessionId)?.hasConversationContent
+@@ -294,13 +296,34 @@ export class SyncEngine {
+         return undefined
+     }
+ 
++    get nodeGraph(): NodeGraphStore { return this.store.nodeGraph }
++
++    /** A genuine new run enrols the chat as a lone node of the active workspace only. */
++    private enrolNode(sessionId: string, namespace: string): void {
++        if (this.store.nodeGraph.addNode(namespace, sessionId)) this.nodeGraphChanged(namespace)
++    }
++
++    private nodeGraphListeners: ((namespace: string) => void)[] = []
++    onNodeGraphChanged(listener: (namespace: string) => void): void { this.nodeGraphListeners.push(listener) }
++    nodeGraphChanged(namespace: string): void { for (const listener of this.nodeGraphListeners) listener(namespace) }
++
++    /** Session Manager lists the active workspace's nodes; the ledger supplies activity evidence. */
+     getSessionManager(namespace: string, includeDismissed = true): SessionManagerRecords {
+-        const records = this.store.sessionManager.list(namespace, includeDismissed)
+-        for (const [id, record] of Object.entries(records)) {
++        const ledger = this.store.sessionManager.list(namespace, true)
++        const members = new Set(this.store.nodeGraph.members(namespace))
++        const records: SessionManagerRecords = {}
++        // Removed (non-member) ledger rows are diagnostic only; the API omits them.
++        const ids = includeDismissed ? [...members, ...Object.keys(ledger).filter(id => !members.has(id) && ledger[id]!.dismissedAt !== null)] : [...members]
++        for (const id of ids) {
+             const current = this.sessionCache.getSession(id)
+-            record.missing = !current || current.namespace !== namespace
+-            if (!record.missing && current) record.session = toSessionSummary(current)
+-            else record.session = { ...record.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0, pendingRequests: [] }
++            const missing = !current || current.namespace !== namespace
++            const saved = ledger[id]
++            const session = !missing && current ? toSessionSummary(current) : saved?.session
++            if (!session) continue
++            records[id] = {
++                session: missing ? { ...session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0, pendingRequests: [] } : session,
++                activityAt: saved?.activityAt ?? 0, dismissedAt: members.has(id) ? null : saved?.dismissedAt ?? null, missing,
++            }
+         }
+         return records
+     }
+@@ -316,15 +339,31 @@ export class SyncEngine {
+         const access = this.resolveSessionAccess(sessionId, namespace)
+         if (!access.ok) return false
+         this.store.sessionManager.add(toSessionSummary(access.session), namespace)
++        if (this.store.nodeGraph.addNode(namespace, access.sessionId)) this.nodeGraphChanged(namespace)
+         return true
+     }
+ 
++    /** Removing a node is refused while its session is busy (Stop first); children become lone. */
+     dismissSessionManagerEntries(namespace: string, ids: readonly string[]): string[] {
+-        // Recheck authoritative runtime state at the mutation boundary, including
+-        // disconnected/deleted entries whose saved summary may still look busy.
+-        const records = this.getSessionManager(namespace)
+-        for (const id of ids) if (records[id]) this.store.sessionManager.observe(records[id].session, namespace, 0, false, 0, false)
+-        return this.store.sessionManager.dismiss(namespace, ids)
++        const skipped: string[] = [], removable: string[] = []
++        for (const id of ids) {
++            const current = this.sessionCache.getSession(id)
++            if (current && current.namespace === namespace && !nodeIsIdle(toSessionSummary(current))) skipped.push(id)
++            else removable.push(id)
++        }
++        if (removable.length) {
++            // Stamp the activity ledger too, so replayed old evidence cannot re-enrol a removed node.
++            const ledger = this.store.sessionManager.list(namespace)
++            for (const id of removable) {
++                const current = this.sessionCache.getSession(id)
++                const summary = current && current.namespace === namespace ? toSessionSummary(current) : ledger[id]?.session
++                if (summary && ledger[id]) this.store.sessionManager.observe(current ? summary : { ...summary, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 }, namespace, 0, false, 0, false)
++            }
++            this.store.sessionManager.dismiss(namespace, removable)
++            this.store.nodeGraph.removeNodes(namespace, removable)
++            this.nodeGraphChanged(namespace)
++        }
++        return skipped
+     }
+ 
+     getSessions(): Session[] {
+diff --git a/hub/src/web/routes/nodeGraph.ts b/hub/src/web/routes/nodeGraph.ts
+new file mode 100644
+index 0000000..9712e39
+--- /dev/null
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -0,0 +1,143 @@
++import { Hono } from 'hono'
++import type { NodeGraphResponse, NodeLayoutPositions } from '@hapi/protocol/nodeGraph'
++import { requestManagerControl } from '../../managerControl'
++import type { SyncEngine } from '../../sync/syncEngine'
++import type { WebAppEnv } from '../middleware/auth'
++import { requireSyncEngine } from './guards'
++import { readManagedSessions } from './managedSessions'
++
++/** The overseer (promoted manager) is the root of every workspace in the owner's namespace. */
++export function readOverseer(namespace: string, read: typeof readManagedSessions = readManagedSessions): string | null {
++    if (namespace !== 'default') return null
++    const entry = Object.entries(read()).find(([, managed]) => managed.role === 'manager')
++    return entry?.[0] ?? process.env.HAPI_OVERSEER_SESSION_ID ?? null
++}
++
++const name = (value: unknown): string | null => typeof value === 'string' && value.trim() && value.trim().length <= 80 ? value.trim() : null
++
++/** Graph edits never message, resume or stop workers except the confirmed workspace switch. */
++export function createNodeGraphRoutes(getSyncEngine: () => SyncEngine | null, options: {
++    overseer?: (namespace: string) => string | null; nudge?: () => void
++} = {}): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    const overseer = options.overseer ?? ((namespace: string) => readOverseer(namespace))
++    // Management follows edges; ask the supervisor to reconcile now instead of on its next cycle.
++    const nudge = options.nudge ?? (() => { void requestManagerControl({ op: 'node_sync' }, { timeoutMs: 5_000 }).catch(() => undefined) })
++    const respond = (engine: SyncEngine, namespace: string): NodeGraphResponse => ({
++        activeWorkspaceId: engine.nodeGraph.active(namespace),
++        workspaces: engine.nodeGraph.workspaces(namespace),
++        graph: engine.nodeGraph.graph(namespace),
++        overseer: overseer(namespace),
++        pausedAt: Object.fromEntries([...engine.nodeGraph.members(namespace), overseer(namespace)].flatMap(id => {
++            const at = id ? engine.getManualPause(id) : null
++            return at === null || !id ? [] : [[id, at]]
++        })),
++    })
++    const changed = (engine: SyncEngine, namespace: string) => { engine.nodeGraphChanged(namespace); if (namespace === 'default') nudge() }
++    const known = (engine: SyncEngine, namespace: string, id: unknown): id is string =>
++        typeof id === 'string' && (id === overseer(namespace) || engine.resolveSessionAccess(id, namespace).ok)
++
++    app.get('/node-graph', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        c.header('Cache-Control', 'no-store')
++        return c.json(respond(engine, c.get('namespace')))
++    })
++    app.post('/node-graph/nodes', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null)
++        if (!engine.addSessionManagerEntry(String(body?.sessionId ?? ''), namespace)) return c.json({ error: 'Session not found' }, 404)
++        if (namespace === 'default') nudge()
++        return c.json(respond(engine, namespace))
++    })
++    app.post('/node-graph/nodes/remove', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null)
++        if (!Array.isArray(body?.ids) || body.ids.length > 1000 || !body.ids.every((id: unknown) => typeof id === 'string')) return c.json({ error: 'Expected session ids' }, 400)
++        const skippedIds = engine.dismissSessionManagerEntries(namespace, body.ids.filter((id: string) => id !== overseer(namespace)))
++        if (namespace === 'default') nudge()
++        return c.json({ ...respond(engine, namespace), skippedIds })
++    })
++    app.post('/node-graph/layout', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null)
++        const positions = body?.positions
++        if (!positions || typeof positions !== 'object' || Object.keys(positions).length > 2000) return c.json({ error: 'Expected positions' }, 400)
++        engine.nodeGraph.layout(namespace, positions as NodeLayoutPositions)
++        return c.json({ ok: true })
++    })
++    app.post('/node-graph/edges', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null)
++        if (!known(engine, namespace, body?.owner) || !known(engine, namespace, body?.child)) return c.json({ error: 'Session not found' }, 404)
++        const createdBy = typeof body.createdBy === 'string' && body.createdBy ? body.createdBy.slice(0, 100) : 'user'
++        try { engine.nodeGraph.setOwner(namespace, body.owner, body.child, createdBy, overseer(namespace)) }
++        catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Invalid edge' }, 409) }
++        changed(engine, namespace)
++        return c.json(respond(engine, namespace))
++    })
++    app.post('/node-graph/edges/remove', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null)
++        if (typeof body?.child !== 'string') return c.json({ error: 'Expected child session id' }, 400)
++        if (engine.nodeGraph.detach(namespace, body.child)) changed(engine, namespace)
++        return c.json(respond(engine, namespace))
++    })
++    app.post('/node-graph/workspaces', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null), label = name(body?.name)
++        if (!label) return c.json({ error: 'Preset name required (1-80 characters)' }, 400)
++        engine.nodeGraph.saveAs(namespace, label)
++        return c.json(respond(engine, namespace))
++    })
++    app.post('/node-graph/workspaces/:id/rename', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), body = await c.req.json().catch(() => null), label = name(body?.name)
++        if (!label) return c.json({ error: 'Name required (1-80 characters)' }, 400)
++        if (!engine.nodeGraph.rename(namespace, c.req.param('id'), label)) return c.json({ error: 'Workspace not found' }, 404)
++        return c.json(respond(engine, namespace))
++    })
++    app.post('/node-graph/workspaces/:id/delete', (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace')
++        try { engine.nodeGraph.delete(namespace, c.req.param('id')) }
++        catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Delete failed' }, 409) }
++        return c.json(respond(engine, namespace))
++    })
++    // Confirmed switch: durable Stop for every node of the slot being left, except the overseer.
++    app.post('/node-graph/workspaces/:id/activate', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const namespace = c.get('namespace'), id = c.req.param('id'), body = await c.req.json().catch(() => null)
++        if (body?.confirm !== true) return c.json({ error: 'Switching stops the current workspace sessions; confirmation required' }, 400)
++        if (!engine.nodeGraph.exists(namespace, id)) return c.json({ error: 'Workspace not found' }, 404)
++        const current = engine.nodeGraph.active(namespace)
++        const stopped: string[] = [], failed: { sessionId: string; error: string }[] = []
++        if (current !== id) {
++            const root = overseer(namespace)
++            // Stops run in parallel: each persists its manual pause before the abort RPC.
++            await Promise.all(engine.nodeGraph.members(namespace, current).map(async sessionId => {
++                if (sessionId === root) return
++                const access = engine.resolveSessionAccess(sessionId, namespace)
++                if (!access.ok) return
++                try {
++                    if (access.session.active) await engine.abortSession(access.sessionId)
++                    else engine.pauseSession(access.sessionId)
++                    stopped.push(sessionId)
++                } catch (error) { failed.push({ sessionId, error: error instanceof Error ? error.message : 'Stop failed' }) }
++            }))
++            engine.nodeGraph.activate(namespace, id)
++            changed(engine, namespace)
++        }
++        return c.json({ ...respond(engine, namespace), stopped, failed })
++    })
++    return app
++}
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+index e9f2f7d..6a2b7e1 100644
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -27,6 +27,7 @@ import { createCodexFoldersRoutes } from './routes/codexFolders'
+ import { createSessionGoalRoutes } from './routes/sessionGoals'
+ import { createCodexContextRoutes } from './routes/codexContext'
+ import { createManagedSessionsRoutes } from './routes/managedSessions'
++import { createNodeGraphRoutes } from './routes/nodeGraph'
+ import { createStorageRoutes } from './routes/storage'
+ import { createChatStatisticsRoutes } from './routes/chatStatistics'
+ import { createSideChatRoutes } from './routes/sideChats'
+@@ -303,6 +304,7 @@ function createWebApp(options: {
+     app.route('/api', createProviderHandoffRoutes(options.getSyncEngine, configuration.dbPath + '.handoffs.json'))
+     app.route('/api', createSessionGoalRoutes(options.getSyncEngine))
+     app.route('/api', createManagedSessionsRoutes())
++    app.route('/api', createNodeGraphRoutes(options.getSyncEngine))
+     app.route('/api', createCodexContextRoutes(options.getSyncEngine))
+     app.route('/api', createStorageRoutes(configuration.dbPath))
+     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+diff --git a/shared/package.json b/shared/package.json
+index df142b3..bf37654 100644
+--- a/shared/package.json
++++ b/shared/package.json
+@@ -8,6 +8,7 @@
+     "exports": {
+         ".": "./src/index.ts",
+         "./sessionManager": "./src/sessionManager.ts",
++        "./nodeGraph": "./src/nodeGraph.ts",
+         "./apiTypes": "./src/apiTypes.ts",
+         "./messages": "./src/messages.ts",
+         "./slashCommands": "./src/slashCommands.ts",
+diff --git a/shared/src/nodeGraph.ts b/shared/src/nodeGraph.ts
+new file mode 100644
+index 0000000..9c836e4
+--- /dev/null
++++ b/shared/src/nodeGraph.ts
+@@ -0,0 +1,72 @@
++/**
++ * Node-graph workspaces. The hub stores nodes/edges/layout per workspace slot;
++ * the external supervisor derives management (owner -> child) from the active
++ * workspace's edges. Graph data never sends messages or changes goals.
++ */
++export type NodeWorkspaceKind = 'default' | 'preset'
++
++export type NodeWorkspace = {
++    id: string
++    name: string
++    kind: NodeWorkspaceKind
++    createdAt: number
++    updatedAt: number
++}
++
++export type NodeGraphNode = {
++    sessionId: string
++    /** Layout position in graph units; null until placed by the user or auto-layout. */
++    x: number | null
++    y: number | null
++    addedAt: number
++}
++
++export type NodeGraphEdge = {
++    owner: string
++    child: string
++    createdAt: number
++    /** 'user' for UI edits, otherwise the acting session id (overseer or mid-level agent). */
++    createdBy: string
++}
++
++export type NodeGraph = {
++    workspaceId: string
++    nodes: NodeGraphNode[]
++    edges: NodeGraphEdge[]
++}
++
++export type NodeGraphResponse = {
++    activeWorkspaceId: string
++    workspaces: NodeWorkspace[]
++    graph: NodeGraph
++    /** Root of every workspace; implicit node even when not stored. */
++    overseer: string | null
++    /** Durable manual Stop time per node (members only). */
++    pausedAt?: Record<string, number>
++}
++
++export type NodeSwitchResult = NodeGraphResponse & { stopped: string[]; failed: { sessionId: string; error: string }[] }
++
++export type NodeLayoutPositions = Record<string, { x: number; y: number }>
++
++/** True when a child is idle: no inference, no background work, no pending input. */
++export function nodeIsIdle(session: { active: boolean; thinking: boolean; backgroundTaskCount?: number; pendingRequestsCount?: number } | null | undefined): boolean {
++    if (!session) return true
++    return !(session.active && (session.thinking || (session.backgroundTaskCount ?? 0) > 0 || (session.pendingRequestsCount ?? 0) > 0))
++}
++
++/** An edge sleeps while its child is idle. */
++export const edgeAsleep = nodeIsIdle
++
++/** Would setting owner->child create a cycle in a single-owner tree? */
++export function createsCycle(edges: readonly Pick<NodeGraphEdge, 'owner' | 'child'>[], owner: string, child: string): boolean {
++    if (owner === child) return true
++    const parent = new Map(edges.map(edge => [edge.child, edge.owner]))
++    const seen = new Set<string>()
++    for (let current: string | undefined = owner; current !== undefined; current = parent.get(current)) {
++        if (current === child) return true
++        if (seen.has(current)) return true
++        seen.add(current)
++    }
++    return false
++}
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index b5866db..77f1c47 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -29,6 +29,7 @@ import { canUseAppBadging, useAppBadge } from '@/hooks/useAppBadge'
+ import { useAppBadgePreference } from '@/hooks/useAppBadgePreference'
+ import { reconcileQueuedStateAfterConnect } from '@/lib/queued-state-reconciliation'
+ import { SessionManagerHost } from '@/components/SessionManagerHost'
++import { NodeGraphHost } from '@/components/NodeGraphHost'
+ import { LoginPrompt } from '@/components/LoginPrompt'
+ import { InstallPrompt } from '@/components/InstallPrompt'
+ import { OfflineBanner } from '@/components/OfflineBanner'
+@@ -534,6 +535,7 @@ function AppInner() {
+                     <Outlet />
+                 </div>
+                 <SessionManagerHost />
++                <NodeGraphHost />
+                 <ToastContainer />
+                 <InstallPrompt />
+             </VoiceProvider>
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index e0d6cd4..c8fa63a 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,4 +1,5 @@
+ import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
++import type { NodeGraphResponse, NodeLayoutPositions, NodeSwitchResult } from '@hapi/protocol/nodeGraph'
+ import type {
+     AttachmentMetadata,
+     AuthResponse,
+@@ -66,6 +67,15 @@ import type { TranscriptionMode, TranscriptionProvider, TranscriptionProviderInf
+ 
+ 
+ /** A chat the persistent manager runs (worker) or the manager chat itself. */
++/** Accepts a flat NodeGraphResponse or one wrapped as `{ graph: NodeGraphResponse }`. */
++export function nodeGraphOf(raw: unknown): NodeGraphResponse | null {
++    const isGraph = (value: unknown): value is NodeGraphResponse => Boolean(value && typeof value === 'object'
++        && typeof (value as NodeGraphResponse).activeWorkspaceId === 'string' && Array.isArray((value as NodeGraphResponse).workspaces)
++        && Array.isArray((value as NodeGraphResponse).graph?.nodes))
++    if (isGraph(raw)) return { activeWorkspaceId: raw.activeWorkspaceId, workspaces: raw.workspaces, graph: { ...raw.graph, edges: raw.graph.edges ?? [] }, overseer: raw.overseer ?? null, ...(raw.pausedAt ? { pausedAt: raw.pausedAt } : {}) }
++    const inner = raw && typeof raw === 'object' ? (raw as { graph?: unknown }).graph : undefined
++    return isGraph(inner) ? nodeGraphOf(inner) : null
++}
+ export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean }
+ 
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+@@ -868,6 +878,58 @@ export class ApiClient {
+         return (await this.request<{ sessions: Record<string, ManagedSession> }>('/api/managed-sessions')).sessions
+     }
+ 
++    async getNodeGraph(): Promise<NodeGraphResponse> {
++        const graph = nodeGraphOf(await this.request<unknown>('/api/node-graph'))
++        if (!graph) throw new Error('Invalid node graph response')
++        return graph
++    }
++
++    private async nodeGraphPost(path: string, body?: unknown): Promise<Record<string, unknown>> {
++        return await this.request<Record<string, unknown>>(`/api/node-graph${path}`, { method: 'POST', body: JSON.stringify(body ?? {}) })
++    }
++
++    /** Graph mutations return the updated graph (flat or as `{graph}`); null when the hub sent none. */
++    async addNode(sessionId: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost('/nodes', { sessionId }))
++    }
++
++    async removeNodes(ids: readonly string[]): Promise<{ graph: NodeGraphResponse | null; skippedIds: string[] }> {
++        const result = await this.nodeGraphPost('/nodes/remove', { ids })
++        return { graph: nodeGraphOf(result), skippedIds: Array.isArray(result.skippedIds) ? result.skippedIds as string[] : [] }
++    }
++
++    async saveNodeLayout(positions: NodeLayoutPositions): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost('/layout', { positions }))
++    }
++
++    async setNodeOwner(owner: string, child: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost('/edges', { owner, child, createdBy: 'user' }))
++    }
++
++    async detachNode(child: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost('/edges/remove', { child }))
++    }
++
++    async saveWorkspace(name: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost('/workspaces', { name }))
++    }
++
++    async renameWorkspace(id: string, name: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost(`/workspaces/${encodeURIComponent(id)}/rename`, { name }))
++    }
++
++    async deleteWorkspace(id: string): Promise<NodeGraphResponse | null> {
++        return nodeGraphOf(await this.nodeGraphPost(`/workspaces/${encodeURIComponent(id)}/delete`))
++    }
++
++    /** Stops (durable manual pause) every node of the slot being left except the overseer. */
++    async activateWorkspace(id: string): Promise<NodeSwitchResult> {
++        const result = await this.nodeGraphPost(`/workspaces/${encodeURIComponent(id)}/activate`, { confirm: true })
++        const graph = nodeGraphOf(result)
++        if (!graph) throw new Error('Invalid workspace switch response')
++        return { ...graph, stopped: Array.isArray(result.stopped) ? result.stopped as string[] : [], failed: Array.isArray(result.failed) ? result.failed as NodeSwitchResult['failed'] : [] }
++    }
++
+     async getSessionGoal(sessionId: string): Promise<SessionGoal | null> {
+         return (await this.request<{ goal: SessionGoal | null }>(`/api/sessions/${encodeURIComponent(sessionId)}/goal`)).goal
+     }
+diff --git a/web/src/api/nodeGraphClient.test.ts b/web/src/api/nodeGraphClient.test.ts
+new file mode 100644
+index 0000000..2d16744
+--- /dev/null
++++ b/web/src/api/nodeGraphClient.test.ts
+@@ -0,0 +1,53 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { ApiClient, nodeGraphOf } from './client'
++
++const graph = {
++    activeWorkspaceId: 'default', overseer: 'O',
++    workspaces: [{ id: 'default', name: 'Default', kind: 'default', createdAt: 1, updatedAt: 1 }],
++    graph: { workspaceId: 'default', nodes: [{ sessionId: 'A', x: null, y: null, addedAt: 1 }], edges: [] },
++}
++let fetchMock: ReturnType<typeof vi.fn>
++const original = globalThis.fetch
++beforeEach(() => { fetchMock = vi.fn(async () => new Response(JSON.stringify(graph), { status: 200 })); globalThis.fetch = fetchMock as unknown as typeof fetch })
++afterEach(() => { globalThis.fetch = original })
++const call = (index: number) => ({ url: fetchMock.mock.calls[index]![0], method: fetchMock.mock.calls[index]![1]?.method ?? 'GET', body: fetchMock.mock.calls[index]![1]?.body ? JSON.parse(fetchMock.mock.calls[index]![1].body) : undefined })
++
++it('uses the node-graph endpoints and bodies from NODEGRAPH.md', async () => {
++    const api = new ApiClient('token')
++    await api.getNodeGraph()
++    await api.addNode('A')
++    await api.saveNodeLayout({ A: { x: 1, y: 2 } })
++    await api.setNodeOwner('O', 'A')
++    await api.detachNode('A')
++    await api.saveWorkspace('Evening')
++    await api.renameWorkspace('p 1', 'Night')
++    await api.deleteWorkspace('p 1')
++    expect([0, 1, 2, 3, 4, 5, 6, 7].map(call)).toEqual([
++        { url: '/api/node-graph', method: 'GET', body: undefined },
++        { url: '/api/node-graph/nodes', method: 'POST', body: { sessionId: 'A' } },
++        { url: '/api/node-graph/layout', method: 'POST', body: { positions: { A: { x: 1, y: 2 } } } },
++        { url: '/api/node-graph/edges', method: 'POST', body: { owner: 'O', child: 'A', createdBy: 'user' } },
++        { url: '/api/node-graph/edges/remove', method: 'POST', body: { child: 'A' } },
++        { url: '/api/node-graph/workspaces', method: 'POST', body: { name: 'Evening' } },
++        { url: '/api/node-graph/workspaces/p%201/rename', method: 'POST', body: { name: 'Night' } },
++        { url: '/api/node-graph/workspaces/p%201/delete', method: 'POST', body: {} },
++    ])
++})
++
++it('returns skipped ids from removal and switch results from activation', async () => {
++    const api = new ApiClient('token')
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ graph, skippedIds: ['B'] }), { status: 200 }))
++    await expect(api.removeNodes(['A', 'B'])).resolves.toEqual({ graph, skippedIds: ['B'] })
++    expect(call(0)).toEqual({ url: '/api/node-graph/nodes/remove', method: 'POST', body: { ids: ['A', 'B'] } })
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ...graph, stopped: ['A'], failed: [{ sessionId: 'B', error: 'x' }] }), { status: 200 }))
++    await expect(api.activateWorkspace('p1')).resolves.toEqual({ ...graph, stopped: ['A'], failed: [{ sessionId: 'B', error: 'x' }] })
++    expect(call(1)).toEqual({ url: '/api/node-graph/workspaces/p1/activate', method: 'POST', body: { confirm: true } })
++})
++
++it('accepts flat or wrapped graph responses and rejects anything else', () => {
++    expect(nodeGraphOf(graph)).toEqual(graph)
++    expect(nodeGraphOf({ graph })).toEqual(graph)
++    expect(nodeGraphOf({ ...graph, skippedIds: [] })).toEqual(graph)
++    expect(nodeGraphOf({ ok: true })).toBeNull()
++    expect(nodeGraphOf(null)).toBeNull()
++})
+diff --git a/web/src/components/AssistantChat/HappyThread.tsx b/web/src/components/AssistantChat/HappyThread.tsx
+index 00f5c2b..74efbe2 100644
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -72,6 +72,9 @@ type ShareTurnSnapshot = {
+     role?: 'user' | 'assistant'
+ }
+ 
++// Stable while closed: a fresh [] each render re-runs the dialog's state-setting layout effect.
++const NO_SHARE_SNAPSHOTS: never[] = []
++
+ export function isNestedScrollEvent(event: Event): boolean {
+     const target = event.target
+     const element = typeof Element !== 'undefined' && target instanceof Element
+@@ -1809,7 +1812,7 @@ export function HappyThread(props: {
+                     isOpen={shareTurn !== null}
+                     title={shareTitle}
+                     metadataItems={shareMetadataItems}
+-                    sourceSnapshots={shareTurn?.snapshots ?? []}
++                    sourceSnapshots={shareTurn?.snapshots ?? NO_SHARE_SNAPSHOTS}
+                     sourceContentWidth={shareTurn?.sourceContentWidth ?? null}
+                     onClose={() => setShareTurn(null)}
+                 />
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+new file mode 100644
+index 0000000..d8f7451
+--- /dev/null
++++ b/web/src/components/FloatingWindow.tsx
+@@ -0,0 +1,213 @@
++import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
++import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
++import { createPortal } from 'react-dom'
++import { useNarrowViewport } from '@/hooks/useNarrowViewport'
++
++export type WindowBounds = { x: number; y: number; width: number; height: number }
++type Position = Pick<WindowBounds, 'x' | 'y'>
++type WindowState = { open: boolean; collapsed?: boolean; pinnedCollapsed?: boolean; bounds?: WindowBounds; bubble?: Position }
++/** Identity of one floating window: cache key for its state, accessible name, bubble icon. */
++export type FloatingWindowConfig = { key: readonly unknown[]; name: string; unit: string; icon: ReactNode; size?: { width: number; height: number } }
++const BUBBLE = { width: 96, height: 44 }
++const viewport = () => ({
++    x: window.visualViewport?.offsetLeft ?? 0, y: window.visualViewport?.offsetTop ?? 0,
++    width: window.visualViewport?.width ?? window.innerWidth, height: window.visualViewport?.height ?? window.innerHeight,
++})
++function mobileDevice(): boolean {
++    return typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
++        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
++}
++export function useFloatingWindowMobile(): boolean {
++    const narrow = useNarrowViewport()
++    // Used for returning to the selected chat with a compact bubble on mobile.
++    return narrow || mobileDevice()
++}
++// Leave 5% visible at each edge. The launcher remains available to close it.
++function fitPosition(position: Position, size: { width: number; height: number }, view = viewport()): Position {
++    return {
++        x: Math.max(view.x - size.width * .95, Math.min(position.x, view.x + view.width - size.width * .05)),
++        y: Math.max(view.y - size.height * .95, Math.min(position.y, view.y + view.height - size.height * .05)),
++    }
++}
++export function fitSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
++    const availableWidth = Math.max(1, view.width - 16), availableHeight = Math.max(1, view.height - 16)
++    const width = Math.min(availableWidth, Math.max(Math.min(280, availableWidth), bounds.width))
++    const height = Math.min(availableHeight, Math.max(Math.min(260, availableHeight), bounds.height))
++    return { width, height, ...fitPosition(bounds, { width, height }, view) }
++}
++export function fitSessionBubble(position: Position, view = viewport()): Position {
++    return fitPosition(position, BUBBLE, view)
++}
++// Automatic recovery is separate from manual placement: drag/resize still permits
++// 95% offscreen. Explicit reopen/expand and a changed viewport restore the controls.
++export function recoverSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
++    const fitted = fitSessionWindow(bounds, view)
++    return { ...fitted,
++        x: Math.max(view.x + 8, Math.min(fitted.x, view.x + view.width - fitted.width - 8)),
++        y: Math.max(view.y + 8, Math.min(fitted.y, view.y + view.height - fitted.height - 8)) }
++}
++function recoverSessionBubble(position: Position, view = viewport()): Position {
++    return { x: Math.max(view.x, Math.min(position.x, view.x + view.width - BUBBLE.width)),
++        y: Math.max(view.y, Math.min(position.y, view.y + view.height - BUBBLE.height)) }
++}
++function initialBoundsFor(size = { width: 480, height: 560 }): WindowBounds {
++    const view = viewport(), width = Math.min(size.width, view.width - 24), height = Math.min(size.height, view.height * .72)
++    return fitSessionWindow({ width, height, x: view.x + view.width - width - 16, y: view.y + 64 }, view)
++}
++export function useFloatingWindow({ key: WINDOW_KEY, size }: Pick<FloatingWindowConfig, 'key' | 'size'>) {
++    const client = useQueryClient()
++    const { data = { open: false } } = useQuery<WindowState>({ queryKey: WINDOW_KEY, queryFn: skipToken, initialData: { open: false }, enabled: false, gcTime: Infinity })
++    const initialBounds = () => initialBoundsFor(size)
++    return {
++        ...data,
++        setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open, ...(open && !old?.open ? { collapsed: false, bounds: recoverSessionWindow(old?.bounds ?? initialBounds()) } : {}) })),
++        toggleOpen: () => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: !old?.open, collapsed: false, ...(!old?.open ? { bounds: recoverSessionWindow(old?.bounds ?? initialBounds()) } : {}) })),
++        setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => {
++            if (collapsed === Boolean(old?.collapsed)) return old
++            const bounds = fitSessionWindow(old?.bounds ?? initialBounds())
++            const bubble = fitSessionBubble(collapsed ? bounds : old?.bubble ?? bounds)
++            return { ...old, open: true, collapsed, bubble, bounds: collapsed ? bounds : recoverSessionWindow({ ...bounds, ...bubble }) }
++        }),
++        setPinnedCollapsed: (pinnedCollapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, pinnedCollapsed })),
++        setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bounds })),
++        setBubble: (bubble: Position) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bubble })),
++    }
++}
++
++/** A movable, resizable window or draggable bubble on desktop and mobile. */
++export function FloatingWindow({ config, title, children, count = 0, bodyClassName = 'flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7' }: {
++    config: FloatingWindowConfig; title?: ReactNode; children: ReactNode; count?: number; bodyClassName?: string
++}) {
++    const { name, unit, icon, size } = config
++    const { open, collapsed, bounds, bubble, setBounds, setBubble, setOpen, setCollapsed } = useFloatingWindow(config)
++    const initialBounds = () => initialBoundsFor(size)
++    const initialBubble = (): Position => { const { x, y } = initialBounds(); return { x, y } }
++    const [view, setView] = useState(viewport)
++    const titleId = useId()
++    const focusTarget = useRef<HTMLButtonElement>(null)
++    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize' | 'bubble'; x: number; y: number; bounds: WindowBounds } | null>(null)
++    const suppressBubbleClick = useRef(false)
++    const current = useRef({ bounds, bubble })
++    current.current = { bounds, bubble }
++    useEffect(() => {
++        if (!open) return
++        let previousView = viewport()
++        setView(previousView)
++        const fit = () => {
++            const nextView = viewport()
++            if (Object.keys(nextView).every(key => nextView[key as keyof typeof nextView] === previousView[key as keyof typeof previousView])) return
++            previousView = nextView
++            gesture.current = null
++            setView(nextView)
++            if (collapsed) setBubble(recoverSessionBubble(current.current.bubble ?? initialBubble(), nextView))
++            else {
++                const preferred = current.current.bounds ?? initialBounds()
++                const recovered = recoverSessionWindow(preferred, nextView)
++                // Keyboard/rotation temporarily constrain rendering, not the user's preferred size.
++                setBounds({ ...recovered, width: preferred.width, height: preferred.height })
++            }
++        }
++        focusTarget.current?.focus({ preventScroll: true })
++        window.addEventListener('resize', fit)
++        window.visualViewport?.addEventListener('resize', fit)
++        window.visualViewport?.addEventListener('scroll', fit)
++        return () => {
++            gesture.current = null
++            window.removeEventListener('resize', fit)
++            window.visualViewport?.removeEventListener('resize', fit)
++            window.visualViewport?.removeEventListener('scroll', fit)
++        }
++        // Cache setters use the latest state; viewport handlers read refs.
++        // eslint-disable-next-line react-hooks/exhaustive-deps
++    }, [open, collapsed])
++    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize' | 'bubble') => {
++        if (event.button !== 0 || gesture.current) return
++        // Touch already has implicit capture; touch-action:none handles dragging.
++        // Preserve native taps instead of cancelling/focusing touch pointerdown.
++        if (event.pointerType !== 'touch') {
++            event.preventDefault()
++            event.currentTarget.focus({ preventScroll: true })
++            event.currentTarget.setPointerCapture(event.pointerId)
++        }
++        suppressBubbleClick.current = false
++        const rect = kind === 'bubble' ? { ...fitSessionBubble(current.current.bubble ?? initialBubble()), ...BUBBLE } : fitSessionWindow(current.current.bounds ?? initialBounds())
++        gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: rect }
++    }
++    const move = (event: PointerEvent<HTMLButtonElement>) => {
++        const start = gesture.current
++        if (!start || start.pointer !== event.pointerId) return
++        const dx = event.clientX - start.x, dy = event.clientY - start.y
++        if (start.kind === 'bubble') {
++            if (Math.hypot(dx, dy) > 5) {
++                suppressBubbleClick.current = true
++                if (event.pointerType !== 'touch') event.currentTarget.setPointerCapture(event.pointerId)
++            }
++            if (suppressBubbleClick.current) setBubble(fitSessionBubble({ x: start.bounds.x + dx, y: start.bounds.y + dy }))
++            return
++        }
++        const next = start.kind === 'move'
++            ? { ...start.bounds, x: start.bounds.x + dx, y: start.bounds.y + dy }
++            : { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
++        const view = viewport()
++        if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
++        setBounds(fitSessionWindow(next))
++    }
++    const end = (event: PointerEvent<HTMLButtonElement>) => {
++        if (gesture.current?.pointer !== event.pointerId) return
++        if (event.type === 'pointercancel') suppressBubbleClick.current = true
++        gesture.current = null
++        // Native touch capture is released by the browser.
++        if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
++    }
++    const keyboard = (event: KeyboardEvent, kind: 'move' | 'resize' | 'bubble') => {
++        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
++        event.preventDefault()
++        const step = event.shiftKey ? 40 : 10
++        const horizontal = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
++        const change = (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1) * step
++        if (kind === 'bubble') {
++            const next = { ...(current.current.bubble ?? initialBubble()) }
++            next[horizontal ? 'x' : 'y'] += change
++            setBubble(fitSessionBubble(next)); return
++        }
++        const next = { ...(current.current.bounds ?? initialBounds()) }
++        if (kind === 'move') next[horizontal ? 'x' : 'y'] += change
++        else next[horizontal ? 'width' : 'height'] += change
++        setBounds(fitSessionWindow(next))
++    }
++    if (!open) return null
++    const pointerEvents = { onPointerMove: move, onPointerUp: end, onPointerCancel: end, onLostPointerCapture: () => { gesture.current = null } }
++    const close = <button type="button" aria-label={`Close ${name}`} onClick={() => setOpen(false)} className={`${collapsed ? 'h-11 w-8 border-l border-[var(--app-divider)]' : 'h-11 w-11 rounded-full'} flex shrink-0 items-center justify-center text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]`}><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-3.5 w-3.5"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
++    if (collapsed) {
++        const position = fitSessionBubble(bubble ?? initialBubble(), view)
++        return createPortal(<div className="pointer-events-none fixed inset-0 z-[45] overflow-hidden"><aside aria-label={`${name} bubble`} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false) } }}
++            className="pointer-events-auto absolute flex items-center overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-lg"
++            style={{ left: position.x, top: position.y, ...BUBBLE }}>
++            <button ref={focusTarget} type="button" aria-label={`Expand ${name}`} title={`${name} · ${count} ${unit} · drag to move`} onPointerDown={event => start(event, 'bubble')} {...pointerEvents}
++                onKeyDown={event => keyboard(event, 'bubble')} onClick={event => { if (!suppressBubbleClick.current || event.detail === 0) setCollapsed(false); suppressBubbleClick.current = false }}
++                className="flex h-full min-w-0 flex-1 touch-none select-none items-center justify-center gap-1 rounded-l-xl cursor-grab active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                {icon}
++                <span className="text-xs font-medium tabular-nums">{count > 99 ? '99+' : count}</span>
++            </button>{close}
++        </aside></div>, document.body)
++    }
++    const rect = fitSessionWindow(bounds ?? initialBounds(), view)
++    return createPortal(<div className="pointer-events-none fixed inset-0 z-[45] overflow-hidden"><section role="dialog" aria-modal="false" aria-labelledby={titleId}
++        onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
++        className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
++        style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
++        <header className="flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
++            <button ref={focusTarget} type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
++                onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
++            </button>
++            <button type="button" aria-label={`Collapse ${name}`} title="Collapse to bubble" onClick={() => setCollapsed(true)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">−</button>
++            {close}
++        </header>
++        <div className={bodyClassName}>{children}</div>
++        <button type="button" aria-label={`Resize ${name}`} title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
++            onKeyDown={event => keyboard(event, 'resize')} className="absolute bottom-0 right-0 flex h-7 w-7 touch-none select-none items-center justify-center rounded-tl-lg bg-[var(--app-dialog-bg)] text-[var(--app-hint)] cursor-nwse-resize focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++            <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor"><path d="m4 13 9-9M9 13l4-4"/></svg>
++        </button>
++    </section></div>, document.body)
++}
+diff --git a/web/src/components/NodeGraphHost.tsx b/web/src/components/NodeGraphHost.tsx
+new file mode 100644
+index 0000000..5ae9229
+--- /dev/null
++++ b/web/src/components/NodeGraphHost.tsx
+@@ -0,0 +1,29 @@
++import { useNavigate } from '@tanstack/react-router'
++import { useAppContext } from '@/lib/app-context'
++import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
++import { useSessions } from '@/hooks/queries/useSessions'
++import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import { FloatingWindow, useFloatingWindowMobile } from './FloatingWindow'
++import { NodeGraphView } from './NodeGraphView'
++import { NODE_GRAPH_WINDOW, useNodeGraphWindow } from './NodeGraphWindow'
++
++/** Detached graph window; lives above routing like SessionManagerHost. */
++export function NodeGraphHost() {
++    const { open } = useNodeGraphWindow()
++    return open ? <NodeGraphWindowContent /> : null
++}
++
++function NodeGraphWindowContent() {
++    const { api } = useAppContext()
++    const navigate = useNavigate()
++    const { sessions, isLoading } = useSessions(api)
++    const { collapsed, setCollapsed } = useNodeGraphWindow()
++    const mobile = useFloatingWindowMobile()
++    const { data } = useNodeGraph(api)
++    const name = activeWorkspaceName(data)
++    return <FloatingWindow config={NODE_GRAPH_WINDOW} title={name ? `Nodes · ${name}` : 'Nodes'} count={data?.graph.nodes.length ?? 0} bodyClassName="flex min-h-0 flex-1 flex-col">
++        <NodeGraphView api={api} sessions={isLoading ? undefined : sessions} visible={!collapsed}
++            onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)); if (mobile) setCollapsed(true) }}
++            onOpenChats={() => { void navigate({ to: '/sessions' }); if (mobile) setCollapsed(true) }} />
++    </FloatingWindow>
++}
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+new file mode 100644
+index 0000000..edc5d0a
+--- /dev/null
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -0,0 +1,317 @@
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { ApiClient } from '@/api/client'
++import type { SessionSummary } from '@/types/api'
++import { I18nProvider } from '@/lib/i18n-context'
++import { NODE_SIZE } from '@/lib/nodeGraphLayout'
++import { NodeGraphView, nodeStatus } from './NodeGraphView'
++
++beforeEach(() => {
++    vi.stubGlobal('PointerEvent', class extends MouseEvent {
++        pointerId: number
++        pointerType: string
++        constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1; this.pointerType = init.pointerType ?? 'mouse' }
++    })
++})
++afterEach(() => { cleanup(); vi.unstubAllGlobals() })
++
++const session = (id: string, name: string, over: Partial<SessionSummary> = {}): SessionSummary => ({
++    id, active: true, thinking: false, activeAt: 1, updatedAt: 1, metadata: { name, path: '/w', flavor: 'codex' },
++    metadataVersion: 0, agentStateVersion: 0, todosUpdatedAt: 0, todoProgress: null, pendingRequestsCount: 0, pendingRequestKinds: [], pendingRequests: [],
++    backgroundTaskCount: 0, futureScheduledMessageCount: 0, nextScheduledAt: null, model: null, effort: null, ...over,
++})
++const sessions = [
++    session('O', 'Overseer chat', { thinking: true }),
++    session('A', 'Alpha', { thinking: true }),
++    session('B', 'Bravo'),
++    session('C', 'Charlie', { backgroundTaskCount: 1 }),
++    session('L', 'Lone one', { active: false }),
++    session('N', 'New chat'),
++]
++const initial = (): NodeGraphResponse => ({
++    activeWorkspaceId: 'default', overseer: 'O',
++    workspaces: [
++        { id: 'p1', name: 'Research', kind: 'preset', createdAt: 2, updatedAt: 2 },
++        { id: 'default', name: 'Default', kind: 'default', createdAt: 1, updatedAt: 1 },
++    ],
++    graph: { workspaceId: 'default', nodes: ['A', 'B', 'C', 'L'].map(sessionId => ({ sessionId, x: null, y: null, addedAt: 1 })), edges: [
++        { owner: 'O', child: 'A', createdAt: 1, createdBy: 'user' }, { owner: 'O', child: 'B', createdAt: 1, createdBy: 'user' }, { owner: 'A', child: 'C', createdAt: 1, createdBy: 'user' },
++    ] },
++})
++
++function makeApi(options: { skip?: string[] } = {}) {
++    let state = initial()
++    const copy = () => structuredClone(state)
++    const setEdges = (child: string, owner?: string) => {
++        state.graph.edges = state.graph.edges.filter(edge => edge.child !== child)
++        if (owner) state.graph.edges.push({ owner, child, createdAt: 2, createdBy: 'user' })
++    }
++    const api = {
++        getNodeGraph: vi.fn(async () => copy()),
++        setNodeOwner: vi.fn(async (owner: string, child: string) => { setEdges(child, owner); return copy() }),
++        detachNode: vi.fn(async (child: string) => { setEdges(child); return copy() }),
++        removeNodes: vi.fn(async (ids: string[]) => {
++            const skippedIds = ids.filter(id => options.skip?.includes(id))
++            const removed = ids.filter(id => !skippedIds.includes(id))
++            state.graph.nodes = state.graph.nodes.filter(node => !removed.includes(node.sessionId))
++            state.graph.edges = state.graph.edges.filter(edge => !removed.includes(edge.child) && !removed.includes(edge.owner))
++            return { graph: copy(), skippedIds }
++        }),
++        addNode: vi.fn(async (sessionId: string) => { state.graph.nodes.push({ sessionId, x: null, y: null, addedAt: 2 }); return copy() }),
++        saveNodeLayout: vi.fn(async (positions: Record<string, { x: number; y: number }>) => {
++            state.graph.nodes = state.graph.nodes.map(node => positions[node.sessionId] ? { ...node, ...positions[node.sessionId] } : node)
++            return copy()
++        }),
++        saveWorkspace: vi.fn(async (name: string) => { state.workspaces.push({ id: 'p2', name, kind: 'preset', createdAt: 3, updatedAt: 3 }); return copy() }),
++        renameWorkspace: vi.fn(async (id: string, name: string) => { state.workspaces = state.workspaces.map(w => w.id === id ? { ...w, name } : w); return copy() }),
++        deleteWorkspace: vi.fn(async (id: string) => { state.workspaces = state.workspaces.filter(w => w.id !== id); return copy() }),
++        activateWorkspace: vi.fn(async (id: string) => {
++            state = { ...state, activeWorkspaceId: id, graph: { workspaceId: id, nodes: [], edges: [] } }
++            return { ...copy(), stopped: ['A', 'B'], failed: [{ sessionId: 'C', error: 'offline' }] }
++        }),
++        abortSession: vi.fn(async () => {}),
++    }
++    return api
++}
++
++function setup(api = makeApi(), list: SessionSummary[] = sessions) {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++    const onOpenChat = vi.fn()
++    const view = render(<QueryClientProvider client={client}><I18nProvider>
++        <NodeGraphView api={api as unknown as ApiClient} sessions={list} onOpenChat={onOpenChat} />
++    </I18nProvider></QueryClientProvider>)
++    return { api, client, onOpenChat, view }
++}
++const openNode = async (name: string) => {
++    fireEvent.click(await screen.findByRole('button', { name: `Node ${name}` }))
++    return screen.findByRole('dialog', { name: `Actions for ${name}` })
++}
++/** Client coordinates of a node card's centre under the current pan/zoom. */
++const nodeCentre = (id: string) => {
++    const card = document.querySelector<HTMLElement>(`[data-node-id="${id}"]`)!
++    const world = card.parentElement!
++    const [, x, y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
++    return { clientX: x! + (parseFloat(card.style.left) + NODE_SIZE.width / 2) * k!, clientY: y! + (parseFloat(card.style.top) + NODE_SIZE.height / 2) * k! }
++}
++
++describe('nodeStatus', () => {
++    it('maps live summary state to node labels', () => {
++        expect(nodeStatus(session('x', 'x', { thinking: true }))).toBe('Running')
++        expect(nodeStatus(session('x', 'x', { backgroundTaskCount: 2 }))).toBe('Background')
++        expect(nodeStatus(session('x', 'x'))).toBe('Idle')
++        expect(nodeStatus(session('x', 'x', { active: false }))).toBe('Inactive')
++        expect(nodeStatus({ ...session('x', 'x'), manualPausedAt: 5 } as SessionSummary)).toBe('Paused')
++        expect(nodeStatus(undefined)).toBe('Unavailable')
++        expect(nodeStatus(undefined, false)).toBe('Loading')
++    })
++})
++
++describe('NodeGraphView', () => {
++    it('draws the overseer root, statuses, lone area and asleep/active edges', async () => {
++        setup()
++        const overseer = await screen.findByRole('button', { name: 'Node Overseer chat' })
++        expect(within(overseer).getByText('Overseer')).toBeInTheDocument()
++        expect(within(screen.getByRole('button', { name: 'Node Alpha' })).getByText(/Running/)).toBeInTheDocument()
++        expect(within(screen.getByRole('button', { name: 'Node Charlie' })).getByText(/Background/)).toBeInTheDocument()
++        expect(within(screen.getByRole('button', { name: 'Node Bravo' })).getByText(/Idle/)).toBeInTheDocument()
++        expect(within(screen.getByRole('button', { name: 'Node Lone one' })).getByText(/Inactive/)).toBeInTheDocument()
++        expect(screen.getByText('Lone')).toBeInTheDocument()
++        expect(document.querySelector('[data-edge="O->A"]')).toHaveAttribute('data-asleep', 'false')
++        expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('data-asleep', 'true')
++        expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('stroke-dasharray', '5 5')
++        expect(document.querySelector('[data-edge="A->C"]')).toHaveAttribute('data-asleep', 'false')
++    })
++
++    it('opens a chat from the node menu', async () => {
++        const { onOpenChat } = setup()
++        const menu = await openNode('Bravo')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Open chat' }))
++        expect(onOpenChat).toHaveBeenCalledWith('B')
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++    })
++
++    it('sets an owner from a picker that excludes the node and its descendants', async () => {
++        const { api } = setup()
++        const menu = await openNode('Alpha')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Set owner…' }))
++        const picker = within(menu).getByRole('group', { name: 'Choose owner' })
++        expect(within(picker).queryByRole('button', { name: 'Make Alpha the owner' })).toBeNull()
++        expect(within(picker).queryByRole('button', { name: 'Make Charlie the owner' })).toBeNull()
++        expect(within(picker).getByRole('button', { name: 'Make Overseer chat the owner' })).toBeDisabled()
++        fireEvent.click(within(picker).getByRole('button', { name: 'Make Bravo the owner' }))
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'A'))
++        await waitFor(() => expect(document.querySelector('[data-edge="B->A"]')).not.toBeNull())
++        expect(screen.queryByRole('dialog', { name: 'Actions for Alpha' })).toBeNull()
++    })
++
++    it('offers no owner actions or removal for the overseer', async () => {
++        setup()
++        const menu = await openNode('Overseer chat')
++        expect(within(menu).queryByRole('button', { name: 'Set owner…' })).toBeNull()
++        expect(within(menu).queryByRole('button', { name: 'Detach from owner' })).toBeNull()
++        expect(within(menu).queryByRole('button', { name: 'Remove from workspace' })).toBeNull()
++    })
++
++    it('detaches a child so it becomes lone', async () => {
++        const { api } = setup()
++        const menu = await openNode('Bravo')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Detach from owner' }))
++        await waitFor(() => expect(api.detachNode).toHaveBeenCalledWith('B'))
++        await waitFor(() => expect(document.querySelector('[data-edge="O->B"]')).toBeNull())
++        expect(within(await openNode('Lone one')).queryByRole('button', { name: 'Detach from owner' })).toBeNull()
++    })
++
++    it('requires Stop before removing a busy node and reports skipped removals', async () => {
++        const { api } = setup(makeApi({ skip: ['A'] }))
++        const menu = await openNode('Alpha')
++        expect(within(menu).queryByRole('button', { name: 'Remove from workspace' })).toBeNull()
++        fireEvent.click(within(menu).getByRole('button', { name: 'Stop Alpha' }))
++        await waitFor(() => expect(api.abortSession).toHaveBeenCalledWith('A'))
++        fireEvent.click(await within(menu).findByRole('button', { name: 'Remove from workspace' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['A']))
++        expect(await within(menu).findByRole('alert')).toHaveTextContent('Alpha is still busy or unavailable and was not removed. Stop it first.')
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toBeInTheDocument()
++    })
++
++    it('removes an idle node', async () => {
++        const { api } = setup()
++        const menu = await openNode('Lone one')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Remove from workspace' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['L']))
++        await waitFor(() => expect(screen.queryByRole('button', { name: 'Node Lone one' })).toBeNull())
++    })
++
++    it('adds an existing chat as a lone node', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.click(screen.getByRole('button', { name: '+ Add chats' }))
++        expect(screen.queryByRole('button', { name: 'Add Alpha to workspace' })).toBeNull()
++        fireEvent.change(screen.getByRole('searchbox', { name: 'Search chats to add' }), { target: { value: 'new' } })
++        fireEvent.click(screen.getByRole('button', { name: 'Add New chat to workspace' }))
++        await waitFor(() => expect(api.addNode).toHaveBeenCalledWith('N'))
++        await screen.findByRole('button', { name: 'Node New chat' })
++    })
++
++    it('drags a node and saves the layout once, debounced', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Bravo' })
++        const card = screen.getByRole('button', { name: 'Node Bravo' })
++        const start = nodeCentre('B'), left = parseFloat(card.parentElement!.style.left)
++        fireEvent.pointerDown(card, { pointerId: 1, button: 0, ...start })
++        fireEvent.pointerMove(card, { pointerId: 1, clientX: start.clientX + 20, clientY: start.clientY })
++        fireEvent.pointerMove(card, { pointerId: 1, clientX: start.clientX + 40, clientY: start.clientY + 10 })
++        fireEvent.pointerUp(card, { pointerId: 1, clientX: start.clientX + 40, clientY: start.clientY + 10 })
++        expect(parseFloat(card.parentElement!.style.left)).toBeGreaterThan(left)
++        expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledTimes(1))
++        const saved = api.saveNodeLayout.mock.calls[0]![0]
++        expect(Object.keys(saved)).toEqual(['B'])
++        expect(saved.B!.x).toBe(Math.round(parseFloat(card.parentElement!.style.left)))
++    })
++
++    it('tapping a node without moving opens its menu', async () => {
++        setup()
++        const card = await screen.findByRole('button', { name: 'Node Bravo' })
++        const start = nodeCentre('B')
++        fireEvent.pointerDown(card, { pointerId: 3, pointerType: 'touch', button: 0, ...start })
++        fireEvent.pointerUp(card, { pointerId: 3, pointerType: 'touch', ...start })
++        expect(await screen.findByRole('dialog', { name: 'Actions for Bravo' })).toBeInTheDocument()
++    })
++
++    it('drags from an owner handle onto another node to make it a child, refusing cycles', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Charlie' })
++        const handle = (id: string) => document.querySelector(`[data-link-handle="${id}"]`)!
++        // Charlie is Alpha's child: Charlie -> Alpha would be a cycle.
++        fireEvent.pointerDown(handle('C'), { pointerId: 1, button: 0, ...nodeCentre('C') })
++        fireEvent.pointerMove(handle('C'), { pointerId: 1, ...nodeCentre('A') })
++        fireEvent.pointerUp(handle('C'), { pointerId: 1, ...nodeCentre('A') })
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        fireEvent.pointerDown(handle('B'), { pointerId: 2, button: 0, ...nodeCentre('B') })
++        fireEvent.pointerMove(handle('B'), { pointerId: 2, ...nodeCentre('L') })
++        expect(screen.getByRole('button', { name: 'Node Lone one' }).className).toContain('ring-2')
++        fireEvent.pointerUp(handle('B'), { pointerId: 2, ...nodeCentre('L') })
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'L'))
++    })
++
++    it('zooms with buttons and fits back to view', async () => {
++        setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        const world = () => document.querySelector<HTMLElement>('[data-node-id="A"]')!.parentElement!.style.transform
++        const fitted = world()
++        fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++        expect(world()).not.toBe(fitted)
++        fireEvent.click(screen.getByRole('button', { name: 'Fit graph to view' }))
++        expect(world()).toBe(fitted)
++    })
++})
++
++describe('WorkspaceBar', () => {
++    it('confirms a switch, listing the sessions that will be stopped, then shows results', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        const slots = screen.getByRole('group', { name: 'Workspace slots' })
++        expect(within(slots).getAllByRole('listitem')[0]).toHaveTextContent('Default')
++        expect(within(slots).queryByRole('button', { name: 'Switch to Default' })).toBeNull()
++        expect(within(slots).queryByRole('button', { name: 'Rename Default' })).toBeNull()
++        fireEvent.click(within(slots).getByRole('button', { name: 'Switch to Research' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Switch to Research?' })
++        expect(dialog).toHaveTextContent('Switching stops 4 sessions in Default (durable Stop; resume them yourself). The overseer keeps running.')
++        const list = within(dialog).getByRole('list', { name: 'Sessions that will be stopped' })
++        expect(within(list).getAllByRole('listitem').map(item => item.textContent)).toEqual(['Alpha', 'Bravo', 'Charlie', 'Lone one'])
++        expect(api.activateWorkspace).not.toHaveBeenCalled()
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Stop and switch' }))
++        await waitFor(() => expect(api.activateWorkspace).toHaveBeenCalledWith('p1'))
++        const done = await screen.findByRole('dialog', { name: 'Switched to Research' })
++        expect(within(within(done).getByRole('list', { name: 'Stopped sessions' })).getAllByRole('listitem').map(item => item.textContent)).toEqual(['Alpha', 'Bravo'])
++        expect(within(done).getByRole('list', { name: 'Failed sessions' })).toHaveTextContent('Charlie: offline')
++        fireEvent.click(within(done).getByRole('button', { name: 'Done' }))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Workspaces' })).toHaveTextContent('Research'))
++        expect(screen.queryByRole('button', { name: 'Node Alpha' })).toBeNull()
++    })
++
++    it('cancelling a switch stops nothing', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Switch to Research' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Switch to Research?' })
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
++        await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Switch to Research?' })).toBeNull())
++        expect(api.activateWorkspace).not.toHaveBeenCalled()
++    })
++
++    it('saves, renames and deletes presets', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        fireEvent.change(screen.getByRole('textbox', { name: 'Preset name' }), { target: { value: 'Evening' } })
++        fireEvent.click(screen.getByRole('button', { name: 'Save as preset' }))
++        await waitFor(() => expect(api.saveWorkspace).toHaveBeenCalledWith('Evening'))
++        fireEvent.click(await screen.findByRole('button', { name: 'Rename Research' }))
++        fireEvent.change(screen.getByRole('textbox', { name: 'New name for Research' }), { target: { value: 'Papers' } })
++        fireEvent.click(screen.getByRole('button', { name: 'Save' }))
++        await waitFor(() => expect(api.renameWorkspace).toHaveBeenCalledWith('p1', 'Papers'))
++        fireEvent.click(await screen.findByRole('button', { name: 'Delete Evening' }))
++        expect(api.deleteWorkspace).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: 'Confirm delete Evening' }))
++        await waitFor(() => expect(api.deleteWorkspace).toHaveBeenCalledWith('p2'))
++        await waitFor(() => expect(screen.queryByText('Evening')).toBeNull())
++    })
++})
++
++describe('chat list link', () => {
++    it('offers Chats (the old back arrow) only when the host provides it', async () => {
++        const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++        const onOpenChats = vi.fn()
++        render(<QueryClientProvider client={client}><I18nProvider>
++            <NodeGraphView api={makeApi() as unknown as ApiClient} sessions={sessions} onOpenChat={vi.fn()} onOpenChats={onOpenChats} />
++        </I18nProvider></QueryClientProvider>)
++        fireEvent.click(await screen.findByRole('button', { name: 'Chats' }))
++        expect(onOpenChats).toHaveBeenCalledOnce()
++    })
++})
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+new file mode 100644
+index 0000000..86c3fef
+--- /dev/null
++++ b/web/src/components/NodeGraphView.tsx
+@@ -0,0 +1,429 @@
++import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
++import { createsCycle, edgeAsleep, nodeIsIdle, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
++import type { ApiClient } from '@/api/client'
++import type { SessionSummary } from '@/types/api'
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { useFloatingWindowMobile } from '@/components/FloatingWindow'
++import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import { clampZoom, fitTransform, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates, type GraphPoint } from '@/lib/nodeGraphLayout'
++import { getSessionTitle } from '@/lib/sessionTitle'
++
++export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Paused' | 'Inactive' | 'Unavailable' | 'Loading'
++type View = { x: number; y: number; k: number }
++type Mutate = ReturnType<typeof useNodeGraph>['mutate']
++type Gesture =
++    | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
++    | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
++    | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint }
++    | { kind: 'link'; pointer: number; from: string }
++
++/** Running/Background/Idle from live summary; Paused only when the summary carries manual-pause evidence. */
++export function nodeStatus(session: SessionSummary | undefined, loaded = true): NodeStatus {
++    if (!session) return loaded ? 'Unavailable' : 'Loading'
++    if ((session as { manualPausedAt?: number | null }).manualPausedAt != null) return 'Paused'
++    if (!nodeIsIdle(session)) return session.thinking || session.pendingRequestsCount > 0 ? 'Running' : 'Background'
++    return session.active ? 'Idle' : 'Inactive'
++}
++const STATUS_DOT: Record<NodeStatus, string> = {
++    Running: 'bg-emerald-500', Background: 'bg-sky-500', Idle: 'bg-[var(--app-hint)]', Paused: 'bg-amber-500',
++    Inactive: 'border border-[var(--app-hint)]', Unavailable: 'bg-[var(--app-badge-error-text)]', Loading: 'border border-dashed border-[var(--app-hint)]',
++}
++const errorText = (error: unknown, fallback: string) => error instanceof Error && error.message ? error.message : fallback
++const round = (point: GraphPoint): GraphPoint => ({ x: Math.round(point.x), y: Math.round(point.y) })
++const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
++const iconButton = 'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:opacity-40'
++const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
++
++/** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
++export function NodeGraphView({ api, sessions, onOpenChat, onOpenChats, visible = true }: {
++    api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; onOpenChats?: () => void; visible?: boolean
++}) {
++    const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
++    const mobile = useFloatingWindowMobile()
++    const canvas = useRef<HTMLDivElement>(null)
++    const [view, setView] = useState<View>({ x: 24, y: 24, k: 1 })
++    const viewRef = useRef(view); viewRef.current = view
++    const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
++    const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner' } | null>(null)
++    const [pending, setPending] = useState<string | null>(null)
++    const [error, setError] = useState<string | null>(null)
++    const [stopped, setStopped] = useState<Record<string, boolean>>({})
++    const [showAdd, setShowAdd] = useState(false)
++    const [addQuery, setAddQuery] = useState('')
++    const [link, setLink] = useState<{ from: string; to: GraphPoint; target: string | null } | null>(null)
++    const pointers = useRef(new Map<number, GraphPoint>())
++    const gesture = useRef<Gesture | null>(null)
++    const pendingSave = useRef<NodeLayoutPositions>({})
++    const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
++    const fittedWorkspace = useRef<string | null>(null)
++
++    // Manual-pause evidence comes with the graph response (summaries do not carry it).
++    const sessionsById = useMemo(() => new Map((sessions ?? []).map(session => [session.id, graph?.pausedAt?.[session.id] != null ? { ...session, manualPausedAt: graph.pausedAt[session.id] } : session])), [sessions, graph?.pausedAt])
++    const title = (id: string) => { const session = sessionsById.get(id); return session ? getSessionTitle(session) : id.slice(0, 8) }
++    const overseer = graph?.overseer ?? null
++    const layout = useMemo(() => graph ? layoutNodeGraph({
++        overseer, nodes: graph.graph.nodes, edges: graph.graph.edges,
++        label: id => { const session = sessionsById.get(id); return session ? getSessionTitle(session) : id },
++    }) : null, [graph, overseer, sessionsById])
++    const positions = useMemo(() => ({ ...layout?.positions, ...overrides }), [layout, overrides])
++    const ids = useMemo(() => Object.keys(layout?.positions ?? {}), [layout])
++    const edges = useMemo(() => Object.entries(layout?.parent ?? {}).map(([child, owner]) => ({ owner, child })), [layout])
++    const positionsRef = useRef(positions); positionsRef.current = positions
++
++    // Overrides last only until the hub echoes the saved position back.
++    useEffect(() => {
++        if (!graph) return
++        setOverrides(old => {
++            const saved = new Map(graph.graph.nodes.map(node => [node.sessionId, node]))
++            const next = Object.fromEntries(Object.entries(old).filter(([id, point]) => { const node = saved.get(id); return node && !(node.x === point.x && node.y === point.y) }))
++            return Object.keys(next).length === Object.keys(old).length ? old : next
++        })
++    }, [graph])
++    const fit = () => {
++        if (!layout) return
++        const element = canvas.current
++        setView(fitTransform(layout.bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
++    }
++    useEffect(() => {
++        if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
++        fittedWorkspace.current = graph.activeWorkspaceId
++        setOverrides({}); setMenu(null); fit()
++        // Fit once per workspace; later polls keep the user's pan/zoom.
++        // eslint-disable-next-line react-hooks/exhaustive-deps
++    }, [graph?.activeWorkspaceId, layout])
++
++    const flushSave = async () => {
++        if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
++        const batch = pendingSave.current
++        pendingSave.current = {}
++        if (!Object.keys(batch).length || !api) return
++        try { await mutate(client => client.saveNodeLayout(batch)) }
++        catch (cause) { setError(errorText(cause, 'Could not save layout')) }
++    }
++    const flushRef = useRef(flushSave); flushRef.current = flushSave
++    useEffect(() => () => { void flushRef.current() }, [])
++    const queueSave = (id: string, point: GraphPoint) => {
++        pendingSave.current = { ...pendingSave.current, [id]: point }
++        if (saveTimer.current) clearTimeout(saveTimer.current)
++        saveTimer.current = setTimeout(() => { void flushRef.current() }, 400)
++    }
++
++    const toGraph = (clientX: number, clientY: number): GraphPoint => {
++        const rect = canvas.current?.getBoundingClientRect(), v = viewRef.current
++        return { x: (clientX - (rect?.left ?? 0) - v.x) / v.k, y: (clientY - (rect?.top ?? 0) - v.y) / v.k }
++    }
++    const zoomAt = (factor: number, clientX?: number, clientY?: number) => setView(v => {
++        const rect = canvas.current?.getBoundingClientRect()
++        const cx = clientX === undefined ? (canvas.current?.clientWidth || 800) / 2 : clientX - (rect?.left ?? 0)
++        const cy = clientY === undefined ? (canvas.current?.clientHeight || 600) / 2 : clientY - (rect?.top ?? 0)
++        const k = clampZoom(v.k * factor)
++        return { k, x: cx - (cx - v.x) * k / v.k, y: cy - (cy - v.y) * k / v.k }
++    })
++    const zoomRef = useRef(zoomAt); zoomRef.current = zoomAt
++    useEffect(() => {
++        const element = canvas.current
++        if (!element) return
++        // Non-passive so the page does not scroll while zooming.
++        const wheel = (event: WheelEvent) => { event.preventDefault(); zoomRef.current(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX, event.clientY) }
++        element.addEventListener('wheel', wheel, { passive: false })
++        return () => element.removeEventListener('wheel', wheel)
++    }, [enabled])
++
++    const linkTarget = (from: string, point: GraphPoint): string | null => {
++        const target = nodeAtPoint(positionsRef.current, point, ids)
++        return target && target !== from && target !== overseer && !createsCycle(edges, from, target) ? target : null
++    }
++    const pinchStart = () => {
++        const [a, b] = [...pointers.current.values()]
++        if (!a || !b) return
++        gesture.current = { kind: 'pinch', distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, view: viewRef.current }
++        setLink(null)
++    }
++    const down = (event: PointerEvent<HTMLDivElement>) => {
++        const target = event.target as Element
++        if (target.closest('[data-graph-ui]')) return
++        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
++        if (pointers.current.size >= 2) { pinchStart(); return }
++        if (event.button !== 0) return
++        const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
++        const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
++        if (handle) { gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ from: handle, to: toGraph(event.clientX, event.clientY), target: null }) }
++        else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
++        else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
++        // Touch has implicit capture; touch-action:none prevents native scrolling.
++        if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
++    }
++    const move = (event: PointerEvent<HTMLDivElement>) => {
++        if (pointers.current.has(event.pointerId)) pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
++        const g = gesture.current
++        if (!g) return
++        if (g.kind === 'pinch') {
++            const [a, b] = [...pointers.current.values()]
++            if (!a || !b) return
++            const rect = canvas.current?.getBoundingClientRect()
++            const k = clampZoom(g.view.k * Math.hypot(a.x - b.x, a.y - b.y) / g.distance)
++            const mid = { x: (a.x + b.x) / 2 - (rect?.left ?? 0), y: (a.y + b.y) / 2 - (rect?.top ?? 0) }
++            const start = { x: g.mid.x - (rect?.left ?? 0), y: g.mid.y - (rect?.top ?? 0) }
++            setView({ k, x: mid.x - (start.x - g.view.x) * k / g.view.k, y: mid.y - (start.y - g.view.y) * k / g.view.k })
++            return
++        }
++        if (g.pointer !== event.pointerId) return
++        if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + event.clientX - g.x, y: g.view.y + event.clientY - g.y })
++        else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ from: g.from, to, target: linkTarget(g.from, to) }) }
++        else {
++            const dx = event.clientX - g.x, dy = event.clientY - g.y
++            if (!g.moved && Math.hypot(dx, dy) < 6) return
++            g.moved = true
++            const k = viewRef.current.k, last = round({ x: g.origin.x + dx / k, y: g.origin.y + dy / k })
++            g.last = last
++            setOverrides(old => ({ ...old, [g.id]: last }))
++        }
++    }
++    const up = (event: PointerEvent<HTMLDivElement>) => {
++        pointers.current.delete(event.pointerId)
++        const g = gesture.current
++        if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
++        if (!g) return
++        if (g.kind === 'pinch') { if (pointers.current.size < 2) gesture.current = null; return }
++        if (g.pointer !== event.pointerId) return
++        gesture.current = null
++        const cancelled = event.type === 'pointercancel'
++        if (g.kind === 'node') {
++            // pointercancel coordinates are unreliable; keep the last moved position.
++            if (g.moved) queueSave(g.id, g.last)
++            else if (!cancelled) openMenu(g.id)
++        } else if (g.kind === 'link') {
++            setLink(null)
++            const target = cancelled ? null : linkTarget(g.from, toGraph(event.clientX, event.clientY))
++            if (target) void act(`link:${target}`, client => client.setNodeOwner(g.from, target))
++        }
++    }
++
++    const openMenu = (id: string) => { setMenu({ id, mode: 'actions' }); setError(null); setShowAdd(false) }
++    const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
++        setPending(key); setError(null)
++        try { return await mutate(run, graphOf) }
++        catch (cause) { setError(errorText(cause, 'Action failed')); return null }
++        finally { setPending(null) }
++    }
++
++    if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
++    const nodeIds = new Set(ids)
++    const addCandidates = (sessions ?? []).filter(session => !nodeIds.has(session.id))
++        .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? 'claude'}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
++        .sort((a, b) => b.updatedAt - a.updatedAt)
++    const menuSession = menu ? sessionsById.get(menu.id) : undefined
++    const menuOwner = menu ? layout?.parent[menu.id] : undefined
++    const menuBusy = menu ? !nodeIsIdle(menuSession) && !stopped[menu.id] : false
++    const closeMenu = () => { setMenu(null); setError(null) }
++    const menuKeys = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu() } }
++
++    return <div className="relative flex h-full min-h-0 w-full flex-col">
++        <div className="relative z-20 flex shrink-0 flex-wrap items-center gap-2 border-b border-[var(--app-divider)] px-2 py-1">
++            {/* The chat list link the old header back arrow provided. */}
++            {onOpenChats && <button type="button" onClick={onOpenChats} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">Chats</button>}
++            {graph && <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={flushSave} />}
++            <button type="button" aria-expanded={showAdd} onClick={() => { setShowAdd(value => !value); setMenu(null) }} className="ml-auto min-h-10 shrink-0 rounded-lg px-3 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)]">{showAdd ? 'Done' : '+ Add chats'}</button>
++            {showAdd && <div role="group" aria-label="Add chats to workspace" className="absolute right-2 top-full mt-1 w-[min(22rem,calc(100%-1rem))] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
++                <input type="search" aria-label="Search chats to add" placeholder="Search chats" value={addQuery} onChange={event => setAddQuery(event.target.value)} className="mb-1 min-h-10 w-full rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                <div className="max-h-64 overflow-y-auto overscroll-contain">
++                    {addCandidates.map(session => <button key={session.id} type="button" disabled={pending !== null} aria-label={`Add ${getSessionTitle(session)} to workspace`}
++                        onClick={() => void act(`add:${session.id}`, client => client.addNode(session.id))}
++                        className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-50">
++                        <span className="min-w-0 flex-1"><span className="block truncate text-sm">{getSessionTitle(session)}</span>
++                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{session.metadata?.flavor ?? 'claude'} · {session.metadata?.path ?? ''}</span></span>
++                        <span aria-hidden="true" className="shrink-0 text-[var(--app-link)]">{pending === `add:${session.id}` ? '…' : '+'}</span>
++                    </button>)}
++                    {!addCandidates.length && <p className="p-2 text-xs text-[var(--app-hint)]">{sessions ? 'No chats to add.' : 'Loading chats…'}</p>}
++                </div>
++                {error && !menu && <p role="alert" className="p-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
++            </div>}
++        </div>
++        {(loadError || (error && !menu && !showAdd)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
++        <div ref={canvas} aria-label="Node graph" role="application" onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
++            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
++            className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab active:cursor-grabbing">
++            {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
++            {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
++                <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width="1" height="1" aria-hidden="true">
++                    <defs>
++                        <marker id="node-edge-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-link)" /></marker>
++                        <marker id="node-edge-asleep" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="var(--app-hint)" /></marker>
++                    </defs>
++                    {edges.map(({ owner, child }) => {
++                        const from = positions[owner], to = positions[child]
++                        if (!from || !to) return null
++                        const asleep = edgeAsleep(sessionsById.get(child))
++                        const x1 = from.x + NODE_SIZE.width / 2, y1 = from.y + NODE_SIZE.height, x2 = to.x + NODE_SIZE.width / 2, y2 = to.y
++                        const bend = Math.max(30, Math.abs(y2 - y1) / 2)
++                        return <path key={child} data-edge={`${owner}->${child}`} data-asleep={asleep ? 'true' : 'false'} d={`M${x1} ${y1} C${x1} ${y1 + bend} ${x2} ${y2 - bend} ${x2} ${y2}`}
++                            fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={asleep ? 1.5 : 2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1}
++                            markerEnd={`url(#${asleep ? 'node-edge-asleep' : 'node-edge-active'})`} />
++                    })}
++                    {link && positions[link.from] && <path d={`M${positions[link.from]!.x + NODE_SIZE.width / 2} ${positions[link.from]!.y + NODE_SIZE.height} L${link.to.x} ${link.to.y}`} fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />}
++                </svg>
++                {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
++                {ids.map(id => {
++                    const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
++                    return <div key={id} data-node-id={id} className="absolute" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
++                        <button type="button" aria-label={`Node ${name}`} aria-haspopup="dialog" aria-expanded={menu?.id === id}
++                            onClick={event => { if (event.detail === 0) openMenu(id) }}
++                            className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : menu?.id === id ? 'border-[var(--app-link)]' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
++                            <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
++                            <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
++                                {id === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 font-medium text-violet-500">Overseer</span>}
++                                <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}</span>
++                            </span>
++                        </button>
++                        {!mobile && <span data-link-handle={id} aria-hidden="true" title="Drag onto another node to make it a child"
++                            className="absolute -bottom-2 left-1/2 h-4 w-4 -translate-x-1/2 rounded-full border-2 border-[var(--app-link)] bg-[var(--app-bg)] cursor-crosshair" />}
++                    </div>
++                })}
++            </div>}
++            {graph && ids.length === 0 && <p className="pointer-events-none absolute inset-x-0 top-6 text-center text-sm text-[var(--app-hint)]">No nodes. Use + Add chats.</p>}
++            <div data-graph-ui className="absolute bottom-2 left-2 z-10 flex gap-1 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++                <button type="button" aria-label="Zoom out" onClick={() => zoomAt(1 / 1.25)} className={iconButton}>−</button>
++                <button type="button" aria-label="Zoom in" onClick={() => zoomAt(1.25)} className={iconButton}>+</button>
++                <button type="button" aria-label="Fit graph to view" onClick={fit} className={`${iconButton} w-auto px-2 text-xs`}>Fit</button>
++            </div>
++            {menu && graph && <section data-graph-ui role="dialog" aria-label={`Actions for ${title(menu.id)}`} onKeyDown={menuKeys}
++                className="absolute inset-x-2 bottom-2 z-20 mx-auto flex max-h-[80%] max-w-sm flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl">
++                <header className="flex shrink-0 items-center gap-2 border-b border-[var(--app-divider)] py-1 pl-3 pr-1">
++                    <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{title(menu.id)}</p>
++                        <p className="truncate text-xs text-[var(--app-hint)]">{menu.id === overseer ? 'Overseer · ' : menuOwner ? `Owner: ${title(menuOwner)} · ` : 'Lone · '}{nodeStatus(menuSession, sessions !== undefined)}</p></div>
++                    <button type="button" aria-label="Close node actions" onClick={closeMenu} className={iconButton}>×</button>
++                </header>
++                <div className="min-h-0 overflow-y-auto overscroll-contain p-1">
++                    {menu.mode === 'actions' ? <>
++                        <button type="button" autoFocus disabled={!menuSession} onClick={() => { const id = menu.id; closeMenu(); onOpenChat(id) }} className={menuItem}>Open chat</button>
++                        {menu.id !== overseer && <button type="button" onClick={() => { setMenu({ ...menu, mode: 'owner' }); setError(null) }} className={menuItem}>Set owner…</button>}
++                        {menuOwner && <button type="button" disabled={pending !== null} onClick={async () => { if (await act('detach', client => client.detachNode(menu.id)) !== null) closeMenu() }} className={menuItem}>Detach from owner</button>}
++                        {menu.id !== overseer && (menuBusy ? <div className="flex min-h-11 items-center gap-2 px-3 text-sm">
++                            <span className="min-w-0 flex-1 text-xs text-[var(--app-hint)]">Busy. Stop it before removing.</span>
++                            <button type="button" aria-label={`Stop ${title(menu.id)}`} disabled={pending !== null} onClick={async () => {
++                                const id = menu.id
++                                setPending('stop'); setError(null)
++                                try { await api!.abortSession(id); setStopped(old => ({ ...old, [id]: true })) }
++                                catch (cause) { setError(errorText(cause, 'Stop failed')) }
++                                finally { setPending(null) }
++                            }} className="min-h-10 rounded-lg px-3 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">{pending === 'stop' ? 'Stopping…' : 'Stop'}</button>
++                        </div> : <button type="button" disabled={pending !== null} onClick={async () => {
++                            const id = menu.id
++                            const result = await act('remove', client => client.removeNodes([id]), r => r.graph)
++                            if (!result) return
++                            if (result.skippedIds.includes(id)) setError(`${title(id)} is still busy or unavailable and was not removed. Stop it first.`)
++                            else closeMenu()
++                        }} className={`${menuItem} text-[var(--app-badge-error-text)]`}>Remove from workspace</button>)}
++                    </> : <div role="group" aria-label="Choose owner">
++                        <button type="button" onClick={() => setMenu({ ...menu, mode: 'actions' })} className={`${menuItem} text-[var(--app-hint)]`}>‹ Back</button>
++                        {ownerCandidates(ids, edges, overseer, menu.id)
++                            .sort((a, b) => Number(b === overseer) - Number(a === overseer) || title(a).localeCompare(title(b)))
++                            .map(candidate => <button key={candidate} type="button" aria-label={`Make ${title(candidate)} the owner`} disabled={pending !== null || candidate === menuOwner}
++                                onClick={async () => { if (await act('owner', client => client.setNodeOwner(candidate, menu.id)) !== null) closeMenu() }} className={menuItem}>
++                                <span className="min-w-0 flex-1 truncate">{title(candidate)}</span>
++                                {candidate === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 text-[11px] text-violet-500">Overseer</span>}
++                                {candidate === menuOwner && <span className="shrink-0 text-xs text-[var(--app-hint)]">current</span>}
++                            </button>)}
++                    </div>}
++                    {error && <p role="alert" className="break-words px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
++                </div>
++            </section>}
++        </div>
++    </div>
++}
++
++const sortWorkspaces = (workspaces: readonly NodeWorkspace[]) => [...workspaces].sort((a, b) =>
++    Number(b.kind === 'default') - Number(a.kind === 'default') || a.createdAt - b.createdAt || a.name.localeCompare(b.name))
++
++/** Current slot, slot list, save/rename/delete presets, and confirmed switching. */
++export function WorkspaceBar({ graph, title, mutate, beforeSwitch }: { graph: NodeGraphResponse; title: (id: string) => string; mutate: Mutate; beforeSwitch?: () => Promise<void> }) {
++    const [open, setOpen] = useState(false)
++    const [presetName, setPresetName] = useState('')
++    const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null)
++    const [deleting, setDeleting] = useState<string | null>(null)
++    const [target, setTarget] = useState<NodeWorkspace | null>(null)
++    const [result, setResult] = useState<NodeSwitchResult | null>(null)
++    const [pending, setPending] = useState(false)
++    const [error, setError] = useState<string | null>(null)
++    const current = activeWorkspaceName(graph) ?? 'Default'
++    const leaving = graph.graph.nodes.map(node => node.sessionId).filter(id => id !== graph.overseer)
++    const run = async (work: () => Promise<unknown>) => {
++        setPending(true); setError(null)
++        try { await work(); return true }
++        catch (cause) { setError(errorText(cause, 'Workspace action failed')); return false }
++        finally { setPending(false) }
++    }
++    const closeSwitch = () => { if (!pending) { setTarget(null); setResult(null); setError(null) } }
++    return <div className="relative min-w-0">
++        <button type="button" aria-label="Workspaces" aria-expanded={open} onClick={() => { setOpen(value => !value); setError(null) }}
++            className="flex min-h-10 min-w-0 max-w-[16rem] items-center gap-1.5 rounded-lg px-2 text-sm hover:bg-[var(--app-subtle-bg)]">
++            <span className="text-xs text-[var(--app-hint)]">Workspace</span><span className="truncate font-medium">{current}</span><span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
++        </button>
++        {open && <div role="group" aria-label="Workspace slots" className="absolute left-0 top-full z-30 mt-1 w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
++            <ul className="max-h-72 overflow-y-auto overscroll-contain">
++                {sortWorkspaces(graph.workspaces).map(workspace => {
++                    const active = workspace.id === graph.activeWorkspaceId, editable = workspace.kind === 'preset' && !active
++                    return <li key={workspace.id} className="flex min-h-11 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1 last:border-b-0">
++                        {renaming?.id === workspace.id ? <form className="flex w-full items-center gap-1" onSubmit={async event => {
++                            event.preventDefault()
++                            const name = renaming.name.trim()
++                            if (name && await run(() => mutate(client => client.renameWorkspace(workspace.id, name)))) setRenaming(null)
++                        }}>
++                            <input aria-label={`New name for ${workspace.name}`} autoFocus value={renaming.name} onChange={event => setRenaming({ id: workspace.id, name: event.target.value })} className="min-h-10 min-w-0 flex-1 rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                            <button type="submit" disabled={pending || !renaming.name.trim()} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] disabled:opacity-40">Save</button>
++                            <button type="button" onClick={() => setRenaming(null)} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-hint)]">Cancel</button>
++                        </form> : <>
++                            <span className="min-w-0 flex-1 truncate px-1 text-sm">{workspace.name}
++                                {workspace.kind === 'default' && <span className="ml-1.5 text-[11px] text-[var(--app-hint)]">default</span>}
++                                {active && <span className="ml-1.5 rounded bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[11px] text-[var(--app-fg)]">active</span>}</span>
++                            {!active && <button type="button" aria-label={`Switch to ${workspace.name}`} disabled={pending} onClick={() => { setTarget(workspace); setResult(null); setError(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Switch</button>}
++                            {editable && <button type="button" aria-label={`Rename ${workspace.name}`} disabled={pending} onClick={() => { setRenaming({ id: workspace.id, name: workspace.name }); setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">Rename</button>}
++                            {editable && (deleting === workspace.id
++                                ? <button type="button" aria-label={`Confirm delete ${workspace.name}`} disabled={pending} onClick={async () => { if (await run(() => mutate(client => client.deleteWorkspace(workspace.id)))) setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm font-medium text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete?</button>
++                                : <button type="button" aria-label={`Delete ${workspace.name}`} disabled={pending} onClick={() => setDeleting(workspace.id)} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete</button>)}
++                        </>}
++                    </li>
++                })}
++            </ul>
++            <form className="mt-2 flex items-center gap-1" onSubmit={async event => {
++                event.preventDefault()
++                const name = presetName.trim()
++                if (name && await run(() => mutate(client => client.saveWorkspace(name)))) setPresetName('')
++            }}>
++                <input aria-label="Preset name" placeholder="Preset name" value={presetName} onChange={event => setPresetName(event.target.value)} className="min-h-10 min-w-0 flex-1 rounded-md bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                <button type="submit" disabled={pending || !presetName.trim()} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Save as preset</button>
++            </form>
++            {error && !target && <p role="alert" className="px-1 pt-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
++        </div>}
++        <Dialog open={target !== null} onOpenChange={value => { if (!value) closeSwitch() }}>
++            {/* Escape closes only this dialog, not a floating window around the graph. */}
++            <DialogContent className="max-w-sm" onKeyDown={event => { if (event.key === 'Escape') event.stopPropagation() }}>
++                <DialogHeader><DialogTitle>{result ? `Switched to ${target?.name ?? ''}` : `Switch to ${target?.name ?? ''}?`}</DialogTitle>
++                    <DialogDescription className="mt-2 text-left">
++                        {result ? `Stopped ${plural(result.stopped.length, 'session')}${result.failed.length ? `; ${result.failed.length} failed` : ''}. Nothing resumes automatically.`
++                            : `Switching stops ${plural(leaving.length, 'session')} in ${current} (durable Stop; resume them yourself). The overseer keeps running.`}
++                    </DialogDescription>
++                </DialogHeader>
++                {result ? <div className="mt-3 max-h-60 space-y-2 overflow-y-auto text-sm">
++                    {result.stopped.length > 0 && <div><p className="text-xs font-medium text-[var(--app-hint)]">Stopped</p><ul aria-label="Stopped sessions">{result.stopped.map(id => <li key={id} className="truncate">{title(id)}</li>)}</ul></div>}
++                    {result.failed.length > 0 && <div><p className="text-xs font-medium text-[var(--app-badge-error-text)]">Failed</p><ul aria-label="Failed sessions">{result.failed.map(item => <li key={item.sessionId} className="break-words">{title(item.sessionId)}: {item.error}</li>)}</ul></div>}
++                </div> : leaving.length > 0 && <ul aria-label="Sessions that will be stopped" className="mt-3 max-h-48 list-disc space-y-0.5 overflow-y-auto pl-5 text-sm">
++                    {leaving.map(id => <li key={id} className="truncate">{title(id)}</li>)}
++                </ul>}
++                {error && <p role="alert" className="mt-3 rounded-md bg-red-50 p-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-400">{error}</p>}
++                <div className="mt-4 flex justify-end gap-2">
++                    {result ? <button type="button" onClick={closeSwitch} className="min-h-10 rounded-lg bg-[var(--app-button)] px-4 text-sm text-[var(--app-button-text)]">Done</button> : <>
++                        <button type="button" disabled={pending} onClick={closeSwitch} className="min-h-10 rounded-lg px-4 text-sm hover:bg-[var(--app-subtle-bg)]">Cancel</button>
++                        <button type="button" disabled={pending} onClick={() => void run(async () => {
++                            const id = target!.id
++                            // Layout edits belong to the slot being left.
++                            await beforeSwitch?.()
++                            setResult(await mutate(client => client.activateWorkspace(id)))
++                            setOpen(false)
++                        })} className="min-h-10 rounded-lg bg-[var(--app-badge-error-text)] px-4 text-sm font-medium text-white disabled:opacity-50">{pending ? 'Switching…' : 'Stop and switch'}</button>
++                    </>}
++                </div>
++            </DialogContent>
++        </Dialog>
++    </div>
++}
+diff --git a/web/src/components/NodeGraphWindow.tsx b/web/src/components/NodeGraphWindow.tsx
+new file mode 100644
+index 0000000..cabb35c
+--- /dev/null
++++ b/web/src/components/NodeGraphWindow.tsx
+@@ -0,0 +1,26 @@
++import { useFloatingWindow, type FloatingWindowConfig } from './FloatingWindow'
++
++export function NodesIcon({ className = 'h-5 w-5' }: { className?: string }) {
++    return <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" className={className}>
++        <rect x="8.5" y="2.5" width="7" height="5" rx="1.5" /><rect x="2.5" y="16.5" width="7" height="5" rx="1.5" /><rect x="14.5" y="16.5" width="7" height="5" rx="1.5" />
++        <path d="M12 7.5v4.5M6 16.5V12h12v4.5" />
++    </svg>
++}
++
++export const NODE_GRAPH_WINDOW: FloatingWindowConfig = {
++    key: ['node-graph-window'], name: 'Nodes', unit: 'nodes', size: { width: 760, height: 600 },
++    icon: <NodesIcon className="h-4 w-4 shrink-0" />,
++}
++export function useNodeGraphWindow() {
++    return useFloatingWindow(NODE_GRAPH_WINDOW)
++}
++
++/** Chat header entry to the graph: opens the floating graph window; when open, collapses/expands it. */
++export function NodesButton() {
++    const { open, collapsed, setOpen, setCollapsed } = useNodeGraphWindow()
++    return <button type="button" aria-label="Nodes" aria-expanded={open && !collapsed} title={open ? (collapsed ? 'Show node graph' : 'Collapse node graph') : 'Node graph'}
++        onClick={() => { if (!open) setOpen(true); else setCollapsed(!collapsed) }}
++        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
++        <NodesIcon className="h-[22px] w-[22px]" />
++    </button>
++}
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+index 3535e6d..7c47e51 100644
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -7,6 +7,9 @@ import { I18nProvider } from '@/lib/i18n-context'
+ import { ToastProvider, useToast } from '@/lib/toast-context'
+ import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
+ 
++const routerMock = vi.hoisted(() => ({ navigate: vi.fn() }))
++vi.mock('@tanstack/react-router', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-router')>(), useRouter: () => routerMock }))
++
+ afterEach(() => {
+     cleanup()
+     localStorage.clear()
+@@ -391,3 +394,33 @@ describe('SessionHeader', () => {
+         expect(await screen.findByText('Could not update pin: Network unavailable')).toBeInTheDocument()
+     })
+ })
++
++describe('SessionHeader Nodes button', () => {
++    const header = (client: QueryClient) => render(
++        <QueryClientProvider client={client}><ToastProvider><I18nProvider>
++            <SessionHeader session={baseSession()} api={null} />
++        </I18nProvider></ToastProvider></QueryClientProvider>
++    )
++    it('replaces the back arrow and opens the floating node graph window (no full page)', () => {
++        routerMock.navigate.mockClear()
++        const client = new QueryClient()
++        header(client)
++        const nodes = screen.getByRole('button', { name: 'Nodes' })
++        expect(nodes.className).toContain('h-10')
++        fireEvent.click(nodes)
++        expect(client.getQueryData<{ open?: boolean; collapsed?: boolean }>(['node-graph-window'])).toMatchObject({ open: true, collapsed: false })
++        expect(routerMock.navigate).not.toHaveBeenCalled()
++    })
++    it('toggles the detached graph window instead of navigating when it is open', async () => {
++        routerMock.navigate.mockClear()
++        const client = new QueryClient()
++        client.setQueryData(['node-graph-window'], { open: true, collapsed: false })
++        header(client)
++        fireEvent.click(screen.getByRole('button', { name: 'Nodes' }))
++        expect(client.getQueryData<{ collapsed?: boolean }>(['node-graph-window'])?.collapsed).toBe(true)
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Nodes' })).toHaveAttribute('title', 'Show node graph'))
++        fireEvent.click(screen.getByRole('button', { name: 'Nodes' }))
++        expect(client.getQueryData<{ collapsed?: boolean }>(['node-graph-window'])?.collapsed).toBe(false)
++        expect(routerMock.navigate).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+index b95a7f2..ca4f493 100644
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -7,6 +7,7 @@ import { isTelegramApp } from '@/hooks/useTelegram'
+ import { sessionModelMutationKey, useSessionActions } from '@/hooks/mutations/useSessionActions'
+ import { SessionActionMenu } from '@/components/SessionActionMenu'
+ import { SideChatButton } from '@/components/SideChatButton'
++import { NodesButton } from '@/components/NodeGraphWindow'
+ import { SessionExportDialog } from '@/components/SessionExportDialog'
+ import { RenameSessionDialog } from '@/components/RenameSessionDialog'
+ import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+@@ -132,7 +133,8 @@ function ModelChangingStatus() {
+ export function SessionHeader(props: {
+     session: Session
+     serviceTier?: string | null
+-    onBack: () => void
++    /** @deprecated Unused: the Nodes button replaced the back arrow. */
++    onBack?: () => void
+     onToggleFiles?: () => void
+     filesActive?: boolean
+     onToggleOutline?: () => void
+@@ -365,26 +367,8 @@ export function SessionHeader(props: {
+         <>
+             <div className="bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+                 <div className="mx-auto w-full max-w-content flex items-center gap-2 p-3">
+-                    {/* Back button */}
+-                    <button
+-                        type="button"
+-                        onClick={props.onBack}
+-                        className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
+-                    >
+-                        <svg
+-                            xmlns="http://www.w3.org/2000/svg"
+-                            width="20"
+-                            height="20"
+-                            viewBox="0 0 24 24"
+-                            fill="none"
+-                            stroke="currentColor"
+-                            strokeWidth="2"
+-                            strokeLinecap="round"
+-                            strokeLinejoin="round"
+-                        >
+-                            <polyline points="15 18 9 12 15 6" />
+-                        </svg>
+-                    </button>
++                    {/* Nodes replaced the back arrow; the graph page links back to Chats. */}
++                    <NodesButton />
+ 
+                     {/* Session info - two lines: title and path */}
+                     <div className="min-w-0 flex-1">
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+index d8a0ba1..d4b06cb 100644
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -40,7 +40,9 @@ describe('Session Manager UI', () => {
+     it('retains across sidebar unmount/navigation, resets with a fresh page cache', async () => {
+         const client = new QueryClient(); const first = render(fixture(client, [session('Codex')])); open()
+         await screen.findByRole('button', { name: 'Open Codex' }); first.unmount()
+-        const second = render(fixture(client, [session('Codex', false, false)])); open()
++        const second = render(fixture(client, [session('Codex', false, false)]))
++        // Window open state persists in the page cache; the launcher toggles, so only open when closed.
++        if (!screen.queryByRole('dialog')) open()
+         await screen.findByText('Inactive', { selector: 'p' }); second.unmount()
+         render(fixture(new QueryClient(), [session('Codex', false, false)])); open()
+         await screen.findByText(/No sessions\./)
+@@ -370,3 +372,12 @@ it('the launcher toggles both the window and bubble closed without stopping sess
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++it('titles the panel with the active workspace when the hub has a node graph', async () => {
++    const graphApi = { ...controls, getNodeGraph: vi.fn(async () => ({ activeWorkspaceId: 'p1', overseer: null, graph: { workspaceId: 'p1', nodes: [], edges: [] },
++        workspaces: [{ id: 'default', name: 'Default', kind: 'default', createdAt: 1, updatedAt: 1 }, { id: 'p1', name: 'Research', kind: 'preset', createdAt: 2, updatedAt: 2 }] })) } as unknown as ApiClient
++    render(<QueryClientProvider client={new QueryClient()}><I18nProvider><SessionManagerButton api={graphApi} sessions={[]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
++    open()
++    expect(await screen.findByRole('dialog', { name: 'Session Manager · Research' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Move Session Manager' })).toBeInTheDocument()
++})
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+index 680ab7e..d350384 100644
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -5,6 +5,7 @@ import type { ApiClient, ManagedSession } from '@/api/client'
+ import { SessionManagerWindow, useSessionManagerWindow, useSessionManagerMobile } from './SessionManagerWindow'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
++import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { sessionHasWork } from '@/lib/sessionManager'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ 
+@@ -36,7 +37,7 @@ export function SessionManagerButton(props: {
+     const [pending, setPending] = useState<Record<string, boolean>>({})
+     const [errors, setErrors] = useState<Record<string, string>>({})
+     const [locallyUnmanaged, setLocallyUnmanaged] = useState<Record<string, boolean>>({})
+-    useEffect(() => { setLocallyUnmanaged(old => Object.fromEntries(Object.entries(old).filter(([id]) => props.managed?.[id]))) }, [props.managed])
++    useEffect(() => { setLocallyUnmanaged(old => { const kept = Object.entries(old).filter(([id]) => props.managed?.[id]); return kept.length === Object.keys(old).length ? old : Object.fromEntries(kept) }) }, [props.managed])
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+     const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+@@ -47,6 +48,8 @@ export function SessionManagerButton(props: {
+     const [showAdd, setShowAdd] = useState(false)
+     const [addQuery, setAddQuery] = useState('')
+     const { entries, dismiss, add, adding, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api, open && !collapsed)
++    // Session Manager lists the active workspace's nodes when the hub has a node graph.
++    const workspace = activeWorkspaceName(useNodeGraph(props.api).data)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+@@ -62,7 +65,7 @@ export function SessionManagerButton(props: {
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+-        {open && <SessionManagerWindow count={rows.length}>
++        {open && <SessionManagerWindow count={rows.length} title={workspace ? `Session Manager · ${workspace}` : undefined}>
+             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+                 <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+                     {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+diff --git a/web/src/components/SessionManagerRace.test.tsx b/web/src/components/SessionManagerRace.test.tsx
+index 36097be..cfcaa46 100644
+--- a/web/src/components/SessionManagerRace.test.tsx
++++ b/web/src/components/SessionManagerRace.test.tsx
+@@ -43,12 +43,14 @@ it('running row switches from Clear to Stop before membership polling catches up
+   client.setQueryData(['session-manager-window'], { open: true })
+   render(<QueryClientProvider client={client}><I18nProvider><Host api={api} /></I18nProvider></QueryClientProvider>)
+   await screen.findByRole('button', { name: 'Dismiss Alpha from Session Manager' })
++  // Let the initial sessions fetch settle so it cannot overwrite the update below (test race).
++  await waitFor(() => expect(client.isFetching({ queryKey: ['sessions'] })).toBe(0))
+   // Background task starts (no prompt ACK), hub records it but browser poll has not refreshed yet.
+   await act(async () => { client.setQueryData(['sessions'], { sessions: [s({ backgroundTaskCount: 1, updatedAt: 3 })] }) })
+-  const x = screen.queryByRole('button', { name: 'Dismiss Alpha from Session Manager' })
+-  const stop = screen.queryByRole('button', { name: 'Stop Alpha' })
+-  expect(x).toBeNull()
+-  expect(stop).toBeInTheDocument()
++  // The cache projection updates in an effect; wait for it, but before any membership poll.
++  await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop Alpha' })).toBeInTheDocument())
++  expect(screen.queryByRole('button', { name: 'Dismiss Alpha from Session Manager' })).toBeNull()
++  expect(api.getSessionManager).toHaveBeenCalledTimes(1)
+   fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
+   expect(api.dismissSessionManager).not.toHaveBeenCalled()
+   expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
+diff --git a/web/src/components/SessionManagerWindow.tsx b/web/src/components/SessionManagerWindow.tsx
+index fb751f0..1b88710 100644
+--- a/web/src/components/SessionManagerWindow.tsx
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -1,210 +1,17 @@
+-import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
+-import { createPortal } from 'react-dom'
+-import { useNarrowViewport } from '@/hooks/useNarrowViewport'
++import type { ReactNode } from 'react'
++import { FloatingWindow, useFloatingWindow, useFloatingWindowMobile, type FloatingWindowConfig } from './FloatingWindow'
+ 
+-export type WindowBounds = { x: number; y: number; width: number; height: number }
+-type Position = Pick<WindowBounds, 'x' | 'y'>
+-type WindowState = { open: boolean; collapsed?: boolean; pinnedCollapsed?: boolean; bounds?: WindowBounds; bubble?: Position }
+-const WINDOW_KEY = ['session-manager-window'] as const
+-const BUBBLE = { width: 96, height: 44 }
+-const viewport = () => ({
+-    x: window.visualViewport?.offsetLeft ?? 0, y: window.visualViewport?.offsetTop ?? 0,
+-    width: window.visualViewport?.width ?? window.innerWidth, height: window.visualViewport?.height ?? window.innerHeight,
+-})
+-function mobileDevice(): boolean {
+-    return typeof navigator !== 'undefined' && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+-        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
+-}
+-export function useSessionManagerMobile(): boolean {
+-    const narrow = useNarrowViewport()
+-    // Used for returning to the selected chat with a compact bubble on mobile.
+-    return narrow || mobileDevice()
+-}
+-// Leave 5% visible at each edge. The launcher remains available to close it.
+-function fitPosition(position: Position, size: { width: number; height: number }, view = viewport()): Position {
+-    return {
+-        x: Math.max(view.x - size.width * .95, Math.min(position.x, view.x + view.width - size.width * .05)),
+-        y: Math.max(view.y - size.height * .95, Math.min(position.y, view.y + view.height - size.height * .05)),
+-    }
+-}
+-export function fitSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
+-    const availableWidth = Math.max(1, view.width - 16), availableHeight = Math.max(1, view.height - 16)
+-    const width = Math.min(availableWidth, Math.max(Math.min(280, availableWidth), bounds.width))
+-    const height = Math.min(availableHeight, Math.max(Math.min(260, availableHeight), bounds.height))
+-    return { width, height, ...fitPosition(bounds, { width, height }, view) }
+-}
+-export function fitSessionBubble(position: Position, view = viewport()): Position {
+-    return fitPosition(position, BUBBLE, view)
+-}
+-// Automatic recovery is separate from manual placement: drag/resize still permits
+-// 95% offscreen. Explicit reopen/expand and a changed viewport restore the controls.
+-export function recoverSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
+-    const fitted = fitSessionWindow(bounds, view)
+-    return { ...fitted,
+-        x: Math.max(view.x + 8, Math.min(fitted.x, view.x + view.width - fitted.width - 8)),
+-        y: Math.max(view.y + 8, Math.min(fitted.y, view.y + view.height - fitted.height - 8)) }
+-}
+-function recoverSessionBubble(position: Position, view = viewport()): Position {
+-    return { x: Math.max(view.x, Math.min(position.x, view.x + view.width - BUBBLE.width)),
+-        y: Math.max(view.y, Math.min(position.y, view.y + view.height - BUBBLE.height)) }
+-}
+-function initialBounds(): WindowBounds {
+-    const view = viewport(), width = Math.min(480, view.width - 24), height = Math.min(560, view.height * .72)
+-    return fitSessionWindow({ width, height, x: view.x + view.width - width - 16, y: view.y + 64 }, view)
+-}
+-function initialBubble(): Position {
+-    const { x, y } = initialBounds()
+-    return { x, y }
++export { fitSessionWindow, fitSessionBubble, recoverSessionWindow, type WindowBounds } from './FloatingWindow'
++
++export const SESSION_MANAGER_WINDOW: FloatingWindowConfig = {
++    key: ['session-manager-window'], name: 'Session Manager', unit: 'sessions',
++    icon: <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>,
+ }
++export const useSessionManagerMobile = useFloatingWindowMobile
+ export function useSessionManagerWindow() {
+-    const client = useQueryClient()
+-    const { data = { open: false } } = useQuery<WindowState>({ queryKey: WINDOW_KEY, queryFn: skipToken, initialData: { open: false }, enabled: false, gcTime: Infinity })
+-    return {
+-        ...data,
+-        setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open, ...(open && !old?.open ? { collapsed: false, bounds: recoverSessionWindow(old?.bounds ?? initialBounds()) } : {}) })),
+-        toggleOpen: () => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: !old?.open, collapsed: false, ...(!old?.open ? { bounds: recoverSessionWindow(old?.bounds ?? initialBounds()) } : {}) })),
+-        setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => {
+-            if (collapsed === Boolean(old?.collapsed)) return old
+-            const bounds = fitSessionWindow(old?.bounds ?? initialBounds())
+-            const bubble = fitSessionBubble(collapsed ? bounds : old?.bubble ?? bounds)
+-            return { ...old, open: true, collapsed, bubble, bounds: collapsed ? bounds : recoverSessionWindow({ ...bounds, ...bubble }) }
+-        }),
+-        setPinnedCollapsed: (pinnedCollapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, pinnedCollapsed })),
+-        setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bounds })),
+-        setBubble: (bubble: Position) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bubble })),
+-    }
++    return useFloatingWindow(SESSION_MANAGER_WINDOW)
+ }
+ 
+-/** A movable, resizable window or draggable bubble on desktop and mobile. */
+-export function SessionManagerWindow({ children, count = 0 }: { children: ReactNode; count?: number }) {
+-    const { open, collapsed, bounds, bubble, setBounds, setBubble, setOpen, setCollapsed } = useSessionManagerWindow()
+-    const [view, setView] = useState(viewport)
+-    const titleId = useId()
+-    const focusTarget = useRef<HTMLButtonElement>(null)
+-    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize' | 'bubble'; x: number; y: number; bounds: WindowBounds } | null>(null)
+-    const suppressBubbleClick = useRef(false)
+-    const current = useRef({ bounds, bubble })
+-    current.current = { bounds, bubble }
+-    useEffect(() => {
+-        if (!open) return
+-        let previousView = viewport()
+-        setView(previousView)
+-        const fit = () => {
+-            const nextView = viewport()
+-            if (Object.keys(nextView).every(key => nextView[key as keyof typeof nextView] === previousView[key as keyof typeof previousView])) return
+-            previousView = nextView
+-            gesture.current = null
+-            setView(nextView)
+-            if (collapsed) setBubble(recoverSessionBubble(current.current.bubble ?? initialBubble(), nextView))
+-            else {
+-                const preferred = current.current.bounds ?? initialBounds()
+-                const recovered = recoverSessionWindow(preferred, nextView)
+-                // Keyboard/rotation temporarily constrain rendering, not the user's preferred size.
+-                setBounds({ ...recovered, width: preferred.width, height: preferred.height })
+-            }
+-        }
+-        focusTarget.current?.focus({ preventScroll: true })
+-        window.addEventListener('resize', fit)
+-        window.visualViewport?.addEventListener('resize', fit)
+-        window.visualViewport?.addEventListener('scroll', fit)
+-        return () => {
+-            gesture.current = null
+-            window.removeEventListener('resize', fit)
+-            window.visualViewport?.removeEventListener('resize', fit)
+-            window.visualViewport?.removeEventListener('scroll', fit)
+-        }
+-        // Cache setters use the latest state; viewport handlers read refs.
+-        // eslint-disable-next-line react-hooks/exhaustive-deps
+-    }, [open, collapsed])
+-    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize' | 'bubble') => {
+-        if (event.button !== 0 || gesture.current) return
+-        // Touch already has implicit capture; touch-action:none handles dragging.
+-        // Preserve native taps instead of cancelling/focusing touch pointerdown.
+-        if (event.pointerType !== 'touch') {
+-            event.preventDefault()
+-            event.currentTarget.focus({ preventScroll: true })
+-            event.currentTarget.setPointerCapture(event.pointerId)
+-        }
+-        suppressBubbleClick.current = false
+-        const rect = kind === 'bubble' ? { ...fitSessionBubble(current.current.bubble ?? initialBubble()), ...BUBBLE } : fitSessionWindow(current.current.bounds ?? initialBounds())
+-        gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: rect }
+-    }
+-    const move = (event: PointerEvent<HTMLButtonElement>) => {
+-        const start = gesture.current
+-        if (!start || start.pointer !== event.pointerId) return
+-        const dx = event.clientX - start.x, dy = event.clientY - start.y
+-        if (start.kind === 'bubble') {
+-            if (Math.hypot(dx, dy) > 5) {
+-                suppressBubbleClick.current = true
+-                if (event.pointerType !== 'touch') event.currentTarget.setPointerCapture(event.pointerId)
+-            }
+-            if (suppressBubbleClick.current) setBubble(fitSessionBubble({ x: start.bounds.x + dx, y: start.bounds.y + dy }))
+-            return
+-        }
+-        const next = start.kind === 'move'
+-            ? { ...start.bounds, x: start.bounds.x + dx, y: start.bounds.y + dy }
+-            : { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
+-        const view = viewport()
+-        if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
+-        setBounds(fitSessionWindow(next))
+-    }
+-    const end = (event: PointerEvent<HTMLButtonElement>) => {
+-        if (gesture.current?.pointer !== event.pointerId) return
+-        if (event.type === 'pointercancel') suppressBubbleClick.current = true
+-        gesture.current = null
+-        // Native touch capture is released by the browser.
+-        if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+-    }
+-    const keyboard = (event: KeyboardEvent, kind: 'move' | 'resize' | 'bubble') => {
+-        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+-        event.preventDefault()
+-        const step = event.shiftKey ? 40 : 10
+-        const horizontal = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+-        const change = (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1) * step
+-        if (kind === 'bubble') {
+-            const next = { ...(current.current.bubble ?? initialBubble()) }
+-            next[horizontal ? 'x' : 'y'] += change
+-            setBubble(fitSessionBubble(next)); return
+-        }
+-        const next = { ...(current.current.bounds ?? initialBounds()) }
+-        if (kind === 'move') next[horizontal ? 'x' : 'y'] += change
+-        else next[horizontal ? 'width' : 'height'] += change
+-        setBounds(fitSessionWindow(next))
+-    }
+-    if (!open) return null
+-    const pointerEvents = { onPointerMove: move, onPointerUp: end, onPointerCancel: end, onLostPointerCapture: () => { gesture.current = null } }
+-    const close = <button type="button" aria-label="Close Session Manager" onClick={() => setOpen(false)} className={`${collapsed ? 'h-11 w-8 border-l border-[var(--app-divider)]' : 'h-11 w-11 rounded-full'} flex shrink-0 items-center justify-center text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]`}><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-3.5 w-3.5"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
+-    if (collapsed) {
+-        const position = fitSessionBubble(bubble ?? initialBubble(), view)
+-        return createPortal(<div className="pointer-events-none fixed inset-0 z-[45] overflow-hidden"><aside aria-label="Session Manager bubble" onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false) } }}
+-            className="pointer-events-auto absolute flex items-center overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-lg"
+-            style={{ left: position.x, top: position.y, ...BUBBLE }}>
+-            <button ref={focusTarget} type="button" aria-label="Expand Session Manager" title={`Session Manager · ${count} sessions · drag to move`} onPointerDown={event => start(event, 'bubble')} {...pointerEvents}
+-                onKeyDown={event => keyboard(event, 'bubble')} onClick={event => { if (!suppressBubbleClick.current || event.detail === 0) setCollapsed(false); suppressBubbleClick.current = false }}
+-                className="flex h-full min-w-0 flex-1 touch-none select-none items-center justify-center gap-1 rounded-l-xl cursor-grab active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+-                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+-                <span className="text-xs font-medium tabular-nums">{count > 99 ? '99+' : count}</span>
+-            </button>{close}
+-        </aside></div>, document.body)
+-    }
+-    const rect = fitSessionWindow(bounds ?? initialBounds(), view)
+-    return createPortal(<div className="pointer-events-none fixed inset-0 z-[45] overflow-hidden"><section role="dialog" aria-modal="false" aria-labelledby={titleId}
+-        onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+-        className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+-        style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
+-            <button ref={focusTarget} type="button" aria-label="Move Session Manager" title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
+-                onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+-                <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">Session Manager</span>
+-            </button>
+-            <button type="button" aria-label="Collapse Session Manager" title="Collapse to bubble" onClick={() => setCollapsed(true)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">−</button>
+-            {close}
+-        </header>
+-        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7">{children}</div>
+-        <button type="button" aria-label="Resize Session Manager" title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
+-            onKeyDown={event => keyboard(event, 'resize')} className="absolute bottom-0 right-0 flex h-7 w-7 touch-none select-none items-center justify-center rounded-tl-lg bg-[var(--app-dialog-bg)] text-[var(--app-hint)] cursor-nwse-resize focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+-            <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor"><path d="m4 13 9-9M9 13l4-4"/></svg>
+-        </button>
+-    </section></div>, document.body)
++export function SessionManagerWindow({ children, count = 0, title }: { children: ReactNode; count?: number; title?: ReactNode }) {
++    return <FloatingWindow config={SESSION_MANAGER_WINDOW} title={title} count={count}>{children}</FloatingWindow>
+ }
+diff --git a/web/src/hooks/useManagedSessions.test.tsx b/web/src/hooks/useManagedSessions.test.tsx
+new file mode 100644
+index 0000000..16ed15e
+--- /dev/null
++++ b/web/src/hooks/useManagedSessions.test.tsx
+@@ -0,0 +1,17 @@
++import { describe, expect, it } from 'vitest'
++import { renderHook } from '@testing-library/react'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import type { ReactNode } from 'react'
++import { useManagedSessions } from './useManagedSessions'
++
++describe('useManagedSessions', () => {
++    it('returns a stable empty map while loading or unavailable (dependent effects must not loop)', () => {
++        const client = new QueryClient()
++        const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>
++        const { result, rerender } = renderHook(() => useManagedSessions(null), { wrapper })
++        const first = result.current
++        rerender(); rerender()
++        expect(result.current).toBe(first)
++        expect(first).toEqual({})
++    })
++})
+diff --git a/web/src/hooks/useManagedSessions.ts b/web/src/hooks/useManagedSessions.ts
+index a102a67..8696bfc 100644
+--- a/web/src/hooks/useManagedSessions.ts
++++ b/web/src/hooks/useManagedSessions.ts
+@@ -1,6 +1,9 @@
+ import { useQuery } from '@tanstack/react-query'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+ 
++// Stable while loading/failed: a fresh {} each render would retrigger dependent effects forever.
++const NONE: Record<string, ManagedSession> = {}
++
+ /** Chats the persistent manager runs (vs chats the user runs), refreshed every 30 s. */
+ export function useManagedSessions(api: ApiClient | null): Record<string, ManagedSession> {
+     const query = useQuery({
+@@ -11,5 +14,5 @@ export function useManagedSessions(api: ApiClient | null): Record<string, Manage
+         refetchInterval: 30_000,
+         retry: false,
+     })
+-    return query.data ?? {}
++    return query.data ?? NONE
+ }
+diff --git a/web/src/hooks/useNodeGraph.ts b/web/src/hooks/useNodeGraph.ts
+new file mode 100644
+index 0000000..43eaa7b
+--- /dev/null
++++ b/web/src/hooks/useNodeGraph.ts
+@@ -0,0 +1,39 @@
++import { useCallback } from 'react'
++import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
++import type { NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { ApiClient } from '@/api/client'
++import { SESSION_MANAGER_REMOTE_KEY } from '@/hooks/useSessionManager'
++
++export const NODE_GRAPH_KEY = ['node-graph'] as const
++
++/** Hub-owned graph of the active workspace; polls only while a graph view is visible. */
++export function useNodeGraph(api: ApiClient | null | undefined, visible = false) {
++    const client = useQueryClient()
++    const enabled = typeof api?.getNodeGraph === 'function'
++    const query = useQuery<NodeGraphResponse>({
++        queryKey: NODE_GRAPH_KEY,
++        queryFn: enabled ? () => api!.getNodeGraph() : skipToken,
++        enabled, refetchInterval: enabled && visible ? 5000 : false, retry: false,
++    })
++    /** Runs a graph mutation, applies a returned graph, then refreshes graph + Session Manager + managed views. */
++    const mutate = useCallback(async <T,>(run: (api: ApiClient) => Promise<T>, graphOf: (result: T) => NodeGraphResponse | null = result => result as NodeGraphResponse | null): Promise<T> => {
++        if (!api) throw new Error('API unavailable')
++        await client.cancelQueries({ queryKey: NODE_GRAPH_KEY })
++        const result = await run(api)
++        const graph = graphOf(result)
++        if (graph) client.setQueryData(NODE_GRAPH_KEY, graph)
++        void client.invalidateQueries({ queryKey: NODE_GRAPH_KEY })
++        void client.invalidateQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
++        void client.invalidateQueries({ queryKey: ['managed-sessions'] })
++        return result
++    }, [api, client])
++    return {
++        data: query.data, enabled, isLoading: query.isLoading,
++        error: query.error instanceof Error ? query.error.message : null,
++        mutate,
++    }
++}
++
++export function activeWorkspaceName(graph: NodeGraphResponse | undefined): string | null {
++    return graph?.workspaces.find(workspace => workspace.id === graph.activeWorkspaceId)?.name ?? null
++}
+diff --git a/web/src/hooks/useSessionManager.test.tsx b/web/src/hooks/useSessionManager.test.tsx
+index dcc0b31..a5c862c 100644
+--- a/web/src/hooks/useSessionManager.test.tsx
++++ b/web/src/hooks/useSessionManager.test.tsx
+@@ -91,3 +91,18 @@ it('does not poll membership while the panel is closed, and clears old action er
+     await waitFor(() => expect(hook.result.current.error).toBeNull())
+     hook.unmount(); hook.client.clear()
+ })
++
++describe('render stability', () => {
++    it('does not rewrite the shared cache when a re-render brings identical data (chat page loop, React #185)', async () => {
++        const f = setup()
++        const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++        const wrapper = ({ children }: PropsWithChildren) => <QueryClientProvider client={client}>{children}</QueryClientProvider>
++        // A fresh sessions array each render, as the chat page's consumers produce.
++        const hook = renderHook(() => useSessionManager([{ ...session }], {}, f.controls as unknown as ApiClient, false), { wrapper })
++        await waitFor(() => expect(hook.result.current.entries.s?.dismissed).toBe(false))
++        const updatedAt = client.getQueryState(['session-manager-retained'])?.dataUpdatedAt
++        hook.rerender(); hook.rerender(); hook.rerender()
++        expect(client.getQueryState(['session-manager-retained'])?.dataUpdatedAt).toBe(updatedAt)
++        hook.unmount()
++    })
++})
+diff --git a/web/src/hooks/useSessionManager.ts b/web/src/hooks/useSessionManager.ts
+index 1ec7920..8165f78 100644
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -6,6 +6,8 @@ import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+ import { dismissSessions, markSessionStopped, observeSessions, reconcileSessionManager, SESSION_MANAGER_KEY, SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity, type SessionManagerState } from '@/lib/sessionManager'
+ 
+ export const SESSION_MANAGER_REMOTE_KEY = ['session-manager-membership'] as const
++// Membership is the active workspace's nodes; '@/hooks/useNodeGraph' NODE_GRAPH_KEY (literal avoids an import cycle).
++const NODE_GRAPH_QUERY = ['node-graph'] as const
+ 
+ /** Hub owns durable membership; query cache is only the current UI projection. */
+ export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>, api?: ApiClient | null, visible = false) {
+@@ -36,8 +38,15 @@ export function useSessionManager(sessions?: readonly SessionSummary[], managed?
+     })
+     useEffect(() => {
+         if (!sessions) return
+-        if (remote.data) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => reconcileSessionManager(old ?? {}, remote.data, sessions))
+-        else if (!remoteEnabled) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity))
++        // Keep the cached object when nothing changed: every consumer of this cache re-renders on a new
++        // object, and several mount this hook, so unconditional writes looped the chat page (React #185).
++        // Skip the write entirely when nothing changed: setQueryData notifies every subscriber (new
++        // dataUpdatedAt) even for identical data, and several components mount this hook, so
++        // unconditional writes looped the chat page (React #185).
++        const old = client.getQueryData<SessionManagerState>(SESSION_MANAGER_KEY)
++        const next = remote.data ? reconcileSessionManager(old ?? {}, remote.data, sessions)
++            : !remoteEnabled ? observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity) : null
++        if (next && !(old && JSON.stringify(old) === JSON.stringify(next))) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, next)
+     }, [client, sessions, managed, activity, remote.data, remoteEnabled])
+     return {
+         entries, clearing, adding, error: clearError ?? (remote.error instanceof Error ? remote.error.message : null),
+@@ -50,6 +59,7 @@ export function useSessionManager(sessions?: readonly SessionSummary[], managed?
+                 const records = await api.addSessionManager(id)
+                 await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
+                 client.setQueryData(SESSION_MANAGER_REMOTE_KEY, records)
++                void client.invalidateQueries({ queryKey: NODE_GRAPH_QUERY })
+                 return true
+             } catch (error) {
+                 errorAt.current = Date.now()
+@@ -71,6 +81,7 @@ export function useSessionManager(sessions?: readonly SessionSummary[], managed?
+                 const records = await api!.dismissSessionManager(clearable)
+                 await client.cancelQueries({ queryKey: SESSION_MANAGER_REMOTE_KEY })
+                 client.setQueryData(SESSION_MANAGER_REMOTE_KEY, records)
++                void client.invalidateQueries({ queryKey: NODE_GRAPH_QUERY })
+             } catch (error) {
+                 errorAt.current = Date.now()
+                 setClearError(error instanceof Error ? error.message : 'Clear failed')
+diff --git a/web/src/lib/nodeGraphLayout.test.ts b/web/src/lib/nodeGraphLayout.test.ts
+new file mode 100644
+index 0000000..6f8b4ff
+--- /dev/null
++++ b/web/src/lib/nodeGraphLayout.test.ts
+@@ -0,0 +1,91 @@
++import { describe, expect, it } from 'vitest'
++import { fitTransform, graphParents, layoutNodeGraph, NODE_SIZE, nodeAtPoint, ownerCandidates } from './nodeGraphLayout'
++
++const node = (sessionId: string, x: number | null = null, y: number | null = null) => ({ sessionId, x, y })
++const edge = (owner: string, child: string) => ({ owner, child })
++const titles: Record<string, string> = { O: 'Overseer', a: 'Bravo', b: 'Alpha', c: 'Charlie', d: 'Delta', l1: 'Zulu', l2: 'Echo' }
++const label = (id: string) => titles[id] ?? id
++
++describe('layoutNodeGraph', () => {
++    it('puts the overseer on top, children one level down, sorted by title then id, parents centred', () => {
++        const layout = layoutNodeGraph({ overseer: 'O', nodes: [node('a'), node('b'), node('c')], edges: [edge('O', 'a'), edge('O', 'b'), edge('a', 'c')], label })
++        const { positions: p } = layout
++        expect(layout.roots).toEqual(['O'])
++        expect(p.O!.y).toBe(0)
++        expect(p.a!.y).toBe(p.b!.y); expect(p.a!.y).toBeGreaterThan(p.O!.y + NODE_SIZE.height)
++        expect(p.c!.y).toBeGreaterThan(p.a!.y)
++        // Alpha (b) sorts before Bravo (a).
++        expect(p.b!.x).toBeLessThan(p.a!.x)
++        expect(p.c!.x).toBe(p.a!.x)
++        expect(p.O!.x + NODE_SIZE.width / 2).toBeCloseTo((p.b!.x + p.a!.x + NODE_SIZE.width) / 2)
++    })
++
++    it('is deterministic regardless of input order', () => {
++        const nodes = [node('a'), node('b'), node('c'), node('l1'), node('l2')], edges = [edge('O', 'a'), edge('O', 'b'), edge('a', 'c')]
++        const one = layoutNodeGraph({ overseer: 'O', nodes, edges, label })
++        const two = layoutNodeGraph({ overseer: 'O', nodes: [...nodes].reverse(), edges: [...edges].reverse(), label })
++        expect(two).toEqual(one)
++    })
++
++    it('lays lone nodes out in a labelled grid below the trees', () => {
++        const layout = layoutNodeGraph({ overseer: 'O', nodes: [node('a'), node('l1'), node('l2')], edges: [edge('O', 'a')], label })
++        expect(layout.lone).toEqual(['l2', 'l1'])
++        expect(layout.loneLabel).not.toBeNull()
++        expect(layout.loneLabel!.y).toBeGreaterThan(layout.positions.a!.y + NODE_SIZE.height)
++        expect(layout.positions.l2!.y).toBeGreaterThan(layout.loneLabel!.y)
++        expect(layout.positions.l2!.y).toBe(layout.positions.l1!.y)
++        expect(layout.positions.l2!.x).toBeLessThan(layout.positions.l1!.x)
++    })
++
++    it('treats an unowned node with children as its own tree beside the overseer', () => {
++        const layout = layoutNodeGraph({ overseer: 'O', nodes: [node('a'), node('c')], edges: [edge('a', 'c')], label })
++        expect(layout.roots).toEqual(['O', 'a'])
++        expect(layout.lone).toEqual([])
++        expect(layout.positions.a!.y).toBe(0)
++        expect(layout.positions.a!.x).toBeGreaterThan(layout.positions.O!.x + NODE_SIZE.width)
++    })
++
++    it('saved positions override auto layout without moving other nodes', () => {
++        const auto = layoutNodeGraph({ overseer: 'O', nodes: [node('a'), node('b')], edges: [edge('O', 'a'), edge('O', 'b')], label })
++        const saved = layoutNodeGraph({ overseer: 'O', nodes: [node('a', 900, -40), node('b')], edges: [edge('O', 'a'), edge('O', 'b')], label })
++        expect(saved.positions.a).toEqual({ x: 900, y: -40 })
++        expect(saved.positions.b).toEqual(auto.positions.b)
++        expect(saved.bounds.y).toBe(-40)
++        expect(saved.bounds.x + saved.bounds.width).toBe(900 + NODE_SIZE.width)
++    })
++
++    it('drops cycles, second owners and the overseer as a child', () => {
++        const parent = graphParents([edge('a', 'b'), edge('b', 'a'), edge('c', 'b'), edge('a', 'O')], 'O')
++        // Sorted by child id: b->a kept, a->b would close a cycle, c->b is b's only remaining owner.
++        expect(parent).toEqual({ a: 'b', b: 'c' })
++        const layout = layoutNodeGraph({ overseer: 'O', nodes: [node('a'), node('b'), node('c')], edges: [edge('a', 'b'), edge('b', 'a'), edge('a', 'O')], label })
++        expect(Object.keys(layout.positions).sort()).toEqual(['O', 'a', 'b', 'c'])
++    })
++
++    it('handles an empty graph and a graph without an overseer', () => {
++        expect(layoutNodeGraph({ overseer: null, nodes: [], edges: [] }).positions).toEqual({})
++        const layout = layoutNodeGraph({ overseer: null, nodes: [node('l1')], edges: [] })
++        expect(layout.positions.l1).toEqual({ x: 0, y: 28 })
++        expect(layout.loneLabel).toEqual({ x: 0, y: 0 })
++    })
++})
++
++describe('graph helpers', () => {
++    it('owner candidates exclude the node and its descendants; the overseer has none', () => {
++        const edges = [edge('O', 'a'), edge('a', 'c'), edge('c', 'd')]
++        expect(ownerCandidates(['O', 'a', 'b', 'c', 'd'], edges, 'O', 'a')).toEqual(['O', 'b'])
++        expect(ownerCandidates(['O', 'a', 'b', 'c', 'd'], edges, 'O', 'd')).toEqual(['O', 'a', 'b', 'c'])
++        expect(ownerCandidates(['O', 'a'], edges, 'O', 'O')).toEqual([])
++    })
++
++    it('hit-tests cards and fits bounds into a viewport', () => {
++        const positions = { a: { x: 0, y: 0 }, b: { x: 100, y: 10 } }
++        expect(nodeAtPoint(positions, { x: 150, y: 20 })).toBe('b')
++        expect(nodeAtPoint(positions, { x: 10, y: 10 })).toBe('a')
++        expect(nodeAtPoint(positions, { x: 500, y: 500 })).toBeNull()
++        const fit = fitTransform({ x: 0, y: 0, width: 2000, height: 400 }, { width: 1048, height: 600 })
++        expect(fit.k).toBeCloseTo(0.5)
++        expect(fit.x).toBeCloseTo(24)
++        expect(fitTransform({ x: 0, y: 0, width: 100, height: 100 }, { width: 1000, height: 1000 }).k).toBe(1)
++    })
++})
+diff --git a/web/src/lib/nodeGraphLayout.ts b/web/src/lib/nodeGraphLayout.ts
+new file mode 100644
+index 0000000..e95a67b
+--- /dev/null
++++ b/web/src/lib/nodeGraphLayout.ts
+@@ -0,0 +1,117 @@
++import { createsCycle, type NodeGraphEdge, type NodeGraphNode } from '@hapi/protocol/nodeGraph'
++
++/** Node card size in graph units; positions are card top-left corners. */
++export const NODE_SIZE = { width: 184, height: 76 } as const
++const GAP_X = 28, GAP_Y = 72, TREE_GAP = 56, LONE_GAP = 88, LONE_LABEL = 28
++
++export type GraphPoint = { x: number; y: number }
++export type GraphBounds = { x: number; y: number; width: number; height: number }
++export type NodeGraphLayout = {
++    positions: Record<string, GraphPoint>
++    /** child -> owner after dropping invalid edges (cycles, second owners, overseer as child). */
++    parent: Record<string, string>
++    roots: string[]
++    lone: string[]
++    loneLabel: GraphPoint | null
++    bounds: GraphBounds
++}
++type LayoutInput = {
++    overseer: string | null
++    nodes: readonly Pick<NodeGraphNode, 'sessionId' | 'x' | 'y'>[]
++    edges: readonly Pick<NodeGraphEdge, 'owner' | 'child'>[]
++    label?: (id: string) => string
++}
++
++/** Strict owner tree as the UI draws it; tolerant of stale or conflicting edges. */
++export function graphParents(edges: LayoutInput['edges'], overseer: string | null): Record<string, string> {
++    const kept: { owner: string; child: string }[] = []
++    const parent: Record<string, string> = {}
++    for (const edge of [...edges].sort((a, b) => a.child.localeCompare(b.child) || a.owner.localeCompare(b.owner))) {
++        if (edge.child === overseer || parent[edge.child] || createsCycle(kept, edge.owner, edge.child)) continue
++        kept.push(edge); parent[edge.child] = edge.owner
++    }
++    return parent
++}
++
++/** Deterministic tidy tree: overseer root first, owner -> child downward, lone nodes in a grid below. */
++export function layoutNodeGraph({ overseer, nodes, edges, label = id => id }: LayoutInput): NodeGraphLayout {
++    const ids = new Set(nodes.map(node => node.sessionId))
++    if (overseer) ids.add(overseer)
++    for (const edge of edges) { ids.add(edge.owner); ids.add(edge.child) }
++    const parent = graphParents(edges, overseer)
++    const order = (a: string, b: string) => label(a).localeCompare(label(b)) || a.localeCompare(b)
++    const children = new Map<string, string[]>()
++    for (const [child, owner] of Object.entries(parent)) children.set(owner, [...children.get(owner) ?? [], child])
++    for (const list of children.values()) list.sort(order)
++    const unowned = [...ids].filter(id => !parent[id] && id !== overseer).sort(order)
++    const roots = [...(overseer ? [overseer] : []), ...unowned.filter(id => children.has(id))]
++    const lone = unowned.filter(id => !children.has(id))
++
++    const positions: Record<string, GraphPoint> = {}
++    const width = new Map<string, number>()
++    const measure = (id: string): number => {
++        const kids = children.get(id) ?? []
++        const span = kids.reduce((sum, kid, index) => sum + measure(kid) + (index ? GAP_X : 0), 0)
++        const result = Math.max(NODE_SIZE.width, span)
++        width.set(id, result)
++        return result
++    }
++    let bottom = -Infinity
++    const place = (id: string, left: number, depth: number) => {
++        const y = depth * (NODE_SIZE.height + GAP_Y)
++        positions[id] = { x: left + (width.get(id)! - NODE_SIZE.width) / 2, y }
++        bottom = Math.max(bottom, y + NODE_SIZE.height)
++        const kids = children.get(id) ?? []
++        const span = kids.reduce((sum, kid, index) => sum + width.get(kid)! + (index ? GAP_X : 0), 0)
++        let cursor = left + (width.get(id)! - span) / 2
++        for (const kid of kids) { place(kid, cursor, depth + 1); cursor += width.get(kid)! + GAP_X }
++    }
++    let left = 0
++    for (const root of roots) { measure(root); place(root, left, 0); left += width.get(root)! + TREE_GAP }
++    const treesWidth = Math.max(0, left - TREE_GAP)
++
++    let loneLabel: GraphPoint | null = null
++    if (lone.length) {
++        const top = (roots.length ? bottom + LONE_GAP : 0) + LONE_LABEL
++        const columns = Math.max(1, Math.min(lone.length, Math.max(3, Math.floor((treesWidth + GAP_X) / (NODE_SIZE.width + GAP_X)))))
++        loneLabel = { x: 0, y: top - LONE_LABEL }
++        lone.forEach((id, index) => {
++            positions[id] = { x: (index % columns) * (NODE_SIZE.width + GAP_X), y: top + Math.floor(index / columns) * (NODE_SIZE.height + GAP_X) }
++        })
++    }
++    for (const node of nodes) if (node.x !== null && node.y !== null && Number.isFinite(node.x) && Number.isFinite(node.y)) positions[node.sessionId] = { x: node.x, y: node.y }
++    return { positions, parent, roots, lone, loneLabel, bounds: graphBounds(positions, loneLabel) }
++}
++
++export function graphBounds(positions: Readonly<Record<string, GraphPoint>>, label?: GraphPoint | null): GraphBounds {
++    const points = Object.values(positions)
++    if (!points.length && !label) return { x: 0, y: 0, width: NODE_SIZE.width, height: NODE_SIZE.height }
++    const xs = [...points.map(p => p.x), ...(label ? [label.x] : [])], ys = [...points.map(p => p.y), ...(label ? [label.y] : [])]
++    const right = Math.max(...points.map(p => p.x + NODE_SIZE.width), ...(label ? [label.x + 60] : []))
++    const lower = Math.max(...points.map(p => p.y + NODE_SIZE.height), ...(label ? [label.y + 20] : []))
++    const x = Math.min(...xs), y = Math.min(...ys)
++    return { x, y, width: right - x, height: lower - y }
++}
++
++/** Valid new owners for `child`: never itself or one of its descendants; the overseer is never a child. */
++export function ownerCandidates(ids: readonly string[], edges: LayoutInput['edges'], overseer: string | null, child: string): string[] {
++    if (child === overseer) return []
++    return ids.filter(id => id !== child && !createsCycle(edges, id, child))
++}
++
++/** Topmost node whose card contains the graph point (later cards draw on top). */
++export function nodeAtPoint(positions: Readonly<Record<string, GraphPoint>>, point: GraphPoint, order: readonly string[] = Object.keys(positions)): string | null {
++    for (let index = order.length - 1; index >= 0; index -= 1) {
++        const id = order[index]!, p = positions[id]
++        if (p && point.x >= p.x && point.x <= p.x + NODE_SIZE.width && point.y >= p.y && point.y <= p.y + NODE_SIZE.height) return id
++    }
++    return null
++}
++
++/** Zoom/offset that fits `bounds` into a viewport, capped so small graphs are not blown up. */
++export function fitTransform(bounds: GraphBounds, view: { width: number; height: number }, padding = 24): { x: number; y: number; k: number } {
++    const k = clampZoom(Math.min((view.width - padding * 2) / bounds.width, (view.height - padding * 2) / bounds.height, 1))
++    return { k, x: (view.width - bounds.width * k) / 2 - bounds.x * k, y: (view.height - bounds.height * k) / 2 - bounds.y * k }
++}
++
++export const clampZoom = (k: number) => Math.min(2.5, Math.max(0.2, Number.isFinite(k) ? k : 1))

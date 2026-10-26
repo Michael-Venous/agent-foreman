@@ -1,0 +1,780 @@
+diff --git a/hub/src/chatStatistics.test.ts b/hub/src/chatStatistics.test.ts
+new file mode 100644
+index 0000000..c240c5f
+--- /dev/null
++++ b/hub/src/chatStatistics.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'bun:test'
++import { nativeTotals, parsePlanWindows } from './chatStatistics'
++import { Store } from './store'
++import { getUsageSummary } from './sync/usageService'
++
++describe('chat statistics', () => {
++    it('counts Claude request snapshots once, including cached input, excluding separate agents', async () => {
++        const msg = (output: number, sidechain = false) => JSON.stringify({ type: 'assistant', isSidechain: sidechain, message: { id: sidechain ? 'child' : 'one', usage: { input_tokens: 5, cache_creation_input_tokens: 15, cache_read_input_tokens: 80, output_tokens: output } } })
++        expect(await nativeTotals([msg(2), msg(20), msg(20), msg(500, true), '{partial'], 'claude')).toEqual({ total: 120, input: 100, output: 20, cachedInput: 80 })
++        expect(await nativeTotals(['{}'], 'claude')).toBeNull()
++    })
++    it('does not sum Codex cumulative snapshots or add cached/reasoning tokens twice', async () => {
++        const msg = (input: number, output: number) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: 80, reasoning_output_tokens: 10 } } } })
++        expect(await nativeTotals([msg(100, 20), msg(200, 40), msg(200, 40), msg(100, 20)], 'codex')).toEqual({ total: 240, input: 200, output: 40, cachedInput: 80 })
++    })
++    it('converts live provider percentages and reset units without inventing missing allowances', () => {
++        expect(parsePlanWindows('claude', { five_hour: { utilization: 29, resets_at: '2026-10-20T01:20:00Z' }, seven_day: null })).toEqual([{ label: '5-hour', remainingPercent: 71, resetsAt: Date.parse('2026-10-20T01:20:00Z') }])
++        const limit = { primary: { usedPercent: 76, windowDurationMins: 10080, resetsAt: 1792891660 }, secondary: null }
++        expect(parsePlanWindows('codex', { rateLimits: limit, rateLimitsByLimitId: { codex: limit } })).toEqual([{ label: 'Weekly', remainingPercent: 24, resetsAt: 1792891660000 }])
++        expect(parsePlanWindows('codex', { rateLimits: { primary: { windowDurationMins: 300 } } })).toEqual([])
++        expect(parsePlanWindows('claude', { five_hour: { utilization: 100 } })[0].remainingPercent).toBe(0)
++    })
++    it('isolates fallback recorded totals to the requested chat', () => {
++        const store = new Store(':memory:')
++        try {
++            const a = store.sessions.getOrCreateSession('a', { flavor: 'claude' }, null, 'default')
++            const b = store.sessions.getOrCreateSession('b', { flavor: 'claude' }, null, 'default')
++            for (const [id, input] of [[a.id, 10], [b.id, 999]] as const) store.messages.addMessage(id, { role: 'agent', content: { type: 'output', data: { type: 'assistant', message: { id: 'request', usage: { input_tokens: input, output_tokens: 2 } } } } })
++            expect(getUsageSummary(store, 'default', 'all', 'UTC', a.id).totals.totalTokens).toBe(12)
++        } finally { store.close() }
++    })
++})
+diff --git a/hub/src/chatStatistics.ts b/hub/src/chatStatistics.ts
+new file mode 100644
+index 0000000..55fdcd3
+--- /dev/null
++++ b/hub/src/chatStatistics.ts
+@@ -0,0 +1,143 @@
++import { createReadStream, existsSync, readdirSync, realpathSync } from 'node:fs'
++import { readFile } from 'node:fs/promises'
++import { homedir } from 'node:os'
++import { join, resolve, sep } from 'node:path'
++import { createInterface } from 'node:readline'
++import { Database } from 'bun:sqlite'
++import { codexHome, createStdioAppServer } from './codexFolders'
++
++type RecordValue = Record<string, any>
++export type TokenTotals = { total: number; input: number; output: number; cachedInput: number }
++export type PlanWindow = { label: string; remainingPercent: number; resetsAt: number | null }
++export type PlanUsage = { windows: PlanWindow[]; updatedAt: number; error?: string }
++const record = (x: unknown): RecordValue => x && typeof x === 'object' && !Array.isArray(x) ? x as RecordValue : {}
++const count = (x: unknown): number => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : 0
++const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
++const claudeHome = () => resolve(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'))
++
++// Claude sends multiple stream snapshots per message; Codex reports cumulative
++// totals. Cache reads are part of input, and reasoning is already part of output.
++export async function nativeTotals(lines: AsyncIterable<string> | Iterable<string>, flavor: string): Promise<TokenTotals | null> {
++    const messages = new Map<string, TokenTotals>()
++    let cumulative: TokenTotals | null = null
++    for await (const line of lines) {
++        let data: RecordValue
++        try { data = record(JSON.parse(line)) } catch { continue }
++        if (flavor === 'claude' && data.type === 'assistant' && !data.isSidechain) {
++            const message = record(data.message), usage = record(message.usage)
++            if (typeof message.id !== 'string' || !Object.keys(usage).length) continue
++            const input = count(usage.input_tokens) + count(usage.cache_creation_input_tokens) + count(usage.cache_read_input_tokens)
++            const output = count(usage.output_tokens), cachedInput = count(usage.cache_read_input_tokens)
++            const old = messages.get(message.id)
++            const next = { input: Math.max(old?.input ?? 0, input), output: Math.max(old?.output ?? 0, output), cachedInput: Math.max(old?.cachedInput ?? 0, cachedInput), total: 0 }
++            next.total = next.input + next.output
++            messages.set(message.id, next)
++        } else if (flavor === 'codex' && data.type === 'event_msg' && data.payload?.type === 'token_count') {
++            const usage = record(data.payload.info?.total_token_usage)
++            if (!Object.keys(usage).length) continue
++            const input = count(usage.input_tokens), output = count(usage.output_tokens)
++            const next = { input, output, cachedInput: count(usage.cached_input_tokens), total: input + output }
++            if (!cumulative || next.total >= cumulative.total) cumulative = next
++        }
++    }
++    if (flavor === 'codex') return cumulative
++    if (!messages.size) return null
++    return [...messages.values()].reduce((sum, x) => ({ total: sum.total + x.total, input: sum.input + x.input, output: sum.output + x.output, cachedInput: sum.cachedInput + x.cachedInput }), { total: 0, input: 0, output: 0, cachedInput: 0 })
++}
++
++function transcript(metadata: RecordValue): string | null {
++    const flavor = metadata.flavor
++    const id = flavor === 'codex' ? metadata.codexSessionId : metadata.claudeSessionId
++    if (typeof id !== 'string' || !uuid.test(id)) return null
++    if (flavor === 'claude') {
++        const root = join(claudeHome(), 'projects')
++        const files = readdirSync(root, { withFileTypes: true }).filter(x => x.isDirectory()).map(x => join(root, x.name, id + '.jsonl')).filter(existsSync)
++        // Aliases may point at the same transcript; distinct histories are ambiguous.
++        const unique = [...new Set(files.map(x => realpathSync(x)))]
++        return unique.length === 1 ? unique[0] : null
++    }
++    if (flavor === 'codex') {
++        const home = codexHome(), db = new Database(join(home, 'state_5.sqlite'), { readonly: true })
++        try {
++            const row = db.query('SELECT rollout_path FROM threads WHERE id=?').get(id) as { rollout_path: string } | null
++            if (!row) return null
++            const path = realpathSync(row.rollout_path)
++            return path.startsWith(realpathSync(home) + sep) ? path : null
++        } finally { db.close() }
++    }
++    return null
++}
++
++const nativeCache = new Map<string, { until: number; promise: Promise<TokenTotals | null> }>()
++export async function readNativeTotals(metadata: RecordValue): Promise<TokenTotals | null> {
++    try {
++        const path = transcript(metadata)
++        if (!path) return null
++        const cached = nativeCache.get(path)
++        if (cached && cached.until > Date.now()) return cached.promise
++        const promise = (async () => {
++            const stream = createReadStream(path, { encoding: 'utf8' })
++            const lines = createInterface({ input: stream, crlfDelay: Infinity })
++            try { return await nativeTotals(lines, metadata.flavor) } finally { lines.close(); stream.destroy() }
++        })().catch(() => null)
++        if (nativeCache.size >= 30) nativeCache.delete(nativeCache.keys().next().value!)
++        nativeCache.set(path, { until: Date.now() + 15_000, promise })
++        return promise
++    } catch { return null }
++}
++
++export function parsePlanWindows(flavor: string, raw: unknown): PlanWindow[] {
++    const data = record(raw), windows: PlanWindow[] = []
++    const add = (label: string, used: unknown, reset: unknown) => {
++        if (typeof used !== 'number' || !Number.isFinite(used) || used < 0) return
++        const timestamp = typeof reset === 'number' ? reset * 1000 : typeof reset === 'string' ? Date.parse(reset) : NaN
++        windows.push({ label, remainingPercent: Math.max(0, 100 - used), resetsAt: Number.isFinite(timestamp) ? timestamp : null })
++    }
++    if (flavor === 'claude') {
++        for (const [key, label] of [['five_hour', '5-hour'], ['seven_day', 'Weekly'], ['seven_day_opus', 'Weekly · Opus'], ['seven_day_sonnet', 'Weekly · Sonnet']]) {
++            const value = record(data[key]); add(label, value.utilization, value.resets_at)
++        }
++    } else {
++        const limits = Object.keys(record(data.rateLimitsByLimitId)).length ? record(data.rateLimitsByLimitId) : { codex: data.rateLimits }
++        for (const [id, rawLimit] of Object.entries(limits)) {
++            const limit = record(rawLimit)
++            for (const key of ['primary', 'secondary']) {
++                const value = record(limit[key]), minutes = value.windowDurationMins
++                const duration = minutes === 10080 ? 'Weekly' : minutes === 300 ? '5-hour' : typeof minutes === 'number' ? `${minutes / 60}-hour` : key === 'primary' ? 'Primary' : 'Secondary'
++                add(id === 'codex' ? duration : `${limit.limitName || id} · ${duration}`, value.usedPercent, value.resetsAt)
++            }
++        }
++    }
++    return windows
++}
++
++const appServer = createStdioAppServer()
++const planCache = new Map<string, { until: number; promise: Promise<PlanUsage> }>()
++export function readPlanUsage(flavor: string): Promise<PlanUsage> {
++    const cached = planCache.get(flavor)
++    if (cached && cached.until > Date.now()) return cached.promise
++    const promise = (async (): Promise<PlanUsage> => {
++        try {
++            let data: unknown
++            if (flavor === 'codex') data = await appServer(call => call('account/rateLimits/read', {}))
++            else if (flavor === 'claude') {
++                const auth = JSON.parse(await readFile(join(claudeHome(), '.credentials.json'), 'utf8')).claudeAiOauth
++                if (typeof auth?.accessToken !== 'string') throw new Error('No subscription credentials')
++                const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
++                    headers: { Authorization: `Bearer ${auth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
++                    signal: AbortSignal.timeout(12_000), redirect: 'error'
++                })
++                if (!response.ok) throw new Error('Provider unavailable')
++                data = await response.json()
++            } else throw new Error('Unsupported provider')
++            const windows = parsePlanWindows(flavor, data)
++            return { windows, updatedAt: Date.now(), ...(!windows.length ? { error: 'This account did not report a plan allowance.' } : {}) }
++        } catch {
++            // Never return credentials, account identifiers, or raw provider errors.
++            return { windows: [], updatedAt: Date.now(), error: 'Plan usage is unavailable. Check the provider usage page or sign in through its CLI.' }
++        }
++    })()
++    // Shared by chats on this provider; coalesces clicks and refreshes, including failures.
++    planCache.set(flavor, { until: Date.now() + 60_000, promise })
++    return promise
++}
+diff --git a/hub/src/sync/usageService.ts b/hub/src/sync/usageService.ts
+index 1dac14b..f462bec 100644
+--- a/hub/src/sync/usageService.ts
++++ b/hub/src/sync/usageService.ts
+@@ -333,9 +333,10 @@ export function getUsageSummary(
+     store: Store,
+     namespace: string,
+     range: string | undefined,
+-    timeZone: string = 'UTC'
++    timeZone: string = 'UTC',
++    sessionId?: string
+ ): UsageSummaryResponse {
+-    const sessions = store.sessions.getSessionsByNamespace(namespace)
++    const sessions = store.sessions.getSessionsByNamespace(namespace).filter(session => !sessionId || session.id === sessionId)
+     // This is intentionally lazy. Existing HAPI databases have no usage table;
+     // the first dashboard request backfills history, while later requests only
+     // update the idempotent event rows.
+diff --git a/hub/src/web/routes/chatStatistics.test.ts b/hub/src/web/routes/chatStatistics.test.ts
+new file mode 100644
+index 0000000..f0ab0de
+--- /dev/null
++++ b/hub/src/web/routes/chatStatistics.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from 'bun:test'
++import { Hono } from 'hono'
++import { Store } from '../../store'
++import type { WebAppEnv } from '../middleware/auth'
++import type { SyncEngine } from '../../sync/syncEngine'
++import { createChatStatisticsRoutes } from './chatStatistics'
++describe('chat statistics access', () => {
++    it('requires owner and session access; remote chats never use the local account', async () => {
++        const store = new Store(':memory:')
++        try {
++            const session = store.sessions.getOrCreateSession('remote', { flavor: 'claude', machineId: 'remote' }, null, 'default')
++            const engine = { resolveSessionAccess: (id: string) => id === session.id ? { ok: true, sessionId: id, session } : { ok: false, reason: 'not-found' } } as unknown as SyncEngine
++            const app = (namespace: string) => {
++                const app = new Hono<WebAppEnv>()
++                app.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
++                app.route('/api', createChatStatisticsRoutes(() => engine, store))
++                return app
++            }
++            expect((await app('tenant').request(`/api/sessions/${session.id}/statistics`)).status).toBe(403)
++            expect((await app('default').request('/api/sessions/missing/statistics')).status).toBe(404)
++            const response = await app('default').request(`/api/sessions/${session.id}/statistics`)
++            expect(response.status).toBe(200)
++            expect(response.headers.get('cache-control')).toBe('no-store')
++            const body = await response.json() as { totals: null; plan: { windows: unknown[]; error: string } }
++            expect(body.totals).toBeNull()
++            expect(body.plan.windows).toEqual([])
++            expect(body.plan.error).toContain('hub machine')
++        } finally { store.close() }
++    })
++})
+diff --git a/hub/src/web/routes/chatStatistics.ts b/hub/src/web/routes/chatStatistics.ts
+new file mode 100644
+index 0000000..ccde0fe
+--- /dev/null
++++ b/hub/src/web/routes/chatStatistics.ts
+@@ -0,0 +1,29 @@
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++import type { SyncEngine } from '../../sync/syncEngine'
++import type { Store } from '../../store'
++import { requireSessionFromParam, requireSyncEngine } from './guards'
++import { getUsageSummary } from '../../sync/usageService'
++import { readNativeTotals, readPlanUsage } from '../../chatStatistics'
++
++export function createChatStatisticsRoutes(getEngine: () => SyncEngine | null, store: Store): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    app.get('/sessions/:id/statistics', async c => {
++        if (c.get('namespace') !== 'default') return c.json({ error: 'Only the hub owner can read local plan usage' }, 403)
++        const engine = requireSyncEngine(c, getEngine)
++        if (engine instanceof Response) return engine
++        const access = requireSessionFromParam(c, engine)
++        if (access instanceof Response) return access
++        c.header('Cache-Control', 'no-store')
++        const metadata = access.session.metadata
++        const local = Boolean(process.env.HAPI_LOCAL_CATALOG_MACHINE) && metadata?.machineId === process.env.HAPI_LOCAL_CATALOG_MACHINE
++        const [native, plan] = await Promise.all([
++            local ? readNativeTotals(metadata ?? {}) : Promise.resolve(null),
++            local ? readPlanUsage(metadata?.flavor ?? '') : Promise.resolve({ windows: [], updatedAt: Date.now(), error: 'Plan usage requires a chat on the hub machine.' })
++        ])
++        const recorded = native ? null : getUsageSummary(store, c.get('namespace'), 'all', 'UTC', access.sessionId).totals
++        const totals = native ?? (recorded && recorded.requests > 0 ? { total: recorded.totalTokens, input: recorded.inputTokens, output: recorded.outputTokens, cachedInput: recorded.cacheReadTokens } : null)
++        return c.json({ totals, source: native ? 'native' : 'recorded', plan, updatedAt: Date.now() })
++    })
++    return app
++}
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+index 412caef..3a603c7 100644
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -26,6 +26,7 @@ import { createSessionGoalRoutes } from './routes/sessionGoals'
+ import { createCodexContextRoutes } from './routes/codexContext'
+ import { createManagedSessionsRoutes } from './routes/managedSessions'
+ import { createStorageRoutes } from './routes/storage'
++import { createChatStatisticsRoutes } from './routes/chatStatistics'
+ import { createUsageRoutes } from './routes/usage'
+ import { createGitRoutes } from './routes/git'
+ import { createCliRoutes } from './routes/cli'
+@@ -301,6 +302,7 @@ function createWebApp(options: {
+     app.route('/api', createStorageRoutes(configuration.dbPath))
+     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+     app.route('/api', createUsageRoutes(options.store))
++    app.route('/api', createChatStatisticsRoutes(options.getSyncEngine, options.store))
+     app.route('/api', createGitRoutes(options.getSyncEngine))
+     // 中文注释：这里提供两类 Codex 辅助能力：扫描本地 transcript 以导入到 Hapi，以及按需重启 Codex Desktop 客户端。
+     app.route('/api', createCodexDesktopRoutes({
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index cc8cada..f6224f7 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -840,6 +840,15 @@ export class ApiClient {
+         return (await this.request<{ folder: CodexFolder }>(`/api/codex-folders/${encodeURIComponent(folderId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })).folder
+     }
+ 
++    async getChatStatistics(sessionId: string): Promise<{
++        totals: { total: number; input: number; output: number; cachedInput: number } | null
++        source: 'native' | 'recorded'
++        plan: { windows: { label: string; remainingPercent: number; resetsAt: number | null }[]; updatedAt: number; error?: string }
++        updatedAt: number
++    }> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/statistics`)
++    }
++
+     async getUsageSummary(
+         range: '7d' | '30d' | 'all' = '7d',
+         timeZone: string = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+diff --git a/web/src/components/AssistantChat/ChatStatisticsButton.test.tsx b/web/src/components/AssistantChat/ChatStatisticsButton.test.tsx
+new file mode 100644
+index 0000000..2b89a05
+--- /dev/null
++++ b/web/src/components/AssistantChat/ChatStatisticsButton.test.tsx
+@@ -0,0 +1,35 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { I18nProvider } from '@/lib/i18n-context'
++import type { ApiClient } from '@/api/client'
++import { ChatStatisticsButton } from './ChatStatisticsButton'
++afterEach(cleanup)
++function mount(getChatStatistics = vi.fn()) {
++    render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><I18nProvider>
++        <ChatStatisticsButton api={{ getChatStatistics } as unknown as ApiClient} sessionId="one" flavor="claude" model="claude-opus-5-5" contextSize={200000} contextWindow={1000000} />
++    </I18nProvider></QueryClientProvider>)
++    return getChatStatistics
++}
++it('loads only when opened and separates context, total tokens and live plan allowance', async () => {
++    const request = mount(vi.fn().mockResolvedValue({ totals: { total: 12345, input: 12000, output: 345, cachedInput: 10000 }, source: 'native', plan: { windows: [{ label: '5-hour', remainingPercent: 71, resetsAt: Date.now() + 3600000 }], updatedAt: Date.now() }, updatedAt: Date.now() }))
++    expect(request).not.toHaveBeenCalled()
++    fireEvent.click(screen.getByRole('button', { name: 'Statistics' }))
++    expect(await screen.findByText('12,345')).toBeTruthy()
++    expect(screen.getByText('200,000 / 1,000,000 tokens')).toBeTruthy()
++    expect(screen.getByText('71% left')).toBeTruthy()
++    expect(request).toHaveBeenCalledWith('one')
++})
++it('labels provider failure instead of showing zero or full allowance', async () => {
++    mount(vi.fn().mockResolvedValue({ totals: null, source: 'recorded', plan: { windows: [], updatedAt: Date.now(), error: 'Plan usage is unavailable.' }, updatedAt: Date.now() }))
++    fireEvent.click(screen.getByRole('button', { name: 'Statistics' }))
++    expect(await screen.findByText('Plan usage is unavailable.')).toBeTruthy()
++    expect(screen.queryByText('0% left')).toBeNull()
++    expect(screen.queryByText('100% left')).toBeNull()
++})
++it('does not present an expired quota snapshot as current allowance', async () => {
++    mount(vi.fn().mockResolvedValue({ totals: null, source: 'recorded', plan: { windows: [{ label: 'Weekly', remainingPercent: 0, resetsAt: Date.now() - 1 }], updatedAt: Date.now() } }))
++    fireEvent.click(screen.getByRole('button', { name: 'Statistics' }))
++    expect(await screen.findByText('Refresh needed')).toBeTruthy()
++    expect(screen.queryByText('0% left')).toBeNull()
++})
+diff --git a/web/src/components/AssistantChat/ChatStatisticsButton.tsx b/web/src/components/AssistantChat/ChatStatisticsButton.tsx
+new file mode 100644
+index 0000000..529f9dc
+--- /dev/null
++++ b/web/src/components/AssistantChat/ChatStatisticsButton.tsx
+@@ -0,0 +1,77 @@
++import { useState } from 'react'
++import { useQuery } from '@tanstack/react-query'
++import type { ApiClient } from '@/api/client'
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { getContextBudgetTokens } from '@/chat/modelConfig'
++
++const number = (value: number) => Math.round(value).toLocaleString()
++function Meter({ used, label }: { used: number; label: string }) {
++    return <div role="progressbar" aria-label={label} aria-valuenow={Math.round(used)} aria-valuemin={0} aria-valuemax={100}
++        className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--app-divider)]">
++        <div className="h-full rounded-full bg-[var(--app-link)]" style={{ width: `${Math.min(100, Math.max(0, used))}%` }} />
++    </div>
++}
++export function ChatStatisticsButton(props: {
++    api: ApiClient | null; sessionId: string; flavor: string | null; model: string | null
++    contextSize?: number; contextWindow?: number | null
++}) {
++    const [open, setOpen] = useState(false)
++    const query = useQuery({
++        queryKey: ['chat-statistics', props.sessionId],
++        queryFn: () => props.api!.getChatStatistics(props.sessionId),
++        enabled: open && Boolean(props.api), staleTime: 15_000,
++        refetchInterval: open ? 60_000 : false, refetchOnWindowFocus: false, retry: false
++    })
++    const data = query.data
++    const capacity = props.contextWindow ?? getContextBudgetTokens(props.model, props.flavor)
++    const size = props.contextSize
++    const used = size !== undefined && capacity ? Math.min(100, size / capacity * 100) : null
++    const providerUrl = props.flavor === 'claude' ? 'https://claude.ai/settings/usage'
++        : props.flavor === 'codex' ? 'https://chatgpt.com/codex/settings/usage' : null
++    return <>
++        <button type="button" aria-label="Statistics" title="Statistics" onClick={() => setOpen(true)}
++            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]">
++            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
++                <path d="M4 20h16M7 16v-5M12 16V4M17 16V8" />
++            </svg>
++        </button>
++        <Dialog open={open} onOpenChange={setOpen}>
++            <DialogContent className="max-w-md max-h-[85dvh] overflow-y-auto">
++                <DialogHeader><DialogTitle>Chat statistics</DialogTitle><DialogDescription>Context, conversation tokens, and your shared plan allowance.</DialogDescription></DialogHeader>
++                <div className="space-y-5 text-sm">
++                    <section aria-label="Current context">
++                        <h3 className="font-medium">Current context</h3>
++                        <p className="mt-1 text-xl tabular-nums">{size === undefined ? 'Not reported yet' : `${number(size)}${capacity ? ` / ${number(capacity)}` : ''} tokens`}</p>
++                        {used !== null ? <><Meter used={used} label="Context used" /><p className="mt-1 text-xs text-[var(--app-hint)]">{used.toFixed(1)}% used · {number(Math.max(0, capacity! - size!))} tokens free{!props.contextWindow ? ' · estimated capacity' : ''}</p></> : null}
++                    </section>
++                    <section aria-label="Total chat tokens">
++                        <h3 className="font-medium">Total chat tokens</h3>
++                        <p className="mt-1 text-xl tabular-nums">{data?.totals ? number(data.totals.total) : query.isPending && props.api ? 'Loading…' : 'Unavailable'}</p>
++                        {data?.totals ? <p className="mt-1 text-xs text-[var(--app-hint)]">{number(data.totals.input)} input · {number(data.totals.output)} output<br />{number(data.totals.cachedInput)} cached input, included above</p> : null}
++                        <p className="mt-2 text-xs text-[var(--app-hint)]">{data?.source === 'native' ? 'Full conversation history, including before this chat was resumed.' : 'Messages recorded in this HAPI chat; earlier native history may be missing.'} Separate agent chats are excluded. Token totals do not translate directly into plan allowance.</p>
++                    </section>
++                    <section aria-label="Plan usage remaining">
++                        <h3 className="font-medium">Plan usage remaining</h3>
++                        <p className="mt-1 text-xs text-[var(--app-hint)]">Shared across chats on this {props.flavor === 'claude' ? 'Claude' : props.flavor === 'codex' ? 'Codex' : 'provider'} account.</p>
++                        {data?.plan.windows.map((window, index) => {
++                            const expired = window.resetsAt !== null && window.resetsAt <= Date.now()
++                            return <div key={`${window.label}-${index}`} className="mt-3">
++                                <div className="flex justify-between gap-3"><span>{window.label}</span><strong className="tabular-nums">{expired ? 'Refresh needed' : `${number(window.remainingPercent)}% left`}</strong></div>
++                                {!expired ? <Meter used={window.remainingPercent} label={`${window.label} remaining`} /> : null}
++                                <p className="mt-1 text-xs text-[var(--app-hint)]">{window.resetsAt ? `${expired ? 'Reported reset' : 'Resets'} ${new Date(window.resetsAt).toLocaleString()}` : 'Reset time not reported'}</p>
++                            </div>
++                        })}
++                        {data?.plan.error ? <p className="mt-2 text-xs text-[var(--app-hint)]">{data.plan.error}</p> : null}
++                        {!data ? <p className="mt-2 text-[var(--app-hint)]">{query.isPending && props.api ? 'Checking plan…' : 'Unavailable'}</p> : null}
++                        {data ? <p className="mt-3 text-xs text-[var(--app-hint)]">Plan checked {new Date(data.plan.updatedAt).toLocaleTimeString()} · refreshes at most once a minute.</p> : null}
++                    </section>
++                    {query.error ? <p role="alert" className="text-sm text-red-500">Could not load statistics. Try refreshing.</p> : null}
++                    <div className="flex items-center justify-between gap-3 border-t border-[var(--app-border)] pt-3">
++                        {providerUrl ? <a href={providerUrl} target="_blank" rel="noopener noreferrer" className="text-[var(--app-link)] underline">Provider usage ↗</a> : <span />}
++                        <button type="button" disabled={!props.api || query.isFetching} onClick={() => void query.refetch()} className="rounded-lg border border-[var(--app-border)] px-3 py-1.5 disabled:opacity-50">{query.isFetching ? 'Refreshing…' : 'Refresh'}</button>
++                    </div>
++                </div>
++            </DialogContent>
++        </Dialog>
++    </>
++}
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index a5bef83..feaf459 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -601,6 +601,7 @@ export function DictationButton(props: {
+ export function ComposerButtons(props: {
+     canSend: boolean
+     controlsDisabled: boolean
++    statisticsButton?: React.ReactNode
+     showSettingsButton: boolean
+     settingsButtonRef?: Ref<HTMLButtonElement>
+     settingsDisabled?: boolean
+@@ -657,17 +658,15 @@ export function ComposerButtons(props: {
+     const { t } = useTranslation()
+     const { layout } = useComposerToolbarLayout()
+     const isNarrowViewport = useNarrowViewport()
+-    // Narrow viewports collapse the model/effort value buttons into the settings
+-    // sheet, so the gear must stay reachable even when a persisted layout hides
+-    // it (otherwise no session-settings trigger remains). Wide layouts keep
+-    // honoring the user's hidden choice.
+-    const effectiveLayout: ComposerToolbarLayout = isNarrowViewport && layout.hidden.includes('settings')
+-        ? {
+-            ...layout,
+-            hidden: layout.hidden.filter((item) => item !== 'settings'),
+-            left: [...layout.left, 'settings'],
+-        }
+-        : layout
++    // With no gear button, retain model controls on narrow screens too.
++    const required: ComposerToolbarItemId[] = isNarrowViewport
++        ? [...(props.modelValueLabel ? ['model' as const] : []), ...(props.effortValueLabel ? ['effort' as const] : [])]
++        : []
++    const effectiveLayout: ComposerToolbarLayout = {
++        ...layout,
++        hidden: layout.hidden.filter(item => !required.includes(item)),
++        left: [...layout.left, ...required.filter(item => !layout.left.includes(item) && !layout.right.includes(item))],
++    }
+     const isVoiceConnected = props.voiceStatus === 'connected'
+     const [showSchedulePicker, setShowSchedulePicker] = useState(false)
+     const scheduleButtonRef = useRef<HTMLButtonElement>(null)
+@@ -695,22 +694,6 @@ export function ComposerButtons(props: {
+                 </ComposerPrimitive.AddAttachment>
+                 </ToolbarItemSlot>
+ 
+-                <ToolbarItemSlot item="settings">
+-                {props.showSettingsButton ? (
+-                    <button
+-                        ref={props.settingsButtonRef}
+-                        type="button"
+-                        aria-label={t('composer.settings')}
+-                        title={t('composer.settings')}
+-                        className="settings-button flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]"
+-                        onClick={props.onSettingsToggle}
+-                        disabled={props.settingsDisabled ?? props.controlsDisabled}
+-                    >
+-                        <SettingsIcon />
+-                    </button>
+-                ) : null}
+-                </ToolbarItemSlot>
+-
+                 <ToolbarItemSlot item="expand">
+                 <ComposerExpandButton
+                     expanded={props.expanded}
+@@ -760,20 +743,7 @@ export function ComposerButtons(props: {
+                 ) : null}
+                 </ToolbarItemSlot>
+ 
+-                <ToolbarItemSlot item="terminal">
+-                {props.showTerminalButton ? (
+-                    <button
+-                        type="button"
+-                        aria-label={props.terminalLabel}
+-                        title={props.terminalLabel}
+-                        className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+-                        onClick={props.onTerminal}
+-                        disabled={props.terminalDisabled}
+-                    >
+-                        <TerminalIcon />
+-                    </button>
+-                ) : null}
+-                </ToolbarItemSlot>
++
+ 
+                 <ToolbarItemSlot item="abort">
+                 {props.showAbortButton ? (
+@@ -887,6 +857,7 @@ export function ComposerButtons(props: {
+                 ) : null}
+                 </ToolbarItemSlot>
+                 </OrderedToolbarItems>
++                {props.statisticsButton}
+             </div>
+ 
+             <DictationButton
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index 29f2037..0772256 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -152,7 +152,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         renderComposer('claude')
+         expect(screen.getByRole('button', { name: 'Sonnet 4' })).toBeTruthy()
+         expect(screen.getByRole('button', { name: 'High' })).toBeTruthy()
+-        expect(screen.getByRole('button', { name: 'Settings' })).toBeTruthy()
++        expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull()
+     })
+ 
+     it('shows only the model button for flavors without effort support', () => {
+@@ -161,12 +161,12 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         expect(screen.queryByRole('button', { name: 'High' })).toBeNull()
+     })
+ 
+-    it('hides value buttons on narrow viewports, keeping settings', () => {
++    it('keeps model controls available on narrow viewports without a gear', () => {
+         runtime.narrowViewport = true
+         renderComposer('claude')
+-        expect(screen.queryByRole('button', { name: 'Sonnet 4' })).toBeNull()
+-        expect(screen.queryByRole('button', { name: 'High' })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Settings' })).toBeTruthy()
++        expect(screen.getByRole('button', { name: 'Sonnet 4' })).toBeTruthy()
++        expect(screen.getByRole('button', { name: 'High' })).toBeTruthy()
++        expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull()
+     })
+ 
+     it('opens only the Model section from the model button (anchored open)', () => {
+@@ -195,23 +195,11 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         expect(screen.queryByText('Model')).toBeNull()
+     })
+ 
+-    it('opens the full sheet from the gear with Model before Permission', () => {
+-        renderComposer('claude')
+-        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+-        const model = screen.getByText('Model')
+-        const permission = screen.getByText('Permission Mode')
+-        expect(model.compareDocumentPosition(permission) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+-        expect(screen.getByText('Effort')).toBeTruthy()
+-    })
+-
+-    it('expands an anchored sheet to the full sheet when the gear is clicked', () => {
+-        renderComposer('claude')
+-        fireEvent.click(screen.getByRole('button', { name: 'Sonnet 4' }))
+-        expect(screen.queryByText('Effort')).toBeNull()
+-        fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+-        expect(screen.getByText('Model')).toBeTruthy()
+-        expect(screen.getByText('Effort')).toBeTruthy()
+-        expect(screen.getByText('Permission Mode')).toBeTruthy()
++    it('replaces gear and terminal with the supplied statistics control', () => {
++        renderComposer('claude', { onTerminal: vi.fn(), statisticsButton: <button>Statistics</button> })
++        expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull()
++        expect(screen.queryByRole('button', { name: 'Terminal' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Statistics' })).toBeTruthy()
+     })
+ 
+     it('shows generic value buttons for Pi with the provider-qualified model label', () => {
+@@ -225,7 +213,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         // Pi uses the same value buttons as every other flavor.
+         expect(screen.getByRole('button', { name: 'Gemini 2.5 Pro' })).toBeTruthy()
+         expect(screen.getByRole('button', { name: 'High' })).toBeTruthy()
+-        expect(screen.getByRole('button', { name: 'Settings' })).toBeTruthy()
++        expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull()
+     })
+ 
+     it('opens the settings sheet with provider-grouped model rows for Pi', () => {
+@@ -245,7 +233,7 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         expect(screen.queryByText('Effort')).toBeNull()
+     })
+ 
+-    it('keeps the gear reachable on narrow viewports even when the toolbar layout hides it', () => {
++    it('keeps statistics reachable when a saved toolbar layout hides the old gear', () => {
+         runtime.narrowViewport = true
+         runtime.toolbarLayout = {
+             mode: 'left',
+@@ -253,14 +241,14 @@ describe('HappyComposer generic model/effort value buttons', () => {
+             right: [],
+             hidden: ['settings', 'abort'],
+         }
+-        renderComposer('claude')
+-        // Narrow mode collapses the value buttons into the settings sheet, so the
+-        // gear must stay visible regardless of the persisted layout.
+-        expect(screen.queryByRole('button', { name: 'Sonnet 4' })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Settings' })).toBeTruthy()
++        renderComposer('claude', { statisticsButton: <button>Statistics</button> })
++        expect(screen.getByRole('button', { name: 'Statistics' })).toBeTruthy()
++        // Statistics stays visible independently of the old toolbar preference.
++        expect(screen.getByRole('button', { name: 'Sonnet 4' })).toBeTruthy()
++        expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull()
+     })
+ 
+-    it('keeps the Pi settings gear live mid-turn on narrow viewports', () => {
++    it('keeps the Pi model control live mid-turn on narrow viewports', () => {
+         runtime.narrowViewport = true
+         runtime.snapshot.thread.isDisabled = true
+         renderComposer('pi', {
+@@ -269,13 +257,12 @@ describe('HappyComposer generic model/effort value buttons', () => {
+             ],
+             piSelectedModel: { provider: 'gemini', modelId: 'gemini-2.5-pro' },
+         })
+-        // Value buttons are collapsed on narrow; the gear is the only trigger and
+-        // must stay clickable while a Pi turn is running (#1442).
+-        const gear = screen.getByRole('button', { name: 'Settings' })
++        // The model control remains available while a Pi turn is running.
++        const gear = screen.getByRole('button', { name: 'Gemini 2.5 Pro' })
+         expect(gear).not.toBeDisabled()
+         fireEvent.click(gear)
+         expect(screen.getByText('Model')).toBeTruthy()
+-        expect(screen.getByText('Gemini 2.5 Pro')).toBeTruthy()
++        expect(screen.getAllByText('Gemini 2.5 Pro').length).toBeGreaterThan(0)
+     })
+ 
+     it('highlights only the matching provider row when model IDs collide across providers', () => {
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index c950bb5..255b4fe 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -14,6 +14,7 @@ import {
+     type FormEvent as ReactFormEvent,
+     type KeyboardEvent as ReactKeyboardEvent,
+     type MutableRefObject,
++    type ReactNode,
+     type SyntheticEvent as ReactSyntheticEvent,
+     useCallback,
+     useEffect,
+@@ -283,6 +284,7 @@ export function ModelEffortSettingsSection(props: {
+ }
+ 
+ export function HappyComposer(props: {
++    statisticsButton?: ReactNode
+     sessionId?: string
+     focusInputRef?: MutableRefObject<(() => void) | null>
+     onUploadDraftSnapshot?: (text: string, attachments: AttachmentDraftInput[]) => void
+@@ -1638,7 +1640,6 @@ export function HappyComposer(props: {
+     // disable rule (controlsDisabled) would lock them for the entire turn.
+     const modelEffortControlsDisabled = agentFlavor === 'pi' ? configurationControlsDisabled : controlsDisabled
+     const modelValueLabel = useMemo(() => {
+-        if (isNarrowViewport) return undefined
+         if (!onModelChange || !supportsModelChange(agentFlavor)) return undefined
+         // Pi models come from the dynamic piModels catalog; show the
+         // provider-qualified selection name. No button until the catalog
+@@ -1658,7 +1659,6 @@ export function HappyComposer(props: {
+         return option?.label ?? rawKey ?? undefined
+     }, [isNarrowViewport, onModelChange, agentFlavor, selectedPiModel, model, modelOptions, selectedModelBase])
+     const effortValueLabel = useMemo(() => {
+-        if (isNarrowViewport) return undefined
+         if (!onEffortChange || !supportsEffort(agentFlavor)) return undefined
+         // Pi: without a resolved catalog entry there is no capability map to
+         // derive levels from; hide the button until the selected model is known.
+@@ -2362,6 +2362,7 @@ export function HappyComposer(props: {
+                             </> : undefined}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
++                            statisticsButton={props.statisticsButton}
+                             showSettingsButton={showSettingsButton}
+                             settingsButtonRef={settingsButtonRef}
+                             settingsDisabled={modelEffortControlsDisabled}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index eda603d..65ddab0 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -85,6 +85,7 @@ import {
+ import { useTranslation } from '@/lib/use-translation'
+ import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutations/useSendMessage'
+ import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
++import { ChatStatisticsButton } from '@/components/AssistantChat/ChatStatisticsButton'
+ import { SessionHeader } from '@/components/SessionHeader'
+ import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
+ import { TeamPanel } from '@/components/TeamPanel'
+@@ -2030,6 +2031,11 @@ function SessionChatInner(props: SessionChatProps) {
+                         <HappyComposer
+                         focusInputRef={focusComposerRef}
+                         key={`composer-${props.session.id}`}
++                        statisticsButton={<ChatStatisticsButton api={props.api} sessionId={props.session.id}
++                            flavor={props.session.metadata?.flavor ?? null}
++                            contextSize={reduced.latestUsage?.contextSize}
++                            contextWindow={reduced.latestUsage?.contextWindow ?? piContextWindow}
++                            model={reduced.latestUsage?.model ?? props.session.model ?? null} />}
+                         sessionId={props.session.id}
+                         canRestoreAttachments={props.session.active}
+                         onUploadDraftSnapshot={(text, attachments) => {
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+index de96825..3535e6d 100644
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -181,7 +181,7 @@ describe('SessionHeader', () => {
+         expect(screen.queryByRole('menuitem', { name: /Sync Pi history/ })).toBeNull()
+     })
+ 
+-    it('renders and toggles the agent terminal control', () => {
++    it('omits the terminal control even when terminal access is available', () => {
+         const onToggleTerminal = vi.fn()
+         render(
+             <QueryClientProvider client={new QueryClient()}>
+@@ -199,10 +199,8 @@ describe('SessionHeader', () => {
+             </QueryClientProvider>
+         )
+ 
+-        const terminal = screen.getByRole('button', { name: 'Terminal' })
+-        expect(terminal).toHaveAttribute('aria-pressed', 'true')
+-        terminal.click()
+-        expect(onToggleTerminal).toHaveBeenCalledOnce()
++        expect(screen.queryByRole('button', { name: 'Terminal' })).toBeNull()
++        expect(onToggleTerminal).not.toHaveBeenCalled()
+     })
+ 
+     it('shows an inherited catalog-default Fast tier', () => {
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+index f42ac39..83d79d2 100644
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -100,15 +100,6 @@ function headerToggleClass(active: boolean): string {
+     }`
+ }
+ 
+-function TerminalIcon(props: { className?: string }) {
+-    return (
+-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+-            <polyline points="4 17 10 11 4 5" />
+-            <line x1="12" y1="19" x2="20" y2="19" />
+-        </svg>
+-    )
+-}
+-
+ function MoreVerticalIcon(props: { className?: string }) {
+     return (
+         <svg
+@@ -482,19 +473,6 @@ export function SessionHeader(props: {
+                         </button>
+                     ) : null}
+ 
+-                    {props.onToggleTerminal ? (
+-                        <button
+-                            type="button"
+-                            onClick={props.onToggleTerminal}
+-                            className={headerToggleClass(props.terminalActive ?? false)}
+-                            title="Terminal"
+-                            aria-label="Terminal"
+-                            aria-pressed={props.terminalActive ?? false}
+-                        >
+-                            <TerminalIcon />
+-                        </button>
+-                    ) : null}
+-
+                     <button
+                         type="button"
+                         onClick={handleMenuToggle}

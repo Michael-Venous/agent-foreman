@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent Manager hapi-runner
+After=network-online.target hapi-hub.service
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/code/agent-foreman
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=HAPI_DISABLE_VERSION_HANDOFF=1
+Environment=HAPI_RUNNER_WEBHOOK_TIMEOUT_MS=120000
+Environment=HAPI_RUNNER_SESSION_ISOLATION=systemd
+ExecStart=%h/Documents/code/agent-foreman/vendor/hapi runner start-sync
+Restart=always
+RestartSec=5
+KillMode=process
+UMask=0077
+[Install]
+WantedBy=default.target

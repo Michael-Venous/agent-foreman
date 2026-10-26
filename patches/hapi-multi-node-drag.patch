@@ -1,0 +1,293 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,5 +1,5 @@
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+-import { fitNodeFrame, framePoints, placeInFrame, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
++import { fitNodeFrame, framePoints, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
+ import { useNodeGrid } from '@/hooks/useNodeGrid'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import * as Popover from '@radix-ui/react-popover'
+@@ -37,7 +37,7 @@
+     | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+-    | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint; frames: NodeAnnotation[] }
++    | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint; frames: NodeAnnotation[]; origins: NodeLayoutPositions; positions: NodeLayoutPositions }
+     | { kind: 'link'; pointer: number; from: string }
+     | { kind: 'input'; pointer: number; child: string; wire?: Wire; x: number; y: number; moved: boolean }
+ 
+@@ -105,20 +105,23 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
+-    const cancelBoxSelection = () => {
++    const cancelSelectionGesture = () => {
+         const current = gesture.current
+-        if (current?.kind !== 'box') return
+-        setSelectedNodes(current.before); setSelectionRect(null)
++        if (current?.kind === 'box') { setSelectedNodes(current.before); setSelectionRect(null) }
++        else if (current?.kind === 'node') {
++            setAnnotationDrafts({})
++            setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in current.origins))))
++        } else return
+         pointers.current.delete(current.pointer); gesture.current = null
+     }
+-    const cancelBoxRef = useRef(cancelBoxSelection); cancelBoxRef.current = cancelBoxSelection
++    const cancelSelectionRef = useRef(cancelSelectionGesture); cancelSelectionRef.current = cancelSelectionGesture
+     useEffect(() => {
+-        const cancel = () => cancelBoxRef.current()
++        const cancel = () => cancelSelectionRef.current()
+         const hidden = () => { if (document.hidden) cancel() }
+         window.addEventListener('blur', cancel); window.addEventListener('resize', cancel); document.addEventListener('visibilitychange', hidden)
+         return () => { window.removeEventListener('blur', cancel); window.removeEventListener('resize', cancel); document.removeEventListener('visibilitychange', hidden) }
+     }, [])
+-    useEffect(() => { if (!visible) cancelBoxRef.current() }, [visible])
++    useEffect(() => { if (!visible) cancelSelectionRef.current() }, [visible])
+     const lastPointerType = useRef('mouse')
+     const touchMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const cancelTouchMenu = () => { if (touchMenuTimer.current) clearTimeout(touchMenuTimer.current); touchMenuTimer.current = null }
+@@ -205,7 +208,7 @@
+         const element = canvas.current
+         if (!element) return
+         // Non-passive so the page does not scroll while zooming.
+-        const wheel = (event: WheelEvent) => { event.preventDefault(); if (gesture.current?.kind === 'box') return; zoomRef.current(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX, event.clientY) }
++        const wheel = (event: WheelEvent) => { event.preventDefault(); if (gesture.current?.kind === 'box' || gesture.current?.kind === 'node') return; zoomRef.current(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX, event.clientY) }
+         element.addEventListener('wheel', wheel, { passive: false })
+         return () => element.removeEventListener('wheel', wheel)
+     }, [enabled])
+@@ -277,6 +280,10 @@
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
+         const previous = gesture.current
++        if (previous?.kind === 'node') {
++            setAnnotationDrafts({})
++            setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in previous.origins))))
++        }
+         if (previous?.kind === 'junction-move') setJunctionDrafts({})
+         if (previous?.kind === 'annotation') {
+             setAnnotationDrafts({}); setJunctionDrafts({})
+@@ -293,7 +300,7 @@
+         lastPointerType.current = event.pointerType || 'mouse'
+         if (target.closest('[data-graph-ui]')) return
+         if ((event.button !== 0 && event.button !== 1) || pending || mutationBusy.current || dropInFlight.current) return
+-        if (gesture.current?.kind === 'box') cancelBoxSelection()
++        if (gesture.current?.kind === 'box') cancelSelectionGesture()
+         if (event.button === 1) {
+             event.preventDefault(); event.currentTarget.focus({ preventScroll: true }); cancelTouchMenu()
+             pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+@@ -323,8 +330,10 @@
+         else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, wire: nodeRouting(graph!.graph).edges.find(e => e.child === input), x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) {
+-            setSelectedNode(node)
+-            gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]!, frames: graph!.graph.annotations ?? [] }
++            const moving = selectedNodes.includes(node) ? selectedNodes : [node]
++            if (!selectedNodes.includes(node)) setSelectedNode(node)
++            gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]!, frames: graph!.graph.annotations ?? [],
++                origins: Object.fromEntries(moving.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), positions: { ...positionsRef.current } }
+             if (event.pointerType === 'touch') {
+                 // Navigation is handled on pointerup. Suppress the compatibility click/focus
+                 // that would dismiss a hold-opened popover as soon as the finger lifts.
+@@ -427,10 +436,12 @@
+             g.moved = true
+             const k = viewRef.current.k, last = snap({ x: g.origin.x + dx / k, y: g.origin.y + dy / k })
+             g.last = last
+-            setOverrides(old => ({ ...old, [g.id]: last }))
++            const moved = Object.fromEntries(Object.entries(g.origins).map(([id, p]) => [id, { x: p.x + last.x - g.origin.x, y: p.y + last.y - g.origin.y }]))
++            setOverrides(old => ({ ...old, ...moved }))
+             {
+                 try {
+-                    const frames = placeInFrame(g.frames, g.id, framePoints({ ...positionsRef.current, [g.id]: last }, g.frames, junctionsRef.current))
++                    const points = framePoints({ ...g.positions, ...moved }, g.frames, junctionsRef.current)
++                    const frames = Object.keys(g.origins).length > 1 ? placeSelectionInFrames(g.frames, Object.keys(g.origins), points) : placeInFrame(g.frames, g.id, points)
+                     setAnnotationDrafts(Object.fromEntries(frames.filter((a, i) => JSON.stringify(a) !== JSON.stringify(g.frames[i])).map(a => [a.id, a])))
+                 } catch { /* The final drop reports bounds errors and restores geometry. */ }
+             }
+@@ -446,6 +457,7 @@
+             if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+             return
+         }
++        if (g && g.kind !== 'pinch' && g.pointer === event.pointerId) gesture.current = null
+         if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+         if (!g) return
+         if (g.kind === 'pinch') { if (pointers.current.size < 2) gesture.current = null; return }
+@@ -473,9 +485,15 @@
+             } else if (g.moved && !cancelled) void saveAnnotation(g.last, g.origin).finally(clear)
+             else clear()
+         } else if (g.kind === 'node') {
+-            if (cancelled) {
+-                setAnnotationDrafts({})
+-                setOverrides(old => { const next = { ...old }; delete next[g.id]; return next })
++            const clear = () => { setAnnotationDrafts({}); setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in g.origins)))) }
++            if (cancelled) { clear(); return }
++            if (g.moved && Object.keys(g.origins).length > 1) {
++                if (g.last.x === g.origin.x && g.last.y === g.origin.y) { clear(); return }
++                const moved = Object.fromEntries(Object.entries(g.origins).map(([id, p]) => [id, { x: p.x + g.last.x - g.origin.x, y: p.y + g.last.y - g.origin.y }]))
++                try {
++                    const frames = placeSelectionInFrames(g.frames, Object.keys(g.origins), framePoints({ ...g.positions, ...moved }, g.frames, junctionsRef.current))
++                    void changeVisual({ positions: g.origins, annotations: g.frames }, { positions: moved, annotations: frames }).finally(clear)
++                } catch (cause) { setError(errorText(cause, 'Could not move selection')); clear() }
+                 return
+             }
+             if (g.moved) {
+@@ -834,7 +852,7 @@
+             }}
+             onKeyDown={event => {
+                 const target = event.target instanceof Element ? event.target : null
+-                if (event.key === 'Escape' && gesture.current?.kind === 'box') { event.preventDefault(); event.stopPropagation(); cancelBoxSelection(); return }
++                if (event.key === 'Escape' && (gesture.current?.kind === 'box' || gesture.current?.kind === 'node')) { event.preventDefault(); event.stopPropagation(); cancelSelectionGesture(); return }
+                 if ((event.key === 'Delete' || event.key === 'Backspace') && !event.ctrlKey && !event.metaKey && !target?.closest('input, textarea, select, [contenteditable], [data-graph-ui]') && selectedNode) { event.preventDefault(); event.stopPropagation(); void removeNode(selectedNode); return }
+                 if (event.shiftKey && event.key.toLowerCase() === 'a' && event.target === event.currentTarget) {
+                     event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); showAddMenu(rect.left + rect.width / 2, rect.top + rect.height / 2); return
+@@ -843,7 +861,7 @@
+             onAuxClick={event => { if (event.button === 1) event.preventDefault() }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+-            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'box' && g.pointer === event.pointerId) { cancelBoxSelection(); return } if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
++            onLostPointerCapture={event => { const g = gesture.current; if ((g?.kind === 'box' || g?.kind === 'node') && g.pointer === event.pointerId) { cancelSelectionGesture(); return } if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
+             style={grid.visible ? { backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--app-hint) 35%, transparent) 0.5px, transparent 0.65px)', backgroundSize: `${grid.size * view.k}px ${grid.size * view.k}px`, backgroundPosition: `${view.x}px ${view.y}px` } : undefined}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-default outline-none">
+             {selectionRect && <div data-testid="graph-selection-box" aria-hidden="true" className="pointer-events-none absolute z-10 border border-[var(--app-link)] bg-[var(--app-link)]/10"
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1457,3 +1457,78 @@
+         expect(world.style.transform).not.toBe(before)
+     })
+ })
++
++const cardPositions = () => Object.fromEntries([...document.querySelectorAll<HTMLElement>('[data-node-id]')].map(card => [card.dataset.nodeId!, { x: parseFloat(card.style.left), y: parseFloat(card.style.top) }]))
++const selectPair = () => { fireEvent.pointerUp(boxDrag(['A', 'B']), { pointerId: 71 }); return screen.getByRole('application') }
++const startGroupDrag = (dx = 45, dy = 27, pointerType = 'mouse') => {
++    const card = screen.getByRole('button', { name: 'Node Bravo' }), start = nodeCentre('B'), canvas = screen.getByRole('application')
++    fireEvent.pointerDown(card, { pointerId: 81, pointerType, button: 0, ...start })
++    fireEvent.pointerMove(canvas, { pointerId: 81, pointerType, clientX: start.clientX + dx, clientY: start.clientY + dy })
++    return canvas
++}
++describe('dragging selected nodes together', () => {
++    it('keeps the selection and offsets, commits one edit, and undoes/redoes the whole move', async () => {
++        const { api, onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++        const before = cardPositions(); const canvas = startGroupDrag(); const moved = cardPositions()
++        expect(moved.A).not.toEqual(before.A)
++        expect(moved.B.x - before.B.x).toBe(moved.A.x - before.A.x)
++        expect(moved.B.y - before.B.y).toBe(moved.A.y - before.A.y)
++        expect(moved.C).toEqual(before.C)
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'true')
++        fireEvent.pointerUp(canvas, { pointerId: 81 })
++        await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(1))
++        expect(api.editNodeVisual.mock.calls[0][1].positions).toEqual({ A: moved.A, B: moved.B })
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).not.toBeDisabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(cardPositions()).toEqual(before))
++        fireEvent.click(screen.getByRole('button', { name: 'Redo graph edit' }))
++        await waitFor(() => expect(cardPositions()).toEqual(moved))
++        expect(api.editNodeVisual).toHaveBeenCalledTimes(3)
++        expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++    })
++    it('uses one snapped anchor delta under zoom without changing off-grid spacing', async () => {
++        localStorage.setItem(NODE_GRID_KEY, JSON.stringify({ enabled: true, visible: true, size: 20 }))
++        const api = makeApi(); await api.saveNodeLayout({ A: { x: 1101, y: 1011 }, B: { x: 1437, y: 1011 } }); api.saveNodeLayout.mockClear()
++        setup(api); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++        fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++        const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!, k = Number(/scale\(([-\d.e]+)\)/.exec(world.style.transform)![1])
++        const canvas = startGroupDrag(28 * k, 18 * k), moved = cardPositions()
++        expect(moved.B).toEqual({ x: 1460, y: 1020 }); expect(moved.A).toEqual({ x: 1124, y: 1020 })
++        fireEvent.pointerUp(canvas, { pointerId: 81 }); await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
++    })
++    it.each(['pointerCancel', 'escape', 'lostPointerCapture', 'blur', 'pinch'])('rolls back every preview on %s without saving', async cancel => {
++        const { api, onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++        const before = cardPositions(), canvas = startGroupDrag(45, 27, cancel === 'pinch' ? 'touch' : 'mouse')
++        if (cancel === 'escape') fireEvent.keyDown(canvas, { key: 'Escape' })
++        else if (cancel === 'blur') fireEvent(window, new Event('blur'))
++        else if (cancel === 'pinch') fireEvent.pointerDown(canvas, { pointerId: 82, pointerType: 'touch', button: 0, clientX: 80, clientY: 80 })
++        else fireEvent[ cancel === 'pointerCancel' ? 'pointerCancel' : 'lostPointerCapture'](canvas, { pointerId: 81 })
++        expect(cardPositions()).toEqual(before)
++        fireEvent.pointerUp(canvas, { pointerId: 81 })
++        expect(api.editNodeVisual).not.toHaveBeenCalled(); expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++    })
++    it('restores every card and creates no undo entry if the atomic move conflicts', async () => {
++        const api = makeApi(); api.editNodeVisual.mockRejectedValueOnce(new Error('Node moved elsewhere'))
++        setup(api); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++        const before = cardPositions(), canvas = startGroupDrag()
++        fireEvent.pointerUp(canvas, { pointerId: 81 })
++        expect(await screen.findByRole('alert')).toHaveTextContent('Node moved elsewhere')
++        await waitFor(() => expect(cardPositions()).toEqual(before))
++        expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeDisabled()
++    })
++})
++
++it('moves a selected pair inside a frame and fits the frame in the same transaction', async () => {
++    const api = makeApi()
++    await api.saveNodeLayout({ A: { x: 1000, y: 1000 }, B: { x: 1300, y: 1000 } }); api.saveNodeLayout.mockClear()
++    const frame: NodeAnnotation = { id: 'group', kind: 'frame', text: 'Group', color: 'blue', x: 976, y: 948, width: 548, height: 156, members: ['A', 'B'] }
++    await api.editNodeAnnotation('default', frame.id, frame, null); api.editNodeAnnotation.mockClear()
++    setup(api); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++    const canvas = startGroupDrag(), moved = cardPositions()
++    fireEvent.pointerUp(canvas, { pointerId: 81 })
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
++    const after = api.editNodeVisual.mock.calls[0][1]
++    expect(after.positions).toEqual({ A: moved.A, B: moved.B })
++    expect(after.annotations[0]).toEqual(fitNodeFrame(frame, moved))
++    expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++})
+diff --git a/web/src/lib/nodeFrames.ts b/web/src/lib/nodeFrames.ts
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -28,6 +28,22 @@
+     })
+ }
+ 
++/** Resolve every drop against the same frame geometry, then fit once. */
++export function placeSelectionInFrames(annotations: NodeAnnotation[], ids: string[], positions: Record<string, FramePoint>): NodeAnnotation[] {
++    const targets = new Map(ids.map(id => {
++        const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
++        const target = p ? annotations.filter(a => a.kind === 'frame' && p.x + (p.width ?? NODE_SIZE.width) / 2 >= a.x && p.x + (p.width ?? NODE_SIZE.width) / 2 <= a.x + a.width && p.y + (p.height ?? NODE_SIZE.height) / 2 >= a.y && p.y + (p.height ?? NODE_SIZE.height) / 2 <= a.y + a.height)
++            .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? current : undefined
++        return [id, target?.id] as const
++    }))
++    return annotations.map(frame => {
++        if (frame.kind !== 'frame' || !ids.some(id => frame.members?.includes(id) || targets.get(id) === frame.id)) return frame
++        const members = (frame.members ?? []).filter(id => !targets.has(id) || targets.get(id) === frame.id)
++        for (const id of ids) if (targets.get(id) === frame.id && !members.includes(id)) members.push(id)
++        return fitNodeFrame({ ...frame, members }, positions)
++    })
++}
++
+ export function translateFrame(frame: NodeAnnotation, annotations: NodeAnnotation[], positions: Record<string, FramePoint>, routing: NodeRouting, delta: GraphPoint): NodeVisualState {
+     const members = new Set(frame.members ?? [])
+     const moved = Object.fromEntries(Object.entries(positions).filter(([id]) => members.has(id)).map(([id, p]) => [id, { ...p, x: p.x + delta.x, y: p.y + delta.y }]))
+diff --git a/web/src/lib/nodeFrames.test.ts b/web/src/lib/nodeFrames.test.ts
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -1,6 +1,6 @@
+ import { expect, it } from 'vitest'
+ import type { NodeAnnotation } from '@hapi/protocol/nodeGraph'
+-import { fitNodeFrame, framePoints, placeInFrame, translateFrame } from './nodeFrames'
++import { fitNodeFrame, framePoints, placeInFrame, placeSelectionInFrames, translateFrame } from './nodeFrames'
+ const frame: NodeAnnotation = { id:'f', kind:'frame', text:'Group', color:'blue', x:0, y:0, width:600, height:500 }
+ it('enters a frame, tightly fits around members and stays attached when moved outside', () => {
+     const initial = { A:{x:100,y:120}, B:{x:300,y:300} }
+@@ -38,3 +38,22 @@
+     const released=placeInFrame(moved.annotations,'text:note',framePoints(moved.positions,moved.annotations,moved.routing!.junctions),true)
+     expect(released[0].members).not.toContain('text:note')
+ })
++
++
++it('fits a group drop once without changing its target frames as earlier members expand them', () => {
++    const target = { ...frame, width: 300, height: 200 }
++    // A is inside the original frame; fitting it would expand the frame under B.
++    const points = { A: { x: 190, y: 50 }, B: { x: 290, y: 50 } }
++    const forward = placeSelectionInFrames([target], ['A', 'B'], points)
++    const reverse = placeSelectionInFrames([target], ['B', 'A'], points)
++    expect(forward).toEqual(reverse)
++    expect(forward[0].members).toEqual(['A'])
++})
++it('keeps existing group membership, text and junction bounds while fitting moved cards', () => {
++    const target = { ...frame, members: ['A', 'B', 'text:note', 'junction:dot'] }
++    const points = { A: { x: 900, y: 300 }, B: { x: 1200, y: 300 }, 'text:note': { x: 100, y: 100, width: 100, height: 100 }, 'junction:dot': { x: 80, y: 80, width: 16, height: 16 } }
++    const result = placeSelectionInFrames([target], ['A', 'B'], points)[0]
++    expect(result.members).toEqual(target.members)
++    expect(result.x).toBe(56)
++    expect(result.x + result.width).toBe(1424)
++})

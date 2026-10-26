@@ -1,0 +1,22 @@
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -264,7 +264,7 @@
+                     ) : null}
+                 </div>
+                 {alignActivityColumns ? <div data-session-activity-column className="min-w-0 text-left">{activity}</div> : null}
+-                <div data-session-time-column={alignActivityColumns || undefined} className="flex min-w-0 items-center justify-end gap-2 overflow-hidden text-xs">
++                <div data-session-time-column={alignActivityColumns || undefined} className={`flex min-w-0 items-center ${alignActivityColumns ? 'justify-start' : 'justify-end'} gap-2 overflow-hidden text-xs`}>
+                     {todoProgress ? (
+                         <span className="flex shrink-0 items-center gap-1 text-[var(--app-hint)]">
+                             <BulbIcon className="h-3 w-3" />
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -94,7 +94,7 @@
+                             <SessionRowSummary session={session} showPath={false} singleLine alignActivityColumns managed={isManaged(session.id)} />
+                         </button>
+                     <SessionOversightBadge managed={currentManaged[session.id]} />
+-                    <div className="max-w-14 shrink-0 overflow-hidden text-right"><SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} /></div>
++                    <div className="w-12 shrink-0 overflow-hidden text-left"><SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} /></div>
+                     <div className="grid shrink-0 grid-cols-[2rem_2rem] items-center gap-1">
+                         {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" aria-label="Unmanage" title="Stop managing this chat" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {

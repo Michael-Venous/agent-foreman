@@ -1,0 +1,366 @@
+--- a/web/src/components/ChatFolderDragButton.tsx
++++ b/web/src/components/ChatFolderDragButton.tsx
+@@ -1,8 +1,9 @@
++import { FOLDER_GRAPH_DRAG_TYPE } from '@/lib/folderGraphDrop'
+ import type { ReactNode } from 'react'
+ import { useLongPress } from '@/hooks/useLongPress'
+ import { FOLDER_DRAG_TYPE } from '@/lib/chatFolderTree'
+ export function ChatFolderDragButton(props: {
+-    id: string; label: string; expanded: boolean; disabled?: boolean; onClick: () => void; onEdit: () => void; children: ReactNode
++    provider?: 'codex' | 'claude'; id: string; label: string; expanded: boolean; disabled?: boolean; onClick: () => void; onEdit: () => void; children: ReactNode
+     onStart: (id: string) => void; onMove: (point: { x: number; y: number }) => void; onDrop: (point: { x: number; y: number }) => void; onEnd: () => void
+ }) {
+     const press = useLongPress({ disabled: props.disabled, onClick: props.onClick, onLongPress: props.onEdit, touchDrag: props.id ? {
+@@ -10,6 +11,6 @@
+     } : undefined })
+     return <div {...press} role="button" tabIndex={0} aria-label={props.label} aria-expanded={props.expanded}
+         draggable={Boolean(props.id) && !props.disabled} className="flex min-w-0 flex-1 select-none cursor-grab items-center gap-2 text-left active:cursor-grabbing"
+-        onDragStart={event => { press.onMouseLeave(event); event.dataTransfer.setData(FOLDER_DRAG_TYPE, props.id); event.dataTransfer.effectAllowed = 'move'; props.onStart(props.id) }}
++        onDragStart={event => { press.onMouseLeave(event); event.dataTransfer.setData(FOLDER_DRAG_TYPE, props.id); event.dataTransfer.setData(FOLDER_GRAPH_DRAG_TYPE, JSON.stringify({ origin: window.location.origin, folderId: props.id, provider: props.provider ?? 'codex' })); event.dataTransfer.effectAllowed = 'copyMove'; props.onStart(props.id) }}
+         onClick={event => { if (event.detail === 0) props.onClick() }} onDragEnd={props.onEnd}>{props.children}</div>
+ }
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1738,10 +1738,10 @@
+                             }}>
+                             {folder !== undefined ? (
+                                 <div data-folder-header={folder?.id} className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
+-                                    <ChatFolderDragButton id={folder?.id ?? ''} label={`${folder?.name ?? t('folders.none')} folder`} expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
++                                    <ChatFolderDragButton provider={activeTab === 'claude' ? 'claude' : 'codex'} id={folder?.id ?? ''} label={`${folder?.name ?? t('folders.none')} folder`} expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
+                                         disabled={Boolean(folderDialog)} onClick={() => toggleFolder(folder?.id ?? null)} onEdit={() => folder && setFolderDialog({ folder })}
+                                         onStart={startFolderDrag} onEnd={endFolderDrag} onMove={point => setFolderDrop(touchFolderTarget(point))}
+-                                        onDrop={point => { const id = draggedFolderRef.current, drop = touchFolderTarget(point); if (id && drop) void moveFolder(id, drop); else endFolderDrag() }}>
++                                        onDrop={point => { const id = draggedFolderRef.current, drop = touchFolderTarget(point); const graphCanvas = document.elementFromPoint(point.x, point.y)?.closest('[data-node-graph-drop]'); if (id && graphCanvas) { graphCanvas.dispatchEvent(new CustomEvent('hapi:folder-graph-drop', { detail: { payload: { origin: window.location.origin, folderId: id, provider: activeTab === 'claude' ? 'claude' : 'codex' }, x: point.x, y: point.y } })); endFolderDrag(); return } if (id && drop) void moveFolder(id, drop); else endFolderDrag() }}>
+                                     <ChevronIcon className="h-3 w-3" collapsed={Boolean(collapsedFolders[folderKey(folder?.id ?? null)]) && !isFiltering} />
+                                     <FolderGlyph className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]" />
+                                     <span className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,3 +1,4 @@
++import { FOLDER_GRAPH_DRAG_TYPE, readFolderGraphDrag, folderGraphMembers, folderGraphState, makeFolderGraphGroup, type FolderGraphDrag } from '@/lib/folderGraphDrop'
+ import { sessionFailureLabel } from '@/lib/sessionFailure'
+ import { fitNodeFrame, framePoints, frameMemberIds, placeInFrame, placeSelectionInFrames, translateFrame, type NodeVisualState } from '@/lib/nodeFrames'
+ import { useNodeGrid } from '@/hooks/useNodeGrid'
+@@ -888,9 +889,45 @@
+     undoRef.current = () => replayHistory('undo')
+     redoRef.current = () => replayHistory('redo')
+ 
++    const folderDropHandler = useRef<(payload: unknown, x: number, y: number) => void>(() => {})
++    useEffect(() => {
++        const element = canvas.current
++        const drop = (event: Event) => { const detail = (event as CustomEvent).detail; if (detail) folderDropHandler.current(detail.payload, detail.x, detail.y) }
++        element?.addEventListener('hapi:folder-graph-drop', drop)
++        return () => element?.removeEventListener('hapi:folder-graph-drop', drop)
++    }, [enabled])
++    const placeFolder = (payload: FolderGraphDrag, x: number, y: number) => {
++        if (previewing || !graph || pending || dropInFlight.current || !api) return
++        const workspace = graph.graph.workspaceId, point = snap(toGraph(x, y))
++        setMenu(null); setPending('folder:' + payload.folderId); setError(null)
++        dropInFlight.current = (async () => {
++            try {
++                await flushSave()
++                const eligible = (sessions ?? []).filter(s => payload.provider === 'codex' ? s.metadata?.flavor === 'codex' : !s.metadata?.flavor || s.metadata.flavor === 'claude')
++                const threadIds = eligible.flatMap(s => s.metadata?.agentSessionId ? [s.metadata.agentSessionId] : [])
++                const catalog = await api.getCodexFolders(payload.provider === 'codex' ? threadIds.slice(0, 300) : [], payload.provider)
++                for (let offset = 300; payload.provider === 'codex' && offset < threadIds.length; offset += 300) {
++                    const page = await api.getCodexFolders(threadIds.slice(offset, offset + 300), payload.provider)
++                    Object.assign(catalog.assignments, page.assignments)
++                }
++                const members = folderGraphMembers(payload.folderId, catalog, eligible, payload.provider)
++                const fresh = await api.getNodeGraph()
++                if (fresh.activeWorkspaceId !== workspace) throw new Error('Workspace changed. Try the drop again.')
++                const before = folderGraphState(fresh.graph)
++                const after = makeFolderGraphGroup(fresh, catalog.folders.find(f => f.id === payload.folderId)!, members.map(s => s.id), point, crypto.randomUUID())
++                await mutate(client => client.editFolderGraph(workspace, after, before))
++                const priorPositions = layoutNodeGraph({ overseer: fresh.overseer, ...fresh.graph, label: title }).positions
++                const undoBefore = { ...before, nodes: before.nodes.map(n => members.some(s => s.id === n.sessionId) && n.x == null ? { ...n, ...priorPositions[n.sessionId] } : n) }
++                remember({ kind: 'folder', workspace, before: undoBefore, after })
++            } catch (cause) { setError(errorText(cause, 'Could not add folder to workspace')) }
++            finally { setPending(null); dropInFlight.current = null }
++        })()
++    }
++    folderDropHandler.current = (value, x, y) => { const payload = readFolderGraphDrag(value, window.location.origin); if (payload) placeFolder(payload, x, y) }
++
+     if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
+     const dragOver = (event: DragEvent<HTMLDivElement>) => {
+-        if (previewing || !hasSessionDrag(event.dataTransfer)) return
++        if (previewing || !(hasSessionDrag(event.dataTransfer) || Array.from(event.dataTransfer.types).includes(FOLDER_GRAPH_DRAG_TYPE))) return
+         event.preventDefault()
+         if (!graph || pending || dropInFlight.current) { event.dataTransfer.dropEffect = 'none'; return }
+         event.dataTransfer.dropEffect = 'copy'
+@@ -900,6 +937,7 @@
+         if (previewing) return
+         event.preventDefault()
+         setDropActive(false)
++        if (Array.from(event.dataTransfer.types).includes(FOLDER_GRAPH_DRAG_TYPE)) { folderDropHandler.current(event.dataTransfer.getData(FOLDER_GRAPH_DRAG_TYPE), event.clientX, event.clientY); return }
+         const id = readSessionDrag(event.dataTransfer)
+         if (!graph || pending || dropInFlight.current || !id || !sessionsById.has(id) || id === overseer) return
+         const at = toGraph(event.clientX, event.clientY)
+@@ -987,7 +1025,7 @@
+             <div className="min-w-0">{workspaceControl}</div>{gridControl}
+         </div>}
+         {(loadError || (error && !menu && !objectMenu && !editingAnnotation)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+-        <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
++        <div ref={canvas} data-node-graph-drop aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+             onDoubleClick={event => {
+                 // Touch hold/double-tap is handled by pointers; ignore duplicate
+                 // compatibility double-clicks even if preventDefault is ignored.
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1,3 +1,4 @@
++import { FOLDER_GRAPH_DRAG_TYPE } from '@/lib/folderGraphDrop'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+@@ -2096,3 +2097,28 @@
+     expect((await api.getNodeGraph()).graph).toEqual(before)
+     expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
+ })
++
++
++it.each(['native', 'touch'])('imports a folder through %s drop without invoking chat controls', async kind => {
++    const api = Object.assign(makeApi(), {
++        getCodexFolders: vi.fn(async () => ({ folders: [{ id: 'school', name: 'School', position: 0 }], assignments: { nativeN: { folderId: 'school', source: 'app-server' } } })),
++        editFolderGraph: vi.fn(async () => initial()),
++    })
++    setup(api, sessions.map(s => s.id === 'N' ? { ...s, metadata: { ...s.metadata!, agentSessionId: 'nativeN' } } : s))
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    const canvas = screen.getByRole('application', { name: 'Node graph' })
++    const payload = { origin: window.location.origin, folderId: 'school', provider: 'codex' }
++    if (kind === 'native') fireEvent.drop(canvas, { clientX: 150, clientY: 200, dataTransfer: { types: [FOLDER_GRAPH_DRAG_TYPE], getData: () => JSON.stringify(payload) } })
++    else act(() => { canvas.dispatchEvent(new CustomEvent('hapi:folder-graph-drop', { detail: { payload, x: 150, y: 200 } })) })
++    await waitFor(() => expect(api.editFolderGraph).toHaveBeenCalledOnce())
++    const [workspace, after, before] = api.editFolderGraph.mock.calls[0] as unknown as [string, import('@/lib/folderGraphDrop').FolderGraphState, import('@/lib/folderGraphDrop').FolderGraphState]
++    expect(workspace).toBe('default')
++    expect(after.nodes.some(n => n.sessionId === 'N')).toBe(true)
++    expect(before.nodes.some(n => n.sessionId === 'N')).toBe(false)
++    expect(after.annotations.at(-1)?.text).toBe('School')
++    expect(after.routing.junctions.at(-1)?.targets).toEqual(['N'])
++    expect(after.routing.edges).toEqual(nodeRouting(initial().graph).edges)
++    expect(api.abortSession).not.toHaveBeenCalled()
++    expect(api.addNode).not.toHaveBeenCalled()
++    expect(api.setNodeOwner).not.toHaveBeenCalled()
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,3 +1,4 @@
++import { folderGraphState, type FolderGraphState } from '@/lib/folderGraphDrop'
+ import { nodeRouting } from '@hapi/protocol/nodeGraph'
+ import type { NodeVisualState } from '@/lib/nodeFrames'
+ import type { SessionManagerRecords } from '@hapi/protocol/sessionManager'
+@@ -932,6 +933,26 @@
+         return this.getNodeGraph()
+     }
+ 
++    /** One versioned transaction for folder enrollment, layout and visual wiring. */
++    async editFolderGraph(workspace: string, value: FolderGraphState, expected: FolderGraphState): Promise<NodeGraphResponse> {
++        const tree = await this.request<{ activeWorkspaceId: string; workspaces: { version: string; graph: NodeGraphResponse['graph'] }[] }>(`/api/node-graph/tree?workspaceId=${encodeURIComponent(workspace)}`)
++        const snapshot = tree.workspaces[0]
++        const canonical = (state: FolderGraphState) => folderGraphState({ nodes: state.nodes, annotations: state.annotations, ...state.routing } as NodeGraphResponse['graph'])
++        if (!snapshot || tree.activeWorkspaceId !== workspace || JSON.stringify(folderGraphState(snapshot.graph)) !== JSON.stringify(canonical(expected))) throw new Error('The graph changed elsewhere. Try the folder drop again.')
++        const removed = expected.nodes.filter(n => !value.nodes.some(v => v.sessionId === n.sessionId)).map(n => n.sessionId)
++        const changedAnnotations = new Set([...expected.annotations, ...value.annotations].filter(a => JSON.stringify(expected.annotations.find(b => b.id === a.id)) !== JSON.stringify(value.annotations.find(b => b.id === a.id))).map(a => a.id))
++        const changes: unknown[] = [
++            ...value.nodes.filter(n => !expected.nodes.some(v => v.sessionId === n.sessionId)).map(n => ({ action: 'add', sessionId: n.sessionId })),
++            { action: 'routing', value: value.routing },
++            ...[...changedAnnotations].map(id => ({ action: 'annotation', id, value: null })),
++            ...value.annotations.filter(a => changedAnnotations.has(a.id)).map(a => ({ action: 'annotation', id: a.id, value: a })),
++            ...(removed.length ? [{ action: 'remove', ids: removed }] : []),
++            { action: 'layout', positions: Object.fromEntries(value.nodes.filter(n => n.x != null && n.y != null).map(n => [n.sessionId, { x: n.x, y: n.y }])) },
++        ]
++        await this.nodeGraphPost(`/workspaces/${encodeURIComponent(workspace)}/edit`, { version: snapshot.version, createdBy: 'user', preserveConnections: !removed.length, changes })
++        return this.getNodeGraph()
++    }
++
+     async editNodeRouting(workspace: string, value: NodeRouting, expected: NodeRouting): Promise<NodeGraphResponse | null> {
+         return nodeGraphOf(await this.nodeGraphPost(`/workspaces/${encodeURIComponent(workspace)}/routing`, { value, expected }))
+     }
+--- a/web/src/lib/nodeGraphUndo.ts
++++ b/web/src/lib/nodeGraphUndo.ts
+@@ -1,3 +1,4 @@
++import type { FolderGraphState } from './folderGraphDrop'
+ import type { NodeVisualState } from './nodeFrames'
+ import { nodeRouting, createsCycle, type NodeRouting, type NodeAnnotation, type NodeGraphEdge, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+@@ -5,6 +6,7 @@
+ 
+ type Base = { workspace: string }
+ export type GraphEdit = Base & (
++    | { kind: 'folder'; before: FolderGraphState; after: FolderGraphState }
+     | { kind: 'visual'; before: NodeVisualState; after: NodeVisualState }
+     | { kind: 'routing'; before: NodeRouting; after: NodeRouting }
+     | { kind: 'annotation'; id: string; before: NodeAnnotation | null; after: NodeAnnotation | null }
+@@ -27,6 +29,7 @@
+     if (graph.activeWorkspaceId !== edit.workspace) throw changed()
+     const node = 'id' in edit ? graph.graph.nodes.find(n => n.sessionId === edit.id) : undefined
+     switch (edit.kind) {
++        case 'folder': return client.editFolderGraph(edit.workspace, edit.before, edit.after)
+         case 'visual': return client.editNodeVisual(edit.workspace, edit.before, edit.after, visualDisconnect(edit.before, edit.after) ? { allowDisconnect: true } : undefined)
+         case 'routing': return client.editNodeRouting(edit.workspace, edit.before, edit.after)
+         case 'annotation': return client.editNodeAnnotation(edit.workspace, edit.id, edit.before, edit.after)
+--- a/hub/src/sync/nodeTree.test.ts
++++ b/hub/src/sync/nodeTree.test.ts
+@@ -280,3 +280,29 @@
+         } finally { f.close(); rmSync(dir, { recursive: true, force: true }) }
+     })
+ })
++
++
++it('atomically saves a dropped folder stack with pending fan-out and rolls back invalid imports', async () => {
++    const f = fixture()
++    try {
++        const junction = { id: 'folder-j', owner: null, x: 200, y: 100, targets: [f.a.id, f.b.id] }
++        const frame = { id: 'folder', kind: 'frame', text: 'School', color: 'blue', x: 88, y: 72, width: 224, height: 240, members: ['junction:folder-j', f.a.id, f.b.id] }
++        const changes = [
++            { action: 'add', sessionId: f.a.id }, { action: 'add', sessionId: f.b.id },
++            { action: 'routing', value: { junctions: [junction], edges: [] } },
++            { action: 'annotation', id: 'folder', value: frame },
++            { action: 'layout', positions: { [f.a.id]: { x: 100, y: 120 }, [f.b.id]: { x: 100, y: 220 } } },
++        ]
++        const before = f.snapshot()
++        const invalid = await f.edit([...changes, { action: 'add', sessionId: f.foreign.id }], { preserveConnections: true })
++        expect(invalid.status).toBe(409); expect(f.snapshot()).toEqual(before)
++        const imported = await f.edit(changes, { preserveConnections: true })
++        expect(imported.status).toBe(200)
++        const saved = f.snapshot().graph
++        expect(saved.edges).toEqual([])
++        expect(saved.junctions?.[0]).toMatchObject(junction)
++        expect(saved.annotations?.[0]).toMatchObject(frame)
++        expect(saved.nodes.find(n => n.sessionId === f.b.id)).toMatchObject({ x: 100, y: 220 })
++        noControls(f)
++    } finally { f.close() }
++})
+--- /dev/null
++++ b/web/src/lib/folderGraphDrop.ts
+@@ -0,0 +1,45 @@
++import type { CodexFolder, CodexFoldersResponse } from '@/api/client'
++import type { SessionSummary } from '@/types/api'
++import { nodeRouting, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import { fitNodeFrame, framePoints, fitFrames } from './nodeFrames'
++import { NODE_SIZE, type GraphPoint } from './nodeGraphLayout'
++
++export const FOLDER_GRAPH_DRAG_TYPE = 'application/x-hapi-folder-graph'
++export type FolderGraphDrag = { origin: string; folderId: string; provider: 'codex' | 'claude' }
++export function readFolderGraphDrag(value: unknown, origin: string): FolderGraphDrag | null {
++    try {
++        const data = typeof value === 'string' ? JSON.parse(value) : value
++        return data && data.origin === origin && typeof data.folderId === 'string' && data.folderId && ['codex', 'claude'].includes(data.provider) ? data : null
++    } catch { return null }
++}
++/** The receiving window resolves current membership; drag data never supplies chat IDs. */
++export function folderGraphMembers(folderId: string, catalog: CodexFoldersResponse, sessions: readonly SessionSummary[], provider: FolderGraphDrag['provider']): SessionSummary[] {
++    if (!catalog.folders.some(f => f.id === folderId)) throw new Error('Folder no longer exists. Refresh the chat list.')
++    const descendants = new Set([folderId])
++    for (let changed = true; changed;) {
++        changed = false
++        for (const f of catalog.folders) if (f.parentId && descendants.has(f.parentId) && !descendants.has(f.id)) { descendants.add(f.id); changed = true }
++    }
++    return sessions.filter(s => (provider === 'codex' ? s.metadata?.flavor === 'codex' : !s.metadata?.flavor || s.metadata.flavor === 'claude') && descendants.has(catalog.assignments[provider === 'claude' ? s.id : s.metadata?.agentSessionId ?? '']?.folderId ?? ''))
++}
++export type FolderGraphState = { nodes: { sessionId: string; x: number | null; y: number | null }[]; annotations: NonNullable<NodeGraphResponse['graph']['annotations']>; routing: ReturnType<typeof nodeRouting> }
++export function folderGraphState(graph: NodeGraphResponse['graph']): FolderGraphState {
++    return { nodes: graph.nodes.map(({ sessionId, x, y }) => ({ sessionId, x, y })).sort((a, b) => a.sessionId.localeCompare(b.sessionId)), annotations: [...graph.annotations ?? []].sort((a, b) => a.id.localeCompare(b.id)), routing: nodeRouting(graph) }
++}
++/** A visual bundle, with disconnected fan-out wires. Existing ownership is untouched. */
++export function makeFolderGraphGroup(graph: NodeGraphResponse, folder: CodexFolder, sessionIds: string[], point: GraphPoint, token: string): FolderGraphState {
++    const before = folderGraphState(graph.graph), ids = [...new Set(sessionIds)].filter(id => id !== graph.overseer)
++    if (!ids.length) throw new Error('This folder has no chats to add.')
++    // Keep frame bounds within the supported canvas range; no partial enrollment.
++    if (ids.length > 75) throw new Error('This folder is too large for one stack. Drop a smaller subfolder instead.')
++    const junctionId = `folder-j-${token}`, frameId = `folder-${token}`
++    const positions = Object.fromEntries(before.nodes.map(n => [n.sessionId, { x: n.x ?? 0, y: n.y ?? 0 }]))
++    ids.forEach((id, i) => { positions[id] = { x: point.x - NODE_SIZE.width / 2, y: point.y + 20 + i * (NODE_SIZE.height + 20) } })
++    const nodes = [...before.nodes.filter(n => !ids.includes(n.sessionId)), ...ids.map(sessionId => ({ sessionId, ...positions[sessionId] }))]
++    const occupied = new Set([...before.routing.edges.map(e => e.child), ...before.routing.junctions.flatMap(j => j.targets ?? [])])
++    const routing = { ...before.routing, junctions: [...before.routing.junctions, { id: junctionId, x: point.x, y: point.y, owner: null, targets: ids.filter(id => !occupied.has(id)) }] }
++    // Move imported cards out of their old visual frames, without touching wires.
++    const annotations = before.annotations.map(a => a.kind === 'frame' ? { ...a, members: a.members?.filter(id => !ids.includes(id)) } : a)
++    const frame = fitNodeFrame({ id: frameId, kind: 'frame', text: folder.name, color: 'blue', x: point.x, y: point.y, width: 224, height: 100, members: ['junction:' + junctionId, ...ids] }, framePoints(positions, annotations, routing.junctions))
++    return { nodes, annotations: [...fitFrames(annotations, framePoints(positions, annotations, routing.junctions)), frame], routing }
++}
+--- /dev/null
++++ b/web/src/lib/folderGraphDrop.test.ts
+@@ -0,0 +1,65 @@
++import { describe, expect, it, vi } from 'vitest'
++import { nodeRoutingError, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
++import type { SessionSummary } from '@/types/api'
++import { ApiClient } from '@/api/client'
++import { folderGraphMembers, folderGraphState, makeFolderGraphGroup, readFolderGraphDrag } from './folderGraphDrop'
++import { redoGraphEdit, undoGraphEdit } from './nodeGraphUndo'
++const graph = (): NodeGraphResponse => ({ activeWorkspaceId: 'w', overseer: 'O', workspaces: [], graph: { workspaceId: 'w', nodes: [{ sessionId: 'A', x: 10, y: 10, addedAt: 1 }], edges: [{ owner: 'O', child: 'A', createdAt: 1, createdBy: 'user' }] } })
++const catalog = { folders: [{ id: 'f', name: 'School', position: 0 }, { id: 'sub', name: 'Sub', position: 1, parentId: 'f' }], assignments: { nA: { folderId: 'f', source: 'app-server' as const }, nB: { folderId: 'sub', source: 'app-server' as const }, C: { folderId: 'f', source: 'hapi' as const } } }
++const sessions = [{ id: 'A', metadata: { flavor: 'codex', agentSessionId: 'nA' } }, { id: 'B', metadata: { flavor: 'codex', agentSessionId: 'nB' } }, { id: 'C', metadata: { flavor: 'claude' } }] as SessionSummary[]
++describe('folder graph import', () => {
++    it('validates origin and provider without accepting supplied session IDs', () => {
++        expect(readFolderGraphDrag('{', 'here')).toBeNull()
++        expect(readFolderGraphDrag({ origin: 'elsewhere', folderId: 'f', provider: 'codex' }, 'here')).toBeNull()
++        expect(readFolderGraphDrag({ origin: 'here', folderId: 'f', provider: 'other' }, 'here')).toBeNull()
++        expect(readFolderGraphDrag(JSON.stringify({ origin: 'here', folderId: 'f', provider: 'claude' }), 'here')?.provider).toBe('claude')
++    })
++    it('resolves subtree membership per provider and rejects deleted folders', () => {
++        expect(folderGraphMembers('f', catalog, sessions, 'codex').map(s => s.id)).toEqual(['A', 'B'])
++        expect(folderGraphMembers('f', catalog, sessions, 'claude').map(s => s.id)).toEqual(['C'])
++        expect(() => folderGraphMembers('gone', catalog, sessions, 'codex')).toThrow('no longer exists')
++    })
++    it('stacks cards under a junction in a named frame, retaining ownership', () => {
++        const state = makeFolderGraphGroup(graph(), catalog.folders[0]!, ['O', 'A', 'B', 'B'], { x: 200, y: 100 }, 'test')
++        expect(state.nodes.find(n => n.sessionId === 'A')).toMatchObject({ x: 100, y: 120 })
++        expect(state.nodes.find(n => n.sessionId === 'B')).toMatchObject({ x: 100, y: 220 })
++        expect(state.routing.edges).toEqual([{ owner: 'O', child: 'A' }])
++        expect(state.routing.junctions[0]).toMatchObject({ x: 200, y: 100, owner: null, targets: ['B'] })
++        expect(state.annotations[0]).toMatchObject({ text: 'School', members: ['junction:folder-j-test', 'A', 'B'] })
++        expect(nodeRoutingError(state.routing, 'O')).toBeNull()
++    })
++    it('does not steal existing disconnected junction inputs or change the original graph', () => {
++        const g = graph(); g.graph.junctions = [{ id: 'old', x: 0, y: 0, owner: null, targets: ['B'] }]
++        const before = structuredClone(g)
++        const state = makeFolderGraphGroup(g, catalog.folders[0]!, ['B'], { x: 0, y: 0 }, 'new')
++        expect(state.routing.junctions.find(j => j.id === 'folder-j-new')?.targets).toEqual([])
++        expect(g).toEqual(before)
++    })
++    it('rejects empty or oversized stacks before saving anything', () => {
++        expect(() => makeFolderGraphGroup(graph(), catalog.folders[0]!, [], { x: 0, y: 0 }, 'x')).toThrow('no chats')
++        expect(() => makeFolderGraphGroup(graph(), catalog.folders[0]!, Array.from({ length: 76 }, (_, i) => 'N' + i), { x: 0, y: 0 }, 'x')).toThrow('too large')
++    })
++    it('atomically enrolls before wiring/layout and uses snapshot CAS; undo/redo reuse the same transaction', async () => {
++        const g = graph(), before = folderGraphState(g.graph), after = makeFolderGraphGroup(g, catalog.folders[0]!, ['B'], { x: 0, y: 0 }, 'x')
++        const calls: { url: string; body: any }[] = []
++        const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
++            const url = String(input); calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null })
++            return new Response(JSON.stringify(url.includes('/tree') ? { activeWorkspaceId: 'w', workspaces: [{ version: 'a'.repeat(64), graph: g.graph }] } : url.endsWith('/edit') ? {} : g))
++        })
++        try {
++            const api = new ApiClient('test')
++            await api.editFolderGraph('w', after, before)
++            const edit = calls.find(c => c.url.endsWith('/edit'))!.body
++            expect(edit).toMatchObject({ version: 'a'.repeat(64), createdBy: 'user', preserveConnections: true })
++            expect(edit.changes[0]).toEqual({ action: 'add', sessionId: 'B' })
++            expect(edit.changes.at(-1).action).toBe('layout')
++            const client = { getNodeGraph: vi.fn(async () => g), editFolderGraph: vi.fn(async () => g) } as unknown as ApiClient
++            const entry = { kind: 'folder' as const, workspace: 'w', before, after }
++            await undoGraphEdit(client, entry); expect(client.editFolderGraph).toHaveBeenLastCalledWith('w', before, after)
++            await redoGraphEdit(client, entry); expect(client.editFolderGraph).toHaveBeenLastCalledWith('w', after, before)
++            calls.length = 0
++            await expect(api.editFolderGraph('w', before, after)).rejects.toThrow('changed elsewhere')
++            expect(calls.some(c => c.url.endsWith('/edit'))).toBe(false)
++        } finally { request.mockRestore() }
++    })
++})
+--- /dev/null
++++ b/web/src/components/ChatFolderDragButton.test.tsx
+@@ -0,0 +1,15 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++import { ChatFolderDragButton } from './ChatFolderDragButton'
++import { FOLDER_GRAPH_DRAG_TYPE } from '@/lib/folderGraphDrop'
++import { FOLDER_DRAG_TYPE } from '@/lib/chatFolderTree'
++afterEach(cleanup)
++it.each(['codex', 'claude'] as const)('exports %s folder metadata across windows while retaining reorder data', provider => {
++    const transfer = { setData: vi.fn(), effectAllowed: '' }, onStart = vi.fn()
++    render(<ChatFolderDragButton id="f" provider={provider} label="School folder" expanded onClick={vi.fn()} onEdit={vi.fn()} onStart={onStart} onMove={vi.fn()} onDrop={vi.fn()} onEnd={vi.fn()}>School</ChatFolderDragButton>)
++    fireEvent.dragStart(screen.getByRole('button', { name: 'School folder' }), { dataTransfer: transfer })
++    expect(transfer.setData).toHaveBeenCalledWith(FOLDER_DRAG_TYPE, 'f')
++    expect(transfer.setData).toHaveBeenCalledWith(FOLDER_GRAPH_DRAG_TYPE, JSON.stringify({ origin: window.location.origin, folderId: 'f', provider }))
++    expect(transfer.effectAllowed).toBe('copyMove')
++    expect(onStart).toHaveBeenCalledWith('f')
++})

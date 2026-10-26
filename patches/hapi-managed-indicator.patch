@@ -1,0 +1,348 @@
+diff --git a/hub/src/web/routes/managedSessions.test.ts b/hub/src/web/routes/managedSessions.test.ts
+new file mode 100644
+index 0000000..29868f7
+--- /dev/null
++++ b/hub/src/web/routes/managedSessions.test.ts
+@@ -0,0 +1,31 @@
++import { afterAll, describe, expect, it } from 'bun:test'
++import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++import { createManagedSessionsRoutes, readManagedSessions } from './managedSessions'
++
++const dir = mkdtempSync(join(tmpdir(), 'hapi-managed-'))
++afterAll(() => rmSync(dir, { recursive: true, force: true }))
++
++describe('managed sessions', () => {
++    it('reads the published file and tolerates missing or broken files', () => {
++        const file = join(dir, 'managed.json')
++        writeFileSync(file, JSON.stringify({ sessions: { s1: { role: 'worker', watch: 'quiet' }, m: { role: 'manager' } } }))
++        expect(readManagedSessions(file)).toEqual({ s1: { role: 'worker', watch: 'quiet' }, m: { role: 'manager' } })
++        expect(readManagedSessions(join(dir, 'missing.json'))).toEqual({})
++        writeFileSync(file, '{not json'); expect(readManagedSessions(file)).toEqual({})
++        expect(readManagedSessions(undefined)).toEqual({})
++    })
++    it('serves the owner only', async () => {
++        const app = (namespace: string) => {
++            const root = new Hono<WebAppEnv>()
++            root.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
++            root.route('/api', createManagedSessionsRoutes(() => ({ s1: { role: 'worker' } })))
++            return root
++        }
++        expect(await (await app('default').request('/api/managed-sessions')).json()).toEqual({ sessions: { s1: { role: 'worker' } } })
++        expect(await (await app('tenant').request('/api/managed-sessions')).json()).toEqual({ sessions: {} })
++    })
++})
+diff --git a/hub/src/web/routes/managedSessions.ts b/hub/src/web/routes/managedSessions.ts
+new file mode 100644
+index 0000000..77e1650
+--- /dev/null
++++ b/hub/src/web/routes/managedSessions.ts
+@@ -0,0 +1,26 @@
++import { readFileSync } from 'node:fs'
++import { Hono } from 'hono'
++import type { WebAppEnv } from '../middleware/auth'
++
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string }
++
++/** Chats an external manager supervises, published as JSON (HAPI_MANAGED_SESSIONS_FILE). */
++export function readManagedSessions(path = process.env.HAPI_MANAGED_SESSIONS_FILE): Record<string, ManagedSession> {
++    if (!path) return {}
++    try {
++        const sessions = (JSON.parse(readFileSync(path, 'utf8')) as { sessions?: Record<string, ManagedSession> }).sessions
++        return sessions && typeof sessions === 'object' ? sessions : {}
++    } catch {
++        return {}
++    }
++}
++
++export function createManagedSessionsRoutes(read: () => Record<string, ManagedSession> = () => readManagedSessions()): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    app.get('/managed-sessions', (c) => {
++        c.header('Cache-Control', 'no-store')
++        // The manager belongs to the hub owner.
++        return c.json({ sessions: c.get('namespace') === 'default' ? read() : {} })
++    })
++    return app
++}
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+index 27a1b4c..5d21601 100644
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -23,6 +23,7 @@ import { createPermissionsRoutes } from './routes/permissions'
+ import { createMachinesRoutes } from './routes/machines'
+ import { createCodexFoldersRoutes } from './routes/codexFolders'
+ import { createSessionGoalRoutes } from './routes/sessionGoals'
++import { createManagedSessionsRoutes } from './routes/managedSessions'
+ import { createStorageRoutes } from './routes/storage'
+ import { createUsageRoutes } from './routes/usage'
+ import { createGitRoutes } from './routes/git'
+@@ -294,6 +295,7 @@ function createWebApp(options: {
+     app.route('/api', createMachinesRoutes(options.getSyncEngine))
+     app.route('/api', createCodexFoldersRoutes())
+     app.route('/api', createSessionGoalRoutes(options.getSyncEngine))
++    app.route('/api', createManagedSessionsRoutes())
+     app.route('/api', createStorageRoutes(configuration.dbPath))
+     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+     app.route('/api', createUsageRoutes(options.store))
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 6995b4e..b3f818a 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -64,6 +64,9 @@ import type { CancelMessageResponse, SteerQueuedMessageResponse } from '@hapi/pr
+ import type { TranscriptionMode, TranscriptionProvider, TranscriptionProviderInfo } from '@hapi/protocol/voice'
+ 
+ 
++/** A chat the persistent manager runs (worker) or the manager chat itself. */
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string }
++
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+ export type SessionGoal = {
+     objective: string
+@@ -799,6 +802,10 @@ export class ApiClient {
+         })
+     }
+ 
++    async getManagedSessions(): Promise<Record<string, ManagedSession>> {
++        return (await this.request<{ sessions: Record<string, ManagedSession> }>('/api/managed-sessions')).sessions
++    }
++
+     async getSessionGoal(sessionId: string): Promise<SessionGoal | null> {
+         return (await this.request<{ goal: SessionGoal | null }>(`/api/sessions/${encodeURIComponent(sessionId)}/goal`)).goal
+     }
+diff --git a/web/src/components/RunningBar.test.tsx b/web/src/components/RunningBar.test.tsx
+new file mode 100644
+index 0000000..c29edb6
+--- /dev/null
++++ b/web/src/components/RunningBar.test.tsx
+@@ -0,0 +1,34 @@
++import { cleanup, render, screen } from '@testing-library/react'
++import { afterEach, describe, expect, it } from 'vitest'
++import { RunningBar } from './RunningBar'
++import { SessionRowSummary } from './SessionRowSummary'
++import { I18nProvider } from '@/lib/i18n-context'
++import type { SessionSummary } from '@/types/api'
++afterEach(cleanup)
++
++const summary = { id: 's', active: true, thinking: true, activeAt: 0, updatedAt: Date.now(), metadata: { path: '/w', name: 'SampleSmoke', flavor: 'claude' },
++    metadataVersion: 0, agentStateVersion: 0, todosUpdatedAt: 0, todoProgress: null, pendingRequestsCount: 0, pendingRequestKinds: [], pendingRequests: [],
++    backgroundTaskCount: 0, futureScheduledMessageCount: 0, nextScheduledAt: null, model: null, effort: null } as unknown as SessionSummary
++
++describe('running indicators', () => {
++    it('shows a violet labelled bar for manager-run chats and a plain bar for your own', () => {
++        render(<RunningBar running managed />)
++        expect(screen.getByTestId('running-bar')).toHaveAttribute('data-managed', 'true')
++        expect(screen.getByText('Managed by Manager')).toBeInTheDocument()
++        cleanup()
++        render(<RunningBar running managed={false} />)
++        expect(screen.getByTestId('running-bar')).not.toHaveAttribute('data-managed')
++        expect(screen.queryByText('Managed by Manager')).toBeNull()
++        cleanup()
++        render(<RunningBar running={false} managed />)
++        expect(screen.queryByTestId('running-bar')).toBeNull()
++    })
++    it('uses a distinct sidebar spinner for manager-run chats', () => {
++        render(<I18nProvider><SessionRowSummary session={summary} managed /></I18nProvider>)
++        expect(screen.getByLabelText('Manager is running this chat')).toBeInTheDocument()
++        cleanup()
++        render(<I18nProvider><SessionRowSummary session={summary} /></I18nProvider>)
++        expect(screen.queryByTestId('managed-running')).toBeNull()
++        expect(screen.getByLabelText('Running')).toBeInTheDocument()
++    })
++})
+diff --git a/web/src/components/RunningBar.tsx b/web/src/components/RunningBar.tsx
+new file mode 100644
+index 0000000..f026223
+--- /dev/null
++++ b/web/src/components/RunningBar.tsx
+@@ -0,0 +1,22 @@
++/** Thin indeterminate bar while a chat runs: violet striped when the manager runs it, green otherwise. */
++export function RunningBar(props: { running: boolean; managed: boolean }) {
++    if (!props.running) return null
++    return (
++        <div
++            role="status"
++            data-testid="running-bar"
++            data-managed={props.managed || undefined}
++            className="relative shrink-0"
++            title={props.managed ? 'Managed by Manager · running' : 'Running'}
++        >
++            <div className={`h-1 w-full overflow-hidden ${props.managed ? 'bg-violet-500/20' : 'bg-[var(--app-badge-success-text)]/15'}`}>
++                <div className={props.managed ? 'running-bar-managed h-full w-full' : 'running-bar-own h-full w-1/3 bg-[var(--app-badge-success-text)]'} />
++            </div>
++            {props.managed ? (
++                <span className="absolute right-2 top-1.5 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-600 dark:text-violet-300">
++                    Managed by Manager
++                </span>
++            ) : <span className="sr-only">Running</span>}
++        </div>
++    )
++}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index 0776608..eda603d 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,5 +1,7 @@
+ import { QuickApproval } from './QuickApproval'
+ import { GoalBanner } from './GoalBanner'
++import { RunningBar } from './RunningBar'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { flushSync } from 'react-dom'
+ import { useNavigate } from '@tanstack/react-router'
+@@ -1859,6 +1861,7 @@ function SessionChatInner(props: SessionChatProps) {
+         pendingSendIntentRef,
+     })
+ 
++    const managedSessions = useManagedSessions(props.api)
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+             {agentFlavor === 'claude' && claudeCatalog.isError && <div role="status" className="px-3 text-sm text-[var(--app-hint)]">Live Claude model discovery unavailable. Showing fallback aliases; check CLI authentication.</div>}
+@@ -1891,6 +1894,7 @@ function SessionChatInner(props: SessionChatProps) {
+                     )
+                 }}
+             />
++            <RunningBar running={Boolean(props.session.active && props.session.thinking)} managed={Boolean(managedSessions[props.session.id])} />
+             <GoalBanner api={props.api} sessionId={props.session.id} running={Boolean(props.session.thinking)} />
+ 
+             <CursorMigrationBanner metadata={props.session.metadata} />
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+index 46aad91..b779441 100644
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -61,6 +61,7 @@ import { useToast } from '@/lib/toast-context'
+ import { getPathDisplayName } from '@/utils/path'
+ import type { CodexFolder } from '@/api/client'
+ import { CodexFolderNameDialog, MoveToFolderDialog, useCodexFolders } from '@/components/CodexFolders'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
+ 
+ export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
+ 
+@@ -904,6 +905,7 @@ function SessionItem(props: {
+     machineLabel?: string
+     lastSeenVersion: number
+     onMoveToFolder?: (session: SessionSummary) => void
++    managed?: boolean
+ }) {
+     const { t } = useTranslation()
+     const { addToast } = useToast()
+@@ -1039,6 +1041,7 @@ function SessionItem(props: {
+                     selected={selected}
+                     nestedTooltips
+                     attentionTooltipId={attentionId}
++                    managed={props.managed}
+                     lastSeenVersion={lastSeenVersion}
+                     scheduleTooltipId={scheduleId}
+                     inRunningSection={inRunningSection}
+@@ -1433,6 +1436,7 @@ export function SessionList(props: {
+         [props.sessions]
+     )
+     const codexFolders = useCodexFolders(api, codexThreadIds)
++    const managedSessions = useManagedSessions(api)
+     const folderOf = (session: SessionSummary): string | null => {
+         const threadId = session.metadata?.agentSessionId
+         return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
+@@ -1524,6 +1528,7 @@ export function SessionList(props: {
+                                             projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                                             machineLabel={resolveMachineLabel(s.metadata?.machineId ?? null)}
+                                             lastSeenVersion={lastSeenVersion}
++                                            managed={Boolean(managedSessions[s.id])}
+                                         />
+                                     ))}
+                                 </div>
+@@ -1556,6 +1561,7 @@ export function SessionList(props: {
+                 projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                 machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
+                 lastSeenVersion={lastSeenVersion}
++                managed={Boolean(managedSessions[s.id])}
+                 onMoveToFolder={canMoveToFolder && getChatTab(s) === 'codex' ? handleMoveToFolder : undefined}
+             />
+         </div>
+@@ -1928,6 +1934,7 @@ export function SessionList(props: {
+                                             projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
+                                             machineLabel={resolveMachineLabel(s.metadata?.machineId ?? null)}
+                                             lastSeenVersion={lastSeenVersion}
++                                            managed={Boolean(managedSessions[s.id])}
+                                         />
+                                     ))}
+                                 </div>
+diff --git a/web/src/components/SessionRowSummary.tsx b/web/src/components/SessionRowSummary.tsx
+index 0602f7a..6e9895e 100644
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -111,6 +111,8 @@ export function SessionRowSummary(props: {
+     attentionTooltipId?: string
+     /** Recompute local unread attention when the session-list watermark changes. */
+     lastSeenVersion?: number
++    /** Run by the persistent manager: distinct running indicator. */
++    managed?: boolean
+     scheduleTooltipId?: string
+     className?: string
+     /** Rows inside the pinned "in progress" section skip the text label (dot only). */
+@@ -128,6 +130,7 @@ export function SessionRowSummary(props: {
+         nestedTooltips = true,
+         attentionTooltipId: attentionTooltipIdProp,
+         lastSeenVersion,
++        managed = false,
+         scheduleTooltipId: scheduleTooltipIdProp,
+         className,
+         inRunningSection = false,
+@@ -188,7 +191,15 @@ export function SessionRowSummary(props: {
+                             aria-label={attentionLabel ?? undefined}
+                         />
+                     ) : s.active && s.thinking ? (
+-                        <LoaderIcon className="h-3.5 w-3.5 shrink-0 animate-spin-slow text-[var(--app-badge-success-text)]" />
++                        managed ? (
++                            <span className="inline-flex shrink-0" title="Manager is running this chat" aria-label="Manager is running this chat" data-testid="managed-running">
++                                <LoaderIcon className="h-3.5 w-3.5 animate-spin text-violet-500" />
++                            </span>
++                        ) : (
++                            <span className="inline-flex shrink-0" title="Running" aria-label="Running">
++                                <LoaderIcon className="h-3.5 w-3.5 animate-spin-slow text-[var(--app-badge-success-text)]" />
++                            </span>
++                        )
+                     ) : urgentAttention && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+diff --git a/web/src/hooks/useManagedSessions.ts b/web/src/hooks/useManagedSessions.ts
+new file mode 100644
+index 0000000..a102a67
+--- /dev/null
++++ b/web/src/hooks/useManagedSessions.ts
+@@ -0,0 +1,15 @@
++import { useQuery } from '@tanstack/react-query'
++import type { ApiClient, ManagedSession } from '@/api/client'
++
++/** Chats the persistent manager runs (vs chats the user runs), refreshed every 30 s. */
++export function useManagedSessions(api: ApiClient | null): Record<string, ManagedSession> {
++    const query = useQuery({
++        queryKey: ['managed-sessions'],
++        queryFn: () => api!.getManagedSessions(),
++        enabled: Boolean(api),
++        staleTime: 15_000,
++        refetchInterval: 30_000,
++        retry: false,
++    })
++    return query.data ?? {}
++}
+diff --git a/web/src/index.css b/web/src/index.css
+index 2e5a087..32efc0d 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -695,3 +695,14 @@ html[data-theme="oled"] .shiki span:not([data-line-number]) {
+     transition: none;
+   }
+ }
++
++/* Running bars: own chats slide a green segment; manager-run chats show moving violet stripes. */
++@keyframes running-bar-slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
++@keyframes running-bar-stripes { from { background-position: 0 0; } to { background-position: 28px 0; } }
++.running-bar-own { animation: running-bar-slide 1.4s ease-in-out infinite; }
++.running-bar-managed {
++    background-image: repeating-linear-gradient(-45deg, rgb(139 92 246) 0 7px, rgb(196 181 253) 7px 14px);
++    background-size: 28px 100%;
++    animation: running-bar-stripes 0.9s linear infinite;
++}
++@media (prefers-reduced-motion: reduce) { .running-bar-own, .running-bar-managed { animation: none; } }

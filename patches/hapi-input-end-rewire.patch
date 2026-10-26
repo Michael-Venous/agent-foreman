@@ -1,0 +1,269 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -16,6 +16,16 @@
+ export type NodeStatus = 'Running' | 'Background' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+ type Mutate = ReturnType<typeof useNodeGraph>['mutate']
++type Wire = NodeRouting['edges'][number]
++
++/** Move only the picked-up child end, preserving its source and branch route. */
++function moveWire(routing: NodeRouting, wire: Wire, child: string | null): NodeRouting {
++    const current = routing.edges.find(e => e.child === wire.child)
++    if (!current || current.owner !== wire.owner || current.via !== wire.via) throw new Error('This connection changed elsewhere. Try again.')
++    if (child === wire.child) return routing
++    return { ...routing, edges: [...routing.edges.filter(e => e.child !== wire.child && e.child !== child), ...(child ? [{ ...wire, child }] : [])] }
++}
++
+ type Gesture =
+     | { kind: 'junction-move'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean }
+     | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean }
+@@ -23,7 +33,7 @@
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint }
+     | { kind: 'link'; pointer: number; from: string }
+-    | { kind: 'input'; pointer: number; child: string; x: number; y: number; moved: boolean }
++    | { kind: 'input'; pointer: number; child: string; wire?: Wire; x: number; y: number; moved: boolean }
+ 
+ /** Running/Background/Idle from live summary; Stopped only when the summary carries manual-pause evidence. */
+ export function nodeStatus(session: SessionSummary | undefined, loaded = true): NodeStatus {
+@@ -67,7 +77,7 @@
+     useEffect(() => { setAddMenu(null) }, [graph?.activeWorkspaceId])
+     const [dropActive, setDropActive] = useState(false)
+     const dropInFlight = useRef<Promise<void> | null>(null)
+-    const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null } | null>(null)
++    const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null; movingChild?: string } | null>(null)
+     const [history, setHistory] = useState<GraphEdit[]>([])
+     const historyRef = useRef(history); historyRef.current = history
+     const undoRef = useRef<() => void>(() => {})
+@@ -210,6 +220,12 @@
+         }
+         const owner = direction === 'child' ? fixed : target, child = direction === 'child' ? target : fixed
+         return child !== overseer && !createsCycle(edges.filter(edge => edge.child !== child), owner, child) ? target : null
++    }
++    const movedWireTarget = (wire: Wire, point: GraphPoint): string | null => {
++        const child = portAt(point, 'input')
++        if (!graph || !child || junctionsRef.current.some(j => j.id === child)) return null
++        try { return nodeRoutingError(moveWire(nodeRouting(graph.graph), wire, child), overseer) ? null : child }
++        catch { return null }
+     }
+     const pinchStart = () => {
+         const [a, b] = [...pointers.current.values()]
+@@ -244,7 +260,7 @@
+             else { gesture.current = { kind: 'link', pointer: event.pointerId, from: dotId }; setLink({ fixed: dotId, direction: 'child', to: dot, target: null }) }
+         }
+         else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize') } }
+-        else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, x: event.clientX, y: event.clientY, moved: false } }
++        else if (input) { setMenu(null); gesture.current = { kind: 'input', pointer: event.pointerId, child: input, wire: nodeRouting(graph!.graph).edges.find(e => e.child === input), x: event.clientX, y: event.clientY, moved: false } }
+         else if (handle) { setMenu(null); gesture.current = { kind: 'link', pointer: event.pointerId, from: handle }; setLink({ fixed: handle, direction: 'child', to: toGraph(event.clientX, event.clientY), target: null }) }
+         else if (node && positionsRef.current[node]) gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]! }
+         else gesture.current = { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current }
+@@ -272,7 +288,8 @@
+             if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
+             g.moved = true
+             const to = toGraph(event.clientX, event.clientY)
+-            setLink({ fixed: g.child, direction: 'owner', to, target: linkTarget(g.child, to, 'owner') })
++            if (g.wire) setLink({ fixed: g.wire.via ?? g.wire.owner, direction: 'child', movingChild: g.child, to, target: movedWireTarget(g.wire, to) })
++            else setLink({ fixed: g.child, direction: 'owner', to, target: linkTarget(g.child, to, 'owner') })
+         }
+         else if (g.kind === 'junction-move') {
+             const dx = event.clientX - g.x, dy = event.clientY - g.y
+@@ -332,9 +349,20 @@
+                 else void changeOwner(target, g.from)
+             } else if (junctionsRef.current.some(j => j.id === g.from && !j.owner) && portAt(toGraph(event.clientX, event.clientY), 'input') && portAt(toGraph(event.clientX, event.clientY), 'input') !== g.from) setError('Connect a chat output to this junction first')
+         } else if (g.kind === 'input') {
++            if (cancelled || !g.moved) { setLink(null); return }
++            const point = toGraph(event.clientX, event.clientY)
++            if (g.wire) {
++                const wire = g.wire, child = movedWireTarget(wire, point)
++                const blank = !portAt(point, 'input') && !portAt(point, 'output') && !nodeAtPoint(positionsRef.current, point, ids)
++                if (child || blank) {
++                    // Keep the picked-up wire visible until the atomic routing edit lands.
++                    if (child) setLink(old => old ? { ...old, to: portPoint(child, 'input')!, target: child } : old)
++                    void changeRouting(r => moveWire(r, wire, child)).finally(() => setLink(null))
++                } else setLink(null)
++                return
++            }
+             setLink(null)
+-            if (cancelled || !g.moved) return
+-            const point = toGraph(event.clientX, event.clientY), owner = linkTarget(g.child, point, 'owner')
++            const owner = linkTarget(g.child, point, 'owner')
+             if (owner) {
+                 if (junctionsRef.current.some(j => j.id === owner)) { setSelectedJunction(owner); void changeRouting(r => junctionBranch(r, owner, g.child)) }
+                 else void changeOwner(g.child, owner)
+@@ -547,13 +575,14 @@
+                         if (!from || !to) return null
+                         const asleep = edgeAsleep(sessionsById.get(child))
+                         const dot = junctions.find(j => j.id === via)
+-                        const x1 = dot?.x ?? from.x + NODE_SIZE.width / 2, y1 = dot?.y ?? from.y + NODE_SIZE.height, x2 = to.x + NODE_SIZE.width / 2, y2 = to.y
++                        const moving = link?.movingChild === child ? link.to : null
++                        const x1 = dot?.x ?? from.x + NODE_SIZE.width / 2, y1 = dot?.y ?? from.y + NODE_SIZE.height, x2 = moving?.x ?? to.x + NODE_SIZE.width / 2, y2 = moving?.y ?? to.y
+                         const bend = Math.max(30, Math.abs(y2 - y1) / 2)
+                         return <path key={child} data-edge={`${owner}->${child}`} data-asleep={asleep ? 'true' : 'false'} d={`M${x1} ${y1} C${x1} ${y1 + bend} ${x2} ${y2 - bend} ${x2} ${y2}`}
+                             fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={asleep ? 1.5 : 2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1}
+                             markerEnd={`url(#${asleep ? 'node-edge-asleep' : 'node-edge-active'})`} />
+                     })}
+-                    {link && portPoint(link.fixed, link.direction === 'child' ? 'output' : 'input') && (() => {
++                    {link && !link.movingChild && portPoint(link.fixed, link.direction === 'child' ? 'output' : 'input') && (() => {
+                         const p = portPoint(link.fixed, link.direction === 'child' ? 'output' : 'input')!
+                         return <path d={`M${p.x} ${p.y} L${link.to.x} ${link.to.y}`} fill="none" stroke="var(--app-link)" strokeWidth={2} strokeDasharray="4 4" />
+                     })()}
+@@ -581,7 +610,7 @@
+                         </button>
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+                             style={{ scale: Math.max(1, 0.85 / view.k) }}
+-                            title="Input: connect from an output. Drag to another output to reconnect, or to empty space to disconnect."
++                            title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+                             onClick={event => { if (event.detail === 0) { setMenu({ id, mode: 'owner' }); setError(null) } }}
+                             className="absolute -top-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                             <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${layout.parent[id] ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'}`} />
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -376,46 +376,95 @@
+         expect(screen.getAllByRole('button', { name: /^Output for/ })).toHaveLength(5)
+     })
+ 
+-    it('reconnects an input to another output, then Ctrl+Z restores its old owner', async () => {
++    it.each(['mouse', 'touch'])('picks up the existing child end smoothly and moves it atomically to a new input (%s)', async pointerType => {
+         const { api } = setup()
+         await screen.findByRole('button', { name: 'Node Charlie' })
+-        dragPort('C', 'input', portPoint('B', 'output'))
+-        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'C'))
++        const canvas = screen.getByRole('application'), original = document.querySelector('[data-edge="A->C"]')!
++        const before = original.getAttribute('d')!, start = portPoint('C', 'input'), end = portPoint('B', 'input')
++        const mid = { clientX: (start.clientX + end.clientX) / 2, clientY: (start.clientY + end.clientY) / 2 - 40 }
++        const pathsBefore = canvas.querySelectorAll('svg > path').length
++        fireEvent.pointerDown(port('C', 'input'), { pointerId: 1, pointerType, button: 0, ...start })
++        fireEvent.pointerMove(canvas, { pointerId: 1, pointerType, ...mid })
++        const moving = document.querySelector('[data-edge="A->C"]')!
++        expect(moving).toBe(original)
++        expect(moving.getAttribute('d')?.split(' C')[0]).toBe(before.split(' C')[0])
++        expect(moving.getAttribute('d')).toContain(' C')
++        expect(moving.getAttribute('d')).not.toBe(before)
++        expect(canvas.querySelectorAll('svg > path')).toHaveLength(pathsBefore)
++        expect(api.editNodeRouting).not.toHaveBeenCalled()
++        fireEvent.pointerMove(canvas, { pointerId: 1, pointerType, ...end })
++        expect(screen.getByRole('button', { name: 'Node Bravo' }).className).toContain('ring-2')
++        fireEvent.pointerUp(canvas, { pointerId: 1, pointerType, ...end })
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledOnce())
++        const after = api.editNodeRouting.mock.calls[0][1]
++        expect(after.edges).toContainEqual({ owner: 'A', child: 'B' })
++        expect(after.edges.some(e => e.child === 'C')).toBe(false)
++        expect(after.edges.some(e => e.owner === 'O' && e.child === 'B')).toBe(false)
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
+-        fireEvent.keyDown(screen.getByRole('application'), { key: 'z', ctrlKey: true })
+-        await waitFor(() => expect(api.setNodeOwner).toHaveBeenLastCalledWith('A', 'C'))
++        fireEvent.keyDown(canvas, { key: 'z', ctrlKey: true })
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(2))
++        expect(api.editNodeRouting.mock.calls[1][1]).toEqual(nodeRouting(initial().graph))
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.detachNode).not.toHaveBeenCalled()
+         expect(api.abortSession).not.toHaveBeenCalled()
+     })
+ 
+-    it('disconnects an input on blank space and undo restores that connection', async () => {
++    it('keeps the same wire at the drop position while persistence is pending', async () => {
++        const api = makeApi(), edit = api.editNodeRouting.getMockImplementation()!
++        let release!: () => void
++        api.editNodeRouting.mockImplementation(async (...args) => { await new Promise<void>(resolve => { release = resolve }); return edit(...args) })
++        setup(api)
++        await screen.findByRole('button', { name: 'Node Charlie' })
++        dragPort('C', 'input', portPoint('L', 'input'))
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledOnce())
++        expect(document.querySelector('[data-edge="A->C"]')).toBeInTheDocument()
++        release()
++        await waitFor(() => expect(document.querySelector('[data-edge="A->L"]')).toBeInTheDocument())
++        expect(document.querySelector('[data-edge="A->C"]')).toBeNull()
++    })
++
++    it('disconnects an input on blank space atomically and undo restores that connection', async () => {
+         const { api } = setup()
+         await screen.findByRole('button', { name: 'Node Alpha' })
+         dragPort('A', 'input', { clientX: -100, clientY: -100 })
+-        await waitFor(() => expect(api.detachNode).toHaveBeenCalledWith('A'))
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledOnce())
++        expect(api.editNodeRouting.mock.calls[0][1].edges.some(e => e.child === 'A')).toBe(false)
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
+         fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
+-        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('O', 'A'))
+-    })
+-
+-    it('records the actual owner for undo when another window changed a stale view', async () => {
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(2))
++        expect(api.editNodeRouting.mock.calls[1][1]).toEqual(nodeRouting(initial().graph))
++    })
++
++    it('refuses to move a wire that another window changed since pickup', async () => {
+         const { api } = setup()
+         await screen.findByRole('button', { name: 'Node Charlie' })
++        const canvas = screen.getByRole('application')
++        fireEvent.pointerDown(port('C', 'input'), { pointerId: 1, button: 0, ...portPoint('C', 'input') })
+         await api.setNodeOwner('B', 'C')
+-        dragPort('C', 'input', { clientX: -100, clientY: -100 })
+-        await waitFor(() => expect(api.detachNode).toHaveBeenCalledWith('C'))
+-        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
+-        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
+-        await waitFor(() => expect(api.setNodeOwner).toHaveBeenLastCalledWith('B', 'C'))
++        fireEvent.pointerMove(canvas, { pointerId: 1, ...portPoint('L', 'input') })
++        fireEvent.pointerUp(canvas, { pointerId: 1, ...portPoint('L', 'input') })
++        expect(await screen.findByRole('alert')).toHaveTextContent('This connection changed elsewhere')
++        expect(api.editNodeRouting).not.toHaveBeenCalled()
++        expect((await api.getNodeGraph()).graph.edges.find(e => e.child === 'C')?.owner).toBe('B')
++    })
++
++    it('still connects an empty input to an output', async () => {
++        const { api } = setup()
++        await screen.findByRole('button', { name: 'Node Lone one' })
++        dragPort('L', 'input', portPoint('B', 'output'))
++        await waitFor(() => expect(api.setNodeOwner).toHaveBeenCalledWith('B', 'L'))
+     })
+ 
+     it('preserves the old connection on an invalid, cancelled or stationary input drag', async () => {
+         const { api } = setup()
+         await screen.findByRole('button', { name: 'Node Alpha' })
+-        dragPort('A', 'input', portPoint('C', 'output')) // descendant: cycle
++        dragPort('C', 'input', portPoint('A', 'input')) // A -> A: cycle
++        dragPort('A', 'input', portPoint('C', 'output')) // wrong end
+         dragPort('A', 'input', { clientX: -100, clientY: -100 }, 'pointercancel')
+         dragPort('A', 'input', portPoint('A', 'input'))
+         expect(api.setNodeOwner).not.toHaveBeenCalled()
+         expect(api.detachNode).not.toHaveBeenCalled()
++        expect(api.editNodeRouting).not.toHaveBeenCalled()
+         expect(document.querySelector('[data-edge="O->A"]')).toBeInTheDocument()
+     })
+ 
+@@ -671,6 +720,33 @@
+         expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled()
+         expect(document.querySelector(`[data-junction-input="${id}"]`)).toBeInTheDocument()
+     })
++    it('moves a branch child end to a new input while retaining the dot and sibling branches', async () => {
++        const { api } = setup(), id = await addDot()
++        dragPort('O', 'output', dotPoint(id))
++        await waitFor(() => expect(screen.getByRole('combobox', { name: 'Junction input' })).toHaveValue('O'))
++        dotTo(id, 'B')
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'B')?.via).toBe(id))
++        dotTo(id, 'C')
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)?.[1].edges.find(e => e.child === 'C')?.via).toBe(id))
++        const before = structuredClone(api.editNodeRouting.mock.calls.at(-1)![1]), count = api.editNodeRouting.mock.calls.length
++        const original = document.querySelector('[data-edge="O->C"]')!, path = original.getAttribute('d')!
++        const canvas = screen.getByRole('application'), end = portPoint('L', 'input')
++        fireEvent.pointerDown(port('C', 'input'), { pointerId: 1, button: 0, ...portPoint('C', 'input') })
++        fireEvent.pointerMove(canvas, { pointerId: 1, ...end })
++        expect(document.querySelector('[data-edge="O->C"]')).toBe(original)
++        expect(original.getAttribute('d')?.split(' C')[0]).toBe(path.split(' C')[0])
++        fireEvent.pointerUp(canvas, { pointerId: 1, ...end })
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledTimes(count + 1))
++        const after = api.editNodeRouting.mock.calls.at(-1)![1]
++        expect(after.junctions).toEqual(before.junctions)
++        expect(after.edges).toContainEqual({ owner: 'O', child: 'B', via: id })
++        expect(after.edges).toContainEqual({ owner: 'O', child: 'L', via: id })
++        expect(after.edges.some(e => e.child === 'C')).toBe(false)
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.editNodeRouting.mock.calls.at(-1)![1]).toEqual(nodeRouting(before)))
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
+     it('deletes only the wiring dot, leaves logical connections and undoes the removal', async () => {
+         const { api } = setup(), id = await addDot()
+         fireEvent.change(screen.getByRole('combobox', { name: 'Junction input' }), { target: { value: 'O' } })

@@ -1,0 +1,235 @@
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index feaf459..2db2f0c 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -1,3 +1,4 @@
++import * as Popover from '@radix-ui/react-popover'
+ import { ComposerPrimitive } from '@assistant-ui/react'
+ import type { ConversationStatus } from '@/realtime/types'
+ import { useTranslation } from '@/lib/use-translation'
+@@ -601,6 +602,7 @@ export function DictationButton(props: {
+ export function ComposerButtons(props: {
+     canSend: boolean
+     controlsDisabled: boolean
++    onSendImmediately?: () => void
+     statisticsButton?: React.ReactNode
+     showSettingsButton: boolean
+     settingsButtonRef?: Ref<HTMLButtonElement>
+@@ -871,6 +873,34 @@ export function ComposerButtons(props: {
+ 
+             {props.modelMenu}
+ 
++            {props.onSendImmediately && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
++                <Popover.Root>
++                    <Popover.Trigger asChild>
++                        <button type="button" aria-label="Send options" title="Send options" disabled={props.controlsDisabled}
++                            className="flex h-8 w-7 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] disabled:opacity-50">
++                            <ChevronIcon />
++                        </button>
++                    </Popover.Trigger>
++                    <Popover.Portal>
++                        <Popover.Content side="top" align="end" sideOffset={8} collisionPadding={12} aria-label="Send options"
++                            className="z-[100] w-64 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-xl">
++                            <Popover.Close asChild>
++                                <button type="button" onClick={() => props.onSend('queue')} disabled={props.controlsDisabled}
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
++                                    <span className="block font-medium">Queue message</span><span className="text-xs text-[var(--app-hint)]">Wait for the current response to finish.</span>
++                                </button>
++                            </Popover.Close>
++                            <Popover.Close asChild>
++                                <button type="button" onClick={props.onSendImmediately} disabled={props.controlsDisabled}
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
++                                    <span className="block font-medium">Send immediately</span><span className="text-xs text-[var(--app-hint)]">Interrupt Claude’s current response and send.</span>
++                                </button>
++                            </Popover.Close>
++                        </Popover.Content>
++                    </Popover.Portal>
++                </Popover.Root>
++            ) : null}
++
+             <UnifiedButton
+                 canSend={props.canSend}
+                 voiceStatus={props.voiceStatus}
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index 0772256..3b9c0f0 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -118,7 +118,7 @@ vi.mock('@/components/ChatInput/Autocomplete', () => ({ Autocomplete: () => null
+ vi.mock('@/components/AssistantChat/StatusBar', () => ({ StatusBar: () => null }))
+ 
+ function renderComposer(agentFlavor: string, overrides: Partial<Parameters<typeof HappyComposer>[0]> = {}) {
+-    render(
++    return render(
+         <I18nProvider>
+             <HappyComposer
+                 sessionId="composer-test"
+@@ -146,6 +146,69 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         runtime.toolbarLayout = null
+         runtime.snapshot.thread.isDisabled = false
+         runtime.sentIntents = []
++        runtime.pendingSendIntentRef.current = 'default'
++        runtime.snapshot.composer = { text: '', attachments: [] }
++    })
++
++    function draft() {
++        runtime.snapshot.composer = { text: 'Change direction now', attachments: [] }
++        runtime.setSnapshot = updater => { runtime.snapshot = updater(runtime.snapshot) }
++    }
++    it('offers immediate send for a running Claude chat and waits for stop acknowledgement', async () => {
++        draft()
++        let finish!: () => void
++        const interrupt = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
++        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
++        fireEvent.click(screen.getByRole('button', { name: /Send immediately/ }))
++        expect(interrupt).toHaveBeenCalledOnce()
++        expect(runtime.sentIntents).toEqual([])
++        expect(runtime.snapshot.composer.text).toBe('Change direction now')
++        await act(async () => finish())
++        expect(runtime.sentIntents).toEqual(['queue'])
++    })
++    it('preserves the draft and sends nothing when interruption fails', async () => {
++        draft()
++        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: vi.fn().mockRejectedValue(new Error('timeout')) })
++        fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
++        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Send immediately/ })) })
++        expect(screen.getByRole('alert')).toHaveTextContent('Your message has not been sent')
++        expect(runtime.sentIntents).toEqual([])
++        expect(runtime.snapshot.composer.text).toBe('Change direction now')
++    })
++    it('leaves ordinary send queued without interrupting Claude', async () => {
++        draft()
++        const interrupt = vi.fn()
++        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Send' })) })
++        expect(interrupt).not.toHaveBeenCalled()
++        expect(runtime.sentIntents).toEqual(['default'])
++    })
++    it('offers an explicit queue action without stopping the response', async () => {
++        draft()
++        const interrupt = vi.fn()
++        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
++        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Queue message/ })) })
++        expect(interrupt).not.toHaveBeenCalled()
++        expect(runtime.sentIntents).toEqual(['queue'])
++    })
++    it('does not send into an old chat after navigation during interruption', async () => {
++        draft()
++        let finish!: () => void
++        const interrupt = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
++        const view = renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
++        fireEvent.click(screen.getByRole('button', { name: /Send immediately/ }))
++        view.unmount()
++        await act(async () => finish())
++        expect(runtime.sentIntents).toEqual([])
++    })
++
++    it('does not offer interruption for a scheduled message', () => {
++        draft()
++        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: vi.fn(), onSchedule: vi.fn(), pendingSchedule: { type: 'absolute', ms: Date.now() + 60000 } })
++        expect(screen.queryByRole('button', { name: 'Send options' })).toBeNull()
+     })
+ 
+     it('shows model and effort value buttons for Claude on wide viewports', () => {
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index 255b4fe..399d579 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -284,6 +284,7 @@ export function ModelEffortSettingsSection(props: {
+ }
+ 
+ export function HappyComposer(props: {
++    onInterruptForImmediateSend?: () => Promise<void>
+     statisticsButton?: ReactNode
+     sessionId?: string
+     focusInputRef?: MutableRefObject<(() => void) | null>
+@@ -531,8 +532,17 @@ export function HappyComposer(props: {
+         onScratchlistParkingChange?.(isParkingScratchlist)
+     }, [isParkingScratchlist, onScratchlistParkingChange])
+ 
++    const [interruptingForSend, setInterruptingForSend] = useState(false)
++    const [immediateSendError, setImmediateSendError] = useState<string | null>(null)
++    const immediateSendPending = useRef(false)
++    const mountedForImmediateSend = useRef(true)
++    useEffect(() => {
++        mountedForImmediateSend.current = true
++        return () => { mountedForImmediateSend.current = false }
++    }, [])
++
+     const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
+-    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
++    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled || interruptingForSend
+     const trimmed = composerText.trim()
+     const hasText = trimmed.length > 0
+     const hasAttachments = attachments.length > 0
+@@ -1141,6 +1151,7 @@ export function HappyComposer(props: {
+     }, [pendingSendIntentRef])
+ 
+     const handleSend = useCallback(async (intent: ComposerSendIntent = 'default') => {
++        if (immediateSendPending.current) return
+         // SessionChat preloads the ref only when restoring a rejected send:
+         // queue retries remain queue, while an ordinary fresh send always
+         // starts from the explicit/default argument. Capture it before the
+@@ -1254,6 +1265,28 @@ export function HappyComposer(props: {
+         resetPendingSendIntent,
+     ])
+ 
++    const handleSendImmediately = useCallback(async () => {
++        if (!canSend || immediateSendPending.current || !props.onInterruptForImmediateSend || pendingSchedule || props.scratchlistMode) return
++        immediateSendPending.current = true
++        setInterruptingForSend(true)
++        setImmediateSendError(null)
++        try {
++            // Keep the draft and attachments until the stop is acknowledged.
++            // A failed/uncertain interruption must not silently send or retry.
++            await props.onInterruptForImmediateSend()
++            if (mountedForImmediateSend.current) {
++                immediateSendPending.current = false
++                await handleSend('queue')
++            }
++        } catch {
++            if (mountedForImmediateSend.current) setImmediateSendError('Could not confirm the interruption. Your message has not been sent; the draft is preserved.')
++        } finally {
++            immediateSendPending.current = false
++            if (mountedForImmediateSend.current) setInterruptingForSend(false)
++        }
++    }, [canSend, props.onInterruptForImmediateSend, pendingSchedule, props.scratchlistMode, handleSend])
++
++
+     const flushAndSend = useCallback((intent: ComposerSendIntent = 'default') => {
+         void handleSend(intent)
+     }, [handleSend])
+@@ -2209,6 +2242,7 @@ export function HappyComposer(props: {
+                         </div>
+                     ) : null}
+ 
++                    {immediateSendError ? <p role="alert" className="mb-2 text-sm text-red-600">{immediateSendError}</p> : null}
+                     {sendError ? (
+                         <div
+                             role="alert"
+@@ -2362,6 +2396,7 @@ export function HappyComposer(props: {
+                             </> : undefined}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
++                            onSendImmediately={agentFlavor === 'claude' && active && thinking && !controlledByUser && props.onInterruptForImmediateSend ? handleSendImmediately : undefined}
+                             statisticsButton={props.statisticsButton}
+                             showSettingsButton={showSettingsButton}
+                             settingsButtonRef={settingsButtonRef}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index 65ddab0..fa3ddc4 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -2031,6 +2031,11 @@ function SessionChatInner(props: SessionChatProps) {
+                         <HappyComposer
+                         focusInputRef={focusComposerRef}
+                         key={`composer-${props.session.id}`}
++                        onInterruptForImmediateSend={async () => {
++                            const current = await props.api.getSession(props.session.id)
++                            if (!current.session.active || current.session.metadata?.flavor !== 'claude' || current.session.agentState?.controlledByUser) throw new Error('Chat is no longer available for remote interruption')
++                            if (current.session.thinking) await props.api.abortSession(props.session.id)
++                        }}
+                         statisticsButton={<ChatStatisticsButton api={props.api} sessionId={props.session.id}
+                             flavor={props.session.metadata?.flavor ?? null}
+                             contextSize={reduced.latestUsage?.contextSize}

@@ -1,0 +1,94 @@
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -687,6 +687,7 @@
+     const onViewModeChangeRef = useRef(props.onViewModeChange)
+     const forceScrollTokenRef = useRef(props.forceScrollToken)
+     const lastScrollTopRef = useRef(0)
++    const lastScrollGeometryRef = useRef({ height: 0, client: 0 })
+     const sessionIdRef = useRef(props.sessionId)
+     const initialScrollSessionRef = useRef<string | null>(null)
+     const initialScrollDeadlineRef = useRef(0)
+@@ -779,6 +780,7 @@
+         if (!viewport) return
+ 
+         lastScrollTopRef.current = viewport.scrollTop
++        lastScrollGeometryRef.current = { height: viewport.scrollHeight, client: viewport.clientHeight }
+ 
+         const setAutoScrollMode = (enabled: boolean) => {
+             if (autoScrollEnabledRef.current === enabled) {
+@@ -832,6 +834,9 @@
+         }
+ 
+         const handleScroll = () => {
++            const previousGeometry = lastScrollGeometryRef.current
++            const geometryChanged = previousGeometry.height !== viewport.scrollHeight || previousGeometry.client !== viewport.clientHeight
++            lastScrollGeometryRef.current = { height: viewport.scrollHeight, client: viewport.clientHeight }
+             const intent = getScrollIntent({
+                 scrollTop: viewport.scrollTop,
+                 scrollHeight: viewport.scrollHeight,
+@@ -839,6 +844,17 @@
+                 previousScrollTop: lastScrollTopRef.current
+             })
+             lastScrollTopRef.current = viewport.scrollTop
++
++            // Streaming/tool reflow or mobile viewport changes can move scrollTop
++            // before ResizeObserver runs. That is not a user leaving the tail.
++            // Otherwise tail/history window trimming and bottom-follow fight.
++            if (geometryChanged && atBottomRef.current && autoScrollEnabledRef.current
++                && !pendingScrollRef.current && !hasExplicitUpwardIntent(intent)) {
++                viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'instant' })
++                lastScrollTopRef.current = viewport.scrollTop
++                setShowScrollToBottom(false)
++                return
++            }
+ 
+             // A slow older-page request must not restore the position from
+             // when it started after the user has already scrolled elsewhere.
+@@ -1119,6 +1135,7 @@
+         setShowScrollToBottom(false)
+         if (viewport) {
+             viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'instant' })
++            lastScrollGeometryRef.current = { height: viewport.scrollHeight, client: viewport.clientHeight }
+             lastScrollTopRef.current = viewport.scrollTop
+         }
+     }, [])
+--- a/web/src/components/AssistantChat/HappyThread.mobile-scroll.test.tsx
++++ b/web/src/components/AssistantChat/HappyThread.mobile-scroll.test.tsx
+@@ -310,3 +310,37 @@
+         expect(onViewModeChange).not.toHaveBeenCalledWith('history')
+     })
+ })
++
++describe('tail layout movement', () => {
++    it('does not switch to history when streamed content changes scroll geometry before resize notification', () => {
++        const {viewport,onViewModeChange}=renderThread()
++        act(()=>vi.advanceTimersByTime(1800))
++        onViewModeChange.mockClear()
++        Object.defineProperty(viewport,'scrollHeight',{configurable:true,value:1400})
++        viewport.scrollTop=650
++        fireEvent.scroll(viewport)
++        act(()=>resizeCallbacks.at(-1)?.())
++        expect(onViewModeChange).not.toHaveBeenCalledWith('history')
++        expect(viewport.scrollTop).toBe(870)
++    })
++    it('keeps the tail aligned when mobile viewport height changes', () => {
++        const {viewport,onViewModeChange}=renderThread()
++        act(()=>vi.advanceTimersByTime(1800))
++        onViewModeChange.mockClear()
++        Object.defineProperty(viewport,'clientHeight',{configurable:true,value:700})
++        viewport.scrollTop=490;fireEvent.scroll(viewport)
++        expect(viewport.scrollTop).toBe(532)
++        expect(onViewModeChange).not.toHaveBeenCalledWith('history')
++    })
++    it('still honors a real touch swipe when content changes at the same time', () => {
++        const {viewport,onViewModeChange}=renderThread()
++        act(()=>vi.advanceTimersByTime(1800))
++        const down=new Event('pointerdown',{bubbles:true});Object.defineProperties(down,{button:{value:0},pointerType:{value:'touch'}})
++        fireEvent(viewport,down)
++        Object.defineProperty(viewport,'scrollHeight',{configurable:true,value:1400})
++        viewport.scrollTop=600;fireEvent.scroll(viewport)
++        act(()=>resizeCallbacks.at(-1)?.())
++        expect(onViewModeChange).toHaveBeenLastCalledWith('history')
++        expect(viewport.scrollTop).toBe(600)
++    })
++})

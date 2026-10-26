@@ -1,0 +1,46 @@
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -752,11 +752,13 @@
+ /* Public runtime reasoning stays readable without competing with the answer. */
+ .aui-reasoning-content {
+     font-size: 0.8125rem;
+-    line-height: 1.55;
++    line-height: 1.4;
+     color: var(--app-hint);
+ }
+ .aui-reasoning-content :where(.aui-md-p, .aui-md-li) {
+     line-height: inherit;
+-    margin-block: 0.35rem;
++    margin-block: 0.2rem;
+ }
+ .aui-reasoning-content :where(.aui-md-strong, .aui-md-em) { color: inherit; }
++.aui-reasoning-content > :first-child { margin-top: 0; }
++.aui-reasoning-content > :last-child { margin-bottom: 0; }
+--- a/web/src/components/assistant-ui/reasoning.tsx
++++ b/web/src/components/assistant-ui/reasoning.tsx
+@@ -203,14 +203,14 @@
+     }, [])
+ 
+     return (
+-        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-1.5 overflow-hidden rounded-lg border-l-2 border-[var(--app-divider)]">
++        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-1 overflow-hidden rounded-lg border-l-2 border-[var(--app-divider)]">
+             <button
+                 type="button"
+                 onClick={handleToggle}
+                 aria-expanded={isOpen}
+                 aria-controls={contentId}
+                 className={cn(
+-                    'flex w-full items-center gap-1.5 min-h-8 px-2 py-1 text-left text-xs font-medium',
++                    'flex w-full items-center gap-1.5 min-h-7 px-2 py-0.5 text-left text-xs font-medium',
+                     'text-[var(--app-hint)] hover:text-[var(--app-fg)]',
+                     'transition-colors cursor-pointer select-none'
+                 )}
+@@ -244,7 +244,7 @@
+                     // (onNestedScrollFollowChange) already pauses the outer
+                     // auto-follow while the user scrolls inside this panel, so
+                     // contain is not needed to stop the two from fighting.
+-                    className="aui-reasoning-scroll max-h-[min(35dvh,14rem)] overflow-y-auto px-2 pb-2"
++                    className="aui-reasoning-scroll max-h-[min(35dvh,14rem)] overflow-y-auto px-2 pb-1"
+                 >
+                     {children}
+                 </div>

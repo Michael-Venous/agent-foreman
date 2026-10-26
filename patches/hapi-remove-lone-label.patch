@@ -1,0 +1,21 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1109,7 +1109,6 @@
+                     })()}
+ 
+                 </svg>
+-                {layout.loneLabel && <div className="pointer-events-none absolute text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]" style={{ left: layout.loneLabel.x, top: layout.loneLabel.y }}>Lone</div>}
+                 {junctions.map((j, index) => <Fragment key={j.id}><button key={j.id} type="button" data-junction-id={j.id} aria-label={`Junction ${index + 1}`} aria-pressed={selectedJunctions.includes(j.id)} onContextMenu={e => { e.preventDefault(); boxSelection.current = false; setSelectedJunction(j.id); openObjectMenu('junction:' + j.id, e.clientX, e.clientY) }} title={movingJunction === j.id ? 'Drag to move junction' : 'Drag to branch. Right-click or hold for actions.'}
+                     onClick={event => { if (event.detail === 0) { setSelectedJunction(j.id); setSelectedAnnotation(null); setMenu(null) } }}
+                     className={`absolute z-[4] flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${movingJunction === j.id ? 'cursor-move' : 'cursor-crosshair'}`}
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -220,7 +220,7 @@
+         expect(within(screen.getByRole('button', { name: 'Node Charlie' })).getByText(/Background/)).toBeInTheDocument()
+         expect(within(screen.getByRole('button', { name: 'Node Bravo' })).getByText(/Idle/)).toBeInTheDocument()
+         expect(within(screen.getByRole('button', { name: 'Node Lone one' })).getByText(/Inactive/)).toBeInTheDocument()
+-        expect(screen.getByText('Lone')).toBeInTheDocument()
++        expect(screen.queryByText('Lone')).not.toBeInTheDocument()
+         expect(document.querySelector('[data-edge="O->A"]')).toHaveAttribute('data-asleep', 'false')
+         expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('data-asleep', 'true')
+         expect(document.querySelector('[data-edge="O->B"]')).toHaveAttribute('stroke-dasharray', '5 5')

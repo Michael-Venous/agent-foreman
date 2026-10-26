@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Manager hapi-hub
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/code/agent-foreman
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=HAPI_RUNNER_SUPERVISED=1
+Environment=HAPI_LOCAL_CATALOG_MACHINE=140880a2-f86d-57a5-99ad-d28d0d7da11a
+Environment=HAPI_CLAUDE_CATALOG_SCRIPT=%h/Documents/code/agent-foreman/claude_catalog.py
+Environment=HAPI_MANAGED_SESSIONS_FILE=%h/Documents/code/agent-foreman/state/managed-sessions.json
+ExecStart=%h/.bun/bin/bun %h/Documents/code/agent-foreman/vendor/hapi-source/hub/src/index.ts --no-relay
+Restart=on-failure
+RestartSec=5
+KillMode=process
+UMask=0077
+[Install]
+WantedBy=default.target

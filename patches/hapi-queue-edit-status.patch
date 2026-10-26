@@ -1,0 +1,498 @@
+--- a/cli/src/claude/sdk/types.ts
++++ b/cli/src/claude/sdk/types.ts
+@@ -104,7 +104,7 @@
+         request_id: string
+         subtype: 'success' | 'error'
+         error?: string
+-        response?: { send_now?: 'stopped' | 'delivering' | 'nothing_waiting' }
++        response?: { cancelled?: boolean; send_now?: 'stopped' | 'delivering' | 'nothing_waiting' }
+     }
+ }
+ 
+--- a/cli/src/claude/sdk/query.ts
++++ b/cli/src/claude/sdk/query.ts
+@@ -192,6 +192,14 @@
+         }, this.childStdin)
+     }
+ 
++    async cancelWaitingMessage(uuid: string): Promise<boolean> {
++        if (!uuid || !this.childStdin) throw new Error('No native message target')
++        const request = { subtype: 'cancel_async_message', message_uuid: uuid }
++        const result = await this.request(request, this.childStdin)
++        if (typeof result.response?.cancelled !== 'boolean') throw new Error('Native cancellation receipt missing')
++        return result.response.cancelled
++    }
++
+     /** Promote an existing native message; never re-send its content or issue a plain Stop. */
+     async sendWaitingMessageNow(uuid: string): Promise<'stopped' | 'delivering' | 'nothing_waiting'> {
+         if (!uuid || !this.childStdin) throw new Error('No native message target')
+--- a/cli/src/claude/claudeRemote.ts
++++ b/cli/src/claude/claudeRemote.ts
+@@ -36,6 +36,7 @@
+ 
+     // Callbacks
+     onPriorityInput?: (send: ((message: string, priority: 'now' | 'next', uuid?: string) => Promise<void>) | null) => void,
++    onReadyCancel?: (cancel: ((uuid: string) => Promise<boolean>) | null) => void,
+     onReadyDelivery?: (sendNow: ((uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>) | null) => void,
+     onSessionFound: (id: string, extras?: { forkedFrom?: string }) => void,
+     onThinkingChange?: (thinking: boolean) => void,
+@@ -326,6 +327,7 @@
+ 
+                 const systemInit = message as SDKSystemMessage;
+                 const capabilities = message.capabilities;
++                opts.onReadyCancel?.((uuid) => response.cancelWaitingMessage(uuid));
+                 opts.onReadyDelivery?.(Array.isArray(capabilities) && capabilities.includes('interrupt_send_now_v1') && capabilities.includes('msg_lifecycle_v1')
+                     ? (uuid) => response.sendWaitingMessageNow(uuid) : null);
+ 
+@@ -428,6 +430,7 @@
+             `${debugPrefix} finally ` +
+             `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
+         );
++        opts.onReadyCancel?.(null);
+         opts.onReadyDelivery?.(null);
+         opts.onPriorityInput?.(null);
+         updateThinking(false);
+--- a/cli/src/claude/claudeRemoteLauncher.ts
++++ b/cli/src/claude/claudeRemoteLauncher.ts
+@@ -51,6 +51,7 @@
+ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+     private readonly session: Session;
+     private prioritySender: { send: (text: string, priority: 'now' | 'next', uuid?: string) => Promise<void>; modeHash: string } | null = null;
++    private readyCancel: ((uuid: string) => Promise<boolean>) | null = null;
+     private readyMessages: ClaudeReadyMessages;
+     private readySendNow: ((uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>) | null = null;
+     private abortController: AbortController | null = null;
+@@ -151,6 +152,10 @@
+                 ready: this.readySendNow ? this.readyMessages : undefined,
+             });
+         });
++        session.client.rpcHandlerManager.registerHandler('cancel-native-ready-message', (payload: { localId?: string }) => {
++            if (!payload?.localId || !this.readyCancel) return { cancelled: false, error: 'Native cancellation unavailable; resume this chat with the updated controller' };
++            return this.readyMessages.cancel(payload.localId, this.readyCancel);
++        });
+         this.readyMessages.clear();
+         session.client.updateMetadata(metadata => ({ ...metadata, capabilities: { ...metadata.capabilities, claudeInputPriorities: true, claudeReadyMessages: false } }));
+         const permissionHandler = new PermissionHandler(session);
+@@ -507,6 +512,7 @@
+                             // launch attempt can still resume the original session.
+                             session.consumeOneTimeFlags();
+                         },
++                        onReadyCancel: cancel => { this.readyCancel = cancel; },
+                         onReadyDelivery: (sendNow) => {
+                             this.readySendNow = sendNow;
+                             if (!sendNow) this.readyMessages.clear();
+--- a/cli/src/claude/readyMessages.ts
++++ b/cli/src/claude/readyMessages.ts
+@@ -1,5 +1,5 @@
+ import { randomUUID } from 'node:crypto'
+-export type ReadyMessage = { localId: string; text: string; state: 'waiting' | 'sending' | 'uncertain' }
++export type ReadyMessage = { localId: string; text: string; canCancel?: boolean; state: 'waiting' | 'sending' | 'uncertain' }
+ type Entry = ReadyMessage & { uuid: string; published: boolean; pending?: Promise<{ steered: boolean; error?: string }> }
+ 
+ /** Tracks SDK admission separately from actual model consumption. No automatic replays. */
+@@ -7,11 +7,11 @@
+     private knownIds = new Set<string>()
+     private entries = new Map<string, Entry>()
+     constructor(private publish: (messages: ReadyMessage[]) => void) {}
+-    private emit() { this.publish([...this.entries.values()].filter(e => e.published).map(({ localId, text, state }) => ({ localId, text, state }))) }
++    private emit() { this.publish([...this.entries.values()].filter(e => e.published).map(({ localId, text, state }) => ({ localId, text, state, canCancel: true }))) }
+     prepare(localId: string, text: string): string {
+         this.knownIds.add(localId)
+         const uuid = randomUUID()
+-        this.entries.set(localId, { uuid, localId, text: text.slice(0, 1000), state: 'waiting', published: false })
++        this.entries.set(localId, { uuid, localId, text, state: 'waiting', published: false })
+         return uuid
+     }
+     admitted(localId: string) { const entry = this.entries.get(localId); if (entry) { entry.published = true; this.emit() } }
+@@ -25,10 +25,28 @@
+         if (message.state === 'queued') this.admitted(entry.localId)
+         if (['started', 'completed', 'cancelled', 'discarded', 'refused'].includes(String(message.state))) this.remove(entry.localId)
+     }
++    async cancel(localId: string, cancelNative: (uuid: string) => Promise<boolean>): Promise<{ cancelled: boolean; text?: string; error?: string }> {
++        const entry = this.entries.get(localId)
++        if (!entry || entry.state !== 'waiting' || entry.pending) return { cancelled: false, error: 'Message is already being delivered or no longer waiting' }
++        entry.state = 'sending'; this.emit()
++        try {
++            const cancelled = await cancelNative(entry.uuid)
++            if (!cancelled) {
++                if (this.entries.get(localId) === entry) { entry.state = 'waiting'; this.emit() }
++                return { cancelled: false, error: 'Claude already started processing this message; it was not cancelled' }
++            }
++            this.remove(localId)
++            return { cancelled: true, text: entry.text }
++        } catch {
++            if (this.entries.get(localId) === entry) { entry.state = 'uncertain'; this.emit() }
++            return { cancelled: false, error: 'Cancellation unconfirmed; no replacement was sent' }
++        }
++    }
+     promote(localId: string, sendNow: (uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>): Promise<{ steered: boolean; error?: string }> {
+         const entry = this.entries.get(localId)
+         if (!entry) return Promise.resolve({ steered: true }) // already consumed: never stop an unrelated turn
+         if (entry.pending) return entry.pending
++        if (entry.state === 'sending') return Promise.resolve({ steered: false, error: 'Another delivery operation is pending' })
+         if (entry.state === 'uncertain') return Promise.resolve({ steered: false, error: 'Delivery unconfirmed; not automatically retried' })
+         entry.state = 'sending'; this.emit()
+         entry.pending = (async () => {
+--- a/hub/src/sync/rpcGateway.ts
++++ b/hub/src/sync/rpcGateway.ts
+@@ -466,6 +466,10 @@
+      * Ask the CLI to deliver one queued message into the active Pi turn
+      * (Pi native steer). Only the pi flavor registers this handler.
+      */
++    async cancelNativeReadyMessage(sessionId: string, localId: string): Promise<{ cancelled: boolean; text?: string; error?: string }> {
++        return await this.sessionRpc(sessionId, 'cancel-native-ready-message', { localId }) as { cancelled: boolean; text?: string; error?: string }
++    }
++
+     async steerQueuedMessage(
+         sessionId: string,
+         localId: string,
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1049,6 +1049,16 @@
+         return {}
+     }
+ 
++    async cancelNativeReadyMessage(sessionId: string, localId: string) {
++        const session = this.getSession(sessionId)
++        if (!session?.active || session.metadata?.flavor !== 'claude'
++            || !session.agentState?.claudeReadyMessages?.some(m => m.localId === localId && m.state === 'waiting')) {
++            return { cancelled: false, error: 'Message is no longer waiting' }
++        }
++        try { return await this.rpcGateway.cancelNativeReadyMessage(sessionId, localId) }
++        catch { return { cancelled: false, error: 'Cancellation unavailable or unconfirmed. The message was not resent.' } }
++    }
++
+     async cancelQueuedMessage(
+         sessionId: string,
+         messageId: string
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -349,6 +349,14 @@
+         }
+     })
+ 
++    app.post('/sessions/:id/ready-messages/:localId/cancel', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const session = requireSessionFromParam(c, engine, { requireActive: true })
++        if (session instanceof Response) return session
++        return c.json(await engine.cancelNativeReadyMessage(session.sessionId, c.req.param('localId')))
++    })
++
+     app.post('/sessions/:id/abort', async (c) => {
+         const engine = requireSyncEngine(c, getSyncEngine)
+         if (engine instanceof Response) {
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -585,6 +585,10 @@
+         )
+     }
+ 
++    async cancelNativeReadyMessage(sessionId: string, localId: string): Promise<{ cancelled: boolean; text?: string; error?: string }> {
++        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/ready-messages/${encodeURIComponent(localId)}/cancel`, { method: 'POST' })
++    }
++
+     async cancelMessage(sessionId: string, messageId: string): Promise<CancelMessageResponse> {
+         const response = await this.request(
+             `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+--- a/web/src/components/AssistantChat/NativeReadyMessages.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.tsx
+@@ -1,12 +1,33 @@
++import { useState } from 'react'
++import { useAui } from '@assistant-ui/react'
++import type { ApiClient } from '@/api/client'
+ import type { AgentState } from '@/types/api'
+-export function NativeReadyMessages(props: { messages: NonNullable<AgentState['claudeReadyMessages']>; busy: boolean; onInterrupt: (localId: string) => void }) {
+-    if (!props.messages.length) return null
++export function NativeReadyMessages(props: { api?: ApiClient; sessionId?: string; messages: NonNullable<AgentState['claudeReadyMessages']>; busy: boolean; onInterrupt: (localId: string) => void }) {
++    const aui = useAui()
++    const [pending, setPending] = useState(false)
++    const [error, setError] = useState<string | null>(null)
++    const cancel = async (localId: string, edit: boolean) => {
++        if (!props.api || !props.sessionId || pending) return
++        setPending(true); setError(null)
++        try {
++            const result = await props.api.cancelNativeReadyMessage(props.sessionId, localId)
++            if (!result.cancelled) { setError(result.error ?? 'Message was not cancelled'); return }
++            if (edit && result.text) {
++                const current = aui.composer().getState().text
++                aui.composer().setText(current ? current + '\n' + result.text : result.text)
++            }
++        } catch { setError('Cancellation unconfirmed; no replacement sent') }
++        finally { setPending(false) }
++    }
++    if (!props.messages.length && !error) return null
+     return <div aria-label="Messages waiting for Claude" className="mx-auto w-full max-h-40 max-w-content space-y-1 overflow-y-auto px-3 pt-2">
++        {error ? <p role="alert">{error}</p> : null}
+         {props.messages.map(message => <div key={message.localId} className="rounded-lg bg-[var(--app-secondary-bg)] px-3 py-2 text-xs">
+             <p className="line-clamp-2 whitespace-pre-wrap break-words">{message.text}</p>
+             <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+                 <span className="text-[var(--app-hint)]">{message.state === 'waiting' ? 'When Claude is ready · tap again to interrupt' : message.state === 'sending' ? 'Sending now…' : 'Delivery unconfirmed · check the conversation before retrying'}</span>
+-                {message.state === 'waiting' ? <button type="button" title="Send now; Claude may also process other waiting messages." disabled={props.busy} onClick={() => props.onInterrupt(message.localId)}
++                {message.state === 'waiting' && message.canCancel && props.api ? <><button disabled={pending || props.busy} onClick={() => void cancel(message.localId, true)}>Edit</button><button disabled={pending || props.busy} onClick={() => void cancel(message.localId, false)}>Cancel</button></> : null}
++                {message.state === 'waiting' ? <button type="button" title="Send now; Claude may also process other waiting messages." disabled={props.busy || pending} onClick={() => props.onInterrupt(message.localId)}
+                     className="min-h-8 rounded-md px-2 text-[var(--app-link)] disabled:opacity-40">Interrupt & send</button> : null}
+             </div>
+         </div>)}
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -2029,7 +2029,7 @@
+                                     disabled={props.isSending || isScratchlistParking}
+                                 />
+                             ) : null}
+-                            <NativeReadyMessages messages={readyMessages} busy={promoteReady.isPending} onInterrupt={interruptReady} />
++                            <NativeReadyMessages api={props.api} sessionId={props.session.id} messages={readyMessages} busy={promoteReady.isPending} onInterrupt={interruptReady} />
+                             <QueuedMessagesBar
+                                 sessionId={props.session.id}
+                                 api={props.api}
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -13,20 +13,7 @@
+ import { useTranslation } from '@/lib/use-translation'
+ import { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
+ 
+-function LoaderIcon(props: { className?: string }) {
+-    return (
+-        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+-            <line x1="12" y1="2" x2="12" y2="6" />
+-            <line x1="12" y1="18" x2="12" y2="22" />
+-            <line x1="4.93" y1="4.93" x2="7.76" y2="7.76" />
+-            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+-            <line x1="2" y1="12" x2="6" y2="12" />
+-            <line x1="18" y1="12" x2="22" y2="12" />
+-            <line x1="4.93" y1="19.07" x2="7.76" y2="16.24" />
+-            <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
+-        </svg>
+-    )
+-}
++
+ 
+ function BulbIcon(props: { className?: string }) {
+     return (
+@@ -177,16 +164,11 @@
+                     >
+                         {sessionName}
+                     </div>
+-                    {s.active && s.thinking ? (
+-                        managed ? (
+-                            <span className="inline-flex shrink-0" title="Manager is running this chat" aria-label="Manager is running this chat" data-testid="managed-running">
+-                                <LoaderIcon className="h-3.5 w-3.5 animate-spin text-violet-500" />
+-                            </span>
+-                        ) : (
+-                            <span data-testid="activity-progress" className="inline-flex shrink-0" title="Running" aria-label="Running">
+-                                <LoaderIcon className="h-3.5 w-3.5 animate-spin-slow text-[var(--app-badge-success-text)]" />
+-                            </span>
+-                        )
++                    {s.active && (s.thinking || (s.backgroundTaskCount ?? 0) > 0) ? (
++                        <span aria-label={s.thinking ? 'Running' : 'Background'} data-testid={s.thinking ? (managed ? 'managed-running' : 'activity-progress') : 'background-idle'}
++                            className={`shrink-0 text-[11px] font-medium ${managed ? 'text-violet-500' : s.thinking ? 'text-green-500' : 'text-[var(--app-hint)]'}`}>
++                            {s.thinking ? 'Running' : 'Background'}
++                        </span>
+                     ) : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+@@ -214,31 +196,6 @@
+                             title={attentionLabel ?? undefined}
+                             aria-label={attentionLabel ?? undefined}
+                         />
+-                    ) : showDetailedStatus && attention?.kind === 'background' && nestedTooltips && attentionId ? (
+-                        <SessionAttentionIndicator
+-                            attention={attention}
+-                            summary={s}
+-                            label={attentionLabel ?? ''}
+-                            tooltipId={attentionId}
+-                        />
+-                    ) : showDetailedStatus && attention?.kind === 'background' ? (
+-                        <span
+-                            className={`inline-flex h-2 w-2 shrink-0 rounded-full ${ATTENTION_DOT_CLASS.background}`}
+-                            title={attentionLabel ?? undefined}
+-                            aria-label={attentionLabel ?? undefined}
+-                        />
+-                    ) : s.active && (s.backgroundTaskCount ?? 0) > 0 ? (
+-                        <span
+-                            className="inline-flex shrink-0 items-center gap-1 text-[var(--app-hint)]"
+-                            title={t('session.item.background')}
+-                            aria-label={t('session.item.background')}
+-                            data-testid="background-idle"
+-                        >
+-                            <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
+-                            {!inRunningSection ? (
+-                                <span className="text-[11px] font-medium leading-none">{t('session.item.backgroundShort')}</span>
+-                            ) : null}
+-                        </span>
+                     ) : s.active && (s.pendingRequestsCount ?? 0) > 0 ? (
+                         <span
+                             className="inline-flex shrink-0 items-center gap-1 text-[var(--app-badge-warning-text)]"
+@@ -249,14 +206,14 @@
+                                 <span className="text-[11px] font-medium leading-none">{t('session.item.pending')}</span>
+                             ) : null}
+                         </span>
+-                    ) : attention && nestedTooltips && attentionId ? (
++                    ) : attention && attention.kind !== 'background' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+                             summary={s}
+                             label={attentionLabel ?? ''}
+                             tooltipId={attentionId}
+                         />
+-                    ) : attention ? (
++                    ) : attention && attention.kind !== 'background' ? (
+                         <span
+                             className={`inline-flex h-2 w-2 shrink-0 rounded-full ${ATTENTION_DOT_CLASS[attention.kind]}`}
+                             title={attentionLabel ?? undefined}
+--- a/cli/src/claude/readyMessages.test.ts
++++ b/cli/src/claude/readyMessages.test.ts
+@@ -6,7 +6,7 @@
+         const uuid = ready.prepare('local', 'correction')
+         expect(publish).not.toHaveBeenCalled()
+         ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state: 'queued' })
+-        expect(publish).toHaveBeenLastCalledWith([{ localId: 'local', text: 'correction', state: 'waiting' }])
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'local', text: 'correction', state: 'waiting', canCancel: true }])
+         ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state: 'started' })
+         ready.admitted('local')
+         expect(publish).toHaveBeenLastCalledWith([])
+@@ -30,7 +30,7 @@
+         const fail = vi.fn().mockRejectedValue(new Error('pipe lost'))
+         expect((await ready.promote('one', fail)).steered).toBe(false)
+         await ready.promote('one', fail); expect(fail).toHaveBeenCalledTimes(1)
+-        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'uncertain' }])
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'uncertain', canCancel: true }])
+         ready.prepare('two', 'two'); ready.admitted('two')
+         await ready.promote('two', async () => 'nothing_waiting')
+         expect(publish.mock.calls.at(-1)?.[0]).toHaveLength(1)
+@@ -38,9 +38,31 @@
+     it.each(['completed', 'cancelled', 'discarded', 'refused'])('retires %s and ignores unrelated lifecycle frames', state => {
+         const publish = vi.fn(); const ready = new ClaudeReadyMessages(publish); const uuid = ready.prepare('one', 'one'); ready.admitted('one')
+         ready.lifecycle({ type: 'command_lifecycle', command_uuid: 'unrelated', state: 'started' })
+-        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'waiting' }])
++        expect(publish).toHaveBeenLastCalledWith([{ localId: 'one', text: 'one', state: 'waiting', canCancel: true }])
+         ready.lifecycle({ type: 'command_lifecycle', command_uuid: uuid, state })
+         expect(publish).toHaveBeenLastCalledWith([])
+         ready.clear(); expect(ready.known('one')).toBe(false)
+     })
+ })
++
++describe('native queue cancellation', () => {
++    it('cancels the exact UUID and returns full text for editing without interrupting', async () => {
++        const ready = new ClaudeReadyMessages(vi.fn())
++        const text = 'a'.repeat(2000)
++        const uuid = ready.prepare('local', text); ready.admitted('local')
++        const cancel = vi.fn().mockResolvedValue(true)
++        expect(await ready.cancel('local', cancel)).toEqual({ cancelled: true, text })
++        expect(cancel).toHaveBeenCalledExactlyOnceWith(uuid)
++        expect((await ready.cancel('local', cancel)).cancelled).toBe(false)
++        expect(cancel).toHaveBeenCalledTimes(1)
++    })
++    it('does not edit or replay when consumption wins or cancellation is uncertain', async () => {
++        const ready = new ClaudeReadyMessages(vi.fn())
++        ready.prepare('local', 'text'); ready.admitted('local')
++        expect((await ready.cancel('local', async () => false)).cancelled).toBe(false)
++        expect((await ready.cancel('local', async () => { throw Error('disconnect') })).cancelled).toBe(false)
++        const send = vi.fn()
++        expect((await ready.promote('local', send)).steered).toBe(false)
++        expect(send).not.toHaveBeenCalled()
++    })
++})
+--- a/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
+@@ -1,4 +1,6 @@
+-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++const composer = vi.hoisted(() => ({ getState: () => ({ text: '' }), setText: vi.fn() }))
++vi.mock('@assistant-ui/react', () => ({ useAui: () => ({ composer: () => composer }) }))
++import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ import { NativeReadyMessages } from './NativeReadyMessages'
+ afterEach(cleanup)
+@@ -20,3 +22,11 @@
+         expect(onInterrupt).not.toHaveBeenCalled()
+     })
+ })
++
++it('restores a message for editing only after confirmed native cancellation', async () => {
++    const api = { cancelNativeReadyMessage: vi.fn().mockResolvedValue({ cancelled: true, text: 'full message' }) }
++    render(<NativeReadyMessages api={api as any} sessionId="session" messages={[{ localId: 'local', text: 'full message', state: 'waiting', canCancel: true }]} busy={false} onInterrupt={() => {}} />)
++    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
++    await waitFor(() => expect(composer.setText).toHaveBeenCalledWith('full message'))
++    expect(api.cancelNativeReadyMessage).toHaveBeenCalledWith('session', 'local')
++})
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -56,14 +56,16 @@
+         expect(screen.queryByRole('tooltip', { hidden: true })).not.toBeInTheDocument()
+     })
+ 
+-    it('shows a detailed background dot with the task-count tooltip in Extended mode', () => {
++    it('shows only the Background label even in Extended mode', () => {
+         renderSummary(true)
+-        expect(screen.queryByTestId('activity-progress')).not.toBeInTheDocument()
+-
+-        expect(screen.queryByText('Running', { exact: true })).not.toBeInTheDocument()
+-        const tooltip = screen.getByRole('tooltip', { hidden: true })
+-        expect(tooltip).toHaveTextContent('Background tasks tracked')
+-        expect(tooltip).toHaveTextContent('2 tasks awaiting completion')
++        expect(screen.getByText('Background', { exact: true })).toBeInTheDocument()
++        expect(screen.queryByRole('tooltip', { hidden: true })).not.toBeInTheDocument()
++    })
++    it('prioritizes Running and colors managed activity purple', () => {
++        render(<I18nProvider><SessionRowSummary session={makeSummary({ thinking: true, backgroundTaskCount: 2 })} managed /></I18nProvider>)
++        expect(screen.getByText('Running')).toHaveClass('text-violet-500')
++        expect(screen.queryByText('Background')).not.toBeInTheDocument()
++        expect(document.querySelector('[class*="animate-spin"]')).toBeNull()
+     })
+ 
+     it('refreshes unread attention when the local watermark version changes', () => {
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -208,7 +208,7 @@
+     // (Steer). Surfaced so the web can reflect the inject in progress.
+     steeringActive: z.boolean().nullish(),
+     claudeReadyMessages: z.array(z.object({
+-        localId: z.string(), text: z.string(), state: z.enum(['waiting', 'sending', 'uncertain'])
++        localId: z.string(), text: z.string(), canCancel: z.boolean().optional(), state: z.enum(['waiting', 'sending', 'uncertain'])
+     })).nullish(),
+     // The mode the session was started in. Persisted so reopen/resume can
+     // re-spawn in the same mode — notably 'pty', which has no agent terminal
+--- a/web/src/components/RunningBar.test.tsx
++++ b/web/src/components/RunningBar.test.tsx
+@@ -23,9 +23,9 @@
+         render(<RunningBar running={false} managed />)
+         expect(screen.queryByTestId('running-bar')).toBeNull()
+     })
+-    it('uses a distinct sidebar spinner for manager-run chats', () => {
++    it('uses a purple Running label for manager-run chats', () => {
+         render(<I18nProvider><SessionRowSummary session={summary} managed /></I18nProvider>)
+-        expect(screen.getByLabelText('Manager is running this chat')).toBeInTheDocument()
++        expect(screen.getByLabelText('Running')).toHaveClass('text-violet-500')
+         cleanup()
+         render(<I18nProvider><SessionRowSummary session={summary} /></I18nProvider>)
+         expect(screen.queryByTestId('managed-running')).toBeNull()
+--- a/cli/src/claude/sdk/query.test.ts
++++ b/cli/src/claude/sdk/query.test.ts
+@@ -150,3 +150,17 @@
+     expect(written[0]).not.toContain('correction')
+     stdout.end()
+ })
++
++it('cancels only the named waiting message without interrupting the turn', async () => {
++    const { Query } = await import('./query')
++    const stdout = new PassThrough(); const stdin = new PassThrough()
++    const written: any[] = []
++    stdin.on('data', data => {
++        const request = JSON.parse(data.toString()); written.push(request.request)
++        stdout.write(JSON.stringify({ type: 'control_response', response: { request_id: request.request_id, subtype: 'success', response: { cancelled: true } } }) + '\n')
++    })
++    const query = new Query(stdin, stdout, Promise.resolve())
++    expect(await query.cancelWaitingMessage('native-uuid')).toBe(true)
++    expect(written).toEqual([{ subtype: 'cancel_async_message', message_uuid: 'native-uuid' }])
++    stdout.end()
++})
+--- a/cli/src/claude/priorityInput.test.ts
++++ b/cli/src/claude/priorityInput.test.ts
+@@ -58,6 +58,6 @@
+     expect(send.mock.calls[0]?.slice(0, 2)).toEqual(['correction', 'next'])
+     expect(publish).not.toHaveBeenCalled()
+     ready.lifecycle({ type: 'command_lifecycle', command_uuid: (send.mock.calls[0] as unknown as unknown[])[2], state: 'queued' })
+-    expect(publish).toHaveBeenLastCalledWith([{ localId: 'target', text: 'correction', state: 'waiting' }])
++    expect(publish).toHaveBeenLastCalledWith([{ localId: 'target', text: 'correction', state: 'waiting', canCancel: true }])
+     expect(client.emitMessagesConsumed).toHaveBeenCalledTimes(1)
+ })

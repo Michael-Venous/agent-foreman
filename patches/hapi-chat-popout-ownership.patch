@@ -1,0 +1,951 @@
+diff --git a/web/src/lib/popout.ts b/web/src/lib/popout.ts
+--- a/web/src/lib/popout.ts
++++ b/web/src/lib/popout.ts
+@@ -1,20 +1,25 @@
+ /**
+  * Session Manager and the node graph open as real browser popup windows on desktop.
+- * Popups are same-origin and share auth (localStorage); chat navigation is sent back
+- * to the main window. Phone browsers cannot open separate windows, so they keep the
+- * in-page floating window.
++ * Popups share auth, but navigation and pins belong to their own chat window.
++ * Phone tool launchers retain the in-page windows; explicit chat popouts may open
++ * a separate tab instead, according to the browser's window policy.
+  */
++import { chatWindowId } from './chatWindow'
++import { randomId } from './randomId'
++
+ export type PopoutKind = 'session-manager' | 'nodes'
+-export type PopoutRequest = { action: 'open-session'; sessionId: string } | { action: 'open-chats' }
+-export type PopoutMessage = PopoutRequest & { type: 'hapi-popout' }
++export type PopoutRequest = { action: 'open-session'; sessionId: string; respectPin?: boolean } | { action: 'open-chats' }
++export type PopoutMessage = PopoutRequest & { type: 'hapi-popout'; owner: string; source: PopoutKind }
+ 
+-const SIZES: Record<PopoutKind, { width: number; height: number }> = {
++const SIZES = {
+     'session-manager': { width: 480, height: 640 },
+     nodes: { width: 820, height: 640 },
++    chat: { width: 1120, height: 800 },
+ }
+-const MAIN_WINDOW = 'hapi-main'
+-const boundsKey = (kind: PopoutKind) => 'hapi-popout-bounds:' + kind
+-const opened = new Map<PopoutKind, Window>()
++type BoundsKind = PopoutKind | 'chat'
++const boundsKey = (kind: BoundsKind) => 'hapi-popout-bounds:' + kind
++const opened = new Map<string, Window>()
++const toolName = (owner: string, kind: PopoutKind) => `hapi-popout-${kind}-${owner}`
+ 
+ export const popoutPath = (kind: PopoutKind) => '/popout/' + kind
+ export const isPopoutPath = (pathname: string) => pathname.startsWith('/popout/')
+@@ -26,7 +31,7 @@
+     return !mobile && window.innerWidth >= 920
+ }
+ 
+-function savedBounds(kind: PopoutKind): { left?: number; top?: number; width: number; height: number } {
++function savedBounds(kind: BoundsKind): { left?: number; top?: number; width: number; height: number } {
+     try {
+         const value = JSON.parse(localStorage.getItem(boundsKey(kind)) ?? 'null') as { left: number; top: number; width: number; height: number } | null
+         if (value && [value.left, value.top, value.width, value.height].every(Number.isFinite) && value.width >= 280 && value.height >= 260) return value
+@@ -37,27 +42,39 @@
+ 
+ /** Open (or focus) the popup. Returns false when the browser blocked it, so callers can fall back. */
+ export function openPopout(kind: PopoutKind): boolean {
++    const owner = chatWindowId()
++    const name = toolName(owner, kind)
+     try {
+-        const existing = opened.get(kind)
++        const existing = opened.get(name)
+         if (existing && !existing.closed) { existing.focus(); return true }
+-        // Name the main window so popups can bring it back even after a reload.
+-        if (!window.name) window.name = MAIN_WINDOW
+         const b = savedBounds(kind)
+         const features = ['popup=yes', `width=${Math.round(b.width)}`, `height=${Math.round(b.height)}`]
+         if (b.left !== undefined && b.top !== undefined) features.push(`left=${Math.round(b.left)}`, `top=${Math.round(b.top)}`)
+-        const popup = window.open(popoutPath(kind), 'hapi-popout-' + kind, features.join(','))
++        const popup = window.open(`${popoutPath(kind)}?owner=${encodeURIComponent(owner)}`, name, features.join(','))
+         if (!popup) return false
+-        opened.set(kind, popup)
++        opened.set(name, popup)
+         popup.focus()
+         return true
+     } catch {
+-        opened.delete(kind)
++        opened.delete(name)
+         return false
+     }
+ }
+ 
++/** Always create a separate view of the existing chat; never resume or fork it. */
++export function openChatPopout(sessionId: string): boolean {
++    try {
++        const b = savedBounds('chat')
++        const popup = window.open(`/sessions/${encodeURIComponent(sessionId)}`, `hapi-chat-${randomId()}`,
++            `popup=yes,width=${Math.round(b.width)},height=${Math.round(b.height)},left=${Math.round(b.left ?? 0)},top=${Math.round(b.top ?? 0)}`)
++        if (!popup) return false
++        popup.focus()
++        return true
++    } catch { return false }
++}
++
+ /** Inside a popup: remember its geometry for the next open. */
+-export function rememberPopoutBounds(kind: PopoutKind): () => void {
++export function rememberPopoutBounds(kind: BoundsKind): () => void {
+     let timer: ReturnType<typeof setTimeout> | null = null
+     let lastSaved = ''
+     const save = () => {
+@@ -82,17 +99,20 @@
+     }
+ }
+ 
+-/** Inside a popup: drive the main window (focus it and navigate), or open one if it is gone. */
+-export function sendToMain(message: PopoutRequest): void {
+-    const full = { type: 'hapi-popout', ...message } as PopoutMessage
++/** Inside a tool popup: navigate only its owning chat window. */
++export function sendToMain(message: PopoutRequest, source: PopoutKind): void {
++    const owner = new URLSearchParams(window.location.search).get('owner')
++    const full = { type: 'hapi-popout', ...message, owner, source } as PopoutMessage
+     const opener = window.opener as Window | null
+-    if (opener && !opener.closed) {
+-        opener.postMessage(full, window.location.origin)
+-        opener.focus()
+-        return
+-    }
+-    const path = full.action === 'open-session' ? '/sessions/' + encodeURIComponent(full.sessionId) : '/sessions'
+-    window.open(path, MAIN_WINDOW)?.focus()
++    try {
++        if (owner && opener && !opener.closed && opener.name === owner) {
++            opener.postMessage(full, window.location.origin)
++            return
++        }
++    } catch { /* The opener may have navigated to another origin. */ }
++    // The owner is gone. Never hijack an unrelated main/chat window by name.
++    if (message.action === 'open-session') openChatPopout(message.sessionId)
++    else window.open('/sessions', `hapi-window-${randomId()}`, 'popup=yes,width=1120,height=800')?.focus()
+ }
+ 
+ /** Main window: accept same-origin popup navigation requests only. */
+@@ -101,6 +121,12 @@
+         if (event.origin !== window.location.origin) return
+         const data = event.data as Partial<PopoutMessage> | null
+         if (data?.type !== 'hapi-popout') return
++        if (data.owner !== chatWindowId() || (data.source !== 'nodes' && data.source !== 'session-manager')) return
++        const source = event.source as Window | null
++        try {
++            if (!source || source.closed || source.opener !== window || source.name !== toolName(data.owner, data.source)) return
++        } catch { return }
++        if ('respectPin' in data && data.respectPin !== undefined && typeof data.respectPin !== 'boolean') return
+         if (data.action === 'open-session' && typeof data.sessionId === 'string') handler(data as PopoutMessage)
+         else if (data.action === 'open-chats') handler(data as PopoutMessage)
+     }
+diff --git a/web/src/lib/popout.test.ts b/web/src/lib/popout.test.ts
+--- a/web/src/lib/popout.test.ts
++++ b/web/src/lib/popout.test.ts
+@@ -3,6 +3,9 @@
+ beforeEach(async () => {
+     vi.resetModules()
+     localStorage.clear()
++    sessionStorage.clear()
++    window.name = 'hapi-window-owner'
++    history.replaceState(null, '', '/')
+     vi.stubGlobal('innerWidth', 1280)
+     vi.stubGlobal('innerHeight', 800)
+     popout = await import('./popout')
+@@ -17,7 +20,7 @@
+         expect(popout.openPopout('nodes')).toBe(true)
+         expect(open).toHaveBeenCalledTimes(1)
+         expect(first.focus).toHaveBeenCalledTimes(2)
+-        expect(open.mock.calls[0].slice(0, 2)).toEqual(['/popout/nodes', 'hapi-popout-nodes'])
++        expect(open.mock.calls[0].slice(0, 2)).toEqual(['/popout/nodes?owner=hapi-window-owner', 'hapi-popout-nodes-hapi-window-owner'])
+         expect(open.mock.calls[0][2]).toContain('popup=yes')
+         first.closed = true
+         expect(popout.openPopout('nodes')).toBe(true)
+@@ -63,31 +66,34 @@
+ describe('popup navigation', () => {
+     it('only accepts same-origin supported messages and removes its listener', () => {
+         const handler = vi.fn(), cleanup = popout.listenForPopouts(handler)
+-        const data = { type: 'hapi-popout', action: 'open-session', sessionId: 'chat' }
++        const data = { type: 'hapi-popout', action: 'open-session', sessionId: 'chat', source: 'nodes', owner: window.name }
++        const source = { name: 'hapi-popout-nodes-' + window.name, opener: window } as unknown as Window
+         window.dispatchEvent(new MessageEvent('message', { origin: 'https://elsewhere.test', data }))
+         window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data: { ...data, sessionId: 123 } }))
+         window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data: { type: 'hapi-popout', action: 'stop-session' } }))
+         expect(handler).not.toHaveBeenCalled()
+-        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data }))
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data, source }))
+         expect(handler).toHaveBeenCalledExactlyOnceWith(data)
+         cleanup()
+-        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data }))
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data, source }))
+         expect(handler).toHaveBeenCalledTimes(1)
+     })
+     it('selects chats in the opener without opening another tab', () => {
+-        const opener = { closed: false, postMessage: vi.fn(), focus: vi.fn() }
++        const opener = { name: window.name, closed: false, postMessage: vi.fn(), focus: vi.fn() }
++        history.replaceState(null, '', '/popout/nodes?owner=' + window.name)
+         vi.stubGlobal('opener', opener)
+         const open = vi.spyOn(window, 'open')
+-        popout.sendToMain({ action: 'open-session', sessionId: 'chat' })
+-        expect(opener.postMessage).toHaveBeenCalledWith({ type: 'hapi-popout', action: 'open-session', sessionId: 'chat' }, location.origin)
+-        expect(opener.focus).toHaveBeenCalled()
++        popout.sendToMain({ action: 'open-session', sessionId: 'chat' }, 'nodes')
++        expect(opener.postMessage).toHaveBeenCalledWith({ type: 'hapi-popout', action: 'open-session', sessionId: 'chat', owner: window.name, source: 'nodes' }, location.origin)
++        // The owner decides whether pin allows navigation/focus.
++        expect(opener.focus).not.toHaveBeenCalled()
+         expect(open).not.toHaveBeenCalled()
+     })
+     it('opens a main window safely when the opener has closed', () => {
+         vi.stubGlobal('opener', { closed: true })
+         const focus = vi.fn(), open = vi.spyOn(window, 'open').mockReturnValue({ focus } as unknown as Window)
+-        popout.sendToMain({ action: 'open-session', sessionId: 'a/b?' })
+-        expect(open).toHaveBeenCalledWith('/sessions/a%2Fb%3F', 'hapi-main')
++        popout.sendToMain({ action: 'open-session', sessionId: 'a/b?' }, 'nodes')
++        expect(open).toHaveBeenCalledWith('/sessions/a%2Fb%3F', expect.stringMatching(/^hapi-chat-/), expect.stringContaining('popup=yes'))
+         expect(focus).toHaveBeenCalled()
+     })
+     it('keeps narrow screens and mobile devices on in-page windows', () => {
+@@ -98,3 +104,69 @@
+         expect(popout.canPopout()).toBe(false)
+     })
+ })
++
++
++describe('independent chat popouts', () => {
++    it('opens distinct views of the same existing chat without changing the opener', () => {
++        const focus = vi.fn(), open = vi.spyOn(window, 'open').mockReturnValue({ focus } as unknown as Window)
++        expect(popout.openChatPopout('a/b?')).toBe(true)
++        expect(popout.openChatPopout('a/b?')).toBe(true)
++        expect(open.mock.calls[0][0]).toBe('/sessions/a%2Fb%3F')
++        expect(open.mock.calls[0][1]).toMatch(/^hapi-chat-/)
++        expect(open.mock.calls[1][1]).not.toBe(open.mock.calls[0][1])
++        expect(window.name).toBe('hapi-window-owner')
++        expect(focus).toHaveBeenCalledTimes(2)
++    })
++    it.each(['blocked', 'denied'])('leaves the current chat alone when opening is %s', mode => {
++        const open = vi.spyOn(window, 'open')
++        if (mode === 'blocked') open.mockReturnValue(null)
++        else open.mockImplementation(() => { throw new Error('Denied') })
++        expect(popout.openChatPopout('chat')).toBe(false)
++        expect(location.pathname).toBe('/')
++    })
++    it('uses separate tool windows for each owning chat, keeping an existing tool for its owner', () => {
++        const open = vi.spyOn(window, 'open').mockImplementation(() => ({ closed: false, focus: vi.fn() }) as unknown as Window)
++        popout.openPopout('nodes')
++        window.name = 'hapi-chat-secondary'
++        popout.openPopout('nodes'); popout.openPopout('session-manager')
++        expect(open.mock.calls[1][0]).toBe('/popout/nodes?owner=hapi-chat-secondary')
++        expect(open.mock.calls[1][1]).not.toBe(open.mock.calls[0][1])
++        expect(open.mock.calls[2][1]).toBe('hapi-popout-session-manager-hapi-chat-secondary')
++        window.name = 'hapi-window-owner'
++        popout.openPopout('nodes')
++        expect(open).toHaveBeenCalledTimes(3)
++    })
++    it('rejects navigation for another owner and messages from unrelated windows, including after reload', async () => {
++        // Listener does not depend on an in-memory opened map (lost on reload).
++        const handler = vi.fn(), cleanup = popout.listenForPopouts(handler)
++        const data = { type: 'hapi-popout', action: 'open-session', sessionId: 'chat', owner: window.name, source: 'nodes' }
++        const source = { name: 'hapi-popout-nodes-' + window.name, opener: window } as unknown as Window
++        const post = (value: unknown, from: Window | null = source) => window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data: value, source: from }))
++        post({ ...data, owner: 'hapi-chat-other' }); post(data, null)
++        post(data, { name: source.name, opener: null } as Window)
++        post({ ...data, source: 'session-manager' })
++        expect(handler).not.toHaveBeenCalled()
++        post(data)
++        expect(handler).toHaveBeenCalledExactlyOnceWith(data)
++        cleanup()
++    })
++    it('does not send navigation to a different opener if ownership was lost', () => {
++        history.replaceState(null, '', '/popout/nodes?owner=hapi-chat-closed')
++        const opener = { name: 'hapi-chat-different', closed: false, postMessage: vi.fn() }
++        vi.stubGlobal('opener', opener)
++        const open = vi.spyOn(window, 'open').mockReturnValue(null)
++        popout.sendToMain({ action: 'open-session', sessionId: 'chat' }, 'nodes')
++        expect(opener.postMessage).not.toHaveBeenCalled()
++        expect(open.mock.calls[0][1]).toMatch(/^hapi-chat-/)
++    })
++})
++
++it('supports plain HTTP LAN access without crypto.randomUUID', () => {
++    vi.stubGlobal('crypto', {})
++    window.name = ''
++    const open = vi.spyOn(window, 'open').mockReturnValue({ focus: vi.fn() } as unknown as Window)
++    expect(popout.openChatPopout('chat')).toBe(true)
++    expect(popout.openPopout('nodes')).toBe(true)
++    expect(window.name).toMatch(/^hapi-window-/)
++    expect(open.mock.calls[0][1]).toMatch(/^hapi-chat-/)
++})
+diff --git a/web/src/lib/chatWindow.ts b/web/src/lib/chatWindow.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/chatWindow.ts
+@@ -0,0 +1,29 @@
++import { randomId } from './randomId'
++
++/** Browser-window identity, independent of session/graph selection and shared auth. */
++export function chatWindowId(): string {
++    if (!/^hapi-(?:chat|window|popout-(?:nodes|session-manager))-[\w-]+$/.test(window.name)) {
++        window.name = `hapi-window-${randomId()}`
++    }
++    return window.name
++}
++
++export function isChatPopoutWindow(): boolean {
++    return /^hapi-chat-[\w-]+$/.test(window.name)
++}
++
++export const chatWindowKey = (key: string) => `${chatWindowId()}:${key}`
++// Session storage can be cloned from an opener. Identity-prefixed keys prevent
++// the new chat inheriting its opener's pin/sidebar defaults. Memory is a fallback
++// for browsers disabling storage; same-window hook instances still stay in sync.
++const memory = new Map<string, string>()
++export function readChatWindowPreference(key: string): string | null {
++    const scoped = chatWindowKey(key)
++    try { return sessionStorage.getItem(scoped) ?? memory.get(scoped) ?? null }
++    catch { return memory.get(scoped) ?? null }
++}
++export function writeChatWindowPreference(key: string, value: string): void {
++    const scoped = chatWindowKey(key)
++    try { sessionStorage.setItem(scoped, value); memory.delete(scoped) }
++    catch { memory.set(scoped, value) }
++}
+diff --git a/web/src/hooks/useNodeChatPin.ts b/web/src/hooks/useNodeChatPin.ts
+--- a/web/src/hooks/useNodeChatPin.ts
++++ b/web/src/hooks/useNodeChatPin.ts
+@@ -1,23 +1,29 @@
+ import { useCallback, useEffect, useState } from 'react'
++import { isChatPopoutWindow, readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ const KEY = 'hapi-node-chat-pin'
+ const EVENT = 'hapi-node-chat-pin-change'
+ function read() {
+-    try { return localStorage.getItem(KEY) === 'true' } catch { return false }
++    const stored = readChatWindowPreference(KEY)
++    if (stored !== null) return stored === 'true'
++    // Keep the old preference only as an initial default for normal windows.
++    let initial = isChatPopoutWindow()
++    if (!initial) { try { initial = localStorage.getItem(KEY) === 'true' } catch { /* Optional. */ } }
++    writeChatWindowPreference(KEY, String(initial))
++    return initial
+ }
+ /** A navigation lock only for node clicks. Sidebar/other navigation is never intercepted. */
+ export function useNodeChatPin() {
+     const [chatPinned, setChatPinned] = useState(read)
+     useEffect(() => {
+         const sync = () => setChatPinned(read())
+-        const storage = (event: StorageEvent) => { if (event.key === KEY || event.key === null) sync() }
+-        window.addEventListener(EVENT, sync); window.addEventListener('storage', storage)
+-        return () => { window.removeEventListener(EVENT, sync); window.removeEventListener('storage', storage) }
++        window.addEventListener(EVENT, sync)
++        return () => { window.removeEventListener(EVENT, sync) }
+     }, [])
+     const toggleChatPinned = useCallback(() => {
+         const next = !chatPinned
+         setChatPinned(next)
+-        try { localStorage.setItem(KEY, String(next)); window.dispatchEvent(new Event(EVENT)) }
+-        catch { /* Keep this window usable without storage. */ }
++        writeChatWindowPreference(KEY, String(next))
++        window.dispatchEvent(new Event(EVENT))
+     }, [chatPinned])
+     return { chatPinned, toggleChatPinned }
+ }
+diff --git a/web/src/hooks/useNodeChatPin.test.tsx b/web/src/hooks/useNodeChatPin.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/useNodeChatPin.test.tsx
+@@ -0,0 +1,55 @@
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { useNodeChatPin } from './useNodeChatPin'
++import { chatWindowId, readChatWindowPreference } from '@/lib/chatWindow'
++beforeEach(() => { localStorage.clear(); sessionStorage.clear(); window.name = '' })
++afterEach(() => { cleanup(); vi.restoreAllMocks(); window.name = '' })
++it('starts new chat popouts pinned despite cloned opener storage; each window can unpin independently', () => {
++    window.name = 'hapi-chat-first'
++    const first = renderHook(useNodeChatPin)
++    expect(first.result.current.chatPinned).toBe(true)
++    act(() => first.result.current.toggleChatPinned())
++    expect(first.result.current.chatPinned).toBe(false)
++    first.unmount()
++    window.name = 'hapi-chat-second'
++    const second = renderHook(useNodeChatPin)
++    expect(second.result.current.chatPinned).toBe(true)
++    second.unmount()
++    window.name = 'hapi-chat-first'
++    expect(renderHook(useNodeChatPin).result.current.chatPinned).toBe(false)
++    expect(localStorage.getItem('hapi-node-chat-pin')).toBeNull()
++})
++it('synchronizes hook instances in one window and retains pin across session navigation/remount', () => {
++    const first = renderHook(useNodeChatPin), graph = renderHook(useNodeChatPin)
++    expect(first.result.current.chatPinned).toBe(false)
++    act(() => first.result.current.toggleChatPinned())
++    expect(graph.result.current.chatPinned).toBe(true)
++    const identity = window.name
++    first.unmount(); graph.unmount()
++    expect(renderHook(useNodeChatPin).result.current.chatPinned).toBe(true)
++    expect(window.name).toBe(identity)
++})
++it('ignores pin writes in other windows, including the legacy shared preference', () => {
++    const hook = renderHook(useNodeChatPin)
++    localStorage.setItem('hapi-node-chat-pin', 'true')
++    act(() => { window.dispatchEvent(new StorageEvent('storage', { key: 'hapi-node-chat-pin', newValue: 'true' })) })
++    expect(hook.result.current.chatPinned).toBe(false)
++    hook.unmount()
++    window.name = 'hapi-window-new'
++    expect(renderHook(useNodeChatPin).result.current.chatPinned).toBe(true)
++})
++it('does not rename child tool windows, which must remain identifiable to their owner', () => {
++    window.name = 'hapi-popout-nodes-hapi-chat-owner'
++    renderHook(useNodeChatPin)
++    expect(chatWindowId()).toBe('hapi-popout-nodes-hapi-chat-owner')
++})
++it('keeps defaults and in-window synchronization when storage is unavailable', () => {
++    window.name = 'hapi-chat-no-storage'
++    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('Denied') })
++    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('Denied') })
++    const one = renderHook(useNodeChatPin), two = renderHook(useNodeChatPin)
++    expect(one.result.current.chatPinned).toBe(true)
++    act(() => one.result.current.toggleChatPinned())
++    expect(two.result.current.chatPinned).toBe(false)
++    expect(readChatWindowPreference('hapi-node-chat-pin')).toBe('false')
++})
+diff --git a/web/src/hooks/useSidebarResize.ts b/web/src/hooks/useSidebarResize.ts
+--- a/web/src/hooks/useSidebarResize.ts
++++ b/web/src/hooks/useSidebarResize.ts
+@@ -1,4 +1,5 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
++import { isChatPopoutWindow, readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ 
+ const STORAGE_KEY = 'hapi-sidebar-width'
+ const COLLAPSED_KEY = 'hapi-sidebar-collapsed'
+@@ -11,7 +12,7 @@
+ }
+ 
+ function loadWidth(): number {
+-    const stored = localStorage.getItem(STORAGE_KEY)
++    const stored = isChatPopoutWindow() ? readChatWindowPreference(STORAGE_KEY) : localStorage.getItem(STORAGE_KEY)
+     if (stored) {
+         const parsed = Number(stored)
+         if (Number.isFinite(parsed)) return clamp(parsed)
+@@ -23,10 +24,12 @@
+     const [width, setWidth] = useState(loadWidth)
+     const [isDragging, setIsDragging] = useState(false)
+     // Desktop-only: hide the chat list to give the chat the full width (persists across reloads).
+-    const [collapsed, setCollapsedState] = useState(() => localStorage.getItem(COLLAPSED_KEY) === '1')
++    const [collapsed, setCollapsedState] = useState(() => isChatPopoutWindow()
++        ? readChatWindowPreference(COLLAPSED_KEY) !== '0' : localStorage.getItem(COLLAPSED_KEY) === '1')
+     const setCollapsed = useCallback((value: boolean) => {
+         setCollapsedState(value)
+-        localStorage.setItem(COLLAPSED_KEY, value ? '1' : '0')
++        if (isChatPopoutWindow()) writeChatWindowPreference(COLLAPSED_KEY, value ? '1' : '0')
++        else localStorage.setItem(COLLAPSED_KEY, value ? '1' : '0')
+     }, [])
+     const startXRef = useRef(0)
+     const startWidthRef = useRef(0)
+@@ -77,7 +80,8 @@
+     // Persist width to localStorage when drag ends
+     useEffect(() => {
+         if (!isDragging) {
+-            localStorage.setItem(STORAGE_KEY, String(width))
++            if (isChatPopoutWindow()) writeChatWindowPreference(STORAGE_KEY, String(width))
++            else localStorage.setItem(STORAGE_KEY, String(width))
+         }
+     }, [isDragging, width])
+ 
+diff --git a/web/src/hooks/useSidebarResize.test.tsx b/web/src/hooks/useSidebarResize.test.tsx
+--- a/web/src/hooks/useSidebarResize.test.tsx
++++ b/web/src/hooks/useSidebarResize.test.tsx
+@@ -1,7 +1,7 @@
+ import { act, cleanup, renderHook } from '@testing-library/react'
+ import { afterEach, expect, it } from 'vitest'
+ import { useSidebarResize } from './useSidebarResize'
+-afterEach(() => { cleanup(); localStorage.clear() })
++afterEach(() => { cleanup(); localStorage.clear(); sessionStorage.clear(); window.name = '' })
+ it('keeps the resized width while collapse persists across remount and can be restored', () => {
+     localStorage.setItem('hapi-sidebar-width', '515')
+     let hook = renderHook(useSidebarResize)
+@@ -16,3 +16,26 @@
+     expect(hook.result.current.collapsed).toBe(false)
+     expect(hook.result.current.width).toBe(515)
+ })
++
++it('starts each chat popout collapsed without changing the main selector, and restores its own choice', () => {
++    localStorage.setItem('hapi-sidebar-collapsed', '0')
++    localStorage.setItem('hapi-sidebar-width', '515')
++    window.name = 'hapi-chat-selector-one'
++    let hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(true)
++    act(() => hook.result.current.setCollapsed(false))
++    hook.unmount()
++    window.name = 'hapi-chat-selector-two'
++    hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(true)
++    hook.unmount()
++    window.name = 'hapi-chat-selector-one'
++    hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(false)
++    hook.unmount()
++    window.name = 'hapi-window-main'
++    hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(false)
++    expect(hook.result.current.width).toBe(515)
++    expect(localStorage.getItem('hapi-sidebar-collapsed')).toBe('0')
++})
+diff --git a/web/src/components/PopoutNavigation.tsx b/web/src/components/PopoutNavigation.tsx
+--- a/web/src/components/PopoutNavigation.tsx
++++ b/web/src/components/PopoutNavigation.tsx
+@@ -2,13 +2,17 @@
+ import { useNavigate } from '@tanstack/react-router'
+ import { listenForPopouts } from '@/lib/popout'
+ import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
++import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ 
+ /** Main window: chats chosen in the Session Manager / node graph popups open here. */
+ export function PopoutNavigation() {
+     const navigate = useNavigate()
++    const { chatPinned } = useNodeChatPin()
+     useEffect(() => listenForPopouts(message => {
++        if (message.action === 'open-session' && message.source === 'nodes' && message.respectPin && chatPinned) return
++        window.focus()
+         if (message.action === 'open-session') void navigate(getSessionListSelectionNavigation(message.sessionId))
+         else void navigate({ to: '/sessions' })
+-    }), [navigate])
++    }), [navigate, chatPinned])
+     return null
+ }
+diff --git a/web/src/components/PopoutNavigation.test.tsx b/web/src/components/PopoutNavigation.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/PopoutNavigation.test.tsx
+@@ -0,0 +1,33 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { PopoutNavigation } from './PopoutNavigation'
++import { useNodeChatPin } from '@/hooks/useNodeChatPin'
++const navigate = vi.hoisted(() => vi.fn())
++vi.mock('@tanstack/react-router', () => ({ useNavigate: () => navigate }))
++beforeEach(() => { window.name = 'hapi-chat-' + crypto.randomUUID(); sessionStorage.clear(); navigate.mockClear(); vi.spyOn(window, 'focus').mockImplementation(() => {}) })
++afterEach(() => { cleanup(); window.name = ''; vi.restoreAllMocks() })
++function Pin() { const { toggleChatPinned } = useNodeChatPin(); return <button onClick={toggleChatPinned}>Pin</button> }
++function choose(source: 'nodes' | 'session-manager', respectPin = false) {
++    const child = { name: `hapi-popout-${source}-${window.name}`, opener: window } as unknown as Window
++    act(() => { window.dispatchEvent(new MessageEvent('message', { origin: location.origin, source: child,
++        data: { type: 'hapi-popout', owner: window.name, source, action: 'open-session', sessionId: 'chosen', respectPin } })) })
++}
++it('uses the owning chat current pin: node selection highlights without navigation, explicit choices still navigate', () => {
++    const view = render(<><PopoutNavigation /><Pin /></>)
++    choose('nodes', true)
++    expect(navigate).not.toHaveBeenCalled()
++    expect(window.focus).not.toHaveBeenCalled()
++    // The graph menu explicitly opening a chat and Session Manager choices bypass pin.
++    choose('nodes'); choose('session-manager')
++    expect(navigate).toHaveBeenCalledTimes(2)
++    act(() => view.getByText('Pin').click())
++    choose('nodes', true)
++    expect(navigate).toHaveBeenCalledTimes(3)
++    expect(window.focus).toHaveBeenCalledTimes(3)
++    expect(navigate.mock.lastCall![0]).toMatchObject({ to: '/sessions/$sessionId', params: { sessionId: 'chosen' } })
++})
++it('removes navigation listeners when this chat window unmounts', () => {
++    const view = render(<PopoutNavigation />)
++    view.unmount(); choose('session-manager')
++    expect(navigate).not.toHaveBeenCalled()
++})
+diff --git a/web/src/components/ChatPopoutMenu.tsx b/web/src/components/ChatPopoutMenu.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/ChatPopoutMenu.tsx
+@@ -0,0 +1,18 @@
++import { useState } from 'react'
++import { createPortal } from 'react-dom'
++import { useAnchoredMenu } from '@/hooks/useAnchoredMenu'
++import { openChatPopout } from '@/lib/popout'
++
++/** Context action for compact Session Manager rows; no lifecycle controls. */
++export function ChatPopoutMenu({ sessionId, anchorPoint, onClose }: {
++    sessionId: string; anchorPoint: { x: number; y: number }; onClose: () => void
++}) {
++    const { menuRef, menuStyle } = useAnchoredMenu({ isOpen: true, onClose, anchorPoint, align: 'start' })
++    const [blocked, setBlocked] = useState(false)
++    return createPortal(<div ref={menuRef} style={menuStyle} role="menu" aria-label="Session actions"
++        className="fixed z-[120] max-w-[calc(100vw-16px)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 text-sm shadow-xl">
++        <button type="button" role="menuitem" className="w-full rounded-md px-3 py-2 text-left hover:bg-[var(--app-subtle-bg)]"
++            onClick={() => { if (openChatPopout(sessionId)) onClose(); else setBlocked(true) }}>Open in popout</button>
++        {blocked && <p role="alert" className="max-w-64 px-3 py-2 text-xs text-[var(--app-badge-error-text)]">Popout blocked. Allow popups for this site and try again.</p>}
++    </div>, document.body)
++}
+diff --git a/web/src/components/SessionActionMenu.tsx b/web/src/components/SessionActionMenu.tsx
+--- a/web/src/components/SessionActionMenu.tsx
++++ b/web/src/components/SessionActionMenu.tsx
+@@ -1,4 +1,5 @@
+-import { useId } from 'react'
++import { useId, useState } from 'react'
++import { openChatPopout } from '@/lib/popout'
+ import { useTranslation } from '@/lib/use-translation'
+ import { HoverTooltip } from '@/components/HoverTooltip'
+ import { safeCopyToClipboard } from '@/lib/clipboard'
+@@ -198,6 +199,7 @@
+ 
+ export function SessionActionMenu(props: SessionActionMenuProps) {
+     const { t } = useTranslation()
++    const [popoutBlocked, setPopoutBlocked] = useState(false)
+     const { haptic } = usePlatform()
+     const {
+         isOpen,
+@@ -322,6 +324,13 @@
+                     <EditIcon className="text-[var(--app-hint)]" />
+                     {t('session.action.rename')}
+                 </button>
++
++                <button type="button" role="menuitem" className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
++                    onClick={() => { if (openChatPopout(sessionId)) { setPopoutBlocked(false); onClose() } else setPopoutBlocked(true) }}>
++                    <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" className="text-[var(--app-hint)]"><path d="M14 3h7v7M21 3l-9 9M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" /></svg>
++                    Open in popout
++                </button>
++                {popoutBlocked && <p role="alert" className="max-w-72 px-3 py-2 text-xs text-red-500">Popout blocked. Allow popups for this site and try again.</p>}
+ 
+                 <button
+                     type="button"
+diff --git a/web/src/components/SessionActionMenu.test.tsx b/web/src/components/SessionActionMenu.test.tsx
+--- a/web/src/components/SessionActionMenu.test.tsx
++++ b/web/src/components/SessionActionMenu.test.tsx
+@@ -10,7 +10,7 @@
+     }),
+ }))
+ 
+-afterEach(() => cleanup())
++afterEach(() => { cleanup(); vi.restoreAllMocks() })
+ 
+ function renderMenu(overrides: Partial<React.ComponentProps<typeof SessionActionMenu>> = {}) {
+     const defaults: React.ComponentProps<typeof SessionActionMenu> = {
+@@ -318,3 +318,21 @@
+         })
+     })
+ })
++
++describe('chat popout action', () => {
++    it('opens a separate view and closes only the menu, without session lifecycle actions', () => {
++        const open = vi.spyOn(window, 'open').mockReturnValue({ focus: vi.fn() } as unknown as Window)
++        const { props } = renderMenu()
++        fireEvent.click(screen.getByRole('menuitem', { name: 'Open in popout' }))
++        expect(open).toHaveBeenCalledWith('/sessions/sess-123', expect.stringMatching(/^hapi-chat-/), expect.stringContaining('popup=yes'))
++        expect(props.onClose).toHaveBeenCalledOnce()
++        expect(props.onArchive).not.toHaveBeenCalled(); expect(props.onReopen).not.toHaveBeenCalled(); expect(props.onDelete).not.toHaveBeenCalled()
++    })
++    it('keeps the menu and current chat when popup blocking prevents opening', () => {
++        vi.spyOn(window, 'open').mockReturnValue(null)
++        const { props } = renderMenu()
++        fireEvent.click(screen.getByRole('menuitem', { name: 'Open in popout' }))
++        expect(screen.getByRole('alert')).toHaveTextContent('Popout blocked')
++        expect(props.onClose).not.toHaveBeenCalled()
++    })
++})
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -11,6 +11,7 @@
+ import { sessionHasWork } from '@/lib/sessionManager'
+ import { getSessionTitle } from '@/lib/sessionTitle'
+ import { canPopout, openPopout } from '@/lib/popout'
++import { ChatPopoutMenu } from './ChatPopoutMenu'
+ 
+ 
+ /** Pause evidence is read only, and fetched only for visible panel rows. */
+@@ -41,6 +42,7 @@
+     const client = useQueryClient()
+     const [pending, setPending] = useState<Record<string, boolean>>({})
+     const [errors, setErrors] = useState<Record<string, string>>({})
++    const [contextMenu, setContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null)
+     const [locallyUnmanaged, setLocallyUnmanaged] = useState<Record<string, boolean>>({})
+     useEffect(() => { setLocallyUnmanaged(old => { const kept = Object.entries(old).filter(([id]) => props.managed?.[id]); return kept.length === Object.keys(old).length ? old : Object.fromEntries(kept) }) }, [props.managed])
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+@@ -81,7 +83,11 @@
+                 </button>}
+                 {displayedRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+                     {(!pinnedCollapsed && index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session)) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+-                    <div className="min-w-0 border-b border-[var(--app-divider)]">
++                    <div className="min-w-0 border-b border-[var(--app-divider)]" onContextMenu={event => {
++                        if (missing) return
++                        event.preventDefault(); event.stopPropagation()
++                        setContextMenu({ sessionId: session.id, x: event.clientX, y: event.clientY })
++                    }}>
+                     <div className="flex min-w-0 items-center gap-1">
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex h-8 min-w-0 flex-1 items-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath={false} singleLine alignActivityColumns managed={isManaged(session.id)} />
+@@ -148,6 +154,7 @@
+                 </div>
+             </div>
+         </Frame>}
++        {contextMenu && (props.embedded || (open && !collapsed)) && <ChatPopoutMenu key={contextMenu.sessionId} sessionId={contextMenu.sessionId} anchorPoint={contextMenu} onClose={() => setContextMenu(null)} />}
+     </>
+ }
+ 
+diff --git a/web/src/components/SessionManagerButton.test.tsx b/web/src/components/SessionManagerButton.test.tsx
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -8,7 +8,7 @@
+ import { useSessions } from '@/hooks/queries/useSessions'
+ import { useManagedSessions } from '@/hooks/useManagedSessions'
+ import { queryKeys } from '@/lib/query-keys'
+-afterEach(cleanup)
++afterEach(() => { cleanup(); vi.restoreAllMocks() })
+ const controls = { abortSession: vi.fn(async () => {}), unmanageSession: vi.fn(async () => {}) }
+ beforeEach(() => { vi.clearAllMocks() })
+ const api = controls as unknown as ApiClient
+@@ -559,3 +559,28 @@
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+     expect(add).not.toHaveBeenCalled()
+ })
++
++it('opens a Session Manager row in a new chat popout without selecting, stopping or unmanaging', async () => {
++    const client = new QueryClient(), select = vi.fn()
++    render(fixture(client, [session('Codex')], select)); open()
++    const popup = vi.spyOn(window, 'open').mockReturnValue({ focus: vi.fn() } as unknown as Window)
++    const row = await screen.findByRole('button', { name: 'Open Codex' })
++    fireEvent.contextMenu(row, { clientX: 120, clientY: 180 })
++    fireEvent.click(screen.getByRole('menuitem', { name: 'Open in popout' }))
++    expect(popup).toHaveBeenCalledWith('/sessions/Codex', expect.stringMatching(/^hapi-chat-/), expect.stringContaining('popup=yes'))
++    expect(select).not.toHaveBeenCalled()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++    expect(screen.queryByRole('menu')).toBeNull()
++    fireEvent.contextMenu(row)
++    fireEvent.keyDown(document, { key: 'Escape' })
++    expect(screen.queryByRole('menu')).toBeNull()
++})
++it('shows popup-block feedback on a Session Manager row and leaves it available', async () => {
++    render(fixture(new QueryClient(), [session('Claude')]))
++    open()
++    vi.spyOn(window, 'open').mockReturnValue(null)
++    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Open Claude' }))
++    fireEvent.click(screen.getByRole('menuitem', { name: 'Open in popout' }))
++    expect(screen.getByRole('alert')).toHaveTextContent('Popout blocked')
++    expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
++})
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -16,6 +16,7 @@
+ import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
+ import { junctionInput, junctionBranch, removeJunction } from '@/lib/nodeGraphJunctions'
+ import { redoGraphEdit, undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
++import { openChatPopout } from '@/lib/popout'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+@@ -61,8 +62,10 @@
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+ /** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
+-export function NodeGraphView({ api, sessions, onOpenChat, visible = true, headerTargets }: {
+-    api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; visible?: boolean
++export function NodeGraphView({ api, sessions, onOpenChat, visible = true, headerTargets, respectChatPin = true }: {
++    api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string, respectPin?: boolean) => void; visible?: boolean
++    /** Browser graph popups defer pin decisions to their owning chat window. */
++    respectChatPin?: boolean
+     headerTargets?: { center: HTMLElement | null; actions: HTMLElement | null }
+ }) {
+     const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
+@@ -542,7 +545,13 @@
+         }
+     }
+ 
+-    const selectNode = (id: string) => { setSelectedNode(id); setMenu(null); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
++    const selectNode = (id: string) => {
++        setSelectedNode(id); setMenu(null)
++        if ((!respectChatPin || !chatPinned) && sessionsById.has(id)) {
++            if (respectChatPin) onOpenChat(id)
++            else onOpenChat(id, true)
++        }
++    }
+     const openMenu = (id: string, at?: GraphPoint, mode: 'actions' | 'owner' = 'actions') => {
+         const rect = canvas.current?.getBoundingClientRect()
+         const node = canvas.current?.querySelector(`[data-node-id="${CSS.escape(id)}"]`)?.getBoundingClientRect()
+@@ -1000,6 +1009,7 @@
+                 <div className="min-h-0 overflow-y-auto overscroll-contain p-1">
+                     {menu.mode === 'actions' ? <>
+                         <button type="button" autoFocus disabled={!menuSession} onClick={() => { const id = menu.id; closeMenu(); onOpenChat(id) }} className={menuItem}>Open chat</button>
++                        <button type="button" disabled={!menuSession} onClick={() => { if (openChatPopout(menu.id)) closeMenu(); else setError('Popout blocked. Allow popups for this site and try again.') }} className={menuItem}>Open in popout</button>
+                         {menu.id !== overseer && <button type="button" onClick={() => { setMenu({ ...menu, mode: 'owner' }); setError(null) }} className={menuItem}>Set owner…</button>}
+                         {annotations.some(a => a.members?.includes(menu.id)) && <button type="button" disabled={pending !== null} onClick={() => removeFromFrame(menu.id)} className={menuItem}>Remove from frame</button>}
+                         {menuOwner && <button type="button" disabled={pending !== null} onClick={async () => { if (await changeOwner(menu.id, null) !== null) closeMenu() }} className={menuItem}>Detach from owner</button>}
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -8,10 +8,13 @@
+ import { NODE_SIZE } from '@/lib/nodeGraphLayout'
+ import { NODE_GRID_KEY } from '@/hooks/useNodeGrid'
+ import { fitNodeFrame, framePoints, type NodeVisualState } from '@/lib/nodeFrames'
++import { readChatWindowPreference, writeChatWindowPreference } from '@/lib/chatWindow'
+ import { SESSION_DRAG_TYPE } from '@/lib/sessionDrag'
+ import { NodeGraphView, nodeStatus } from './NodeGraphView'
+ 
+ beforeEach(() => {
++    window.name = ''
++    sessionStorage.clear()
+     localStorage.removeItem(NODE_GRID_KEY)
+     vi.stubGlobal('DragEvent', class extends MouseEvent {
+         dataTransfer: DataTransfer | null
+@@ -23,7 +26,7 @@
+         constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1; this.pointerType = init.pointerType ?? 'mouse' }
+     })
+ })
+-afterEach(() => { cleanup(); vi.unstubAllGlobals() })
++afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+ 
+ const session = (id: string, name: string, over: Partial<SessionSummary> = {}): SessionSummary => ({
+     id, active: true, thinking: false, activeAt: 1, updatedAt: 1, metadata: { name, path: '/w', flavor: 'codex' },
+@@ -170,11 +173,11 @@
+         expect(screen.queryByRole('button', { name: 'Pin current chat' })).toBeNull()
+         expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
+         onOpenChat.mockClear()
+-        act(() => { const next = localStorage.getItem('hapi-node-chat-pin') !== 'true'; localStorage.setItem('hapi-node-chat-pin', String(next)); window.dispatchEvent(new StorageEvent('storage', { key: 'hapi-node-chat-pin', newValue: String(next) })) })
++        act(() => { const next = readChatWindowPreference('hapi-node-chat-pin') !== 'true'; writeChatWindowPreference('hapi-node-chat-pin', String(next)); window.dispatchEvent(new Event('hapi-node-chat-pin-change')) })
+         fireEvent.click(screen.getByRole('button', { name: 'Node Alpha' }))
+         expect(onOpenChat).not.toHaveBeenCalled()
+-        expect(localStorage.getItem('hapi-node-chat-pin')).toBe('true')
+-        act(() => { const next = localStorage.getItem('hapi-node-chat-pin') !== 'true'; localStorage.setItem('hapi-node-chat-pin', String(next)); window.dispatchEvent(new StorageEvent('storage', { key: 'hapi-node-chat-pin', newValue: String(next) })) })
++        expect(readChatWindowPreference('hapi-node-chat-pin')).toBe('true')
++        act(() => { const next = readChatWindowPreference('hapi-node-chat-pin') !== 'true'; writeChatWindowPreference('hapi-node-chat-pin', String(next)); window.dispatchEvent(new Event('hapi-node-chat-pin-change')) })
+         fireEvent.click(screen.getByRole('button', { name: 'Node Alpha' }))
+         expect(onOpenChat).toHaveBeenLastCalledWith('A')
+     })
+@@ -1226,6 +1229,8 @@
+     expect(JSON.parse(localStorage.getItem(NODE_GRID_KEY)!).size).toBe(25)
+     fireEvent.keyDown(field,{key:'Delete'})
+     expect(api.removeNodes).not.toHaveBeenCalled()
++    window.name = ''
++    sessionStorage.clear()
+     localStorage.removeItem(NODE_GRID_KEY)
+ })
+ 
+@@ -1532,3 +1537,22 @@
+     expect(after.annotations[0]).toEqual(fitNodeFrame(frame, moved))
+     expect(api.editNodeAnnotation).not.toHaveBeenCalled()
+ })
++
++it('opens a node in a distinct chat view without changing selection, ownership or runtime', async () => {
++    const popup = vi.spyOn(window, 'open').mockReturnValue({ focus: vi.fn() } as unknown as Window)
++    const { api, onOpenChat } = setup()
++    await openNode('Bravo')
++    fireEvent.click(screen.getByRole('button', { name: 'Open in popout' }))
++    expect(popup).toHaveBeenCalledWith('/sessions/B', expect.stringMatching(/^hapi-chat-/), expect.stringContaining('popup=yes'))
++    expect(onOpenChat).not.toHaveBeenCalled()
++    expect(api.abortSession).not.toHaveBeenCalled(); expect(api.editNodeRouting).not.toHaveBeenCalled()
++    expect(screen.queryByRole('dialog', { name: 'Actions for Bravo' })).toBeNull()
++})
++it('browser graph selection delegates the pin check to its owner but retains local highlight', async () => {
++    window.name = 'hapi-chat-delegation'
++    const client = new QueryClient(), onOpenChat = vi.fn()
++    render(<QueryClientProvider client={client}><I18nProvider><NodeGraphView api={makeApi() as unknown as ApiClient} sessions={sessions} onOpenChat={onOpenChat} respectChatPin={false} /></I18nProvider></QueryClientProvider>)
++    fireEvent.click(await screen.findByRole('button', { name: 'Node Bravo' }))
++    expect(onOpenChat).toHaveBeenCalledWith('B', true)
++    expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-pressed', 'true')
++})
+diff --git a/web/src/components/SessionHeader.test.tsx b/web/src/components/SessionHeader.test.tsx
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -5,6 +5,7 @@
+ import type { ApiClient } from '@/api/client'
+ import { I18nProvider } from '@/lib/i18n-context'
+ import { ToastProvider, useToast } from '@/lib/toast-context'
++import { readChatWindowPreference } from '@/lib/chatWindow'
+ import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
+ 
+ const routerMock = vi.hoisted(() => ({ navigate: vi.fn() }))
+@@ -13,6 +14,8 @@
+ afterEach(() => {
+     cleanup()
+     localStorage.clear()
++    sessionStorage.clear()
++    window.name = ''
+ })
+ 
+ function ToastMessages() {
+@@ -419,14 +422,14 @@
+         expect(pin).toHaveAttribute('aria-pressed', 'false')
+         fireEvent.click(pin)
+         expect(pin).toHaveAttribute('aria-pressed', 'true')
+-        expect(localStorage.getItem('hapi-node-chat-pin')).toBe('true')
++        expect(readChatWindowPreference('hapi-node-chat-pin')).toBe('true')
+         first.unmount()
+         renderHeader(baseSession({ id: 'another-chat' }))
+         const restored = screen.getByRole('button', { name: 'Pin current chat' })
+         expect(restored).toHaveAttribute('aria-pressed', 'true')
+         fireEvent.click(restored)
+         expect(restored).toHaveAttribute('aria-pressed', 'false')
+-        expect(localStorage.getItem('hapi-node-chat-pin')).toBe('false')
++        expect(readChatWindowPreference('hapi-node-chat-pin')).toBe('false')
+     })
+ })
+ 
+diff --git a/web/src/routes/popout.tsx b/web/src/routes/popout.tsx
+--- a/web/src/routes/popout.tsx
++++ b/web/src/routes/popout.tsx
+@@ -22,7 +22,7 @@
+     const machineLabels = Object.fromEntries(machines.map(machine => [machine.id, machine.metadata?.displayName || machine.metadata?.host || machine.id.slice(0, 8)]))
+     return <div className="h-full min-h-0 bg-[var(--app-bg)]">
+         <SessionManagerButton embedded hideTrigger api={api} sessions={isLoading ? undefined : sessions} managed={managed} machineLabels={machineLabels}
+-            onSelect={sessionId => sendToMain({ action: 'open-session', sessionId })} />
++            onSelect={sessionId => sendToMain({ action: 'open-session', sessionId }, 'session-manager')} />
+     </div>
+ }
+ 
+@@ -39,7 +39,8 @@
+             <div ref={setActions} className="flex min-w-0 items-center justify-end" />
+         </header>
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions}
++            respectChatPin={false}
+             headerTargets={{ center, actions }}
+-            onOpenChat={sessionId => sendToMain({ action: 'open-session', sessionId })} />
++            onOpenChat={(sessionId, respectPin) => sendToMain({ action: 'open-session', sessionId, respectPin }, 'nodes')} />
+     </div>
+ }
+diff --git a/web/src/routes/popout.test.tsx b/web/src/routes/popout.test.tsx
+--- a/web/src/routes/popout.test.tsx
++++ b/web/src/routes/popout.test.tsx
+@@ -50,7 +50,8 @@
+         expect(targets.actions?.contains(actions)).toBe(true)
+         expect(within(screen.getByRole('region', { name: 'Graph canvas' })).queryByRole('combobox')).toBeNull()
+         fireEvent.click(screen.getByRole('button', { name: 'Open chat' }))
+-        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'selected-chat' })
++        expect(state.graphRender.mock.lastCall![0].respectChatPin).toBe(false)
++        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'selected-chat', respectPin: undefined }, 'nodes')
+         expect(container.querySelector('header')).toBe(header)
+         expect(container.querySelectorAll('header')).toHaveLength(1)
+         unmount()
+@@ -62,7 +63,7 @@
+         expect(document.title).toBe('Session Manager')
+         expect(state.rememberBounds).toHaveBeenCalledWith('session-manager')
+         fireEvent.click(screen.getByRole('button', { name: 'Open manager chat' }))
+-        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'manager-chat' })
++        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'manager-chat' }, 'session-manager')
+         unmount()
+         expect(state.stopRemembering).toHaveBeenCalledOnce()
+     })
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -45,7 +45,8 @@
+ import { ToastProvider, useToast } from '@/lib/toast-context'
+ import type { SyncEvent } from '@/types/api'
+ import { PopoutNavigation } from '@/components/PopoutNavigation'
+-import { isPopoutPath } from '@/lib/popout'
++import { isPopoutPath, rememberPopoutBounds } from '@/lib/popout'
++import { isChatPopoutWindow } from '@/lib/chatWindow'
+ 
+ type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
+ 
+@@ -79,6 +80,8 @@
+     const goBack = useAppGoBack()
+     const pathname = useLocation({ select: (location) => location.pathname })
+     const popout = isPopoutPath(pathname)
++    const chatPopout = isChatPopoutWindow()
++    useEffect(() => chatPopout ? rememberPopoutBounds('chat') : undefined, [chatPopout])
+     const matchRoute = useMatchRoute()
+     const router = useRouter()
+     const { addToast } = useToast()
+@@ -545,7 +548,7 @@
+                 {!popout && <NodeGraphHost />}
+                 <UtilityPanelHost />
+                 <ToastContainer />
+-                {!popout && <InstallPrompt />}
++                {!popout && !chatPopout && <InstallPrompt />}
+             </VoiceProvider>
+         </AppContextProvider>
+     )

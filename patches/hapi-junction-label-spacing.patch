@@ -1,0 +1,20 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -228,7 +228,7 @@
+     const fit = () => {
+         if (!layout) return
+         const element = canvas.current
+-        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 36 : 16), width: j.label ? 180 : 32, height: j.label ? 52 : 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
++        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 26 : 16), width: j.label ? 180 : 32, height: j.label ? 42 : 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
+         const x = Math.min(...rectangles.map(r => r.x)), y = Math.min(...rectangles.map(r => r.y))
+         const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
+         setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))
+@@ -1127,7 +1127,7 @@
+                     style={{ left: j.x, top: j.y, scale: Math.max(1, 0.85 / view.k) }}>
+                     <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${j.owner ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'} ${selectedJunctions.includes(j.id) || link?.target === j.id ? 'ring-4 ring-[var(--app-link)]/20' : ''}`} />
+                 </button>{j.label && <button type="button" data-junction-id={j.id} data-junction-label={j.id} aria-label={`Edit junction label: ${j.label}`} title={j.label}
+-                    className="absolute z-[4] max-w-[180px] -translate-x-1/2 -translate-y-full cursor-move truncate rounded px-1 text-xs text-[var(--app-fg)]" style={{ left: j.x, top: j.y - 20 }}>{j.label}</button>}</Fragment>)}
++                    className="absolute z-[4] max-w-[180px] -translate-x-1/2 -translate-y-full cursor-move truncate rounded px-1 text-xs text-[var(--app-fg)]" style={{ left: j.x, top: j.y - 10 }}>{j.label}</button>}</Fragment>)}
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>

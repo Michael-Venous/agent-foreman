@@ -1,0 +1,70 @@
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,5 +1,5 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useEffect, useMemo, useState } from 'react'
++import { Fragment, useEffect, useMemo, useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+ import { SessionManagerWindow, useSessionManagerWindow } from './SessionManagerWindow'
+@@ -39,12 +39,13 @@
+     useEffect(() => { setLocallyUnmanaged(old => Object.fromEntries(Object.entries(old).filter(([id]) => props.managed?.[id]))) }, [props.managed])
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
++    const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+     const { open } = useSessionManagerWindow()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+     const { entries, dismiss, markStopped } = useSessionManager(props.sessions, currentManaged)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+-        Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
++        Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+         && (activityFilter === 'all' || (activityFilter === 'active' ? sessionHasWork(e.session) : !sessionHasWork(e.session))))
+     const filtered = managedOnly || activityFilter !== 'all'
+@@ -69,7 +70,9 @@
+                 <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear finished</button>
+             </div>
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+-                {visibleRows.map(({ session, missing, stopped }) => <div key={session.id} className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
++                {visibleRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
++                    {index > 0 && isPinned(visibleRows[index - 1]!.session) && !isPinned(session) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
++                    <div className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+@@ -100,7 +103,7 @@
+                             }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Stop</button>}
+                     </div>
+                     {errors[session.id] && <p role="alert" className="w-full break-words text-xs text-[var(--app-badge-error-text)]">{errors[session.id]}</p>}
+-                </div>)}
++                </div></Fragment>)}
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+             </div>
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -238,3 +238,23 @@
+     expect(controls.abortSession).not.toHaveBeenCalled()
+     expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++
++it('keeps both pin types above active unpinned rows and separates only visible groups', async () => {
++    const client = new QueryClient()
++    const local = { ...session('Local pin', true, false), pinned: true, updatedAt: 1 }
++    const global = { ...session('Global pin'), globalPinned: true, updatedAt: 2 }
++    const active = { ...session('Unpinned'), updatedAt: 99 }
++    const managed = { 'Local pin': { role: 'worker' as const } }
++    const view = (pin: boolean) => <QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={[active, { ...local, pinned: pin }, global]} managed={managed} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>
++    const { rerender } = render(view(true)); open()
++    const order = () => Array.from(screen.getByLabelText('Session Manager sessions').querySelectorAll('button[aria-label^="Open "]')).map(button => button.getAttribute('aria-label'))
++    await waitFor(() => expect(order()).toEqual(['Open Global pin', 'Open Local pin', 'Open Unpinned']))
++    expect(screen.getByRole('separator', { name: 'Pinned sessions' }).nextElementSibling).toContainElement(screen.getByRole('button', { name: 'Open Unpinned' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(order()).toEqual(['Open Local pin']); expect(screen.queryByRole('separator')).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    rerender(view(false))
++    await waitFor(() => expect(order()).toEqual(['Open Global pin', 'Open Unpinned', 'Open Local pin']))
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})

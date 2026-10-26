@@ -1,0 +1,261 @@
+diff --git a/web/index.html b/web/index.html
+--- a/web/index.html
++++ b/web/index.html
+@@ -39,10 +39,23 @@
+         </script>
+         <script>
+             (function () {
++                // This private deployment selects the requested desktop theme once per browser.
++                // The version marker preserves every later manual appearance/theme choice.
++                var selection = '%VITE_DESKTOP_THEME_SELECTION%'
++                try {
++                    if (selection === 'desktop-midnight-v1' && localStorage.getItem('hapi-theme-selection') !== selection) {
++                        localStorage.setItem('hapi-color-theme', 'desktop-midnight')
++                        localStorage.setItem('hapi-appearance', 'dark')
++                        localStorage.setItem('hapi-theme-selection', selection)
++                    }
++                } catch (error) {
++                    // Storage may be unavailable; normal theme detection still works.
++                }
+                 var lightColor = '#ffffff'
+                 var darkColor = '#1c1c1e'
+                 var oledColor = '#000000'
+                 var themeBackgrounds = {
++                    'desktop-midnight': { light: '#f4f6fc', dark: '#000000' },
+                     notion: { light: '#fafafa', dark: '#191919' },
+                     one: { light: '#fbfbff', dark: '#1f2433' },
+                     proof: { light: '#f8f7f2', dark: '#18231f' },
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -196,7 +196,7 @@
+         onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
++        <header className="app-window-chrome flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
+             <button ref={focusTarget} type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -363,7 +363,7 @@
+ 
+     return (
+         <>
+-            <div className="bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
++            <div className="app-window-chrome bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+                 <div className="mx-auto w-full max-w-content flex items-center gap-2 p-3">
+                     {props.onBack ? <button type="button" aria-label="Back to chats" title="Back to chats" onClick={props.onBack}
+                         className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1851,7 +1851,7 @@
+ 
+     return (
+         <div className="flex min-h-0 w-full flex-1 flex-col">
+-            <div className="session-list-scrollbar-offset mx-auto w-full max-w-content shrink-0">
++            <div className="app-window-chrome session-list-scrollbar-offset mx-auto w-full max-w-content shrink-0">
+             {showHeaderRow ? (
+                 <div className="flex items-center gap-1 px-2 py-1">
+                     {showSearch ? (
+diff --git a/web/src/hooks/themeBootstrap.test.ts b/web/src/hooks/themeBootstrap.test.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/themeBootstrap.test.ts
+@@ -0,0 +1,52 @@
++import { readFileSync } from 'node:fs'
++import { runInNewContext } from 'node:vm'
++import { beforeEach, describe, expect, it } from 'vitest'
++
++const html = readFileSync(`${process.cwd()}/index.html`, 'utf8')
++const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]!).find(value => value.includes('var lightColor'))!
++function boot(selection = 'desktop-midnight-v1', storage: Storage = localStorage) {
++    runInNewContext(script.replace('%VITE_DESKTOP_THEME_SELECTION%', selection), {
++        localStorage: storage, document, window: { matchMedia: () => ({ matches: false }) },
++    })
++}
++
++describe('deployment theme selection before paint', () => {
++    beforeEach(() => {
++        localStorage.clear()
++        document.documentElement.removeAttribute('style')
++        document.head.innerHTML = '<meta name="theme-color" content="#ffffff">'
++    })
++    it('selects the requested desktop preset and dark appearance once before paint', () => {
++        localStorage.setItem('hapi-color-theme', 'nord')
++        localStorage.setItem('hapi-theme-colors', '{"dark":{"hint":"#aaaaaa"}}')
++        boot()
++        expect(localStorage.getItem('hapi-color-theme')).toBe('desktop-midnight')
++        expect(localStorage.getItem('hapi-appearance')).toBe('dark')
++        expect(localStorage.getItem('hapi-theme-colors')).toContain('#aaaaaa')
++        expect(document.documentElement).toHaveAttribute('data-color-theme', 'desktop-midnight')
++        expect(document.documentElement.style.backgroundColor).toBe('rgb(0, 0, 0)')
++        expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute('content', '#000000')
++    })
++    it('preserves later manual theme and appearance choices on reload', () => {
++        boot()
++        localStorage.setItem('hapi-color-theme', 'nord')
++        localStorage.setItem('hapi-appearance', 'light')
++        boot()
++        expect(document.documentElement).toHaveAttribute('data-color-theme', 'nord')
++        expect(document.documentElement).toHaveAttribute('data-theme', 'light')
++        localStorage.removeItem('hapi-color-theme')
++        boot()
++        expect(document.documentElement).toHaveAttribute('data-color-theme', 'default')
++    })
++    it('leaves preferences alone without the private deployment selection', () => {
++        localStorage.setItem('hapi-color-theme', 'one')
++        boot('')
++        expect(document.documentElement).toHaveAttribute('data-color-theme', 'one')
++        expect(localStorage.getItem('hapi-theme-selection')).toBeNull()
++    })
++    it('still renders when browser storage is blocked', () => {
++        boot('desktop-midnight-v1', { getItem() { throw Error('blocked') } } as unknown as Storage)
++        expect(document.documentElement).toHaveAttribute('data-theme', 'light')
++        expect(document.documentElement.style.backgroundColor).toBe('rgb(255, 255, 255)')
++    })
++})
+diff --git a/web/src/hooks/useColorTheme.test.ts b/web/src/hooks/useColorTheme.test.ts
+--- a/web/src/hooks/useColorTheme.test.ts
++++ b/web/src/hooks/useColorTheme.test.ts
+@@ -3,6 +3,8 @@
+ import {
+     applyColorTheme,
+     getColorThemeStorageKey,
++    getColorThemeOptions,
++    getColorThemeBackground,
+     getStoredColorTheme,
+     parseColorTheme,
+     useColorTheme,
+@@ -66,6 +68,26 @@
+         expect(document.documentElement.style.getPropertyValue('--app-fg')).toBe('#d9d9d8')
+     })
+ 
++    it('exposes black Desktop Midnight surfaces and readable blue buttons', () => {
++        expect(getColorThemeOptions().some(option => option.value === 'desktop-midnight')).toBe(true)
++        const luminance = (hex: string) => {
++            const [r, g, b] = hex.slice(1).match(/../g)!.map(value => parseInt(value, 16) / 255)
++                .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
++            return r! * 0.2126 + g! * 0.7152 + b! * 0.0722
++        }
++        for (const scheme of ['dark', 'oled'] as const) {
++            applyColorTheme('desktop-midnight', scheme)
++            expect(getColorThemeBackground('desktop-midnight', scheme)).toBe('#000000')
++            expect(document.documentElement.style.getPropertyValue('--app-secondary-bg')).toBe('#090a0f')
++            const bg = luminance(document.documentElement.style.getPropertyValue('--app-button'))
++            const fg = luminance(document.documentElement.style.getPropertyValue('--app-button-text'))
++            expect((Math.max(bg, fg) + 0.05) / (Math.min(bg, fg) + 0.05)).toBeGreaterThanOrEqual(4.5)
++        }
++        expect(getColorThemeBackground('desktop-midnight', 'light')).toBe('#f4f6fc')
++        applyColorTheme('default', 'dark')
++        expect(document.documentElement.style.getPropertyValue('--app-bg')).toBe('')
++    })
++
+     it('uses dark palette contrast values for OLED', () => {
+         applyColorTheme('one', 'oled')
+ 
+diff --git a/web/src/hooks/useColorTheme.ts b/web/src/hooks/useColorTheme.ts
+--- a/web/src/hooks/useColorTheme.ts
++++ b/web/src/hooks/useColorTheme.ts
+@@ -4,6 +4,7 @@
+ export type ColorScheme = 'light' | 'dark' | 'oled'
+ export type ColorThemePreset =
+     | 'default'
++    | 'desktop-midnight'
+     | 'notion'
+     | 'one'
+     | 'proof'
+@@ -50,6 +51,7 @@
+ 
+ const COLOR_THEME_OPTIONS: ReadonlyArray<ColorThemeOption> = [
+     { value: 'default', labelKey: 'settings.display.colorTheme.default', preview: { light: '#ffffff', dark: '#1c1c1e', accent: '#111827' } },
++    { value: 'desktop-midnight', labelKey: 'settings.display.colorTheme.desktopMidnight', preview: { light: '#f4f6fc', dark: '#000000', accent: '#007aff' } },
+     { value: 'notion', labelKey: 'settings.display.colorTheme.notion', preview: { light: '#fafafa', dark: '#191919', accent: '#3183d8' } },
+     { value: 'one', labelKey: 'settings.display.colorTheme.one', preview: { light: '#fbfbff', dark: '#1f2433', accent: '#526fff' } },
+     { value: 'proof', labelKey: 'settings.display.colorTheme.proof', preview: { light: '#f8f7f2', dark: '#18231f', accent: '#2f7d5b' } },
+@@ -69,6 +71,14 @@
+ ]
+ 
+ const PALETTES: Record<Exclude<ColorThemePreset, 'default'>, Record<'light' | 'dark', ThemePalette>> = {
++    'desktop-midnight': {
++        light: palette('#0069df', '#f4f6fc', '#171b2d', '#5b647a', '#e9edf8'),
++        dark: {
++            ...palette('#0071e9', '#000000', '#e2e6ee', '#a2a9b8', '#090a0f'),
++            dialog: '#080910', surface: '#101119', surfaceHover: '#191c28', code: '#0c0e15',
++            border: 'rgba(145, 157, 207, 0.2)', subtle: 'rgba(110, 125, 190, 0.09)',
++        },
++    },
+     notion: {
+         light: palette('#3183d8', '#fafafa', '#37352f', '#787774', '#f1f1ef'),
+         dark: palette('#3183d8', '#191919', '#d9d9d8', '#9b9a97', '#252525'),
+diff --git a/web/src/hooks/useTheme.test.ts b/web/src/hooks/useTheme.test.ts
+--- a/web/src/hooks/useTheme.test.ts
++++ b/web/src/hooks/useTheme.test.ts
+@@ -71,6 +71,15 @@
+         expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toBe(getThemeColor('light'))
+     })
+ 
++    it('keeps Desktop Midnight palette and browser chrome black after initialization', () => {
++        localStorage.setItem('hapi-color-theme', 'desktop-midnight')
++        localStorage.setItem('hapi-appearance', 'dark')
++        initializeTheme()
++        expect(document.documentElement).toHaveAttribute('data-color-theme', 'desktop-midnight')
++        expect(document.documentElement.style.getPropertyValue('--app-bg')).toBe('#000000')
++        expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toBe('#000000')
++    })
++
+     it('exposes OLED Black as a selectable appearance option', () => {
+         expect(getAppearanceOptions().some((opt) => opt.value === 'oled')).toBe(true)
+     })
+diff --git a/web/src/index.css b/web/src/index.css
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -762,3 +762,11 @@
+ .aui-reasoning-content :where(.aui-md-strong, .aui-md-em) { color: inherit; }
+ .aui-reasoning-content > :first-child { margin-top: 0; }
+ .aui-reasoning-content > :last-child { margin-bottom: 0; }
++
++/* Desktop Midnight mirrors the user's black KDE panels and indigo title bars. */
++html[data-color-theme="desktop-midnight"] .app-window-chrome {
++    background: linear-gradient(110deg, #101653 0%, #17103c 55%, #060911 100%);
++}
++html[data-color-theme="desktop-midnight"][data-theme="light"] .app-window-chrome {
++    background: linear-gradient(110deg, #e0e7ff 0%, #eee7fc 55%, #f4f6fc 100%);
++}
+diff --git a/web/src/lib/locales/en.ts b/web/src/lib/locales/en.ts
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -862,6 +862,7 @@
+   'settings.display.appearance.oled': 'OLED Black',
+   'settings.display.appearance.light': 'Light',
+   'settings.display.colorTheme': 'Color theme',
++  'settings.display.colorTheme.desktopMidnight': 'Desktop Midnight',
+   'settings.display.colorTheme.default': 'Default',
+   'settings.display.colorTheme.notion': 'Notion',
+   'settings.display.colorTheme.one': 'One',
+diff --git a/web/src/lib/locales/zh-CN.ts b/web/src/lib/locales/zh-CN.ts
+--- a/web/src/lib/locales/zh-CN.ts
++++ b/web/src/lib/locales/zh-CN.ts
+@@ -854,6 +854,7 @@
+   'settings.display.appearance.oled': 'OLED 纯黑',
+   'settings.display.appearance.light': '浅色',
+   'settings.display.colorTheme': '颜色主题',
++  'settings.display.colorTheme.desktopMidnight': '桌面午夜',
+   'settings.display.colorTheme.default': '默认',
+   'settings.display.colorTheme.notion': 'Notion',
+   'settings.display.colorTheme.one': 'One',
+diff --git a/web/src/routes/settings/display.tsx b/web/src/routes/settings/display.tsx
+--- a/web/src/routes/settings/display.tsx
++++ b/web/src/routes/settings/display.tsx
+@@ -56,7 +56,7 @@
+                 <span className="absolute inset-y-0 right-0 w-1/2" style={{ backgroundColor: preview.dark }} />
+                 <span className="absolute inset-x-1 bottom-1 h-1 rounded-full" style={{ backgroundColor: preview.accent }} />
+             </span>
+-            <span className="min-w-0 truncate font-medium">{props.label}</span>
++            <span className="min-w-0 break-words font-medium leading-tight">{props.label}</span>
+         </label>
+     )
+ }

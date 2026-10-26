@@ -1,0 +1,638 @@
+diff --git a/hub/src/sync/nodeTree.test.ts b/hub/src/sync/nodeTree.test.ts
+--- a/hub/src/sync/nodeTree.test.ts
++++ b/hub/src/sync/nodeTree.test.ts
+@@ -74,6 +74,39 @@
+             noControls(f)
+         } finally { f.close() }
+     })
++    it('permits an explicit user routing/frame disconnect while retaining protection and version CAS', async () => {
++        const f = fixture()
++        try {
++            const routing = { junctions: [{ id: 'J', owner: f.root.id, x: 40, y: 60 }], edges: [
++                { owner: f.root.id, child: f.a.id, via: 'J' }, { owner: f.root.id, child: f.b.id, via: 'J' }
++            ] }
++            const frame = { ...note, id: 'frame', kind: 'frame' as const, color: 'amber' as const, members: [f.a.id, f.b.id, 'junction:J'] }
++            expect((await f.edit([{ action: 'add', sessionId: f.a.id }, { action: 'add', sessionId: f.b.id },
++                { action: 'routing', value: routing }, { action: 'annotation', id: frame.id, value: frame }])).status).toBe(200)
++            const before = f.snapshot(), counts = f.counts()
++            const nextFrame = { ...frame, members: [f.a.id, f.b.id], width: 240 }
++            const changes = [
++                { action: 'routing', value: { junctions: [], edges: [{ owner: f.root.id, child: f.a.id }] } },
++                { action: 'annotation', id: frame.id, value: null },
++                { action: 'annotation', id: frame.id, value: nextFrame }
++            ]
++            const path = `/node-graph/workspaces/${f.ws}/edit`
++            const protectedEdit = await f.call(path, { version: before.version, createdBy: 'user', preserveConnections: true, changes })
++            expect(protectedEdit.status).toBe(409)
++            expect(protectedEdit.json.error).toContain('stay connected')
++            expect(f.snapshot()).toEqual(before); expect(f.counts()).toEqual(counts)
++            const allowed = await f.call(path, { version: before.version, createdBy: 'user', preserveConnections: false, changes })
++            expect(allowed.status).toBe(200)
++            const after = f.snapshot()
++            expect(after.graph.edges.map(edge => ({ owner: edge.owner, child: edge.child }))).toEqual([{ owner: f.root.id, child: f.a.id }])
++            expect(after.graph.nodes.some(node => node.sessionId === f.b.id)).toBe(true)
++            expect(after.graph.annotations).toEqual([nextFrame])
++            const stale = await f.call(path, { version: before.version, createdBy: 'user', preserveConnections: false, changes })
++            expect(stale.status).toBe(409)
++            expect(f.snapshot()).toEqual(after)
++            noControls(f)
++        } finally { f.close() }
++    })
+     it('reads every stored workspace without activation, histories, or native control', async () => {
+         const f = fixture()
+         try {
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -908,8 +908,8 @@
+         return nodeGraphOf(await this.nodeGraphPost('/layout', { positions }))
+     }
+ 
+-    /** Versioned layout + frame edits share one existing tree transaction; no ownership changes. */
+-    async editNodeVisual(workspace: string, value: NodeVisualState, expected: NodeVisualState): Promise<NodeGraphResponse> {
++    /** Atomic layout/frame edits preserve wiring unless a user wiring action explicitly permits disconnection. */
++    async editNodeVisual(workspace: string, value: NodeVisualState, expected: NodeVisualState, options: { allowDisconnect?: boolean } = {}): Promise<NodeGraphResponse> {
+         const tree = await this.request<{ activeWorkspaceId: string; overseer?: string | null; workspaces: { version: string; graph: NodeGraphResponse['graph'] }[] }>(`/api/node-graph/tree?workspaceId=${encodeURIComponent(workspace)}`)
+         const snapshot = tree.workspaces[0]
+         const sameAnnotations = (a: unknown[]) => JSON.stringify([...a].sort((x, y) => (x as NodeAnnotation).id.localeCompare((y as NodeAnnotation).id)))
+@@ -928,7 +928,7 @@
+             ...(Object.keys(value.positions).length ? [{ action: 'layout', positions: value.positions }] : []),
+         ]
+         if (!changes.length) return this.getNodeGraph()
+-        await this.nodeGraphPost(`/workspaces/${encodeURIComponent(workspace)}/edit`, { version: snapshot.version, createdBy: 'user', preserveConnections: true, changes })
++        await this.nodeGraphPost(`/workspaces/${encodeURIComponent(workspace)}/edit`, { version: snapshot.version, createdBy: 'user', preserveConnections: options.allowDisconnect !== true, changes })
+         return this.getNodeGraph()
+     }
+ 
+diff --git a/web/src/api/nodeGraphClient.test.ts b/web/src/api/nodeGraphClient.test.ts
+--- a/web/src/api/nodeGraphClient.test.ts
++++ b/web/src/api/nodeGraphClient.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+ import { ApiClient, nodeGraphOf } from './client'
++import type { NodeVisualState } from '@/lib/nodeFrames'
+ 
+ const graph = {
+     activeWorkspaceId: 'default', overseer: 'O',
+@@ -85,3 +86,63 @@
+     await expect(api.editNodeVisual('default',after,before)).rejects.toThrow('moved elsewhere')
+     expect(fetchMock.mock.calls.filter(c=>c[1]?.method==='POST')).toHaveLength(0)
+ })
++
++
++function framedRoutingEdit() {
++    const frame = { id: 'frame', kind: 'frame' as const, text: 'Group', color: 'blue' as const, x: 0, y: 0, width: 400, height: 300, members: ['A', 'junction:J'] }
++    const before: NodeVisualState = { positions: {}, annotations: [frame], routing: {
++        junctions: [{ id: 'J', owner: 'O', x: 40, y: 60 }], edges: [{ owner: 'O', child: 'A', via: 'J' }]
++    } }
++    const after: NodeVisualState = { positions: {}, annotations: [{ ...frame, members: ['A'], width: 300 }], routing: { junctions: [], edges: [] } }
++    const snapshot = { ...graph.graph, annotations: before.annotations, junctions: before.routing!.junctions,
++        edges: before.routing!.edges.map(edge => ({ ...edge, createdAt: 1, createdBy: 'user' })) }
++    return { before, after, snapshot, version: 'b'.repeat(64) }
++}
++
++it.each([undefined, { allowDisconnect: false }])('keeps batched frame/routing removal protected without explicit disconnect authorization (%j)', async options => {
++    const api = new ApiClient('token'), f = framedRoutingEdit()
++    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
++        if (url.includes('/tree?')) return new Response(JSON.stringify({ activeWorkspaceId: 'default', workspaces: [{ version: f.version, graph: f.snapshot }] }))
++        if (init?.method === 'POST') return new Response(JSON.stringify({ error: 'Idle/completed nodes stay connected. Removing nodes or ownership requires an explicit current user request.' }), { status: 409 })
++        return new Response(JSON.stringify(graph))
++    })
++    await expect(api.editNodeVisual('default', f.after, f.before, options)).rejects.toThrow('stay connected')
++    expect(call(1).body).toMatchObject({ version: f.version, createdBy: 'user', preserveConnections: true })
++    expect(fetchMock.mock.calls).toHaveLength(2)
++})
++
++it('permits an explicitly requested UI disconnect in the atomic routing/frame transaction', async () => {
++    const api = new ApiClient('token'), f = framedRoutingEdit()
++    const disconnected = { ...graph, graph: { ...f.snapshot, annotations: f.after.annotations, junctions: [], edges: [] } }
++    fetchMock.mockImplementation(async (url: string) => new Response(JSON.stringify(url.includes('/tree?')
++        ? { activeWorkspaceId: 'default', workspaces: [{ version: f.version, graph: f.snapshot }] } : disconnected)))
++    await expect(api.editNodeVisual('default', f.after, f.before, { allowDisconnect: true })).resolves.toEqual(disconnected)
++    expect(call(1)).toMatchObject({ url: '/api/node-graph/workspaces/default/edit', method: 'POST', body: {
++        version: f.version, createdBy: 'user', preserveConnections: false,
++        changes: [
++            { action: 'routing', value: f.after.routing },
++            { action: 'annotation', id: 'frame', value: null },
++            { action: 'annotation', id: 'frame', value: f.after.annotations[0] }
++        ]
++    } })
++    expect(fetchMock.mock.calls).toHaveLength(3)
++})
++
++it('still refuses stale routing before writing an explicitly authorized disconnect', async () => {
++    const api = new ApiClient('token'), f = framedRoutingEdit()
++    const changed = { ...f.snapshot, edges: [{ owner: 'another-owner', child: 'A', createdAt: 2, createdBy: 'user' }] }
++    fetchMock.mockResolvedValue(new Response(JSON.stringify({ activeWorkspaceId: 'default', workspaces: [{ version: f.version, graph: changed }] })))
++    await expect(api.editNodeVisual('default', f.after, f.before, { allowDisconnect: true })).rejects.toThrow('junctions changed elsewhere')
++    expect(fetchMock.mock.calls).toHaveLength(1)
++    expect(fetchMock.mock.calls.filter(c => c[1]?.method === 'POST')).toHaveLength(0)
++})
++
++it('keeps the snapshot version and surfaces a concurrent edit rejection without retrying or refetching', async () => {
++    const api = new ApiClient('token'), f = framedRoutingEdit()
++    fetchMock.mockImplementation(async (url: string) => url.includes('/tree?')
++        ? new Response(JSON.stringify({ activeWorkspaceId: 'default', workspaces: [{ version: f.version, graph: f.snapshot }] }))
++        : new Response(JSON.stringify({ error: 'Node tree changed elsewhere. Refresh and try again.' }), { status: 409 }))
++    await expect(api.editNodeVisual('default', f.after, f.before, { allowDisconnect: true })).rejects.toThrow('Node tree changed elsewhere')
++    expect(call(1).body).toMatchObject({ version: f.version, preserveConnections: false })
++    expect(fetchMock.mock.calls).toHaveLength(2)
++})
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -578,6 +578,16 @@
+         fireEvent.keyDown(canvas, { key: 'z', ctrlKey: true })
+         await waitFor(() => expect(api.saveNodeLayout).toHaveBeenLastCalledWith({ B: before }))
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeDisabled())
++        const after = api.saveNodeLayout.mock.calls[0]![0].B!
++        fireEvent.keyDown(canvas, { key: 'Z', ctrlKey: true, shiftKey: true })
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenLastCalledWith({ B: after }))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeDisabled())
++        fireEvent.keyDown(canvas, { key: 'z', metaKey: true })
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeEnabled())
++        fireEvent.keyDown(canvas, { key: 'y', ctrlKey: true })
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeDisabled())
++        input.focus()
++        expect(fireEvent.keyDown(input, { key: 'Z', metaKey: true, shiftKey: true })).toBe(true)
+     })
+ 
+     it('undoes an idle node removal without resuming or aborting it', async () => {
+@@ -603,6 +613,104 @@
+         fireEvent.click(within(menu).getByRole('button', { name: 'Stop Alpha' }))
+         await waitFor(() => expect(api.abortSession).toHaveBeenCalledWith('A'))
+         expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeDisabled()
++    })
++})
++
++describe('visible graph Undo and Redo', () => {
++    it('shows both buttons and round-trips a chat addition without controlling its session', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        const undo = screen.getByRole('button', { name: 'Undo graph edit' }), redo = screen.getByRole('button', { name: 'Redo graph edit' })
++        expect(undo).toBeVisible(); expect(redo).toBeVisible()
++        expect(undo).toBeDisabled(); expect(redo).toBeDisabled()
++        dropChat('N'); await screen.findByRole('button', { name: 'Node New chat' })
++        await waitFor(() => expect(undo).toBeEnabled())
++        fireEvent.click(undo)
++        await waitFor(() => expect(redo).toBeEnabled())
++        expect(screen.queryByRole('button', { name: 'Node New chat' })).toBeNull()
++        fireEvent.click(redo)
++        await screen.findByRole('button', { name: 'Node New chat' })
++        await waitFor(() => expect(redo).toBeDisabled())
++        expect(undo).toBeEnabled(); expect(api.addNode).toHaveBeenCalledTimes(2)
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
++    it('immediately undoes the latest mobile drag before its debounce, preserving older edits', async () => {
++        const { api } = setup(); await addDecoration('text', 'Earlier note')
++        const card = screen.getByRole('button', { name: 'Node Bravo' }), start = nodeCentre('B')
++        const before = { x: parseFloat(card.parentElement!.style.left), y: parseFloat(card.parentElement!.style.top) }
++        fireEvent.pointerDown(card, { pointerId: 20, pointerType: 'touch', button: 0, ...start })
++        fireEvent.pointerMove(card, { pointerId: 20, pointerType: 'touch', clientX: start.clientX + 40, clientY: start.clientY })
++        fireEvent.pointerUp(card, { pointerId: 20, pointerType: 'touch', clientX: start.clientX + 40, clientY: start.clientY })
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenLastCalledWith({ B: before }))
++        expect(api.saveNodeLayout).toHaveBeenCalledTimes(2)
++        expect(screen.getByRole('region', { name: 'Text box: Earlier note' })).toBeInTheDocument()
++        expect(api.editNodeAnnotation).toHaveBeenCalledTimes(1)
++        expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled()
++        expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeEnabled()
++    })
++    it('does not redo an obsolete branch after a new mobile drag still awaiting persistence', async () => {
++        const { api } = setup(); await addDecoration('text', 'Old branch')
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeEnabled())
++        const card = screen.getByRole('button', { name: 'Node Bravo' }), start = nodeCentre('B')
++        fireEvent.pointerDown(card, { pointerId: 20, pointerType: 'touch', button: 0, ...start })
++        fireEvent.pointerMove(card, { pointerId: 20, pointerType: 'touch', clientX: start.clientX + 40, clientY: start.clientY })
++        fireEvent.pointerUp(card, { pointerId: 20, pointerType: 'touch', clientX: start.clientX + 40, clientY: start.clientY })
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++        const canvas = screen.getByRole('application'); canvas.focus()
++        fireEvent.keyDown(canvas, { key: 'Y', ctrlKey: true })
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledTimes(1))
++        expect(api.editNodeAnnotation).toHaveBeenCalledTimes(2)
++        expect(screen.queryByRole('region', { name: 'Text box: Old branch' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Redo graph edit' })).toBeDisabled()
++        expect(screen.getByRole('button', { name: 'Undo graph edit' })).toBeEnabled()
++    })
++    it('keeps a failed redo available, retries safely, and clears redo after a new successful edit', async () => {
++        const { api } = setup(); await addDecoration('text', 'Original note')
++        const undo = screen.getByRole('button', { name: 'Undo graph edit' }), redo = screen.getByRole('button', { name: 'Redo graph edit' })
++        fireEvent.click(undo); await waitFor(() => expect(redo).toBeEnabled())
++        api.editNodeAnnotation.mockRejectedValueOnce(new Error('Temporarily offline'))
++        fireEvent.click(redo)
++        expect(await screen.findByRole('alert')).toHaveTextContent('Temporarily offline')
++        expect(redo).toBeEnabled(); expect(undo).toBeDisabled()
++        fireEvent.click(redo); await screen.findByRole('region', { name: 'Text box: Original note' })
++        await waitFor(() => expect(undo).toBeEnabled())
++        fireEvent.click(undo); await waitFor(() => expect(redo).toBeEnabled())
++        await addDecoration('text', 'Different note')
++        expect(redo).toBeDisabled()
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
++    it('preserves both stacks on failed undo and clears them on a workspace change', async () => {
++        const { api } = setup(); await addDecoration('text', 'Keep me')
++        const undo = screen.getByRole('button', { name: 'Undo graph edit' }), redo = screen.getByRole('button', { name: 'Redo graph edit' })
++        api.editNodeAnnotation.mockRejectedValueOnce(new Error('Changed elsewhere'))
++        fireEvent.click(undo)
++        expect(await screen.findByRole('alert')).toHaveTextContent('Changed elsewhere')
++        expect(undo).toBeEnabled(); expect(redo).toBeDisabled()
++        fireEvent.click(undo); await waitFor(() => expect(redo).toBeEnabled())
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Switch to Research' }))
++        fireEvent.click(within(await screen.findByRole('dialog', { name: 'Switch to Research?' })).getByRole('button', { name: 'Stop and switch' }))
++        await waitFor(() => expect(redo).toBeDisabled())
++        expect(undo).toBeDisabled()
++    })
++    it('explicitly authorizes a framed busy-chat disconnect and replays it without stopping work', async () => {
++        const api = makeApi()
++        await api.editNodeAnnotation('default', 'frame', { id: 'frame', kind: 'frame', color: 'blue', text: 'Group', x: 0, y: 0, width: 500, height: 400, members: ['B'] }, null)
++        setup(api); await screen.findByRole('button', { name: 'Node Charlie' })
++        const canvas = screen.getByRole('application'), start = portPoint('C', 'input')
++        fireEvent.pointerDown(port('C', 'input'), { pointerId: 1, button: 0, ...start })
++        fireEvent.pointerMove(canvas, { pointerId: 1, clientX: -100, clientY: -100 })
++        fireEvent.pointerUp(canvas, { pointerId: 1, clientX: -100, clientY: -100 })
++        await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(1))
++        expect((api.editNodeVisual.mock.calls as unknown[][])[0]?.[3]).toEqual({ allowDisconnect: true })
++        const undo = screen.getByRole('button', { name: 'Undo graph edit' }), redo = screen.getByRole('button', { name: 'Redo graph edit' })
++        await waitFor(() => expect(undo).toBeEnabled()); fireEvent.click(undo)
++        await waitFor(() => expect(redo).toBeEnabled()); fireEvent.click(redo)
++        await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(3))
++        expect((api.editNodeVisual.mock.calls as unknown[][]).map(call => call[3])).toEqual([{ allowDisconnect: true }, { allowDisconnect: true }, { allowDisconnect: true }])
++        expect(api.abortSession).not.toHaveBeenCalled()
+     })
+ })
+ 
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -15,7 +15,7 @@
+ import { hasSessionDrag, readSessionDrag } from '@/lib/sessionDrag'
+ import { GraphAnnotationLayer, GraphAnnotationEditor } from './GraphAnnotations'
+ import { junctionInput, junctionBranch, removeJunction } from '@/lib/nodeGraphJunctions'
+-import { undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
++import { redoGraphEdit, undoGraphEdit, type GraphEdit } from '@/lib/nodeGraphUndo'
+ 
+ export type NodeStatus = 'Running' | 'Background' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+@@ -92,6 +92,10 @@
+     const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null; movingChild?: string } | null>(null)
+     const [history, setHistory] = useState<GraphEdit[]>([])
+     const historyRef = useRef(history); historyRef.current = history
++    const [redoHistory, setRedoHistory] = useState<GraphEdit[]>([])
++    const redoHistoryRef = useRef(redoHistory); redoHistoryRef.current = redoHistory
++    const workspaceRef = useRef(graph?.activeWorkspaceId); workspaceRef.current = graph?.activeWorkspaceId
++    const redoRef = useRef<() => void>(() => {})
+     const undoRef = useRef<() => void>(() => {})
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+@@ -145,7 +149,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); cancelTouchMenu(); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -190,10 +194,11 @@
+     useEffect(() => {
+         if (!visible) return
+         const key = (event: globalThis.KeyboardEvent) => {
+-            if (event.defaultPrevented || event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return
++            const key = event.key.toLowerCase()
++            if (event.defaultPrevented || event.altKey || !(event.ctrlKey || event.metaKey) || (key !== 'z' && key !== 'y') || (key === 'y' && event.shiftKey)) return
+             const target = event.target instanceof Element ? event.target : document.activeElement
+             if (!canvas.current?.contains(document.activeElement) || target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return
+-            event.preventDefault(); undoRef.current()
++            event.preventDefault(); (key === 'y' || event.shiftKey ? redoRef : undoRef).current()
+         }
+         document.addEventListener('keydown', key)
+         return () => document.removeEventListener('keydown', key)
+@@ -483,7 +488,12 @@
+         setMenu({ id, mode, x: (at?.x ?? node?.left ?? rect?.left ?? 0) - (rect?.left ?? 0), y: (at?.y ?? node?.bottom ?? rect?.top ?? 0) - (rect?.top ?? 0) })
+         setError(null)
+     }
+-    const remember = (edit: GraphEdit) => setHistory(old => [...old.slice(-49), edit])
++    const remember = (edit: GraphEdit) => {
++        if (workspaceRef.current !== edit.workspace) return
++        const next = [...historyRef.current.slice(-49), edit]
++        historyRef.current = next; setHistory(next)
++        redoHistoryRef.current = []; setRedoHistory([])
++    }
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
+         if (mutationBusy.current || dropInFlight.current) return null
+         mutationBusy.current = true
+@@ -509,7 +519,7 @@
+             framed = framed.map(a => fitNodeFrame(a, framePoints(positionsRef.current, framed, after.junctions)))
+             if (JSON.stringify(framed) !== JSON.stringify(annotations)) {
+                 const visualBefore = { positions: {}, annotations, routing: before }, visualAfter = { positions: {}, annotations: framed, routing: after }
+-                const result = await client.editNodeVisual(fresh.activeWorkspaceId, visualAfter, visualBefore)
++                const result = await client.editNodeVisual(fresh.activeWorkspaceId, visualAfter, visualBefore, JSON.stringify(before.edges) !== JSON.stringify(after.edges) ? { allowDisconnect: true } : undefined)
+                 remember({ kind: 'visual', workspace: fresh.activeWorkspaceId, before: visualBefore, after: visualAfter })
+                 return result
+             }
+@@ -632,20 +642,42 @@
+             setSelectedNode(null); closeMenu()
+         }
+     }
+-    undoRef.current = () => {
+-        const edit = historyRef.current.at(-1)
+-        if (!edit || gesture.current || pending || mutationBusy.current || dropInFlight.current || !graph || edit.workspace !== graph.activeWorkspaceId) return
+-        void act('undo', async client => {
++    const replayHistory = (direction: 'undo' | 'redo') => {
++        const source = direction === 'undo' ? historyRef : redoHistoryRef
++        if (gesture.current || pending || mutationBusy.current || dropInFlight.current || !graph || (!source.current.length && !Object.keys(pendingSave.current).length)) return
++        const workspace = graph.activeWorkspaceId
++        let replayedEdit: GraphEdit | undefined
++        void act(direction, async client => {
+             await flushSave()
++            // Pending persistence may have yielded to another state update.
++            // Choose the current branch only after it settles.
++            const edit = source.current.at(-1)
++            if (!edit || edit.workspace !== workspace || workspaceRef.current !== workspace) return null
++            replayedEdit = edit
+             if (edit.kind === 'move' && edit.id === overseer && !graph.graph.nodes.some(n => n.sessionId === edit.id)) {
+-                const point = positionsRef.current[edit.id]
+-                if (!point || point.x !== edit.after.x || point.y !== edit.after.y) throw new Error('The node moved elsewhere. Undo is unavailable.')
+-                setOverrides(old => ({ ...old, [edit.id]: edit.before }))
++                const point = positionsRef.current[edit.id], expected = direction === 'undo' ? edit.after : edit.before
++                if (!point || point.x !== expected.x || point.y !== expected.y) throw new Error('The node moved elsewhere. History is unavailable.')
++                setOverrides(old => ({ ...old, [edit.id]: direction === 'undo' ? edit.before : edit.after }))
+                 return graph
+             }
+-            return await undoGraphEdit(client, edit) ?? await client.getNodeGraph()
+-        }).then(result => { if (result !== null) setHistory(old => old.filter(item => item !== edit)) })
+-    }
++            return await (direction === 'undo' ? undoGraphEdit : redoGraphEdit)(client, edit) ?? await client.getNodeGraph()
++        }).then(result => {
++            const edit = replayedEdit
++            if (!edit || result === null || workspaceRef.current !== edit.workspace || source.current.at(-1) !== edit) return
++            const remaining = source.current.slice(0, -1)
++            if (direction === 'undo') {
++                historyRef.current = remaining; setHistory(remaining)
++                const next = [...redoHistoryRef.current.slice(-49), edit]
++                redoHistoryRef.current = next; setRedoHistory(next)
++            } else {
++                redoHistoryRef.current = remaining; setRedoHistory(remaining)
++                const next = [...historyRef.current.slice(-49), edit]
++                historyRef.current = next; setHistory(next)
++            }
++        })
++    }
++    undoRef.current = () => replayHistory('undo')
++    redoRef.current = () => replayHistory('redo')
+ 
+     if (!enabled) return <p className="p-4 text-sm text-[var(--app-hint)]">Node graph is unavailable on this hub.</p>
+     const dragOver = (event: DragEvent<HTMLDivElement>) => {
+@@ -862,6 +894,7 @@
+                 <button type="button" aria-label="Zoom in" onClick={() => zoomAt(1.25)} className={iconButton}>+</button>
+                 <button type="button" aria-label="Fit graph to view" onClick={fit} className={`${iconButton} w-auto px-2 text-xs`}>Fit</button>
+                 <button type="button" aria-label="Undo graph edit" title="Undo graph edit (Ctrl+Z)" disabled={!history.length || pending !== null} onClick={() => undoRef.current()} className={`${iconButton} border-l border-[var(--app-divider)]`}>↶</button>
++                <button type="button" aria-label="Redo graph edit" title="Redo graph edit (Ctrl+Shift+Z)" disabled={!redoHistory.length || pending !== null} onClick={() => redoRef.current()} className={iconButton}>↷</button>
+             </div>
+             {selectedDot && !menu && <section data-graph-ui aria-label="Junction actions" className="absolute bottom-16 right-2 z-20 w-64 max-w-[calc(100%_-_16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow">
+                 <div className="flex items-center gap-1"><span className="flex-1 px-1 text-xs font-medium">Junction</span>
+diff --git a/web/src/lib/nodeGraphUndo.test.ts b/web/src/lib/nodeGraphUndo.test.ts
+--- a/web/src/lib/nodeGraphUndo.test.ts
++++ b/web/src/lib/nodeGraphUndo.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, it, vi } from 'vitest'
+ import { nodeRouting, type NodeRouting, type NodeGraphResponse } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+-import { undoGraphEdit, type GraphEdit } from './nodeGraphUndo'
++import { redoGraphEdit, undoGraphEdit, type GraphEdit } from './nodeGraphUndo'
+ 
+ function setup() {
+     const graph: NodeGraphResponse = { activeWorkspaceId: 'w', workspaces: [], overseer: 'O', graph: { workspaceId: 'w',
+@@ -23,6 +23,7 @@
+         addNode: vi.fn(async (sessionId: string) => { graph.graph.nodes.push({ sessionId, x: null, y: null, addedAt: 2 }); return copy() }),
+         removeNodes: vi.fn(async (ids: readonly string[]) => {
+             graph.graph.nodes = graph.graph.nodes.filter(n => !ids.includes(n.sessionId))
++            graph.graph.edges = graph.graph.edges.filter(edge => !ids.includes(edge.child) && !ids.includes(edge.owner))
+             return { graph: copy(), skippedIds: [] as string[] }
+         }),
+     }
+@@ -142,3 +143,127 @@
+     await expect(undoGraphEdit(client, { kind: 'owner', workspace: 'w', child: 'B', before: 'O', after: 'A' })).rejects.toThrow('changed elsewhere')
+     expect(api.setNodeOwner).not.toHaveBeenCalled()
+ })
++
++
++describe('graph edit redo', () => {
++    it('replays move and owner changes only against their undone state', async () => {
++        const { client, graph, api } = setup()
++        const move: GraphEdit = { kind: 'move', workspace: 'w', id: 'A', before: { x: 1, y: 2 }, after: { x: 10, y: 20 } }
++        await undoGraphEdit(client, move); await redoGraphEdit(client, move)
++        expect(graph.graph.nodes[0]).toMatchObject(move.after)
++        await expect(redoGraphEdit(client, move)).rejects.toThrow('changed elsewhere')
++        const owner: GraphEdit = { kind: 'owner', workspace: 'w', child: 'B', before: 'C', after: 'A' }
++        await undoGraphEdit(client, owner); await redoGraphEdit(client, owner)
++        expect(graph.graph.edges.find(edge => edge.child === 'B')?.owner).toBe('A')
++        expect(api.removeNodes).not.toHaveBeenCalled()
++    })
++    it('replays annotations and routing through expected-state APIs', async () => {
++        const { client, graph } = setup()
++        const note = { id: 'note', kind: 'text' as const, color: 'blue' as const, text: 'Updated', x: 0, y: 0, width: 200, height: 100 }
++        client.editNodeAnnotation = vi.fn(async () => structuredClone(graph))
++        await redoGraphEdit(client, { kind: 'annotation', workspace: 'w', id: note.id, before: null, after: note })
++        expect(client.editNodeAnnotation).toHaveBeenCalledWith('w', note.id, note, null)
++        const before = nodeRouting(graph.graph), after = { ...before, edges: before.edges.filter(e => e.child !== 'B') }
++        client.editNodeRouting = vi.fn(async () => structuredClone(graph))
++        await redoGraphEdit(client, { kind: 'routing', workspace: 'w', before, after })
++        expect(client.editNodeRouting).toHaveBeenCalledWith('w', after, before)
++    })
++    it('authorizes only visual history that changes wiring, preserving the default for geometry', async () => {
++        const { client, graph } = setup()
++        client.editNodeVisual = vi.fn(async () => structuredClone(graph))
++        const routing = nodeRouting(graph.graph), before = { positions: {}, annotations: [], routing }, after = { ...before, routing: { ...routing, edges: [] } }
++        const edit: GraphEdit = { kind: 'visual', workspace: 'w', before, after }
++        await undoGraphEdit(client, edit)
++        expect(client.editNodeVisual).toHaveBeenLastCalledWith('w', before, after, { allowDisconnect: true })
++        await redoGraphEdit(client, edit)
++        expect(client.editNodeVisual).toHaveBeenLastCalledWith('w', after, before, { allowDisconnect: true })
++        await redoGraphEdit(client, { kind: 'visual', workspace: 'w', before, after: { ...before, positions: { A: { x: 3, y: 4 } } } })
++        expect(vi.mocked(client.editNodeVisual).mock.calls.at(-1)?.[3]).toBeUndefined()
++    })
++    it('round-trips an addition without creating duplicate nodes or replaying an uncertain add', async () => {
++        const { client, graph, api } = setup()
++        const edit: GraphEdit = { kind: 'add', workspace: 'w', id: 'C', point: { x: 10, y: 20 } }
++        await undoGraphEdit(client, edit); await redoGraphEdit(client, edit)
++        expect(graph.graph.nodes.filter(node => node.sessionId === 'C')).toHaveLength(1)
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        expect(api.addNode).toHaveBeenCalledTimes(1)
++        await undoGraphEdit(client, edit)
++        api.addNode.mockImplementationOnce(async id => {
++            graph.graph.nodes.push({ sessionId: id, x: null, y: null, addedAt: 3 })
++            throw new Error('Lost response')
++        })
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('Lost response')
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        expect(api.addNode).toHaveBeenCalledTimes(2)
++    })
++    it('retries a proven partial addition without duplicating its first successful stage', async () => {
++        const { client, graph, api } = setup()
++        const edit: GraphEdit = { kind: 'add', workspace: 'w', id: 'C', point: { x: 10, y: 20 } }
++        await undoGraphEdit(client, edit)
++        api.saveNodeLayout.mockRejectedValueOnce(new Error('offline'))
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('offline')
++        await redoGraphEdit(client, edit)
++        expect(api.addNode).toHaveBeenCalledTimes(1)
++        expect(graph.graph.nodes.find(node => node.sessionId === 'C')).toMatchObject({ x: 10, y: 20 })
++    })
++    it('round-trips a removal and refuses changed connections or busy re-removal', async () => {
++        const { client, graph, api } = setup()
++        const edit: GraphEdit = { kind: 'remove', workspace: 'w', id: 'A', point: { x: 10, y: 20 }, edges: graph.graph.edges.map(({ owner, child }) => ({ owner, child })) }
++        await client.removeNodes(['A']); await undoGraphEdit(client, edit)
++        graph.graph.edges.push({ owner: 'A', child: 'C', createdAt: 4, createdBy: 'user' })
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        graph.graph.edges = graph.graph.edges.filter(edge => edge.child !== 'C')
++        api.removeNodes.mockResolvedValueOnce({ graph: structuredClone(graph), skippedIds: ['A'] })
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('busy')
++        await redoGraphEdit(client, edit)
++        expect(graph.graph.nodes.some(node => node.sessionId === 'A')).toBe(false)
++        await undoGraphEdit(client, edit)
++        expect(graph.graph.nodes.filter(node => node.sessionId === 'A')).toHaveLength(1)
++    })
++    it('never replays into a different workspace or blindly repeats an uncertain removal', async () => {
++        const { client, graph, api } = setup()
++        const edit: GraphEdit = { kind: 'remove', workspace: 'other', id: 'C', point: { x: 10, y: 20 }, edges: [] }
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        expect(api.removeNodes).not.toHaveBeenCalled()
++        edit.workspace = 'w'
++        api.removeNodes.mockImplementationOnce(async ids => {
++            graph.graph.nodes = graph.graph.nodes.filter(node => !ids.includes(node.sessionId))
++            throw new Error('Lost response')
++        })
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('Lost response')
++        await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++        expect(api.removeNodes).toHaveBeenCalledTimes(1)
++    })
++})
++
++
++it('refuses new junction routes or junction sources on history that did not record them', async () => {
++    const { client, graph, api } = setup()
++    const edit: GraphEdit = { kind: 'remove', workspace: 'w', id: 'A', point: { x: 10, y: 20 }, edges: graph.graph.edges.map(({ owner, child }) => ({ owner, child })) }
++    graph.graph.junctions = [{ id: 'new', owner: 'A', x: 30, y: 40 }]
++    graph.graph.edges.find(edge => edge.child === 'B')!.via = 'new'
++    await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++    delete graph.graph.edges.find(edge => edge.child === 'B')!.via
++    await expect(redoGraphEdit(client, edit)).rejects.toThrow('changed elsewhere')
++    graph.graph.junctions = [{ id: 'new', owner: 'C', x: 30, y: 40 }]
++    await expect(undoGraphEdit(client, { kind: 'add', workspace: 'w', id: 'C', point: { x: 10, y: 20 } })).rejects.toThrow('changed elsewhere')
++    expect(api.removeNodes).not.toHaveBeenCalled()
++})
++
++it('reconciles a known partial restoration whose frame response was lost without replaying the applied edit', async () => {
++    const { client, graph, api } = setup()
++    const before = [{ id: 'f', kind: 'frame' as const, color: 'blue' as const, text: 'Group', x: 0, y: 0, width: 300, height: 200, members: ['A'] }]
++    const after = [{ ...before[0]!, members: [] }]
++    graph.graph.nodes = graph.graph.nodes.filter(node => node.sessionId !== 'A')
++    graph.graph.edges = []; graph.graph.annotations = after
++    const edit: GraphEdit = { kind: 'remove', workspace: 'w', id: 'A', point: { x: 10, y: 20 }, edges: [], frames: { before, after } }
++    client.editNodeVisual = vi.fn(async (_workspace, value) => {
++        graph.graph.annotations = value.annotations
++        throw new Error('Lost frame response')
++    })
++    await expect(undoGraphEdit(client, edit)).rejects.toThrow('Lost frame response')
++    await undoGraphEdit(client, edit)
++    expect(client.editNodeVisual).toHaveBeenCalledTimes(1)
++    expect(api.addNode).toHaveBeenCalledTimes(1)
++    expect(graph.graph.annotations).toEqual(before)
++})
+diff --git a/web/src/lib/nodeGraphUndo.ts b/web/src/lib/nodeGraphUndo.ts
+--- a/web/src/lib/nodeGraphUndo.ts
++++ b/web/src/lib/nodeGraphUndo.ts
+@@ -10,13 +10,16 @@
+     | { kind: 'annotation'; id: string; before: NodeAnnotation | null; after: NodeAnnotation | null }
+     | { kind: 'move'; id: string; before: GraphPoint; after: GraphPoint }
+     | { kind: 'owner'; child: string; before: string | null; after: string | null }
+-    | { kind: 'add'; id: string; point: GraphPoint }
++    | { kind: 'add'; id: string; point: GraphPoint; restoring?: boolean }
+     | { kind: 'remove'; id: string; point: GraphPoint; edges: Pick<NodeGraphEdge, 'owner' | 'child'>[]; routing?: { before: NodeRouting; after: NodeRouting }; frames?: { before: NodeAnnotation[]; after: NodeAnnotation[] }; restoring?: boolean }
+ )
+ 
+-const changed = () => new Error('The graph changed elsewhere. This edit can no longer be undone safely.')
++const changed = () => new Error('The graph changed elsewhere. This edit can no longer be replayed safely.')
+ const parent = (graph: NodeGraphResponse, child: string) => graph.graph.edges.find(edge => edge.child === child)?.owner ?? null
+ const member = (graph: NodeGraphResponse, id: string) => graph.overseer === id || graph.graph.nodes.some(node => node.sessionId === id)
++const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
++const incident = (graph: NodeGraphResponse, id: string) => graph.graph.edges.filter(edge => edge.owner === id || edge.child === id).map(({ owner, child }) => ({ owner, child })).sort((a, b) => a.child.localeCompare(b.child) || a.owner.localeCompare(b.owner))
++const visualDisconnect = (before: NodeVisualState, after: NodeVisualState) => before.routing && after.routing && !same(nodeRouting(before.routing).edges, nodeRouting(after.routing).edges)
+ 
+ /** Undo only this window's affected fields; never overwrite another editor or undo Stop. */
+ export async function undoGraphEdit(client: ApiClient, edit: GraphEdit): Promise<NodeGraphResponse | null> {
+@@ -24,7 +27,7 @@
+     if (graph.activeWorkspaceId !== edit.workspace) throw changed()
+     const node = 'id' in edit ? graph.graph.nodes.find(n => n.sessionId === edit.id) : undefined
+     switch (edit.kind) {
+-        case 'visual': return client.editNodeVisual(edit.workspace, edit.before, edit.after)
++        case 'visual': return client.editNodeVisual(edit.workspace, edit.before, edit.after, visualDisconnect(edit.before, edit.after) ? { allowDisconnect: true } : undefined)
+         case 'routing': return client.editNodeRouting(edit.workspace, edit.before, edit.after)
+         case 'annotation': return client.editNodeAnnotation(edit.workspace, edit.id, edit.before, edit.after)
+         case 'move':
+@@ -34,7 +37,7 @@
+             if (graph.graph.edges.some(e => e.child === edit.child && e.via) || !member(graph, edit.child) || parent(graph, edit.child) !== edit.after || (edit.before && !member(graph, edit.before))) throw changed()
+             return edit.before ? client.setNodeOwner(edit.before, edit.child) : client.detachNode(edit.child)
+         case 'add': {
+-            if (!node || node.x !== edit.point.x || node.y !== edit.point.y || graph.graph.edges.some(edge => edge.child === edit.id || edge.owner === edit.id)) throw changed()
++            if (!node || node.x !== edit.point.x || node.y !== edit.point.y || graph.graph.edges.some(edge => edge.child === edit.id || edge.owner === edit.id) || graph.graph.annotations?.some(frame => frame.members?.includes(edit.id)) || graph.graph.junctions?.some(junction => junction.owner === edit.id)) throw changed()
+             const result = await client.removeNodes([edit.id])
+             if (result.skippedIds.includes(edit.id)) throw new Error('This chat is busy. Stop it before undoing its addition.')
+             return result.graph
+@@ -53,16 +56,50 @@
+                 proposed.push({ ...edge, createdAt: 0, createdBy: 'user' })
+             }
+             if (!node) { await client.addNode(edit.id); edit.restoring = true }
+-            let result = await client.saveNodeLayout({ [edit.id]: edit.point })
+-            for (const edge of restored) result = await client.setNodeOwner(edge.owner, edge.child)
+-            if (edit.frames) result = await client.editNodeVisual(edit.workspace, { positions: {}, annotations: edit.frames.before }, { positions: {}, annotations: edit.frames.after })
++            let result = graph
++            if (!node || node.x !== edit.point.x || node.y !== edit.point.y) result = await client.saveNodeLayout({ [edit.id]: edit.point }) ?? await client.getNodeGraph()
++            for (const edge of restored) if (parent(result, edge.child) !== edge.owner) result = await client.setNodeOwner(edge.owner, edge.child) ?? await client.getNodeGraph()
++            if (edit.frames) {
++                if (!same(result.graph.annotations ?? [], edit.frames.before)) {
++                    if (!same(result.graph.annotations ?? [], edit.frames.after)) throw changed()
++                    result = await client.editNodeVisual(edit.workspace, { positions: {}, annotations: edit.frames.before }, { positions: {}, annotations: edit.frames.after })
++                }
++            }
+             if (edit.routing) {
+                 const expected = { junctions: edit.routing.after.junctions, edges: [...edit.routing.after.edges.filter(e => !restored.some(old => old.child === e.child)), ...restored] }
+                 const latest = result ?? await client.getNodeGraph()
+-                if (JSON.stringify(nodeRouting(latest.graph)) !== JSON.stringify(nodeRouting(expected))) throw changed()
++                if (same(nodeRouting(latest.graph), nodeRouting(edit.routing.before))) return latest
++                if (!same(nodeRouting(latest.graph), nodeRouting(expected))) throw changed()
+                 return client.editNodeRouting(edit.workspace, edit.routing.before, nodeRouting(expected))
+             }
+             return result
+         }
+     }
+ }
++
++/** Reapply a proven local edit. Stop and session execution are never part of it. */
++export async function redoGraphEdit(client: ApiClient, edit: GraphEdit): Promise<NodeGraphResponse | null> {
++    if (edit.kind === 'add') {
++        const restoration: Extract<GraphEdit, { kind: 'remove' }> = { kind: 'remove', workspace: edit.workspace, id: edit.id, point: edit.point, edges: [], restoring: edit.restoring }
++        try {
++            const result = await undoGraphEdit(client, restoration)
++            edit.restoring = false
++            return result
++        } catch (error) { edit.restoring = restoration.restoring; throw error }
++    }
++    if (edit.kind === 'remove') {
++        const graph = await client.getNodeGraph(), node = graph.graph.nodes.find(node => node.sessionId === edit.id)
++        if (graph.activeWorkspaceId !== edit.workspace || !node || node.x !== edit.point.x || node.y !== edit.point.y) throw changed()
++        if (!same(incident(graph, edit.id), [...edit.edges].map(({ owner, child }) => ({ owner, child })).sort((a, b) => a.child.localeCompare(b.child) || a.owner.localeCompare(b.owner)))) throw changed()
++        if (edit.routing ? !same(nodeRouting(graph.graph), nodeRouting(edit.routing.before)) : graph.graph.edges.some(edge => (edge.owner === edit.id || edge.child === edit.id) && edge.via) || graph.graph.junctions?.some(junction => junction.owner === edit.id)) throw changed()
++        if (edit.frames ? !same(graph.graph.annotations ?? [], edit.frames.before) : graph.graph.annotations?.some(frame => frame.members?.includes(edit.id))) throw changed()
++        const result = await client.removeNodes([edit.id])
++        if (result.skippedIds.includes(edit.id)) throw new Error('This chat is busy. Stop it before redoing its removal.')
++        edit.restoring = false
++        return result.graph
++    }
++    // Both directions share identical expected-state checks. Visual, routing
++    // and annotation edits additionally use atomic expected-value APIs.
++    if (edit.kind === 'owner') return undoGraphEdit(client, { ...edit, before: edit.after, after: edit.before })
++    return undoGraphEdit(client, { ...edit, before: edit.after, after: edit.before } as GraphEdit)
++}

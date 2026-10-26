@@ -1,0 +1,209 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,3 +1,4 @@
++import { autoNodePorts, nodePortOffset, nodePortRotation } from '@/lib/nodePorts'
+ import { sessionWorkEvidence } from '@/lib/sessionEvidence'
+ import { SessionOversightBadge } from './SessionOversightBadge'
+ import { useManagedSessions } from '@/hooks/useManagedSessions'
+@@ -195,6 +196,8 @@
+     const menuDot = objectMenu?.id.startsWith('junction:') ? junctions.find(j => 'junction:' + j.id === objectMenu.id) : undefined
+     const annotations = (graph?.graph.annotations ?? []).map(a => annotationDrafts[a.id] ?? a)
+     const annotationsRef = useRef(annotations); annotationsRef.current = annotations
++    const nodePorts = autoNodePorts(positions, { junctions, edges: graph?.graph.edges ?? [] })
++    const nodePortsRef = useRef(nodePorts); nodePortsRef.current = nodePorts
+     const selected = annotations.find(a => a.id === selectedAnnotation)
+     const annotationActions = useRef<HTMLDivElement>(null)
+     const [actionSize, setActionSize] = useState({ width: 160, height: 44 })
+@@ -310,8 +313,12 @@
+         const junction = junctionsRef.current.find(j => j.id === id)
+         if (junction) return { x: junction.x, y: junction.y }
+         const p = positionsRef.current[id]
+-        return p ? { x: p.x + NODE_SIZE.width / 2, y: p.y + (direction === 'output' ? NODE_SIZE.height : 0) } : null
+-    }
++        if (!p) return null
++        const offset = nodePortOffset(nodePortsRef.current[id] ?? { input: 'top', output: 'bottom' }, direction)
++        return { x: p.x + offset.x, y: p.y + offset.y }
++    }
++    const portTangent = (id: string, direction: 'input' | 'output') => junctionsRef.current.find(j => j.id === id) ?? { rotation: nodePortRotation(nodePortsRef.current[id]?.[direction] ?? (direction === 'input' ? 'top' : 'bottom'), direction) }
++    const nodePortStyle = (id: string, direction: 'input' | 'output') => { const point = nodePortOffset(nodePortsRef.current[id] ?? { input: 'top', output: 'bottom' }, direction); return { left: point.x, top: point.y, scale: Math.max(1, 0.85 / view.k) } }
+     const portAt = (point: GraphPoint, direction: 'input' | 'output'): string | null => {
+         for (const id of [...junctionsRef.current.map(j => j.id), ...[...ids].reverse()]) {
+             if (direction === 'input' && id === overseer) continue
+@@ -1089,12 +1096,12 @@
+                     {junctions.filter(j => j.owner && portPoint(j.owner, 'output')).map(j => {
+                         const from = portPoint(j.owner!, 'output')!, targets = edges.filter(e => e.via === j.id)
+                         const asleep = !targets.length || targets.every(e => edgeAsleep(sessionsById.get(e.child)))
+-                        return <path key={j.id} data-junction-input={j.id} d={junctionCurve(from, j, junctions.find(p => p.id === j.owner), j)} fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1} />
++                        return <path key={j.id} data-junction-input={j.id} d={junctionCurve(from, j, portTangent(j.owner!, 'output'), j)} fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1} />
+                     })}
+                     {junctions.flatMap(j => (j.targets ?? []).map(child => {
+                         const to = link?.movingChild === child ? link.to : portPoint(child, 'input')
+                         if (!to) return null
+-                        return <path key={j.id + ':' + child} data-junction-target={`${j.id}->${child}`} d={junctionCurve(j, to, j)} fill="none" stroke="var(--app-hint)" strokeWidth={1.5} strokeDasharray="5 5" opacity={0.55} markerEnd="url(#node-edge-asleep)" />
++                        return <path key={j.id + ':' + child} data-junction-target={`${j.id}->${child}`} d={junctionCurve(j, to, j, portTangent(child, 'input'))} fill="none" stroke="var(--app-hint)" strokeWidth={1.5} strokeDasharray="5 5" opacity={0.55} markerEnd="url(#node-edge-asleep)" />
+                     }))}
+                     {edges.map(({ owner, child, via }) => {
+                         const from = positions[owner], to = positions[child]
+@@ -1103,8 +1110,8 @@
+                         const asleep = edgeAsleep(sessionsById.get(child))
+                         const dot = junctions.find(j => j.id === via)
+                         const moving = link?.movingChild === child ? link.to : null
+-                        const x1 = dot?.x ?? from.x + NODE_SIZE.width / 2, y1 = dot?.y ?? from.y + NODE_SIZE.height, x2 = moving?.x ?? to.x + NODE_SIZE.width / 2, y2 = moving?.y ?? to.y
+-                        return <path key={child} data-edge={`${owner}->${child}`} data-asleep={asleep ? 'true' : 'false'} d={junctionCurve({ x: x1, y: y1 }, { x: x2, y: y2 }, dot)}
++                        const start = dot ?? portPoint(owner, 'output')!, end = moving ?? portPoint(child, 'input')!
++                        return <path key={child} data-edge={`${owner}->${child}`} data-asleep={asleep ? 'true' : 'false'} d={junctionCurve(start, end, dot ?? portTangent(owner, 'output'), portTangent(child, 'input'))}
+                             fill="none" stroke={asleep ? 'var(--app-hint)' : 'var(--app-link)'} strokeWidth={asleep ? 1.5 : 2} strokeDasharray={asleep ? '5 5' : undefined} opacity={asleep ? 0.55 : 1}
+                             markerEnd={`url(#${asleep ? 'node-edge-asleep' : 'node-edge-active'})`} />
+                     })}
+@@ -1137,16 +1144,16 @@
+                         </button>
+                         {managedSessions[id] && <span data-graph-ui className="absolute bottom-0 right-0"><SessionOversightBadge managed={managedSessions[id]} /></span>}
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+-                            style={{ scale: Math.max(1, 0.85 / view.k) }}
++                            data-port-side={nodePorts[id]?.input} style={nodePortStyle(id, 'input')}
+                             title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+                             onClick={event => { if (event.detail === 0) { openMenu(id, undefined, 'owner') } }}
+-                            className="absolute -top-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                            className="absolute flex h-7 w-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                             <span className={`h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] ${layout.parent[id] ? 'bg-[var(--app-link)]' : 'bg-[var(--app-bg)]'}`} />
+                         </button>}
+                         <button type="button" data-link-handle={id} aria-label={`Output for ${name}`} title="Output: drag to another node’s input to connect."
+-                            style={{ scale: Math.max(1, 0.85 / view.k) }}
++                            data-port-side={nodePorts[id]?.output} style={nodePortStyle(id, 'output')}
+                             onClick={event => { if (event.detail === 0) openMenu(id) }}
+-                            className="absolute -bottom-3.5 left-1/2 flex h-7 w-7 -translate-x-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                            className="absolute flex h-7 w-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full cursor-crosshair focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                             <span className="h-3.5 w-3.5 rounded-full border-2 border-[var(--app-link)] bg-[var(--app-bg)]" />
+                         </button>
+                     </div>
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -168,7 +168,8 @@
+     const centre = nodeCentre(id)
+     const world = document.querySelector<HTMLElement>(`[data-node-id="${id}"]`)!.parentElement!
+     const k = Number(/scale\(([-\d.e]+)\)/.exec(world.style.transform)![1])
+-    return { clientX: centre.clientX, clientY: centre.clientY + (kind === 'input' ? -1 : 1) * NODE_SIZE.height / 2 * k }
++    const handle = port(id, kind) as HTMLElement
++    return { clientX: centre.clientX + (parseFloat(handle.style.left) - NODE_SIZE.width / 2) * k, clientY: centre.clientY + (parseFloat(handle.style.top) - NODE_SIZE.height / 2) * k }
+ }
+ const port = (id: string, kind: 'input' | 'output') => document.querySelector(`[data-${kind === 'input' ? 'input' : 'link'}-handle="${id}"]`)!
+ const dragPort = (id: string, kind: 'input' | 'output', to: { clientX: number; clientY: number }, ending = 'pointerUp') => {
+@@ -2122,3 +2123,23 @@
+     expect(api.addNode).not.toHaveBeenCalled()
+     expect(api.setNodeOwner).not.toHaveBeenCalled()
+ })
++
++
++it.each(['mouse', 'touch'])('uses horizontal port hitboxes to move an existing wire with %s', async pointerType => {
++    const g = initial()
++    g.graph.nodes = ['O','A','B','L'].map((sessionId,i) => ({ sessionId, x: i === 3 ? 400 : i * 400, y: i === 3 ? 300 : 0, addedAt: 1 }))
++    g.graph.edges = [{ owner: 'O', child: 'A', createdAt: 1, createdBy: 'user' }, { owner: 'A', child: 'B', createdAt: 1, createdBy: 'user' }]
++    const { api } = setup(makeApi({ graph: g }))
++    await screen.findByRole('button', { name: 'Input for Alpha' })
++    expect(port('A','input')).toHaveAttribute('data-port-side','left')
++    expect(port('A','output')).toHaveAttribute('data-port-side','right')
++    const path = document.querySelector('[data-edge="A->B"]')!.getAttribute('d')!
++    expect(path).toBe('M600 40 C664 40 736 40 800 40')
++    const canvas = screen.getByRole('application', { name: 'Node graph' }), from = portPoint('B','input'), to = portPoint('L','input')
++    fireEvent.pointerDown(port('B','input'), { ...from, pointerId: 1, pointerType })
++    fireEvent.pointerMove(canvas, { ...to, pointerId: 1, pointerType })
++    fireEvent.pointerUp(canvas, { ...to, pointerId: 1, pointerType })
++    await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledOnce())
++    expect(api.editNodeRouting.mock.calls[0]![1].edges).toContainEqual({ owner: 'A', child: 'L' })
++    expect(api.abortSession).not.toHaveBeenCalled()
++})
+--- a/web/src/lib/nodeGraphJunctions.ts
++++ b/web/src/lib/nodeGraphJunctions.ts
+@@ -37,7 +37,7 @@
+     return { ...routing, junctions: routing.junctions.map(j => ids.includes(j.id) ? { ...j, rotation: ((j.rotation ?? 0) + 90) % 360 } : j) }
+ }
+ /** Clockwise quarter turns rotate both wire tangents, without moving the wiring point. */
+-export function junctionCurve(from: { x: number; y: number }, to: { x: number; y: number }, source?: NodeRouting['junctions'][number], target?: NodeRouting['junctions'][number]): string {
++export function junctionCurve(from: { x: number; y: number }, to: { x: number; y: number }, source?: Pick<NodeRouting['junctions'][number], 'rotation'>, target?: Pick<NodeRouting['junctions'][number], 'rotation'>): string {
+     const vectors = [[0, 1], [-1, 0], [0, -1], [1, 0]] as const
+     const output = vectors[(source?.rotation ?? 0) / 90] ?? vectors[0]
+     const input = vectors[(target?.rotation ?? 0) / 90] ?? vectors[0]
+--- /dev/null
++++ b/web/src/lib/nodePorts.ts
+@@ -0,0 +1,44 @@
++import type { NodeRouting } from '@hapi/protocol/nodeGraph'
++import { NODE_SIZE, type GraphPoint } from './nodeGraphLayout'
++
++export type PortSide = 'top' | 'right' | 'bottom' | 'left'
++export type NodePorts = { input: PortSide; output: PortSide }
++const opposite: Record<PortSide, PortSide> = { top: 'bottom', bottom: 'top', left: 'right', right: 'left' }
++/** Use the dominant travel direction so gently diagonal rows still flow horizontally. */
++function facing(center: GraphPoint, points: GraphPoint[]): PortSide | null {
++    if (!points.length) return null
++    const x = points.reduce((sum, p) => sum + p.x - center.x, 0) / points.length
++    const y = points.reduce((sum, p) => sum + p.y - center.y, 0) / points.length
++    if (Math.abs(x) + Math.abs(y) < 0.001) return null
++    return Math.abs(x) > Math.abs(y) ? x > 0 ? 'right' : 'left' : y > 0 ? 'bottom' : 'top'
++}
++/** Derived visual geometry only. Routing, node positions and ownership are unchanged. */
++export function autoNodePorts(positions: Record<string, GraphPoint>, routing: NodeRouting): Record<string, NodePorts> {
++    const centers = Object.fromEntries(Object.entries(positions).map(([id, p]) => [id, { x: p.x + NODE_SIZE.width / 2, y: p.y + NODE_SIZE.height / 2 }]))
++    const dots = new Map(routing.junctions.map(j => [j.id, j]))
++    const inputs = new Map<string, GraphPoint[]>(), outputs = new Map<string, GraphPoint[]>()
++    const append = (map: Map<string, GraphPoint[]>, id: string, point?: GraphPoint) => { if (point) { const values = map.get(id) ?? []; values.push(point); map.set(id, values) } }
++    for (const edge of routing.edges) {
++        append(inputs, edge.child, edge.via ? dots.get(edge.via) : centers[edge.owner])
++        if (!edge.via) append(outputs, edge.owner, centers[edge.child])
++    }
++    for (const dot of routing.junctions) {
++        if (dot.owner && centers[dot.owner]) append(outputs, dot.owner, dot)
++        for (const child of dot.targets ?? []) append(inputs, child, dot)
++    }
++    return Object.fromEntries(Object.entries(centers).map(([id, center]) => {
++        const towardInput = facing(center, inputs.get(id) ?? []), towardOutput = facing(center, outputs.get(id) ?? [])
++        return [id, { input: towardInput ?? (towardOutput ? opposite[towardOutput] : 'top'), output: towardOutput ?? (towardInput ? opposite[towardInput] : 'bottom') }]
++    }))
++}
++/** Opposing directions can share a face in a folded graph; separate their hitboxes. */
++export function nodePortOffset(ports: NodePorts, direction: keyof NodePorts): GraphPoint {
++    const side = ports[direction], offset = ports.input === ports.output ? (direction === 'input' ? -16 : 16) : 0
++    return side === 'left' || side === 'right' ? { x: side === 'left' ? 0 : NODE_SIZE.width, y: NODE_SIZE.height / 2 + offset }
++        : { x: NODE_SIZE.width / 2 + offset, y: side === 'top' ? 0 : NODE_SIZE.height }
++}
++/** junctionCurve expects output travel and input travel directions, not two outward normals. */
++export function nodePortRotation(side: PortSide, direction: keyof NodePorts): number {
++    const output = { bottom: 0, left: 90, top: 180, right: 270 }[side]
++    return direction === 'output' ? output : (output + 180) % 360
++}
+--- /dev/null
++++ b/web/src/lib/nodePorts.test.ts
+@@ -0,0 +1,34 @@
++import { expect, it } from 'vitest'
++import { autoNodePorts, nodePortOffset, nodePortRotation } from './nodePorts'
++import { junctionCurve } from './nodeGraphJunctions'
++const wire = { owner: 'A', child: 'B' }
++it.each([
++    [{ x: 400, y: 0 }, 'right', 'left'], [{ x: 300, y: 150 }, 'right', 'left'], [{ x: -400, y: 0 }, 'left', 'right'],
++    [{ x: 0, y: 200 }, 'bottom', 'top'], [{ x: 0, y: -200 }, 'top', 'bottom'],
++] as const)('faces connected cards in each direction %j', (point, output, input) => {
++    const ports = autoNodePorts({ A: { x: 0, y: 0 }, B: point }, { junctions: [], edges: [wire] })
++    expect(ports.A!.output).toBe(output);expect(ports.B!.input).toBe(input)
++    expect(ports.B!.output).toBe(output)
++})
++it('uses immediate junction positions rather than distant logical child positions', () => {
++    const ports = autoNodePorts({ A: { x: 0, y: 0 }, B: { x: 0, y: 500 } }, { junctions: [{ id: 'J', x: 400, y: 40, owner: 'A' }], edges: [{ ...wire, via: 'J' }] })
++    expect(ports.A!.output).toBe('right');expect(ports.B!.input).toBe('top')
++})
++it('orients disconnected junction targets and averages fanout without altering topology', () => {
++    const routing = { junctions: [{ id: 'J', x: -200, y: 40, owner: null, targets: ['A'] }], edges: [{ ...wire }, { owner: 'A', child: 'C' }] }
++    const before = structuredClone(routing)
++    const ports = autoNodePorts({ A: { x: 0, y: 0 }, B: { x: 400, y: -50 }, C: { x: 400, y: 50 } }, routing)
++    expect(ports.A).toEqual({ input: 'left', output: 'right' });expect(routing).toEqual(before)
++})
++it('separates input/output hitboxes on folded same-side connections', () => {
++    const ports = autoNodePorts({ A: { x: 0, y: 0 }, B: { x: 400, y: 0 }, C: { x: 800, y: 0 } }, { junctions: [], edges: [wire, { owner: 'B', child: 'C' }] })
++    expect(ports.B).toEqual({ input: 'left', output: 'right' })
++    const folded = { input: 'left', output: 'left' } as const
++    expect(nodePortOffset(folded, 'input')).toEqual({ x: 0, y: 24 })
++    expect(nodePortOffset(folded, 'output')).toEqual({ x: 0, y: 56 })
++})
++it('keeps an unwired card vertical and gives horizontal cables horizontal tangents', () => {
++    expect(autoNodePorts({ A: { x: 0, y: 0 } }, { junctions: [], edges: [] }).A).toEqual({ input: 'top', output: 'bottom' })
++    const path = junctionCurve({ x: 200, y: 40 }, { x: 400, y: 40 }, { rotation: nodePortRotation('right', 'output') }, { rotation: nodePortRotation('left', 'input') })
++    expect(path).toBe('M200 40 C264 40 336 40 400 40')
++})

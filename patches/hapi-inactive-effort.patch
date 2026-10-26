@@ -1,0 +1,40 @@
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -835,7 +835,9 @@
+             return engine
+         }
+ 
+-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
++        // Offline chats may change reasoning: applySessionConfig stores it and resume passes it to the CLI,
++        // exactly as the model route already does. Requiring an active session made the picker fail silently.
++        const sessionResult = requireSessionFromParam(c, engine)
+         if (sessionResult instanceof Response) {
+             return sessionResult
+         }
+--- a/hub/src/web/routes/sessions.test.ts
++++ b/hub/src/web/routes/sessions.test.ts
+@@ -635,6 +635,24 @@
+ 
+ 
+ 
++    it('applies Claude reasoning effort to an offline chat so resume uses it', async () => {
++        const session = createSession({
++            active: false,
++            metadata: { path: '/tmp/project', host: 'localhost', flavor: 'claude' }
++        })
++        const { app, applySessionConfigCalls } = createApp(session)
++
++        const response = await app.request('/api/sessions/session-1/effort', {
++            method: 'POST',
++            headers: { 'content-type': 'application/json' },
++            body: JSON.stringify({ effort: 'max' })
++        })
++
++        expect(response.status).toBe(200)
++        expect(await response.json()).toEqual({ ok: true })
++        expect(applySessionConfigCalls).toEqual([['session-1', { effort: 'max' }]])
++    })
++
+     it('applies model reasoning effort changes for remote OpenCode sessions', async () => {
+         const session = createSession({
+             metadata: {

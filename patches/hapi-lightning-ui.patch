@@ -1,0 +1,208 @@
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -145,6 +145,20 @@
+ })
+ 
+ describe('NodeGraphView', () => {
++    it('opens the selected chat immediately unless the graph navigation pin is enabled', async () => {
++        const { onOpenChat } = setup()
++        fireEvent.click(await screen.findByRole('button', { name: 'Node Bravo' }))
++        expect(onOpenChat).toHaveBeenLastCalledWith('B')
++        onOpenChat.mockClear()
++        fireEvent.click(screen.getByRole('button', { name: 'Pin current chat' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Node Alpha' }))
++        expect(onOpenChat).not.toHaveBeenCalled()
++        expect(screen.getByRole('button', { name: 'Pin current chat' })).toHaveAttribute('aria-pressed', 'true')
++        fireEvent.click(screen.getByRole('button', { name: 'Pin current chat' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Node Alpha' }))
++        expect(onOpenChat).toHaveBeenLastCalledWith('A')
++    })
++
+     it('draws the overseer root, statuses, lone area and asleep/active edges', async () => {
+         setup()
+         const overseer = await screen.findByRole('button', { name: 'Node Overseer chat' })
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,3 +1,4 @@
++import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import * as Popover from '@radix-ui/react-popover'
+ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+@@ -56,6 +57,7 @@
+     const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
+     const [selectedAnnotation, setSelectedAnnotation] = useState<string | null>(null)
+     const [editingAnnotation, setEditingAnnotation] = useState<{ workspace: string; before: NodeAnnotation | null; value: NodeAnnotation } | null>(null)
++    const { chatPinned, toggleChatPinned } = useNodeChatPin()
+     const [menu, setMenu] = useState<{ id: string; mode: 'actions' | 'owner' } | null>(null)
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+@@ -320,7 +322,7 @@
+                 remember({ kind: 'move', workspace: graph!.activeWorkspaceId, id: g.id, before: g.origin, after: g.last })
+                 if (g.id !== overseer || graph?.graph.nodes.some(n => n.sessionId === g.id)) queueSave(g.id, g.last)
+             }
+-            else if (!cancelled) openMenu(g.id)
++            else if (!cancelled) selectNode(g.id)
+         } else if (g.kind === 'link') {
+             setLink(null)
+             const target = cancelled ? null : linkTarget(g.from, toGraph(event.clientX, event.clientY))
+@@ -341,6 +343,7 @@
+         }
+     }
+ 
++    const selectNode = (id: string) => { openMenu(id); if (!chatPinned && sessionsById.has(id)) onOpenChat(id) }
+     const openMenu = (id: string) => { setSelectedJunction(null); setMovingJunction(null); setMenu({ id, mode: 'actions' }); setError(null) }
+     const remember = (edit: GraphEdit) => setHistory(old => [...old.slice(-49), edit])
+     const act = async <T,>(key: string, run: (client: ApiClient) => Promise<T>, graphOf?: (result: T) => NodeGraphResponse | null): Promise<T | null> => {
+@@ -515,6 +518,10 @@
+             {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
+                 <div className="flex items-start gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
+                 <div className="pointer-events-auto flex shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
++                    <button type="button" aria-label="Pin current chat" aria-pressed={chatPinned} title={chatPinned ? 'Chat pinned: node clicks keep the current chat' : 'Pin chat while selecting nodes'} onClick={toggleChatPinned}
++                        className={`${iconButton} ${chatPinned ? 'bg-[var(--app-subtle-bg)] text-[var(--app-link)]' : ''}`}>
++                        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill={chatPinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.5"><path d="m9 3 6 0-1 6 4 4v2H6v-2l4-4-1-6ZM12 15v6" /></svg>
++                    </button>
+                     <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
+                     <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={() => addJunction()} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
+                     <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
+@@ -563,7 +570,8 @@
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+                         <button type="button" aria-label={`Node ${name}`} aria-haspopup="dialog" aria-expanded={menu?.id === id}
+-                            onClick={event => { if (event.detail === 0) openMenu(id) }}
++                            onClick={event => { if (event.detail === 0) selectNode(id) }}
++                            onContextMenu={event => { event.preventDefault(); openMenu(id) }}
+                             className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : menu?.id === id ? 'border-[var(--app-link)]' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
+                             <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
+                             <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -364,7 +364,7 @@
+     return (
+         <>
+             <div className="app-window-chrome bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+-                <div className="mx-auto w-full max-w-content flex items-center gap-2 p-3">
++                <div className="mx-auto w-full max-w-content flex items-center gap-[0.4rem] p-[0.6rem] min-[920px]:gap-2 min-[920px]:p-3">
+                     {props.onBack ? <button type="button" aria-label="Back to chats" title="Back to chats" onClick={props.onBack}
+                         className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+                         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><path d="m12 5-7 7 7 7M5 12h14" /></svg>
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -108,14 +108,14 @@
+                 </button>}
+                 {displayedRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+                     {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+-                    <div className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
++                    <div className="flex min-w-0 flex-wrap items-start gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile && !props.embedded) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+-                            <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile && !props.embedded) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg px-2 py-2.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                            <SessionRowSummary session={session} showPath alignActivityColumns managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+                         <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+                     </div>
+-                    <div className="ml-auto flex shrink-0 items-center gap-1">
++                    <div className="ml-auto flex w-[7.5rem] shrink-0 items-center justify-end gap-1">
+                         {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+diff --git a/web/src/components/SessionRowSummary.tsx b/web/src/components/SessionRowSummary.tsx
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -108,6 +108,8 @@
+     projectLabel?: string
+     /** Machine label shown next to the project name (pinned "in progress" rows). */
+     machineLabel?: string
++    /** Stable status/time columns in the Session Manager. */
++    alignActivityColumns?: boolean
+ }) {
+     const {
+         session: s,
+@@ -123,6 +125,7 @@
+         inRunningSection = false,
+         projectLabel,
+         machineLabel,
++        alignActivityColumns = false,
+     } = props
+     const { t } = useTranslation()
+     const sessionName = getSessionTitle(s)
+@@ -153,9 +156,20 @@
+     const scheduleId = scheduleTooltipIdProp ?? ownedIds.scheduleId
+     const timeLabel = getSessionTimeLabel(s, t)
+ 
++    const activity = (
++        s.active && (s.thinking || (s.backgroundTaskCount ?? 0) > 0) ? (
++                        <span aria-label={s.thinking ? 'Running' : 'Background'} data-testid={s.thinking ? (managed ? 'managed-running' : 'activity-progress') : 'background-idle'}
++                            className={`shrink-0 text-[11px] font-medium ${managed ? 'text-violet-500' : s.thinking ? 'text-green-500' : 'text-[var(--app-hint)]'}`}>
++                            {s.thinking ? 'Running' : 'Background'}
++                        </span>
++                    ) : managed ? (
++                        <span aria-label="Managed session" className="shrink-0 text-[11px] font-medium text-violet-500">Managed</span>
++                    ) : null
++    )
++
+     return (
+         <div className={`flex w-full min-w-0 flex-col gap-1 ${className ?? ''}`}>
+-            <div className={`grid grid-cols-[minmax(9rem,1fr)_minmax(0,max-content)] items-center gap-2 ${!s.active ? 'opacity-50' : ''}`}>
++            <div className={`grid ${alignActivityColumns ? 'grid-cols-[minmax(0,1fr)_4.5rem_3.5rem]' : 'grid-cols-[minmax(9rem,1fr)_minmax(0,max-content)]'} items-center gap-2 ${!s.active ? 'opacity-50' : ''}`}>
+                 <div className="flex min-w-0 items-center gap-2">
+                     <AgentFlavorIcon flavor={s.metadata?.flavor} className="h-4 w-4 shrink-0 -translate-y-px" />
+                     <div
+@@ -164,14 +178,7 @@
+                     >
+                         {sessionName}
+                     </div>
+-                    {s.active && (s.thinking || (s.backgroundTaskCount ?? 0) > 0) ? (
+-                        <span aria-label={s.thinking ? 'Running' : 'Background'} data-testid={s.thinking ? (managed ? 'managed-running' : 'activity-progress') : 'background-idle'}
+-                            className={`shrink-0 text-[11px] font-medium ${managed ? 'text-violet-500' : s.thinking ? 'text-green-500' : 'text-[var(--app-hint)]'}`}>
+-                            {s.thinking ? 'Running' : 'Background'}
+-                        </span>
+-                    ) : managed ? (
+-                        <span aria-label="Managed session" className="shrink-0 text-[11px] font-medium text-violet-500">Managed</span>
+-                    ) : null}
++                    {!alignActivityColumns ? activity : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+@@ -244,7 +251,8 @@
+                         </span>
+                     ) : null}
+                 </div>
+-                <div className="flex min-w-0 items-center justify-end gap-2 overflow-hidden text-xs">
++                {alignActivityColumns ? <div data-session-activity-column className="min-w-0 text-left">{activity}</div> : null}
++                <div data-session-time-column={alignActivityColumns || undefined} className="flex min-w-0 items-center justify-end gap-2 overflow-hidden text-xs">
+                     {todoProgress ? (
+                         <span className="flex shrink-0 items-center gap-1 text-[var(--app-hint)]">
+                             <BulbIcon className="h-3 w-3" />
+diff --git a/web/src/hooks/useNodeChatPin.ts b/web/src/hooks/useNodeChatPin.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/hooks/useNodeChatPin.ts
+@@ -0,0 +1,23 @@
++import { useCallback, useEffect, useState } from 'react'
++const KEY = 'hapi-node-chat-pin'
++const EVENT = 'hapi-node-chat-pin-change'
++function read() {
++    try { return localStorage.getItem(KEY) === 'true' } catch { return false }
++}
++/** A navigation lock only for node clicks. Sidebar/other navigation is never intercepted. */
++export function useNodeChatPin() {
++    const [chatPinned, setChatPinned] = useState(read)
++    useEffect(() => {
++        const sync = () => setChatPinned(read())
++        const storage = (event: StorageEvent) => { if (event.key === KEY || event.key === null) sync() }
++        window.addEventListener(EVENT, sync); window.addEventListener('storage', storage)
++        return () => { window.removeEventListener(EVENT, sync); window.removeEventListener('storage', storage) }
++    }, [])
++    const toggleChatPinned = useCallback(() => {
++        const next = !chatPinned
++        setChatPinned(next)
++        try { localStorage.setItem(KEY, String(next)); window.dispatchEvent(new Event(EVENT)) }
++        catch { /* Keep this window usable without storage. */ }
++    }, [chatPinned])
++    return { chatPinned, toggleChatPinned }
++}

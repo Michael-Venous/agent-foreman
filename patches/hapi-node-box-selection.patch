@@ -1,0 +1,257 @@
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -30,7 +30,9 @@
+     return { ...routing, edges: [...routing.edges.filter(e => e.child !== wire.child && e.child !== child), ...(child ? [{ ...wire, child }] : [])] }
+ }
+ 
++type SelectionRect = { x: number; y: number; width: number; height: number }
+ type Gesture =
++    | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
+     | { kind: 'junction-move'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'annotation'; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'pan'; pointer: number; x: number; y: number; view: View }
+@@ -69,7 +71,10 @@
+     const viewRef = useRef(view); viewRef.current = view
+     const [overrides, setOverrides] = useState<Record<string, GraphPoint>>({})
+     const [junctionDrafts, setJunctionDrafts] = useState<Record<string, GraphPoint>>({})
+-    const [selectedNode, setSelectedNode] = useState<string | null>(null)
++    const [selectedNodes, setSelectedNodes] = useState<string[]>([])
++    const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null
++    const setSelectedNode = (id: string | null) => setSelectedNodes(id ? [id] : [])
++    const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null)
+     const [selectedJunction, setSelectedJunction] = useState<string | null>(null)
+     const [movingJunction, setMovingJunction] = useState<string | null>(null)
+     const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, NodeAnnotation>>({})
+@@ -100,6 +105,20 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
++    const cancelBoxSelection = () => {
++        const current = gesture.current
++        if (current?.kind !== 'box') return
++        setSelectedNodes(current.before); setSelectionRect(null)
++        pointers.current.delete(current.pointer); gesture.current = null
++    }
++    const cancelBoxRef = useRef(cancelBoxSelection); cancelBoxRef.current = cancelBoxSelection
++    useEffect(() => {
++        const cancel = () => cancelBoxRef.current()
++        const hidden = () => { if (document.hidden) cancel() }
++        window.addEventListener('blur', cancel); window.addEventListener('resize', cancel); document.addEventListener('visibilitychange', hidden)
++        return () => { window.removeEventListener('blur', cancel); window.removeEventListener('resize', cancel); document.removeEventListener('visibilitychange', hidden) }
++    }, [])
++    useEffect(() => { if (!visible) cancelBoxRef.current() }, [visible])
+     const lastPointerType = useRef('mouse')
+     const touchMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const cancelTouchMenu = () => { if (touchMenuTimer.current) clearTimeout(touchMenuTimer.current); touchMenuTimer.current = null }
+@@ -149,7 +168,7 @@
+     useEffect(() => {
+         if (!graph || !layout || fittedWorkspace.current === graph.activeWorkspaceId) return
+         fittedWorkspace.current = graph.activeWorkspaceId
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null); fit()
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null); fit()
+         // Fit once per workspace; later polls keep the user's pan/zoom.
+         // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, [graph?.activeWorkspaceId, layout])
+@@ -186,7 +205,7 @@
+         const element = canvas.current
+         if (!element) return
+         // Non-passive so the page does not scroll while zooming.
+-        const wheel = (event: WheelEvent) => { event.preventDefault(); zoomRef.current(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX, event.clientY) }
++        const wheel = (event: WheelEvent) => { event.preventDefault(); if (gesture.current?.kind === 'box') return; zoomRef.current(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX, event.clientY) }
+         element.addEventListener('wheel', wheel, { passive: false })
+         return () => element.removeEventListener('wheel', wheel)
+     }, [enabled])
+@@ -274,6 +293,7 @@
+         lastPointerType.current = event.pointerType || 'mouse'
+         if (target.closest('[data-graph-ui]')) return
+         if ((event.button !== 0 && event.button !== 1) || pending || mutationBusy.current || dropInFlight.current) return
++        if (gesture.current?.kind === 'box') cancelBoxSelection()
+         if (event.button === 1) {
+             event.preventDefault(); event.currentTarget.focus({ preventScroll: true }); cancelTouchMenu()
+             pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+@@ -292,7 +312,7 @@
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+         const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
+-        if (!node) setSelectedNode(null)
++        if (!node && (annotation || dotId || handle || input || event.pointerType === 'touch' || !(event.shiftKey || event.ctrlKey || event.metaKey))) setSelectedNode(null)
+         if (dotId) {
+             setMenu(null); setSelectedJunction(dotId)
+             const dot = junctionsRef.current.find(j => j.id === dotId)!
+@@ -318,7 +338,12 @@
+             }
+         }
+         else {
+-            gesture.current = event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
++            setMenu(null); setObjectMenu(null)
++            const mouse = !event.pointerType || event.pointerType === 'mouse'
++            gesture.current = mouse ? { kind: 'box', pointer: event.pointerId, x: event.clientX, y: event.clientY,
++                origin: toGraph(event.clientX, event.clientY), before: selectedNodes,
++                mode: event.ctrlKey || event.metaKey ? 'subtract' : event.shiftKey ? 'add' : 'replace', moved: false }
++                : event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
+             if (event.pointerType === 'touch') {
+                 event.preventDefault()
+                 const at = { x: event.clientX, y: event.clientY }, pointer = event.pointerId
+@@ -348,6 +373,19 @@
+         }
+         if (g.pointer !== event.pointerId) return
+         if ((g.kind === 'node' || g.kind === 'pan') && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) cancelTouchMenu()
++        if (g.kind === 'box') {
++            if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
++            g.moved = true
++            const end = toGraph(event.clientX, event.clientY)
++            const rect = { x: Math.min(g.origin.x, end.x), y: Math.min(g.origin.y, end.y), width: Math.abs(end.x - g.origin.x), height: Math.abs(end.y - g.origin.y) }
++            const hits = Object.keys(positionsRef.current).filter(id => {
++                const point = positionsRef.current[id]!
++                return point.x <= rect.x + rect.width && point.x + NODE_SIZE.width >= rect.x && point.y <= rect.y + rect.height && point.y + NODE_SIZE.height >= rect.y
++            })
++            setSelectionRect(rect)
++            setSelectedNodes(g.mode === 'replace' ? hits : g.mode === 'add' ? [...new Set([...g.before, ...hits])] : g.before.filter(id => !hits.includes(id)))
++            return
++        }
+         if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + event.clientX - g.x, y: g.view.y + event.clientY - g.y })
+         else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ fixed: g.from, direction: 'child', to, target: linkTarget(g.from, to) }) }
+         else if (g.kind === 'input') {
+@@ -402,6 +440,12 @@
+         cancelTouchMenu()
+         pointers.current.delete(event.pointerId)
+         const g = gesture.current
++        if (g?.kind === 'box' && g.pointer === event.pointerId) {
++            gesture.current = null; setSelectionRect(null)
++            if (event.type === 'pointercancel') setSelectedNodes(g.before)
++            if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
++            return
++        }
+         if (event.pointerType !== 'touch' && event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+         if (!g) return
+         if (g.kind === 'pinch') { if (pointers.current.size < 2) gesture.current = null; return }
+@@ -790,6 +834,7 @@
+             }}
+             onKeyDown={event => {
+                 const target = event.target instanceof Element ? event.target : null
++                if (event.key === 'Escape' && gesture.current?.kind === 'box') { event.preventDefault(); event.stopPropagation(); cancelBoxSelection(); return }
+                 if ((event.key === 'Delete' || event.key === 'Backspace') && !event.ctrlKey && !event.metaKey && !target?.closest('input, textarea, select, [contenteditable], [data-graph-ui]') && selectedNode) { event.preventDefault(); event.stopPropagation(); void removeNode(selectedNode); return }
+                 if (event.shiftKey && event.key.toLowerCase() === 'a' && event.target === event.currentTarget) {
+                     event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); showAddMenu(rect.left + rect.width / 2, rect.top + rect.height / 2); return
+@@ -798,9 +843,11 @@
+             onAuxClick={event => { if (event.button === 1) event.preventDefault() }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+-            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
++            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'box' && g.pointer === event.pointerId) { cancelBoxSelection(); return } if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
+             style={grid.visible ? { backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--app-hint) 35%, transparent) 0.5px, transparent 0.65px)', backgroundSize: `${grid.size * view.k}px ${grid.size * view.k}px`, backgroundPosition: `${view.x}px ${view.y}px` } : undefined}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-default outline-none">
++            {selectionRect && <div data-testid="graph-selection-box" aria-hidden="true" className="pointer-events-none absolute z-10 border border-[var(--app-link)] bg-[var(--app-link)]/10"
++                style={{ left: view.x + selectionRect.x * view.k, top: view.y + selectionRect.y * view.k, width: selectionRect.width * view.k, height: selectionRect.height * view.k }} />}
+             <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
+                 <Popover.Portal><Popover.Content data-graph-ui aria-label="Add node" onKeyDown={addMenuKeys} side="bottom" align="start" sideOffset={0} collisionPadding={12}
+@@ -858,11 +905,11 @@
+                 {ids.map(id => {
+                     const point = positions[id]!, session = sessionsById.get(id), status = nodeStatus(session, sessions !== undefined), name = title(id)
+                     return <div key={id} data-node-id={id} className="absolute z-[2]" style={{ left: point.x, top: point.y, width: NODE_SIZE.width, height: NODE_SIZE.height }}>
+-                        <button type="button" aria-label={`Node ${name}`} aria-pressed={selectedNode === id} aria-haspopup="dialog" aria-expanded={menu?.id === id}
++                        <button type="button" aria-label={`Node ${name}`} aria-pressed={selectedNodes.includes(id)} aria-haspopup="dialog" aria-expanded={menu?.id === id}
+                             onClick={event => { if (event.detail === 0) selectNode(id) }}
+                             onContextMenu={event => { event.preventDefault(); openMenu(id, { x: event.clientX, y: event.clientY }) }}
+                             onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); event.stopPropagation(); openMenu(id) } }}
+-                            className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : selectedNode === id ? 'border-[#ed9b4b] ring-1 ring-[#ed9b4b]/40' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
++                            className={`flex h-full w-full min-w-0 flex-col justify-center gap-1 rounded-xl border bg-[var(--app-bg)] px-3 text-left shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${link?.target === id ? 'border-[var(--app-link)] ring-2 ring-[var(--app-link)]' : selectedNodes.includes(id) ? 'border-[#ed9b4b] ring-1 ring-[#ed9b4b]/40' : id === overseer ? 'border-violet-500/60' : 'border-[var(--app-border)]'} ${status === 'Unavailable' || status === 'Inactive' ? 'opacity-70' : ''}`}>
+                             <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
+                             <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
+                                 {id === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 font-medium text-violet-500">Overseer</span>}
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1370,3 +1370,90 @@
+     expect(within(screen.getByRole('button', { name: 'Node Lone one' })).getByText(/Inactive.*1 background verified/)).toBeInTheDocument()
+     expect(api.abortSession).not.toHaveBeenCalled()
+ })
++
++const boxBounds = (...ids: string[]) => {
++    const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!
++    const k = Number(/scale\(([-\d.e]+)\)/.exec(world.style.transform)![1])
++    const centres = ids.map(nodeCentre)
++    return { left: Math.min(...centres.map(p => p.clientX - NODE_SIZE.width * k / 2)) - 4,
++        top: Math.min(...centres.map(p => p.clientY - NODE_SIZE.height * k / 2)) - 4,
++        right: Math.max(...centres.map(p => p.clientX + NODE_SIZE.width * k / 2)) + 4,
++        bottom: Math.max(...centres.map(p => p.clientY + NODE_SIZE.height * k / 2)) + 4 }
++}
++const boxDrag = (ids: string[], modifiers: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean } = {}, reverse = false) => {
++    const canvas = screen.getByRole('application'), rect = boxBounds(...ids)
++    fireEvent.pointerDown(canvas, { pointerId: 71, pointerType: 'mouse', button: 0,
++        clientX: reverse ? rect.right : rect.left, clientY: reverse ? rect.bottom : rect.top, ...modifiers })
++    fireEvent.pointerMove(canvas, { pointerId: 71, pointerType: 'mouse',
++        clientX: reverse ? rect.left : rect.right, clientY: reverse ? rect.top : rect.bottom })
++    return canvas
++}
++
++describe('desktop drag box selection', () => {
++    it.each([false, true])('selects multiple cards in either drag direction (%s), without opening chats or changing work', async reverse => {
++        const { api, onOpenChat } = setup()
++        const bravo = await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = boxDrag(['A', 'B'], {}, reverse)
++        expect(screen.getByTestId('graph-selection-box')).toBeInTheDocument()
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.getByRole('button', { name: 'Node Charlie' })).toHaveAttribute('aria-pressed', 'false')
++        fireEvent.pointerUp(canvas, { pointerId: 71, pointerType: 'mouse' })
++        expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++        expect(onOpenChat).not.toHaveBeenCalled()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled()
++        expect(api.editNodeVisual).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled()
++    })
++    it('supports additive Shift and subtractive Ctrl/Command drags', async () => {
++        setup(); const bravo = await screen.findByRole('button', { name: 'Node Bravo' })
++        fireEvent.click(bravo)
++        fireEvent.pointerUp(boxDrag(['A'], { shiftKey: true }), { pointerId: 71 })
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'true')
++        fireEvent.pointerUp(boxDrag(['A'], { ctrlKey: true }), { pointerId: 71 })
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'false')
++        fireEvent.pointerUp(boxDrag(['B'], { metaKey: true }), { pointerId: 71 })
++        expect(bravo).toHaveAttribute('aria-pressed', 'false')
++    })
++    it.each(['escape', 'pointerCancel', 'lostPointerCapture', 'blur', 'resize'])('restores the previous selection on %s', async cancel => {
++        setup(); const bravo = await screen.findByRole('button', { name: 'Node Bravo' })
++        fireEvent.click(bravo); const canvas = boxDrag(['A'])
++        expect(bravo).toHaveAttribute('aria-pressed', 'false')
++        if (cancel === 'escape') fireEvent.keyDown(canvas, { key: 'Escape' })
++        else if (cancel === 'blur') fireEvent.blur(window)
++        else if (cancel === 'resize') fireEvent.resize(window)
++        else if (cancel === 'pointerCancel') fireEvent.pointerCancel(canvas, { pointerId: 71 })
++        else fireEvent.lostPointerCapture(canvas, { pointerId: 71 })
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++        fireEvent.pointerUp(canvas, { pointerId: 71 })
++        expect(bravo).toHaveAttribute('aria-pressed', 'true')
++    })
++    it('uses graph coordinates after zoom and pan, and does not zoom mid-box', async () => {
++        const { onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = screen.getByRole('application')
++        fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++        fireEvent.pointerDown(canvas, { pointerId: 5, button: 1, clientX: 20, clientY: 30 })
++        fireEvent.pointerMove(canvas, { pointerId: 5, clientX: 130, clientY: 90 })
++        fireEvent.pointerUp(canvas, { pointerId: 5 })
++        const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!, before = world.style.transform
++        boxDrag(['B']); fireEvent.wheel(canvas, { deltaY: -200 })
++        expect(world.style.transform).toBe(before)
++        fireEvent.pointerUp(canvas, { pointerId: 71 })
++        expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-pressed', 'true')
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toHaveAttribute('aria-pressed', 'false')
++        expect(onOpenChat).not.toHaveBeenCalled()
++    })
++    it('retains touch panning and does not create a mouse selection rectangle', async () => {
++        setup(); await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = screen.getByRole('application'), world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!
++        const before = world.style.transform
++        fireEvent.pointerDown(canvas, { pointerId: 33, pointerType: 'touch', button: 0, clientX: 0, clientY: 0 })
++        fireEvent.pointerMove(canvas, { pointerId: 33, pointerType: 'touch', clientX: 80, clientY: 80 })
++        fireEvent.pointerUp(canvas, { pointerId: 33, pointerType: 'touch' })
++        expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++        expect(world.style.transform).not.toBe(before)
++    })
++})

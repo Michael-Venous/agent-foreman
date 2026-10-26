@@ -1,0 +1,487 @@
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -26,6 +26,7 @@
+ import { useAppContext } from '@/lib/app-context'
+ import { useAppGoBack } from '@/hooks/useAppGoBack'
+ import { isTelegramApp } from '@/hooks/useTelegram'
++import { OPEN_CHAT_PANEL_EVENT, useMobileSidebar } from '@/hooks/useMobileSidebar'
+ import { useSidebarResize } from '@/hooks/useSidebarResize'
+ import { useMessages } from '@/hooks/queries/useMessages'
+ import { useMachines } from '@/hooks/queries/useMachines'
+@@ -211,6 +212,8 @@
+     useSelectedSessionSeen(selectedSessionId, selectedSession?.updatedAt)
+     const isSessionsIndex = pathname === '/sessions' || pathname === '/sessions/'
+     const sidebar = useSidebarResize()
++    const mobileSidebar = useMobileSidebar(!isSessionsIndex, pathname)
++    useEffect(() => { if (isSessionsIndex) sidebar.setCollapsed(false) }, [isSessionsIndex, sidebar.setCollapsed])
+     const handleNewSessionInDirectory = useCallback((args: { machineId: string | null; directory: string }) => {
+         navigate({
+             to: '/sessions/new',
+@@ -223,9 +226,13 @@
+ 
+     return (
+         <>
+-            <div className="flex h-full min-h-0">
++            <div className="relative flex h-full min-h-0 touch-pan-y split:touch-auto" {...mobileSidebar.handlers}>
++            {mobileSidebar.open && !isSessionsIndex ? <button type="button" aria-label="Close chat panel" onClick={mobileSidebar.close}
++                className="absolute inset-0 z-30 bg-black/30 split:hidden" /> : null}
+             <div
+-                className={`${isSessionsIndex ? 'flex' : 'hidden split:flex'} ${sidebar.collapsed ? 'split:hidden!' : ''} w-full shrink-0 flex-col bg-[var(--app-bg)]`}
++                className={`${isSessionsIndex ? 'flex w-full' : mobileSidebar.open ? 'absolute inset-y-0 left-0 z-40 flex w-[min(85vw,420px)] shadow-xl split:static split:z-auto split:shadow-none' : 'hidden split:flex w-full'} ${sidebar.collapsed ? 'split:hidden!' : ''} shrink-0 flex-col bg-[var(--app-bg)]`}
++                data-chat-panel
++                aria-label="Chats panel"
+                 style={{ '--sidebar-w': `${sidebar.width}px` } as React.CSSProperties}
+             >
+                 <div className="flex min-h-0 flex-1 flex-col pt-[env(safe-area-inset-top)]">
+@@ -238,7 +245,7 @@
+                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}
+                         sessions={sessions}
+                         selectedSessionId={selectedSessionId}
+-                        onSelect={(sessionId) => navigate(getSessionListSelectionNavigation(sessionId))}
++                        onSelect={(sessionId) => { mobileSidebar.close(); navigate(getSessionListSelectionNavigation(sessionId)) }}
+                         onNewSession={() => navigate({
+                             to: '/sessions/new',
+                             ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+@@ -252,10 +259,10 @@
+                             <div className="flex items-center gap-2">
+                                 <button
+                                     type="button"
+-                                    onClick={() => sidebar.setCollapsed(true)}
+-                                    className="hidden split:block p-1.5 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors"
+-                                    title="Hide sidebar"
+-                                    aria-label="Hide sidebar"
++                                    onClick={() => { if (mobileSidebar.open) mobileSidebar.close(); else sidebar.setCollapsed(true) }}
++                                    className={`${mobileSidebar.open ? "block" : "hidden split:block"} p-1.5 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors`}
++                                    title="Collapse chat panel"
++                                    aria-label="Collapse chat panel"
+                                 >
+                                     <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M16 10l-2 2 2 2" /></svg>
+                                 </button>
+@@ -843,7 +850,10 @@
+             messagesVersion={messagesVersion}
+             historyVersion={historyVersion}
+             tailRevision={tailRevision}
+-            onBack={goBack}
++            onBack={() => {
++                if (!window.matchMedia('(min-width: 920px)').matches) window.dispatchEvent(new Event(OPEN_CHAT_PANEL_EVENT))
++                else goBack()
++            }}
+             onRefresh={refreshSelectedSession}
+             onLoadMore={loadMoreMessages}
+             onCancelLoadMore={cancelLoadMoreMessages}
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -343,3 +343,17 @@
+         })
+     }
+ })
++
++
++describe('session tool navigation', () => {
++    it('places Nodes after Session Manager and opens the existing graph window', async () => {
++        renderList()
++        const manager = screen.getByRole('button', { name: 'Session Manager' })
++        const nodes = screen.getByRole('button', { name: 'Nodes' })
++        expect(manager.compareDocumentPosition(nodes) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++        fireEvent.click(nodes)
++        await waitFor(() => expect(nodes).toHaveAttribute('aria-expanded', 'true'))
++        fireEvent.click(nodes)
++        await waitFor(() => expect(nodes).toHaveAttribute('aria-expanded', 'false'))
++    })
++})
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -697,3 +697,46 @@
+     expect(screen.queryByRole('alert')).toBeNull()
+     expect(api.editNodeRouting).toHaveBeenCalledTimes(1)
+ })
++
++describe('canvas Add node menu', () => {
++    it('opens only on empty canvas and adds a searched chat at the clicked graph position, with undo', async () => {
++        const { api, onOpenChat } = setup()
++        const node = await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(node, { clientX: 610, clientY: 390 })
++        expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++        const canvas = screen.getByRole('application', { name: 'Node graph' })
++        const world = document.querySelector('[data-node-id]')!.parentElement!
++        const [, x, y, k] = /translate\(([-\d.e]+)px, ([-\d.e]+)px\) scale\(([-\d.e]+)\)/.exec(world.style.transform)!.map(Number)
++        fireEvent.doubleClick(canvas, { clientX: 610, clientY: 390 })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        fireEvent.change(within(menu).getByRole('searchbox'), { target: { value: 'New' } })
++        expect(within(menu).queryByRole('button', { name: 'Alpha' })).toBeNull()
++        fireEvent.click(within(menu).getByRole('button', { name: 'New chat' }))
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledWith({ N: { x: Math.round((610 - x!) / k!), y: Math.round((390 - y!) / k!) } }))
++        expect(api.addNode).toHaveBeenCalledWith('N')
++        expect(onOpenChat).not.toHaveBeenCalled()
++        expect(api.abortSession).not.toHaveBeenCalled()
++        await screen.findByRole('button', { name: 'Node New chat' })
++        fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['N']))
++    })
++    it('supports Shift+A and adds a branch junction without starting a chat', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        const canvas = screen.getByRole('application', { name: 'Node graph' })
++        fireEvent.keyDown(canvas, { key: 'A', shiftKey: true })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        fireEvent.click(within(menu).getByRole('button', { name: 'Branch junction' }))
++        await waitFor(() => expect(api.editNodeRouting).toHaveBeenCalledOnce())
++        expect(api.addNode).not.toHaveBeenCalled()
++        expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++    })
++    it('opens the text editor at the chosen point and Cancel performs no write', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(screen.getByRole('application', { name: 'Node graph' }), { clientX: 450, clientY: 300 })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        fireEvent.click(within(menu).getByRole('button', { name: 'Text box' }))
++        const editor = await screen.findByRole('dialog', { name: 'Text box' })
++        fireEvent.click(within(editor).getByRole('button', { name: 'Cancel' }))
++        expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++    })
++})
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -1,3 +1,4 @@
++import * as Popover from '@radix-ui/react-popover'
+ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+@@ -59,6 +60,9 @@
+     const [pending, setPending] = useState<string | null>(null)
+     const [error, setError] = useState<string | null>(null)
+     const [stopped, setStopped] = useState<Record<string, boolean>>({})
++    const [addMenu, setAddMenu] = useState<{ x: number; y: number; point: GraphPoint; workspace: string } | null>(null)
++    const [addQuery, setAddQuery] = useState('')
++    useEffect(() => { setAddMenu(null) }, [graph?.activeWorkspaceId])
+     const [dropActive, setDropActive] = useState(false)
+     const dropInFlight = useRef<Promise<void> | null>(null)
+     const [link, setLink] = useState<{ fixed: string; direction: 'child' | 'owner'; to: GraphPoint; target: string | null } | null>(null)
+@@ -360,9 +364,9 @@
+             return result
+         })
+     }
+-    const addJunction = () => {
++    const addJunction = (at?: GraphPoint) => {
+         const rect = canvas.current?.getBoundingClientRect()
+-        const centre = round(toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2))
++        const centre = at ?? round(toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2))
+         const id = `j-${crypto.randomUUID()}`
+         setMenu(null); setSelectedAnnotation(null)
+         void changeRouting(r => ({ ...r, junctions: [...r.junctions, { id, ...centre, owner: null }] })).then(result => { if (result) setSelectedJunction(id) })
+@@ -378,13 +382,13 @@
+         }
+         return result
+     }
+-    const addAnnotation = (kind: NodeAnnotation['kind']) => {
++    const addAnnotation = (kind: NodeAnnotation['kind'], at?: GraphPoint) => {
+         if (!graph) return
+         const rect = canvas.current?.getBoundingClientRect()
+         const centre = toGraph((rect?.left ?? 0) + (canvas.current?.clientWidth || 800) / 2, (rect?.top ?? 0) + (canvas.current?.clientHeight || 600) / 2)
+         const width = kind === 'frame' ? 480 : 280, height = kind === 'frame' ? 320 : 180
+         setMenu(null); setSelectedJunction(null); setMovingJunction(null); setError(null)
+-        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...round({ x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
++        setEditingAnnotation({ workspace: graph.activeWorkspaceId, before: null, value: { id: crypto.randomUUID(), kind, text: kind === 'frame' ? 'Frame' : '', color: kind === 'frame' ? 'blue' : 'amber', ...round(at ?? { x: centre.x - width / 2, y: centre.y - height / 2 }), width, height } })
+     }
+     const editAnnotation = (value: NodeAnnotation) => {
+         if (!graph || pending) return
+@@ -441,7 +445,11 @@
+         const id = readSessionDrag(event.dataTransfer)
+         if (!graph || pending || dropInFlight.current || !id || !sessionsById.has(id) || id === overseer) return
+         const at = toGraph(event.clientX, event.clientY)
+-        const point = round({ x: at.x - NODE_SIZE.width / 2, y: at.y - NODE_SIZE.height / 2 })
++        placeChat(id, round({ x: at.x - NODE_SIZE.width / 2, y: at.y - NODE_SIZE.height / 2 }))
++    }
++    const placeChat = (id: string, point: GraphPoint) => {
++        if (!graph || pending || dropInFlight.current) return
++
+         setMenu(null); setPending(`drop:${id}`); setError(null)
+         dropInFlight.current = (async () => {
+             try {
+@@ -457,6 +465,12 @@
+             finally { setPending(null); dropInFlight.current = null }
+         })()
+     }
++    const showAddMenu = (clientX: number, clientY: number) => {
++        if (!graph || pending || mutationBusy.current || dropInFlight.current) return
++        const rect = canvas.current?.getBoundingClientRect()
++        setMenu(null); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddQuery(''); setError(null)
++        setAddMenu({ x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0), point: round(toGraph(clientX, clientY)), workspace: graph.activeWorkspaceId })
++    }
+     const menuSession = menu ? sessionsById.get(menu.id) : undefined
+     const menuOwner = menu ? layout?.parent[menu.id] : undefined
+     const menuBusy = menu ? !nodeIsIdle(menuSession) && !stopped[menu.id] : false
+@@ -466,16 +480,43 @@
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
+         {(loadError || (error && !menu && !editingAnnotation)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+         <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+-            onKeyDown={event => { if (event.key === 'Escape' && (link || gesture.current?.kind === 'input')) { event.preventDefault(); event.stopPropagation(); gesture.current = null; pointers.current.clear(); setLink(null) } }}
++            onDoubleClick={event => {
++                const target = event.target as Element
++                if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui],[data-node-id],[data-junction-id],[data-annotation-id],button,input,[role="dialog"]')) return
++                event.preventDefault(); showAddMenu(event.clientX, event.clientY)
++            }}
++            onKeyDown={event => {
++                if (event.shiftKey && event.key.toLowerCase() === 'a' && event.target === event.currentTarget) {
++                    event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); showAddMenu(rect.left + rect.width / 2, rect.top + rect.height / 2); return
++                }
++                if (event.key === 'Escape' && (link || gesture.current?.kind === 'input')) { event.preventDefault(); event.stopPropagation(); gesture.current = null; pointers.current.clear(); setLink(null) } }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+             onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-grab outline-none active:cursor-grabbing">
++            <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
++                <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
++                <Popover.Portal><Popover.Content aria-label="Add node" side="bottom" align="start" sideOffset={0} collisionPadding={12}
++                    className="z-[110] max-h-[calc(100dvh-24px)] w-64 max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-2 shadow-xl">
++                    <div className="px-2 py-1 text-xs font-semibold text-[var(--app-hint)]">Add node</div>
++                    <input type="search" aria-label="Search chats for node" placeholder="Search chats…" value={addQuery} onChange={event => setAddQuery(event.target.value)}
++                        className="my-1 min-h-10 w-full rounded-lg bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                    <div className="max-h-48 overflow-y-auto overscroll-contain" aria-label="Available chats">
++                        {(sessions ?? []).filter(session => session.id !== overseer && !ids.includes(session.id) && title(session.id).toLowerCase().includes(addQuery.toLowerCase())).slice(0, 50).map(session => <button type="button" key={session.id} data-add-session={session.id} className={menuItem}
++                            onClick={() => { if (!addMenu || addMenu.workspace !== graph?.activeWorkspaceId) return; const point = addMenu.point; setAddMenu(null); placeChat(session.id, point) }}>{title(session.id)}</button>)}
++                        {!(sessions ?? []).some(session => session.id !== overseer && !ids.includes(session.id) && title(session.id).toLowerCase().includes(addQuery.toLowerCase())) ? <p className="px-2 py-2 text-xs text-[var(--app-hint)]">No matching chats</p> : null}
++                    </div>
++                    <div className="my-1 border-t border-[var(--app-border)]" />
++                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addAnnotation('frame', point) }}>Frame</button>
++                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addAnnotation('text', point) }}>Text box</button>
++                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addJunction(point) }}>Branch junction</button>
++                </Popover.Content></Popover.Portal>
++            </Popover.Root>
+             {graph && <div data-graph-ui className="pointer-events-none absolute inset-x-2 top-2 z-30">
+                 <div className="flex items-start gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
+                 <div className="pointer-events-auto flex shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1 shadow">
+                     <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
+-                    <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={addJunction} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
++                    <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={() => addJunction()} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
+                     <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
+                 </div></div>
+             </div>}
+--- a/web/src/components/NodeGraphWindow.tsx
++++ b/web/src/components/NodeGraphWindow.tsx
+@@ -16,7 +16,7 @@
+     return useFloatingWindow(NODE_GRAPH_WINDOW)
+ }
+ 
+-/** Chat header entry to the graph: opens the floating graph window; when open, collapses/expands it. */
++/** Session-list entry to the graph: opens the floating graph window; when open, collapses/expands it. */
+ export function NodesButton() {
+     const { open, collapsed, setOpen, setCollapsed } = useNodeGraphWindow()
+     return <button type="button" aria-label="Nodes" aria-expanded={open && !collapsed} title={open ? (collapsed ? 'Show node graph' : 'Collapse node graph') : 'Node graph'}
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1,4 +1,5 @@
+ import { useSessionManager } from '@/hooks/useSessionManager'
++import { NodesButton } from '@/components/NodeGraphWindow'
+ import { SessionManagerLauncher } from '@/components/SessionManagerButton'
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import { SessionListScrollAnchor } from './SessionListScrollAnchor'
+@@ -1930,7 +1931,10 @@
+                 </div>
+             ) : null}
+ 
+-            <SessionManagerLauncher count={Object.values(sessionManagerEntries).filter(entry => !entry.dismissed).length} />
++            <div className="flex shrink-0 items-center gap-1 pr-3" aria-label="Session tools">
++                <div className="min-w-0 flex-1"><SessionManagerLauncher count={Object.values(sessionManagerEntries).filter(entry => !entry.dismissed).length} /></div>
++                <NodesButton />
++            </div>
+             {showMachineFilterBar ? (
+                 <MachineFilterBar
+                     machines={machineFilterItems}
+--- a/web/src/components/SessionHeader.test.tsx
++++ b/web/src/components/SessionHeader.test.tsx
+@@ -395,32 +395,14 @@
+     })
+ })
+ 
+-describe('SessionHeader Nodes button', () => {
+-    const header = (client: QueryClient) => render(
+-        <QueryClientProvider client={client}><ToastProvider><I18nProvider>
+-            <SessionHeader session={baseSession()} api={null} />
+-        </I18nProvider></ToastProvider></QueryClientProvider>
+-    )
+-    it('replaces the back arrow and opens the floating node graph window (no full page)', () => {
+-        routerMock.navigate.mockClear()
+-        const client = new QueryClient()
+-        header(client)
+-        const nodes = screen.getByRole('button', { name: 'Nodes' })
+-        expect(nodes.className).toContain('h-10')
+-        fireEvent.click(nodes)
+-        expect(client.getQueryData<{ open?: boolean; collapsed?: boolean }>(['node-graph-window'])).toMatchObject({ open: true, collapsed: false })
+-        expect(routerMock.navigate).not.toHaveBeenCalled()
+-    })
+-    it('toggles the detached graph window instead of navigating when it is open', async () => {
+-        routerMock.navigate.mockClear()
+-        const client = new QueryClient()
+-        client.setQueryData(['node-graph-window'], { open: true, collapsed: false })
+-        header(client)
+-        fireEvent.click(screen.getByRole('button', { name: 'Nodes' }))
+-        expect(client.getQueryData<{ collapsed?: boolean }>(['node-graph-window'])?.collapsed).toBe(true)
+-        await waitFor(() => expect(screen.getByRole('button', { name: 'Nodes' })).toHaveAttribute('title', 'Show node graph'))
+-        fireEvent.click(screen.getByRole('button', { name: 'Nodes' }))
+-        expect(client.getQueryData<{ collapsed?: boolean }>(['node-graph-window'])?.collapsed).toBe(false)
+-        expect(routerMock.navigate).not.toHaveBeenCalled()
++describe('SessionHeader back button', () => {
++    it('restores Back to chats and moves the Nodes launcher out of the header', () => {
++        const onBack = vi.fn()
++        render(<QueryClientProvider client={new QueryClient()}><ToastProvider><I18nProvider>
++            <SessionHeader session={baseSession()} api={null} onBack={onBack} />
++        </I18nProvider></ToastProvider></QueryClientProvider>)
++        fireEvent.click(screen.getByRole('button', { name: 'Back to chats' }))
++        expect(onBack).toHaveBeenCalledOnce()
++        expect(screen.queryByRole('button', { name: 'Nodes' })).toBeNull()
+     })
+ })
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -7,7 +7,6 @@
+ import { sessionModelMutationKey, useSessionActions } from '@/hooks/mutations/useSessionActions'
+ import { SessionActionMenu } from '@/components/SessionActionMenu'
+ import { SideChatButton } from '@/components/SideChatButton'
+-import { NodesButton } from '@/components/NodeGraphWindow'
+ import { SessionExportDialog } from '@/components/SessionExportDialog'
+ import { RenameSessionDialog } from '@/components/RenameSessionDialog'
+ import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+@@ -133,7 +132,6 @@
+ export function SessionHeader(props: {
+     session: Session
+     serviceTier?: string | null
+-    /** @deprecated Unused: the Nodes button replaced the back arrow. */
+     onBack?: () => void
+     onToggleFiles?: () => void
+     filesActive?: boolean
+@@ -367,8 +365,10 @@
+         <>
+             <div className="bg-[var(--app-bg)] pt-[env(safe-area-inset-top)]">
+                 <div className="mx-auto w-full max-w-content flex items-center gap-2 p-3">
+-                    {/* Nodes replaced the back arrow; the graph page links back to Chats. */}
+-                    <NodesButton />
++                    {props.onBack ? <button type="button" aria-label="Back to chats" title="Back to chats" onClick={props.onBack}
++                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
++                        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><path d="m12 5-7 7 7 7M5 12h14" /></svg>
++                    </button> : null}
+ 
+                     {/* Session info - two lines: title and path */}
+                     <div className="min-w-0 flex-1">
+--- /dev/null
++++ b/web/src/hooks/useMobileSidebar.ts
+@@ -0,0 +1,56 @@
++import { useCallback, useEffect, useRef, useState, type TouchEvent } from 'react'
++
++export const OPEN_CHAT_PANEL_EVENT = 'hapi:open-chat-panel'
++const DESKTOP_QUERY = '(min-width: 920px)'
++const interactive = 'input,textarea,select,[contenteditable="true"],[role="application"],[role="dialog"],pre,table,[draggable="true"],[data-no-sidebar-swipe]'
++
++/** Horizontal swipes navigate the panel only; native scrolling, selection and graph/row dragging keep their gestures. */
++export function useMobileSidebar(enabled: boolean, routeKey: string) {
++    const [open, setOpen] = useState(false)
++    const start = useRef<{ x: number; y: number; at: number; moved: boolean } | null>(null)
++    const close = useCallback(() => setOpen(false), [])
++    useEffect(() => { close(); start.current = null }, [routeKey, enabled, close])
++    useEffect(() => {
++        const show = () => { if (enabled && !window.matchMedia(DESKTOP_QUERY).matches) setOpen(true) }
++        window.addEventListener(OPEN_CHAT_PANEL_EVENT, show)
++        return () => window.removeEventListener(OPEN_CHAT_PANEL_EVENT, show)
++    }, [enabled])
++    useEffect(() => {
++        const media = window.matchMedia(DESKTOP_QUERY)
++        const change = () => { if (media.matches) close(); start.current = null }
++        media.addEventListener('change', change)
++        return () => media.removeEventListener('change', change)
++    }, [close])
++    const onTouchStartCapture = (event: TouchEvent) => {
++        start.current = null
++        if (!enabled || window.matchMedia(DESKTOP_QUERY).matches || event.touches.length !== 1) return
++        const target = event.target
++        if (!(target instanceof Element) || !event.currentTarget.contains(target) || target.closest(interactive) || (!open && target.closest('button,a')) || document.getSelection()?.isCollapsed === false) return
++        // Keep horizontal code/overflow scrollers and floating-window handles independent.
++        for (let element: Element | null = target; element && element !== event.currentTarget; element = element.parentElement) {
++            if (element.scrollWidth > element.clientWidth + 4 && /auto|scroll/.test(getComputedStyle(element).overflowX)) return
++        }
++        const point = event.touches[0]!
++        start.current = { x: point.clientX, y: point.clientY, at: Date.now(), moved: false }
++    }
++    const onTouchMoveCapture = (event: TouchEvent) => {
++        const origin = start.current
++        if (!origin) return
++        if (event.touches.length !== 1) { start.current = null; return }
++        const point = event.touches[0]!
++        if (!origin.moved && Math.hypot(point.clientX - origin.x, point.clientY - origin.y) >= 8) {
++            // A hold followed by movement belongs to folder/chat dragging.
++            if (Date.now() - origin.at >= 150) { start.current = null; return }
++            origin.moved = true
++        }
++        if (Math.abs(point.clientY - origin.y) > Math.max(16, Math.abs(point.clientX - origin.x))) start.current = null
++    }
++    const onTouchEndCapture = (event: TouchEvent) => {
++        const origin = start.current; start.current = null
++        if (!origin || event.touches.length || event.changedTouches.length !== 1 || Date.now() - origin.at > 650 || document.getSelection()?.isCollapsed === false) return
++        const point = event.changedTouches[0]!, dx = point.clientX - origin.x, dy = point.clientY - origin.y
++        if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.6) return
++        setOpen(dx > 0)
++    }
++    return { open, close, handlers: { onTouchStartCapture, onTouchMoveCapture, onTouchEndCapture, onTouchCancelCapture: () => { start.current = null } } }
++}
+--- /dev/null
++++ b/web/src/hooks/useMobileSidebar.test.tsx
+@@ -0,0 +1,62 @@
++import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { OPEN_CHAT_PANEL_EVENT, useMobileSidebar } from './useMobileSidebar'
++afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
++function Harness({ route = 'chat', enabled = true }: { route?: string; enabled?: boolean }) {
++    const sidebar = useMobileSidebar(enabled, route)
++    return <div data-testid="surface" {...sidebar.handlers}><p data-testid="prose">A message</p><button>Tool</button><pre>Code</pre><div draggable data-testid="row">Drag chat</div><span role="status">{sidebar.open ? 'open' : 'closed'}</span></div>
++}
++function setup(desktop = false) {
++    vi.stubGlobal('matchMedia', () => ({ matches: desktop, addEventListener: vi.fn(), removeEventListener: vi.fn() }))
++    return render(<Harness />)
++}
++function swipe(target: Element, dx: number, dy = 0) {
++    fireEvent.touchStart(target, { touches: [{ clientX: 100, clientY: 100 }] })
++    fireEvent.touchMove(target, { touches: [{ clientX: 100 + dx, clientY: 100 + dy }] })
++    fireEvent.touchEnd(target, { touches: [], changedTouches: [{ clientX: 100 + dx, clientY: 100 + dy }] })
++}
++describe('mobile chat panel', () => {
++    it('opens right and closes left without navigation', () => {
++        setup(); swipe(screen.getByTestId('prose'), 100)
++        expect(screen.getByRole('status')).toHaveTextContent('open')
++        swipe(screen.getByTestId('prose'), -100)
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++    })
++    it('ignores scrolling, short swipes, interactive controls and draggable rows', () => {
++        setup()
++        for (const [dx, dy] of [[25, 0], [90, 140]]) swipe(screen.getByTestId('prose'), dx!, dy!)
++        for (const target of [screen.getByRole('button'), screen.getByText('Code'), screen.getByTestId('row')]) swipe(target, 100)
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++    })
++    it('ignores multi-touch and cancels interrupted gestures', () => {
++        setup(); const target = screen.getByTestId('prose')
++        fireEvent.touchStart(target, { touches: [{ clientX: 100, clientY: 100 }, { clientX: 110, clientY: 100 }] })
++        fireEvent.touchEnd(target, { touches: [], changedTouches: [{ clientX: 250, clientY: 100 }] })
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++        fireEvent.touchStart(target, { touches: [{ clientX: 100, clientY: 100 }] }); fireEvent.touchCancel(target)
++        fireEvent.touchEnd(target, { touches: [], changedTouches: [{ clientX: 250, clientY: 100 }] })
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++    })
++    it('opens from Back and closes after selecting another route', () => {
++        const view = setup(); act(() => window.dispatchEvent(new Event(OPEN_CHAT_PANEL_EVENT)))
++        expect(screen.getByRole('status')).toHaveTextContent('open')
++        view.rerender(<Harness route="other" />)
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++    })
++    it('closes with a quick swipe over panel buttons but preserves a hold-and-drag', () => {
++        setup(); act(() => window.dispatchEvent(new Event(OPEN_CHAT_PANEL_EVENT)))
++        swipe(screen.getByRole('button'), -100)
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++        act(() => window.dispatchEvent(new Event(OPEN_CHAT_PANEL_EVENT)))
++        const clock = vi.spyOn(Date, 'now').mockReturnValue(100)
++        fireEvent.touchStart(screen.getByRole('button'), { touches: [{ clientX: 200, clientY: 100 }] })
++        clock.mockReturnValue(300)
++        fireEvent.touchMove(screen.getByRole('button'), { touches: [{ clientX: 80, clientY: 100 }] })
++        fireEvent.touchEnd(screen.getByRole('button'), { touches: [], changedTouches: [{ clientX: 80, clientY: 100 }] })
++        expect(screen.getByRole('status')).toHaveTextContent('open')
++    })
++    it('does not handle desktop gestures or Back events', () => {
++        setup(true); swipe(screen.getByTestId('prose'), 100); act(() => window.dispatchEvent(new Event(OPEN_CHAT_PANEL_EVENT)))
++        expect(screen.getByRole('status')).toHaveTextContent('closed')
++    })
++})

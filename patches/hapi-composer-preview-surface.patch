@@ -1,0 +1,320 @@
+diff --git a/web/src/components/AssistantChat/ComposerButtons.test.tsx b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+--- a/web/src/components/AssistantChat/ComposerButtons.test.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+@@ -1,3 +1,5 @@
++import { ChatModelMenu } from './ChatModelMenu'
++import { ChatPermissionMenu } from './ChatPermissionMenu'
+ import {
+     AssistantRuntimeProvider,
+     type ChatModelAdapter,
+@@ -223,7 +225,7 @@
+ describe('ComposerButtons responsive toolbar', () => {
+     afterEach(cleanup)
+ 
+-    it('wraps mobile actions without shrinking controls and retains desktop overflow', () => {
++    it('keeps mobile controls on one row with scrollable utilities and full-size buttons', () => {
+         const noop = () => {}
+         render(
+             <RuntimeProviders>
+@@ -261,13 +263,55 @@
+ 
+         const toolbar = screen.getByTestId('composer-toolbar-items')
+         expect(toolbar.className).toContain('overflow-x-auto')
+-        expect(toolbar.className).toContain('max-sm:flex-wrap')
+-        expect(toolbar.className).toContain('max-sm:overflow-visible')
++        expect(toolbar.className).not.toContain('basis-full')
++        expect(toolbar.className).not.toContain('flex-wrap')
++        expect(toolbar.parentElement).toHaveClass('flex-nowrap')
++        expect(toolbar.parentElement).not.toHaveClass('flex-wrap')
+         const toolbarButtons = within(toolbar).getAllByRole('button')
+         expect(toolbarButtons.length).toBeGreaterThanOrEqual(6)
+         for (const button of toolbarButtons) {
+             expect(button.closest('.shrink-0')).not.toBeNull()
+         }
++    })
++
++    it('keeps permission, model, microphone and Send beside the scrollable tools without changing their actions', () => {
++        const onPermission = vi.fn(), onModel = vi.fn(), onReasoning = vi.fn(), onDictate = vi.fn(), onSend = vi.fn(), onAbort = vi.fn()
++        const noop = () => {}
++        render(<RuntimeProviders><div style={{ width: 320 }}><ComposerButtons
++            canSend controlsDisabled={false} showSettingsButton={false} onSettingsToggle={noop}
++            expanded={false} onExpandedToggle={noop} showTerminalButton={false} terminalDisabled={false} terminalLabel="Terminal" onTerminal={noop}
++            showAbortButton abortDisabled={false} isAborting={false} onAbort={onAbort}
++            showSwitchButton={false} switchDisabled={false} isSwitching={false} onSwitch={noop}
++            voiceEnabled={false} voiceStatus="disconnected" onVoiceToggle={noop} onSend={onSend}
++            dictation={{ supported: true, status: 'disconnected', toggle: onDictate }}
++            onSchedule={noop} onScratchlistToggle={noop}
++            modelMenu={<>
++                <ChatPermissionMenu mode="yolo" options={[{ mode: 'yolo', label: 'Yolo', tone: 'danger' }, { mode: 'read-only', label: 'Read only', tone: 'neutral' }]} disabled={false} running={false} onChange={onPermission} />
++                <ChatModelMenu model="gpt-6.1-sol" reasoning="high" models={[{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }, { value: 'gpt-6-astra', label: 'GPT-6-Astra' }]} efforts={[{ value: 'high', label: 'High' }]} disabled={false} onModel={onModel} onReasoning={onReasoning} />
++            </>}
++        /></div></RuntimeProviders>)
++        const tools = screen.getByTestId('composer-toolbar-items'), row = tools.parentElement!
++        const permission = getButton('Permissions: Yolo'), model = getButton('Model and reasoning: GPT-6.1-Sol, High')
++        expect(row).toHaveClass('flex-nowrap')
++        expect(permission.parentElement).toBe(model.parentElement)
++        expect(model.parentElement?.parentElement).toBe(row)
++        expect(model.parentElement).toHaveClass('max-w-[55%]', 'shrink-0')
++        expect(getButton('Dictate').parentElement).toBe(row)
++        expect(getButton('Send').parentElement).toBe(row)
++        expect(getButton('Dictate')).toHaveClass('h-9', 'w-9', 'shrink-0')
++        expect(within(tools).getByRole('button', { name: 'Abort' })).toBeEnabled()
++        fireEvent.click(permission)
++        fireEvent.click(screen.getByRole('radio', { name: /Read only/ }))
++        expect(onPermission).toHaveBeenCalledExactlyOnceWith('read-only')
++        fireEvent.click(model)
++        fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'gpt-6-astra' } })
++        expect(onModel).toHaveBeenCalledExactlyOnceWith('gpt-6-astra')
++        fireEvent.keyDown(screen.getByRole('dialog', { name: 'Model and reasoning' }), { key: 'Escape' })
++        fireEvent.click(getButton('Dictate'))
++        expect(onDictate).toHaveBeenCalledOnce()
++        fireEvent.click(getButton('Send'))
++        expect(onSend).toHaveBeenCalledExactlyOnceWith('default')
++        expect(onAbort).not.toHaveBeenCalled()
+     })
+ 
+     it('uses overflow-safe alignment for centered and right-aligned layouts', () => {
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -694,10 +694,10 @@
+     const toolbarJustifyContent = getComposerToolbarJustifyContent(layout.mode)
+ 
+     return (
+-        <div className="flex shrink-0 flex-wrap items-center gap-1 px-2 pb-2 sm:flex-nowrap">
++        <div className="flex min-w-0 shrink-0 flex-nowrap items-center gap-1 px-2 pb-2">
+             <div
+                 data-testid="composer-toolbar-items"
+-                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto max-sm:basis-full max-sm:flex-wrap max-sm:overflow-visible [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
++                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                 style={{ justifyContent: toolbarJustifyContent }}
+             >
+                 <OrderedToolbarItems layout={effectiveLayout}>
+@@ -878,7 +878,7 @@
+                 {props.statisticsButton}
+             </div>
+ 
+-            {props.modelMenu ? <div className="ml-auto flex min-w-0 items-center gap-1">{props.modelMenu}</div> : null}
++            {props.modelMenu ? <div className="ml-auto flex min-w-0 max-w-[55%] shrink-0 items-center gap-1 sm:max-w-none [&>button]:min-w-0 [&>button]:shrink">{props.modelMenu}</div> : null}
+ 
+             {props.nativePriorityFlavor && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
+                 <Popover.Root>
+diff --git a/web/src/components/AssistantChat/HappyComposer.sendError.test.tsx b/web/src/components/AssistantChat/HappyComposer.sendError.test.tsx
+--- a/web/src/components/AssistantChat/HappyComposer.sendError.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.sendError.test.tsx
+@@ -313,8 +313,10 @@
+ 
+     it('collapses an expanded composer only after an accepted send succeeds', async () => {
+         const controls = renderComposer('message', null)
++        expect(screen.getByTestId('composer-shell')).toHaveClass('bg-transparent')
+         fireEvent.click(screen.getByRole('button', { name: 'expand' }))
+         expect(screen.getByTestId('composer-shell')).toHaveAttribute('data-expanded', 'true')
++        expect(screen.getByTestId('composer-shell')).toHaveClass('bg-[var(--app-bg)]')
+ 
+         send()
+         expect(screen.getByTestId('composer-shell')).toHaveAttribute('data-expanded', 'true')
+@@ -324,6 +326,7 @@
+ 
+         act(() => controls.current!.settleSend())
+         await waitFor(() => expect(screen.getByTestId('composer-shell')).not.toHaveAttribute('data-expanded'))
++        expect(screen.getByTestId('composer-shell')).toHaveClass('bg-transparent')
+     })
+ 
+     it('keeps the composer expanded when an accepted send later fails', async () => {
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -2168,7 +2168,7 @@
+ 
+     const shellClassName = isExpanded
+         ? `z-[60] flex min-h-0 flex-col bg-[var(--app-bg)] px-3 ${bottomPaddingClass} max-sm:fixed max-sm:inset-x-0 max-sm:top-0 max-sm:h-[var(--tg-viewport-stable-height,var(--app-viewport-height,100dvh))] max-sm:pt-[calc(0.5rem+env(safe-area-inset-top))] sm:absolute sm:inset-0 sm:pt-2`
+-        : `bg-[var(--app-bg)] px-3 ${bottomPaddingClass} pt-2`
++        : `bg-transparent px-3 ${bottomPaddingClass} pt-2`
+     const innerClassName = isExpanded
+         ? 'mx-auto flex min-h-0 w-full max-w-content flex-1 flex-col'
+         : 'mx-auto w-full max-w-content'
+diff --git a/web/src/components/AssistantChat/SortableComposerAttachments.preview.test.tsx b/web/src/components/AssistantChat/SortableComposerAttachments.preview.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/AssistantChat/SortableComposerAttachments.preview.test.tsx
+@@ -0,0 +1,79 @@
++import type { ComponentProps, ComponentType } from 'react'
++import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { Attachment } from '@assistant-ui/react'
++
++const { attachments } = vi.hoisted(() => ({
++    attachments: [
++        { id: 'a', name: 'first.png', type: 'file', contentType: 'image/png', previewUrl: '/first.png', status: { type: 'complete' }, content: [] },
++        { id: 'b', name: 'second.png', type: 'file', contentType: 'image/png', previewUrl: '/second.png', status: { type: 'complete' }, content: [] },
++    ],
++}))
++
++vi.mock('@assistant-ui/react', async () => {
++    const React = await import('react')
++    const Context = React.createContext(attachments[0]!)
++    return {
++        ComposerPrimitive: {
++            AttachmentByIndex: ({ index, components }: { index: number; components: { Attachment: ComponentType } }) => {
++                const Component = components.Attachment
++                return <Context.Provider value={attachments[index]!}><Component /></Context.Provider>
++            },
++        },
++        useThreadComposerAttachment: () => React.useContext(Context),
++        AttachmentPrimitive: {
++            Root: ({ children, ...props }: ComponentProps<'div'>) => <div {...props}>{children}</div>,
++            Remove: ({ children, ...props }: ComponentProps<'button'>) => <button {...props}>{children}</button>,
++        },
++    }
++})
++
++import { SortableComposerAttachments } from './SortableComposerAttachments'
++import { MessageAttachments } from './messages/MessageAttachments'
++
++afterEach(cleanup)
++
++function Draft({ update }: { update: number }) {
++    return <div>
++        <div aria-live="polite">Agent update {update}</div>
++        <SortableComposerAttachments attachments={attachments as unknown as Attachment[]}
++            orderedAttachmentIds={attachments.map(a => a.id)} onReorder={vi.fn()} />
++    </div>
++}
++
++describe('image preview during live chat updates', () => {
++    it('preserves the actual draft viewer, zoom and gallery position when reorder callbacks regenerate', () => {
++        const { rerender } = render(<Draft update={0} />)
++        const trigger = screen.getAllByTitle('Click to zoom')[0]!
++        fireEvent.click(trigger)
++        fireEvent.click(screen.getByRole('button', { name: 'Next image' }))
++        fireEvent.click(screen.getByTitle('Zoom in'))
++        const dialog = screen.getByRole('dialog', { name: 'second.png' })
++        expect(within(dialog).getByTitle('Reset zoom')).toHaveTextContent('125%')
++
++        rerender(<Draft update={1} />)
++        expect(screen.getByRole('dialog', { name: 'second.png' })).toBe(dialog)
++        expect(screen.getAllByTitle('Click to zoom')[0]).toBe(trigger)
++        expect(within(dialog).getByTitle('Reset zoom')).toHaveTextContent('125%')
++        fireEvent.keyDown(window, { key: 'ArrowLeft' })
++        expect(screen.getByRole('dialog', { name: 'first.png' })).toBeInTheDocument()
++        fireEvent.keyDown(window, { key: 'Escape' })
++        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++        rerender(<Draft update={2} />)
++        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++    })
++
++    it('keeps sent attachment previews open on message updates and closes on explicit close or session removal', () => {
++        const sent = [{ id: 'sent', filename: 'sent.png', mimeType: 'image/png', size: 3, path: '/sent.png', previewUrl: '/sent.png' }]
++        const { rerender } = render(<MessageAttachments attachments={sent} />)
++        fireEvent.click(screen.getByTitle('Click to zoom'))
++        const dialog = screen.getByRole('dialog', { name: 'sent.png' })
++        rerender(<MessageAttachments attachments={sent.map(a => ({ ...a }))} />)
++        expect(screen.getByRole('dialog', { name: 'sent.png' })).toBe(dialog)
++        fireEvent.click(within(dialog).getByTitle('Close'))
++        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++        fireEvent.click(screen.getByTitle('Click to zoom'))
++        rerender(<div>Other session</div>)
++        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++    })
++})
+diff --git a/web/src/components/AssistantChat/SortableComposerAttachments.tsx b/web/src/components/AssistantChat/SortableComposerAttachments.tsx
+--- a/web/src/components/AssistantChat/SortableComposerAttachments.tsx
++++ b/web/src/components/AssistantChat/SortableComposerAttachments.tsx
+@@ -4,6 +4,8 @@
+     type KeyboardEvent as ReactKeyboardEvent,
+     type MouseEvent as ReactMouseEvent,
+     type PointerEvent as ReactPointerEvent,
++    createContext,
++    useContext,
+     useCallback,
+     useEffect,
+     useMemo,
+@@ -53,6 +55,17 @@
+     }
+     return null
+ }
++
++const AttachmentDragContext = createContext<AttachmentDragHandleProps | undefined>(undefined)
++
++// assistant-ui treats this as a component type. Keep its identity stable when
++// live updates regenerate the drag callbacks, so an open image viewer survives.
++function AttachmentWithHandle() {
++    const dragHandleProps = useContext(AttachmentDragContext)
++    return <AttachmentItem dragHandleProps={dragHandleProps} />
++}
++
++const ATTACHMENT_COMPONENTS = { Attachment: AttachmentWithHandle }
+ 
+ function SortableComposerAttachment(props: SortableComposerAttachmentProps) {
+     const {
+@@ -97,11 +110,7 @@
+                 onSurfaceContextMenu: handleContextMenu,
+                 onSurfaceClick: handleClick,
+             },
+-        [attachment.name, disabled, handleKeyDown, handlePointerDown],
+-    )
+-    const AttachmentWithHandle = useCallback(
+-        () => <AttachmentItem dragHandleProps={dragHandleProps} />,
+-        [dragHandleProps],
++        [attachment.name, disabled, handleKeyDown, handlePointerDown, handleSurfacePointerDown, handleContextMenu, handleClick],
+     )
+ 
+     return (
+@@ -110,10 +119,12 @@
+             data-hapi-composer-attachment-dragging={isDragging || undefined}
+             className={isDragging ? 'opacity-60' : undefined}
+         >
+-            <ComposerPrimitive.AttachmentByIndex
+-                index={index}
+-                components={{ Attachment: AttachmentWithHandle }}
+-            />
++            <AttachmentDragContext.Provider value={dragHandleProps}>
++                <ComposerPrimitive.AttachmentByIndex
++                    index={index}
++                    components={ATTACHMENT_COMPONENTS}
++                />
++            </AttachmentDragContext.Provider>
+         </div>
+     )
+ }
+diff --git a/web/src/components/AssistantChat/StatusBar.popover.test.tsx b/web/src/components/AssistantChat/StatusBar.popover.test.tsx
+--- a/web/src/components/AssistantChat/StatusBar.popover.test.tsx
++++ b/web/src/components/AssistantChat/StatusBar.popover.test.tsx
+@@ -187,7 +187,7 @@
+         const leftStatusGroup = connectionLabel.parentElement?.parentElement
+         const statusBar = leftStatusGroup?.parentElement
+         const rightStatusGroup = statusBar?.lastElementChild
+-        expect(statusBar?.className.split(' ')).toContain('items-baseline')
++        expect(statusBar?.className.split(' ')).toContain('items-center')
+         expect(leftStatusGroup?.className.split(' ')).toContain('items-baseline')
+         expect(rightStatusGroup?.className.split(' ')).toContain('items-baseline')
+         expect(connectionLabel.className.split(' ')).not.toContain('top-px')
+@@ -253,3 +253,16 @@
+     expect(idle.previousElementSibling?.className).not.toContain('animate-pulse')
+     expect(screen.getByRole('button', { name: /Context details/i })).toBeInTheDocument()
+ })
++
++it('uses a content-width translucent status surface without adding a taller row', () => {
++    render(<I18nProvider><StatusBar compact active thinking agentState={null}
++        contextSize={475000} contextWindow={1000000} agentFlavor="codex" /></I18nProvider>)
++    const surface = screen.getByTestId('composer-status')
++    expect(surface).toHaveClass('flex', 'w-fit', 'max-w-full', 'h-5', 'backdrop-blur-md', 'rounded-md')
++    expect(surface.className).toContain('transparent')
++    expect(surface).not.toHaveClass('w-full', 'flex-wrap', 'pb-1')
++    fireEvent.click(screen.getByRole('button', { name: 'Context details' }))
++    expect(screen.getByText(/Active runtime context:/)).toBeInTheDocument()
++    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' })
++    expect(screen.queryByText(/Active runtime context:/)).not.toBeInTheDocument()
++})
+diff --git a/web/src/components/AssistantChat/StatusBar.tsx b/web/src/components/AssistantChat/StatusBar.tsx
+--- a/web/src/components/AssistantChat/StatusBar.tsx
++++ b/web/src/components/AssistantChat/StatusBar.tsx
+@@ -293,7 +293,7 @@
+     const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
+ 
+     return (
+-        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1 px-2 pb-1">
++        <div data-testid="composer-status" className="flex h-5 w-fit max-w-full min-w-0 items-center gap-2 overflow-x-auto rounded-md border border-[var(--app-border)] bg-[color:color-mix(in_srgb,var(--app-bg)_75%,transparent)] px-2 shadow-sm backdrop-blur-md [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+             <div className="flex min-w-0 items-baseline gap-2">
+                 <div className="relative top-px sm:top-0.5 flex shrink-0 items-center gap-1.5">
+                     <span

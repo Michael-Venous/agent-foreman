@@ -1,0 +1,1424 @@
+diff --git a/web/src/components/ManagerShortcut.test.tsx b/web/src/components/ManagerShortcut.test.tsx
+new file mode 100644
+index 0000000..38f1dd0
+--- /dev/null
++++ b/web/src/components/ManagerShortcut.test.tsx
+@@ -0,0 +1,42 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++// Vitest runs from the web package root.
++const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8')
++import { ManagerShortcut } from './ManagerShortcut'
++afterEach(cleanup)
++
++function themeVariables(selector: string): Record<string, string> {
++    const block = css.slice(css.indexOf(selector + ' {')).split('}')[0]!
++    const vars: Record<string, string> = {}
++    for (const match of block.matchAll(/(--app-button(?:-text)?):\s*(?:var\([^,]+,\s*)?(#[0-9a-f]{6})/gi)) vars[match[1]!] = match[2]!
++    return vars
++}
++function luminance(hex: string): number {
++    const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).map(c => c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)
++    return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!
++}
++
++describe('ManagerShortcut', () => {
++    it('uses explicit paired theme foreground/background, never a hardcoded white label', () => {
++        render(<ManagerShortcut sessionId="m" selected={false} onOpen={vi.fn()} />)
++        const link = screen.getByRole('link', { name: /Open your persistent manager/ })
++        expect(link).toHaveClass('bg-[var(--app-button)]', 'text-[var(--app-button-text)]')
++        expect(link.className).not.toMatch(/text-white|bg-\[var\(--app-link\)\]/)
++    })
++    it.each([':root', '[data-theme="dark"]', '[data-theme="oled"]'])('has WCAG AA contrast in %s', (selector) => {
++        const vars = themeVariables(selector)
++        const [a, b] = [luminance(vars['--app-button']!), luminance(vars['--app-button-text']!)]
++        expect((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)).toBeGreaterThanOrEqual(4.5)
++    })
++    it('opens the manager in-app and marks it current', () => {
++        const onOpen = vi.fn()
++        render(<ManagerShortcut sessionId="manager-id" selected onOpen={onOpen} />)
++        const link = screen.getByRole('link', { name: /persistent manager/ })
++        expect(link).toHaveAttribute('href', '/sessions/manager-id')
++        expect(link).toHaveAttribute('aria-current', 'page')
++        fireEvent.click(link)
++        expect(onOpen).toHaveBeenCalledWith('manager-id')
++    })
++})
+diff --git a/web/src/components/ManagerShortcut.tsx b/web/src/components/ManagerShortcut.tsx
+new file mode 100644
+index 0000000..955333a
+--- /dev/null
++++ b/web/src/components/ManagerShortcut.tsx
+@@ -0,0 +1,22 @@
++/**
++ * Persistent link to the manager chat. Uses the theme's paired button
++ * colors (light: near-black with white text, dark: white with dark text, OLED: blue
++ * with black text) so the label never inherits a same-colored background.
++ */
++export function ManagerShortcut(props: { sessionId: string; selected: boolean; onOpen: (sessionId: string) => void }) {
++    return (
++        <a
++            href={`/sessions/${props.sessionId}`}
++            onClick={(event) => {
++                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return
++                event.preventDefault()
++                props.onOpen(props.sessionId)
++            }}
++            aria-current={props.selected ? 'page' : undefined}
++            data-testid="manager-shortcut"
++            className="mx-3 mb-2 mt-3 block shrink-0 rounded-xl border border-[var(--app-border)] bg-[var(--app-button)] px-4 py-3 text-center font-semibold text-[var(--app-button-text)] shadow-sm transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--app-bg)]"
++        >
++            <span aria-hidden="true">★ </span>Open your persistent manager
++        </a>
++    )
++}
+diff --git a/web/src/components/SessionList.directory-action.test.tsx b/web/src/components/SessionList.directory-action.test.tsx
+index 7e399cb..38aa3f5 100644
+--- a/web/src/components/SessionList.directory-action.test.tsx
++++ b/web/src/components/SessionList.directory-action.test.tsx
+@@ -1,4 +1,4 @@
+-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import type { ReactNode } from 'react'
+@@ -59,74 +59,21 @@ function renderWithProviders(children: ReactNode) {
+ }
+ 
+ describe('SessionList directory action', () => {
+-    it('starts a new session with the project machine and directory', () => {
+-        const onNewSessionInDirectory = vi.fn()
+-        const session = makeSession({
+-            id: 'session-1',
+-            updatedAt: Date.now(),
+-            metadata: {
+-                path: '/home/ubuntu',
+-                machineId: 'machine-1',
+-                name: 'Greeting',
+-                flavor: 'codex',
+-            }
+-        })
+-
++    it('keeps the list header padding without a sticky directory header', () => {
+         renderWithProviders(
+             <SessionList
+-                sessions={[session]}
++                sessions={[makeSession({ id: 'session-1', updatedAt: Date.now(), metadata: { path: '/home/ubuntu', name: 'Greeting', flavor: 'codex' } })]}
+                 selectedSessionId={null}
+                 onSelect={vi.fn()}
+                 onNewSession={vi.fn()}
+-                onNewSessionInDirectory={onNewSessionInDirectory}
+                 onRefresh={vi.fn()}
+                 isLoading={false}
+                 renderHeader={false}
+                 api={null}
+-                machineLabelsById={{ 'machine-1': 'Mint' }}
+             />
+         )
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'New session in this directory' }))
+-
+-        expect(onNewSessionInDirectory).toHaveBeenCalledWith({
+-            machineId: 'machine-1',
+-            directory: '/home/ubuntu',
+-        })
+-    })
+-
+-    it('keeps the sticky project header opaque and aligned with the list viewport', () => {
+-        const session = makeSession({
+-            id: 'session-1',
+-            updatedAt: Date.now(),
+-            metadata: {
+-                path: '/home/ubuntu',
+-                name: 'Greeting',
+-                flavor: 'codex',
+-            }
+-        })
+-
+-        renderWithProviders(
+-            <SessionList
+-                sessions={[session]}
+-                selectedSessionId={null}
+-                onSelect={vi.fn()}
+-                onNewSession={vi.fn()}
+-                onRefresh={vi.fn()}
+-                isLoading={false}
+-                renderHeader={false}
+-                api={null}
+-            />
+-        )
+-
+-        const projectHeader = screen.getByTitle('/home/ubuntu')
+-        expect(projectHeader).toHaveClass('bg-[var(--app-bg)]')
+-        expect(projectHeader).toHaveClass('hover:bg-[var(--app-secondary-bg)]')
+-        expect(projectHeader).not.toHaveClass('hover:bg-[var(--app-subtle-bg)]')
+-
+-        const listContent = projectHeader.parentElement?.parentElement
+-        expect(listContent).not.toHaveClass('pt-1')
+-
++        expect(screen.queryByTitle('/home/ubuntu')).toBeNull()
+         fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
+         const searchInput = screen.getByPlaceholderText(SEARCH_PLACEHOLDER)
+         const headerRow = searchInput.parentElement?.parentElement
+@@ -134,6 +81,7 @@ describe('SessionList directory action', () => {
+         expect(headerRow).toHaveClass('py-1')
+     })
+ 
++
+     it('hides the directory action for sessions without path metadata', () => {
+         renderWithProviders(
+             <SessionList
+@@ -381,177 +329,6 @@ describe('SessionList collapse behavior', () => {
+         )
+     }
+ 
+-    function getProjectPanel(): Element {
+-        const header = screen.getByTitle('/work/hapi')
+-        const panel = header.nextElementSibling
+-        if (!panel) {
+-            throw new Error('Expected project collapse panel')
+-        }
+-        return panel
+-    }
+-
+-    it('keeps a selected running path collapsed across live session-list refreshes', async () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const baseSessions = [
+-            makeSession({
+-                id: 'session-running',
+-                active: true,
+-                thinking: true,
+-                pendingRequestsCount: 1,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-old',
+-                updatedAt: 50,
+-                metadata: { path: '/work/hapi', name: 'Older task', flavor: 'codex' },
+-            })
+-        ]
+-        const { rerender } = render(renderSessionList(baseSessions))
+-
+-        // The running session is pinned in the "in progress" section; the
+-        // directory group now only holds inactive sessions and starts
+-        // collapsed.
+-        expect(getProjectPanel().getAttribute('data-open')).toBeNull()
+-
+-        rerender(renderSessionList([
+-            {
+-                ...baseSessions[0]!,
+-                pendingRequestsCount: 2,
+-                updatedAt: 200,
+-            },
+-            baseSessions[1]!
+-        ]))
+-
+-        await waitFor(() => {
+-            expect(getProjectPanel().getAttribute('data-open')).toBeNull()
+-        })
+-    })
+-
+-    it('leaves active sessions in directory groups when pin-in-progress is off', () => {
+-        const sessions = [
+-            makeSession({
+-                id: 'session-running',
+-                active: true,
+-                thinking: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-idle',
+-                updatedAt: 50,
+-                metadata: { path: '/work/other', name: 'Other task', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.queryByTitle('In progress')).toBeNull()
+-        expect(screen.getByTitle('/work/hapi')).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Running task/ })).toBeInTheDocument()
+-        // Active group stays expanded by default so the project glance is immediate.
+-        expect(screen.getByTitle('/work/hapi').nextElementSibling?.getAttribute('data-open')).toBe('true')
+-    })
+-
+-    it('pins active sessions into In progress when the preference is on', () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const sessions = [
+-            makeSession({
+-                id: 'session-running',
+-                active: true,
+-                thinking: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-idle',
+-                updatedAt: 50,
+-                metadata: { path: '/work/hapi', name: 'Idle task', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.getByTitle('In progress')).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Running task/ })).toBeInTheDocument()
+-        // Directory group retains only the inactive session.
+-        expect(getProjectPanel().getAttribute('data-open')).toBeNull()
+-    })
+-
+-    it('keeps project-pinned active sessions in their project group when the preference is on', () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const sessions = [
+-            makeSession({
+-                id: 'session-pinned-running',
+-                active: true,
+-                thinking: true,
+-                pinned: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Pinned running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-idle',
+-                updatedAt: 50,
+-                metadata: { path: '/work/hapi', name: 'Idle task', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.queryByTitle('In progress')).toBeNull()
+-        expect(getProjectPanel().getAttribute('data-open')).toBe('true')
+-        expect(screen.getByRole('button', { name: /Pinned running task/ })).toBeInTheDocument()
+-    })
+-
+-    it('keeps In progress above project-pin groups; project pin stays first inside its group', () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const sessions = [
+-            makeSession({
+-                id: 'session-global',
+-                globalPinned: true,
+-                updatedAt: 300,
+-                metadata: { path: '/work/global', name: 'Global pin', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-project-pin',
+-                pinned: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/pinned-project', name: 'Project pin', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-project-idle',
+-                updatedAt: 200,
+-                metadata: { path: '/work/pinned-project', name: 'Project idle', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-floater',
+-                active: true,
+-                thinking: true,
+-                updatedAt: 250,
+-                metadata: { path: '/work/other', name: 'Unpinned floater', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-idle-other',
+-                updatedAt: 50,
+-                metadata: { path: '/work/other', name: 'Other idle', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        const globalSection = screen.getByTitle('Pinned sessions')
+-        const inProgress = screen.getByTitle('In progress')
+-        const projectPinGroup = screen.getByTitle('/work/pinned-project')
+-        const otherGroup = screen.getByTitle('/work/other')
+-        const projectPinRow = screen.getByRole('button', { name: /Project pin/ })
+-        const projectIdleRow = screen.getByRole('button', { name: /Project idle/ })
+-
+-        // Section order: global pin band → In progress → directory groups
+-        // (project-pin groups may sort first among groups, but never above In progress).
+-        expect(globalSection).toAppearBefore(inProgress)
+-        expect(inProgress).toAppearBefore(projectPinGroup)
+-        expect(projectPinGroup).toAppearBefore(otherGroup)
+-        // Intra-group: project pin stays first inside its folder.
+-        expect(projectPinRow).toAppearBefore(projectIdleRow)
+-        expect(screen.getByRole('button', { name: /Unpinned floater/ })).toBeInTheDocument()
+-    })
+-
+     it('does not label quiet active sessions as Idle', () => {
+         const sessions = [
+             makeSession({
+@@ -568,141 +345,6 @@ describe('SessionList collapse behavior', () => {
+         expect(screen.queryByTitle('Idle')).toBeNull()
+     })
+ 
+-    it('keeps quiet active sessions in the Active section when pin-in-progress is on', () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const sessions = [
+-            makeSession({
+-                id: 'session-running',
+-                active: true,
+-                thinking: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-quiet',
+-                active: true,
+-                updatedAt: 90,
+-                metadata: { path: '/work/hapi', name: 'Quiet task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-pending',
+-                active: true,
+-                pendingRequestsCount: 1,
+-                updatedAt: 80,
+-                metadata: { path: '/work/other', name: 'Pending task', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.getByTitle('In progress')).toBeInTheDocument()
+-        expect(screen.getByText(/Running \(1\)/)).toBeInTheDocument()
+-        expect(screen.getByText(/pending \(1\)/)).toBeInTheDocument()
+-        // Quiet active sessions float into their own Active section (finished
+-        // executing, still connected) instead of falling into directory groups.
+-        expect(screen.getByTitle('Active sessions')).toBeInTheDocument()
+-        expect(screen.getByText(/Active \(1\)/)).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Quiet task/ })).toBeInTheDocument()
+-        // The directory header survives as an action-only header (copy-path /
+-        // new-session-in-directory) even though every row floated.
+-        expect(screen.getByTitle('/work/hapi')).toBeInTheDocument()
+-        expect(screen.getByTitle('/work/hapi').nextElementSibling).toBeNull()
+-        expect(screen.getByTitle('/work/other')).toBeInTheDocument()
+-        expect(screen.getByTitle('/work/other').nextElementSibling).toBeNull()
+-    })
+-
+-    it('keeps new-session-in-directory actions for projects whose rows all floated', () => {
+-        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+-        const onNewSessionInDirectory = vi.fn()
+-        const sessions = [
+-            makeSession({
+-                id: 'session-quiet',
+-                active: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', machineId: 'machine-1', name: 'Quiet task', flavor: 'codex' },
+-            }),
+-        ]
+-        renderWithProviders(
+-            <SessionList
+-                sessions={sessions}
+-                selectedSessionId={null}
+-                onSelect={vi.fn()}
+-                onNewSession={vi.fn()}
+-                onRefresh={vi.fn()}
+-                isLoading={false}
+-                renderHeader={false}
+-                api={null}
+-                onNewSessionInDirectory={onNewSessionInDirectory}
+-            />
+-        )
+-
+-        expect(screen.getByTitle('Active sessions')).toBeInTheDocument()
+-        // The project header survives as an action-only header.
+-        const header = screen.getByTitle('/work/hapi')
+-        expect(header.nextElementSibling).toBeNull()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'New session in this directory' }))
+-        expect(onNewSessionInDirectory).toHaveBeenCalledWith({
+-            machineId: 'machine-1',
+-            directory: '/work/hapi',
+-        })
+-    })
+-
+-    it('auto-expands the path again when the selected session changes', async () => {
+-        const sessions = [
+-            makeSession({
+-                id: 'session-first',
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-next',
+-                updatedAt: 90,
+-                metadata: { path: '/work/hapi', name: 'Next task', flavor: 'codex' },
+-            })
+-        ]
+-        const { rerender } = render(renderSessionList(sessions))
+-
+-        // Inactive-only groups start collapsed; selecting a session inside
+-        // one auto-expands it.
+-        expect(getProjectPanel().getAttribute('data-open')).toBeNull()
+-
+-        rerender(renderSessionList([
+-            ...sessions,
+-            makeSession({
+-                id: 'session-running',
+-                active: true,
+-                thinking: true,
+-                updatedAt: 110,
+-                metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' },
+-            }),
+-        ], 'session-next'))
+-
+-        await waitFor(() => {
+-            expect(getProjectPanel().getAttribute('data-open')).toBe('true')
+-        })
+-    })
+-
+-    it('keeps an inactive project-pinned group expanded with no selection', () => {
+-        const sessions = [
+-            makeSession({
+-                id: 'session-pinned',
+-                pinned: true,
+-                updatedAt: 100,
+-                metadata: { path: '/work/hapi', name: 'Pinned task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-idle',
+-                updatedAt: 50,
+-                metadata: { path: '/work/hapi', name: 'Idle task', flavor: 'codex' },
+-            }),
+-        ]
+-        render(renderSessionList(sessions, null))
+-
+-        expect(getProjectPanel().getAttribute('data-open')).toBe('true')
+-        expect(screen.getByRole('button', { name: /Pinned task/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Idle task/ })).toBeInTheDocument()
+-    })
+-
+     it('toggles the Active section independently of In progress', () => {
+         localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+         const sessions = [
+@@ -802,158 +444,127 @@ describe('SessionList collapse behavior', () => {
+         expect(header.getAttribute('aria-expanded')).toBe('true')
+     })
+ 
+-    it('keeps the previous selected path open when selection moves', async () => {
+-        const sessions = [
+-            makeSession({
+-                id: 'session-first',
+-                updatedAt: 100,
+-                metadata: { path: '/work/first', name: 'First task', flavor: 'codex' },
+-            }),
+-            makeSession({
+-                id: 'session-second',
+-                updatedAt: 90,
+-                metadata: { path: '/work/second', name: 'Second task', flavor: 'codex' },
+-            })
+-        ]
+-        const { rerender } = render(renderSessionList(sessions, 'session-first'))
+-        const firstPanel = screen.getByTitle('/work/first').nextElementSibling
+-
+-        expect(firstPanel?.getAttribute('data-open')).toBe('true')
++})
+ 
+-        rerender(renderSessionList(sessions, 'session-second'))
++describe('SessionList flat chats', () => {
++    function renderList(sessions: SessionSummary[], selectedSessionId: string | null = null, onSelect = vi.fn()) {
++        return (
++            <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}>
++                <ToastProvider>
++                    <I18nProvider>
++                        <SessionList
++                            sessions={sessions}
++                            selectedSessionId={selectedSessionId}
++                            onSelect={onSelect}
++                            onNewSession={vi.fn()}
++                            onNewSessionInDirectory={vi.fn()}
++                            onRefresh={vi.fn()}
++                            isLoading={false}
++                            renderHeader={false}
++                            api={null}
++                        />
++                    </I18nProvider>
++                </ToastProvider>
++            </QueryClientProvider>
++        )
++    }
+ 
+-        await waitFor(() => {
+-            expect(firstPanel?.getAttribute('data-open')).toBe('true')
+-        })
+-    })
++    beforeEach(() => localStorage.clear())
+ 
+-    it('keeps the configured session preview fold while searching', () => {
+-        localStorage.setItem('hapi-session-preview-limit', '2')
+-        const sessions = Array.from({ length: 4 }, (_, index) => makeSession({
+-            id: `matching-${index + 1}`,
+-            updatedAt: 100 - index,
+-            metadata: {
+-                path: '/work/hapi',
+-                name: `Matching task ${index + 1}`,
+-                flavor: 'codex',
+-            },
++    it('shows every chat directly with its directory as secondary text, without directory dropdowns', () => {
++        const sessions = Array.from({ length: 12 }, (_, i) => makeSession({
++            id: `session-${i}`,
++            updatedAt: 100 - i,
++            metadata: { path: i % 2 ? '/work/hapi' : '/work/docs', name: `Chat ${i}`, flavor: 'codex' },
+         }))
++        render(renderList(sessions))
+ 
+-        render(renderSessionList(sessions, null))
+-        fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
+-        fireEvent.change(screen.getByPlaceholderText(SEARCH_PLACEHOLDER), {
+-            target: { value: 'Matching task' },
+-        })
+-
+-        expect(screen.getByRole('button', { name: /Matching task 1/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Matching task 2/ })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: /Matching task 3/ })).toBeNull()
+-        expect(screen.queryByRole('button', { name: /Matching task 4/ })).toBeNull()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand 2' }))
+-
+-        expect(screen.getByRole('button', { name: /Matching task 3/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Matching task 4/ })).toBeInTheDocument()
++        const list = screen.getByTestId('session-chat-list')
++        for (let i = 0; i < 12; i++) {
++            expect(within(list).getByRole('button', { name: new RegExp(`Chat ${i}\\b`) })).toBeInTheDocument()
++        }
++        // No collapsible directory headers, show-more controls, or directory-only actions.
++        expect(screen.queryByTitle('/work/hapi')).toBeNull()
++        expect(screen.queryByRole('button', { name: 'New session in this directory' })).toBeNull()
++        expect(screen.queryByText(/Show \d+ more/i)).toBeNull()
++        expect(within(list).getAllByText('work/hapi')).toHaveLength(6)
++        expect(within(list).getAllByText('work/docs')).toHaveLength(6)
++        expect(within(list).getByRole('button', { name: /Chat 0\b/ })).toAppearBefore(within(list).getByRole('button', { name: /Chat 11\b/ }))
+     })
+ 
+-    it('expands and collapses the session preview one batch at a time', () => {
+-        localStorage.setItem('hapi-session-preview-limit', '2')
+-        const sessions = Array.from({ length: 6 }, (_, index) => makeSession({
+-            id: `session-${index + 1}`,
+-            updatedAt: 100 - index,
+-            metadata: {
+-                path: '/work/hapi',
+-                name: `Task ${index + 1}`,
+-                flavor: 'codex',
+-            },
+-        }))
+-
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.getByRole('button', { name: 'Expand 2' })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: 'Collapse 2' })).toBeNull()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand 2' }))
+-
+-        expect(screen.getByRole('button', { name: /Task 4/ })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: /Task 5/ })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Collapse 2' })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: 'Expand 2' })).toBeInTheDocument()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand 2' }))
+-
+-        expect(screen.getByRole('button', { name: /Task 6/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: 'Collapse 2' })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: 'Expand 2' })).toBeNull()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'Collapse 2' }))
+-
+-        expect(screen.queryByRole('button', { name: /Task 5/ })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Collapse 2' })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: 'Expand 2' })).toBeInTheDocument()
++    it('selects a chat and marks the current one', () => {
++        const onSelect = vi.fn()
++        const sessions = [
++            makeSession({ id: 'session-a', updatedAt: 100, metadata: { path: '/work/a', name: 'Alpha chat', flavor: 'codex' } }),
++            makeSession({ id: 'session-b', updatedAt: 90, metadata: { path: '/work/b', name: 'Beta chat', flavor: 'claude' } }),
++        ]
++        const { rerender } = render(renderList(sessions, 'session-a', onSelect))
++        expect(screen.getByRole('button', { name: /Alpha chat/ })).toHaveAttribute('aria-current', 'page')
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Collapse 2' }))
++        const beta = screen.getByRole('button', { name: /Beta chat/ })
++        fireEvent.mouseDown(beta)
++        fireEvent.mouseUp(beta)
++        expect(onSelect).toHaveBeenCalledWith('session-b')
+ 
+-        expect(screen.queryByRole('button', { name: /Task 3/ })).toBeNull()
+-        expect(screen.queryByRole('button', { name: 'Collapse 2' })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Expand 2' })).toBeInTheDocument()
++        rerender(renderList(sessions, 'session-b', onSelect))
++        expect(screen.getByRole('button', { name: /Beta chat/ })).toHaveAttribute('aria-current', 'page')
++        expect(screen.getByRole('button', { name: /Alpha chat/ })).not.toHaveAttribute('aria-current')
+     })
+ 
+-    it('does not offer a no-op collapse when required sessions exceed the preview limit', () => {
+-        localStorage.setItem('hapi-session-preview-limit', '2')
+-        const sessions = Array.from({ length: 4 }, (_, index) => makeSession({
+-            id: `session-${index + 1}`,
+-            updatedAt: 100 - index,
+-            pendingRequestsCount: index > 0 ? 1 : 0,
+-            metadata: {
+-                path: '/work/hapi',
+-                name: `Task ${index + 1}`,
+-                flavor: 'codex',
+-            },
+-        }))
+-
+-        render(renderSessionList(sessions, null))
+-
+-        expect(screen.queryByRole('button', { name: /Collapse/ })).toBeNull()
+-        expect(screen.queryByRole('button', { name: /Task 1/ })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Expand 1' })).toBeInTheDocument()
+-
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand 1' }))
++    it('keeps running chats in the list with labels when pin-in-progress is off', () => {
++        render(renderList([
++            makeSession({ id: 'session-running', active: true, thinking: true, updatedAt: 100, metadata: { path: '/work/hapi', name: 'Running task', flavor: 'codex' } }),
++            makeSession({ id: 'session-idle', updatedAt: 50, metadata: { path: '/work/other', name: 'Other task', flavor: 'codex' } }),
++        ]))
+ 
+-        expect(screen.getByRole('button', { name: /Task 1/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: 'Collapse 1' })).toBeInTheDocument()
++        expect(screen.queryByTitle('In progress')).toBeNull()
++        const list = screen.getByTestId('session-chat-list')
++        expect(within(list).getByRole('button', { name: /Running task/ })).toAppearBefore(within(list).getByRole('button', { name: /Other task/ }))
++    })
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Collapse 1' }))
++    it('orders global pins, In progress, Active, then chats with project pins first', () => {
++        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
++        render(renderList([
++            makeSession({ id: 'session-global', globalPinned: true, updatedAt: 300, metadata: { path: '/work/global', name: 'Global pin', flavor: 'codex' } }),
++            makeSession({ id: 'session-project-pin', pinned: true, updatedAt: 100, metadata: { path: '/work/p', name: 'Project pin', flavor: 'codex' } }),
++            makeSession({ id: 'session-project-idle', updatedAt: 200, metadata: { path: '/work/p', name: 'Project idle', flavor: 'codex' } }),
++            makeSession({ id: 'session-floater', active: true, thinking: true, updatedAt: 250, metadata: { path: '/work/o', name: 'Unpinned floater', flavor: 'codex' } }),
++            makeSession({ id: 'session-pending', active: true, pendingRequestsCount: 1, updatedAt: 80, metadata: { path: '/work/o', name: 'Pending task', flavor: 'codex' } }),
++            makeSession({ id: 'session-quiet', active: true, updatedAt: 90, metadata: { path: '/work/o', name: 'Quiet task', flavor: 'codex' } }),
++        ]))
+ 
+-        expect(screen.queryByRole('button', { name: /Task 1/ })).toBeNull()
+-        expect(screen.queryByRole('button', { name: /Collapse/ })).toBeNull()
++        const list = screen.getByTestId('session-chat-list')
++        expect(screen.getByTitle('Pinned sessions')).toAppearBefore(screen.getByTitle('In progress'))
++        expect(screen.getByTitle('In progress')).toAppearBefore(screen.getByTitle('Active sessions'))
++        expect(screen.getByTitle('Active sessions')).toAppearBefore(list)
++        expect(screen.getByText(/Running \(1\)/)).toBeInTheDocument()
++        expect(screen.getByText(/pending \(1\)/)).toBeInTheDocument()
++        expect(within(list).queryByRole('button', { name: /Unpinned floater|Quiet task|Pending task|Global pin/ })).toBeNull()
++        expect(within(list).getByRole('button', { name: /Project pin/ })).toAppearBefore(within(list).getByRole('button', { name: /Project idle/ }))
++        expect(within(list).getAllByTestId('session-pin-divider')).toHaveLength(1)
+     })
+ 
+-    it('expands from the rendered count when required sessions exceed the preview limit', () => {
+-        localStorage.setItem('hapi-session-preview-limit', '2')
+-        const sessions = Array.from({ length: 8 }, (_, index) => makeSession({
+-            id: `session-${index + 1}`,
+-            updatedAt: 100 - index,
+-            pendingRequestsCount: index < 5 ? 1 : 0,
+-            metadata: {
+-                path: '/work/hapi',
+-                name: `Task ${index + 1}`,
+-                flavor: 'codex',
+-            },
+-        }))
+-
+-        render(renderSessionList(sessions, null))
++    it('keeps a project-pinned running chat in Chats when pin-in-progress is on', () => {
++        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
++        render(renderList([
++            makeSession({ id: 'session-pinned-running', active: true, thinking: true, pinned: true, updatedAt: 100, metadata: { path: '/work/hapi', name: 'Pinned running task', flavor: 'codex' } }),
++            makeSession({ id: 'session-idle', updatedAt: 50, metadata: { path: '/work/hapi', name: 'Idle task', flavor: 'codex' } }),
++        ]))
+ 
+-        expect(screen.getByRole('button', { name: /Task 5/ })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: /Task 6/ })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Expand 2' })).toBeInTheDocument()
++        expect(screen.queryByTitle('In progress')).toBeNull()
++        expect(within(screen.getByTestId('session-chat-list')).getByRole('button', { name: /Pinned running task/ })).toBeInTheDocument()
++    })
+ 
+-        fireEvent.click(screen.getByRole('button', { name: 'Expand 2' }))
++    it('filters chats by search without directory groups', () => {
++        render(renderList([
++            makeSession({ id: 'session-a', updatedAt: 100, metadata: { path: '/work/a', name: 'Alpha chat', flavor: 'codex' } }),
++            makeSession({ id: 'session-b', updatedAt: 90, metadata: { path: '/work/b', name: 'Beta chat', flavor: 'codex' } }),
++        ]))
++        fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
++        fireEvent.change(screen.getByPlaceholderText(SEARCH_PLACEHOLDER), { target: { value: 'beta' } })
+ 
+-        expect(screen.getByRole('button', { name: /Task 6/ })).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Task 7/ })).toBeInTheDocument()
+-        expect(screen.queryByRole('button', { name: /Task 8/ })).toBeNull()
+-        expect(screen.getByRole('button', { name: 'Expand 1' })).toBeInTheDocument()
++        expect(screen.queryByRole('button', { name: /Alpha chat/ })).toBeNull()
++        expect(screen.getByRole('button', { name: /Beta chat/ })).toBeInTheDocument()
+     })
+ })
+ 
+diff --git a/web/src/components/SessionList.machine-filter.test.tsx b/web/src/components/SessionList.machine-filter.test.tsx
+index f786202..65b464b 100644
+--- a/web/src/components/SessionList.machine-filter.test.tsx
++++ b/web/src/components/SessionList.machine-filter.test.tsx
+@@ -99,10 +99,10 @@ describe('SessionList machine filter', () => {
+ 
+         expect(screen.queryByRole('group', { name: 'Filter sessions by machine' })).toBeNull()
+         expect(screen.queryByRole('button', { name: 'Filter sessions by machine' })).toBeNull()
+-        expect(screen.getByTitle('/work/hapi')).toBeTruthy()
++        expect(screen.getByText('work/hapi')).toBeTruthy()
+     })
+ 
+-    it('shows the filter bar and machine-suffixed group titles with multiple machines', () => {
++    it('shows the filter bar and machine-suffixed chat directory labels with multiple machines', () => {
+         renderSessionList(multiMachineSessions)
+ 
+         expect(screen.getByRole('group', { name: 'Filter sessions by machine' })).toBeTruthy()
+@@ -113,13 +113,12 @@ describe('SessionList machine filter', () => {
+         expect(screen.getByText('work/docs · Teemo')).toBeTruthy()
+     })
+ 
+-    it('filters directory groups when a machine chip is selected', () => {
++    it('filters chats when a machine chip is selected', () => {
+         renderSessionList(multiMachineSessions)
+ 
+         fireEvent.click(screen.getByRole('button', { name: /Teemo \(1\)/ }))
+ 
+-        expect(screen.queryByTitle('/work/hapi')).toBeNull()
+-        expect(screen.getByTitle('/work/docs')).toBeTruthy()
++        expect(screen.queryByText(/work\/hapi/)).toBeNull()
+         // Suffix disappears once a single machine is selected
+         expect(screen.getByText('work/docs')).toBeTruthy()
+         expect(window.localStorage.getItem('hapi-session-list-machine-filter')).toBe('machine-2')
+@@ -129,8 +128,8 @@ describe('SessionList machine filter', () => {
+         window.localStorage.setItem('hapi-session-list-machine-filter', 'gone-machine')
+         renderSessionList(multiMachineSessions)
+ 
+-        expect(screen.getByTitle('/work/hapi')).toBeTruthy()
+-        expect(screen.getByTitle('/work/docs')).toBeTruthy()
++        expect(screen.getByText('work/hapi · Mint')).toBeTruthy()
++        expect(screen.getByText('work/docs · Teemo')).toBeTruthy()
+         expect(screen.getByRole('button', { name: /All \(2\)/ }).getAttribute('aria-pressed')).toBe('true')
+     })
+ 
+@@ -153,7 +152,7 @@ describe('SessionList machine filter', () => {
+         fireEvent.click(screen.getByRole('button', { name: /Teemo \(1\)/ }))
+ 
+         expect(screen.getByText('No sessions match your filters.')).toBeTruthy()
+-        expect(screen.queryByTitle('/work/hapi')).toBeNull()
+-        expect(screen.queryByTitle('/work/docs')).toBeNull()
++        expect(screen.queryByText(/work\/hapi/)).toBeNull()
++        expect(screen.queryByText(/work\/docs/)).toBeNull()
+     })
+ })
+diff --git a/web/src/components/SessionList.search-pin-divider.test.tsx b/web/src/components/SessionList.search-pin-divider.test.tsx
+index 7a79d84..917c9a8 100644
+--- a/web/src/components/SessionList.search-pin-divider.test.tsx
++++ b/web/src/components/SessionList.search-pin-divider.test.tsx
+@@ -99,7 +99,7 @@ function renderList(sessions: SessionSummary[]) {
+ }
+ 
+ describe('SessionList search pin dividers', () => {
+-    it('renders at most one pin divider in a group under relevance sort (tiann #1842)', () => {
++    it('renders at most one pin divider in the chat list under relevance sort (tiann #1842)', () => {
+         renderList(tiannPinDividerSessions())
+ 
+         fireEvent.click(screen.getByRole('button', { name: SEARCH_LABEL }))
+@@ -113,10 +113,12 @@ describe('SessionList search pin dividers', () => {
+         expect(screen.getByRole('button', { name: /homelab pinned/ })).toBeInTheDocument()
+         expect(screen.getByRole('button', { name: /homelab ordinary/ })).toBeInTheDocument()
+ 
+-        const projectHeader = screen.getByTitle(PROJECT_PATH)
+-        const projectRoot = projectHeader.parentElement
+-        expect(projectRoot).toBeTruthy()
+-        const dividers = within(projectRoot as HTMLElement).getAllByTestId('session-pin-divider')
++        const chatList = screen.getByTestId('session-chat-list')
++        const dividers = within(chatList).getAllByTestId('session-pin-divider')
+         expect(dividers).toHaveLength(1)
++        const names = within(chatList).getAllByRole('button').map(b => b.getAttribute('aria-label') ?? b.textContent ?? '')
++        const lastPinned = Math.max(names.findIndex(n => /Home pinned/.test(n)), names.findIndex(n => /homelab pinned/.test(n)))
++        const firstOrdinary = Math.min(names.findIndex(n => /Home ordinary/.test(n)), names.findIndex(n => /homelab ordinary/.test(n)))
++        expect(lastPinned).toBeLessThan(firstOrdinary)
+     })
+ })
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+index 37dd96e..8484763 100644
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -5,7 +5,6 @@ import type { ApiClient } from '@/api/client'
+ import {
+     buildSessionSearchScoreIndex,
+     compareSessionsBySearchRelevance,
+-    rankSessionGroupsBySearchRelevance,
+     sessionMatchesQuery,
+     sortSessionsBySearchRelevance,
+ } from '@/lib/sessionListSearch'
+@@ -16,7 +15,7 @@ import { SessionActionMenu } from '@/components/SessionActionMenu'
+ import { SessionExportDialog } from '@/components/SessionExportDialog'
+ import { RenameSessionDialog } from '@/components/RenameSessionDialog'
+ import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+-import { CopyIcon, CheckIcon, MarkAllReadIcon } from '@/components/icons'
++import { MarkAllReadIcon } from '@/components/icons'
+ 
+ function PinnedSectionIcon(props: { className?: string }) {
+     return (
+@@ -29,7 +28,7 @@ function PinnedSectionIcon(props: { className?: string }) {
+ }
+ import { cn } from '@/lib/utils'
+ import { useTranslation } from '@/lib/use-translation'
+-import { DEFAULT_SESSION_PREVIEW_LIMIT, useSessionPreviewLimit } from '@/hooks/useSessionPreviewLimit'
++import { DEFAULT_SESSION_PREVIEW_LIMIT } from '@/hooks/useSessionPreviewLimit'
+ import { useSessionListStatusMode } from '@/hooks/useSessionListStatusMode'
+ import { useShowActiveSessionsOnly } from '@/hooks/useShowActiveSessionsOnly'
+ import { usePinInProgressSessions } from '@/hooks/usePinInProgressSessions'
+@@ -283,6 +282,16 @@ export function getPreviousSessionVisibleCount(current: number, step: number): n
+     return Math.max(normalizedStep, current - normalizedStep)
+ }
+ 
++export function sortChatSessions(sessions: SessionSummary[]): SessionSummary[] {
++    return [...sessions].sort((a, b) => {
++        if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
++        const rankA = a.active ? (a.pendingRequestsCount > 0 ? 0 : 1) : 2
++        const rankB = b.active ? (b.pendingRequestsCount > 0 ? 0 : 1) : 2
++        if (rankA !== rankB) return rankA - rankB
++        return b.updatedAt - a.updatedAt
++    })
++}
++
+ function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
+     const groups = new Map<string, { directory: string; machineId: string | null; sessions: SessionSummary[] }>()
+ 
+@@ -388,36 +397,6 @@ function groupByMachine(
+     })
+ }
+ 
+-function CopyPathButton({ path, className }: { path: string; className?: string }) {
+-    const [copied, setCopied] = useState(false)
+-    const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+-
+-    const handleClick = (e: React.MouseEvent) => {
+-        e.stopPropagation()
+-        navigator.clipboard.writeText(path)
+-        setCopied(true)
+-        clearTimeout(timerRef.current)
+-        timerRef.current = setTimeout(() => setCopied(false), 1500)
+-    }
+-
+-    useEffect(() => () => clearTimeout(timerRef.current), [])
+-
+-    return (
+-        <button
+-            type="button"
+-            className={`shrink-0 p-0.5 rounded transition-colors ${copied ? 'text-[var(--app-badge-success-text)]' : 'text-[var(--app-hint)] hover:text-[var(--app-fg)]'} ${className ?? ''}`}
+-            title={copied ? 'Copied!' : `Copy: ${path}`}
+-            onClick={handleClick}
+-        >
+-            {copied
+-                ? <CheckIcon className="h-3.5 w-3.5" />
+-                : <CopyIcon className="h-3.5 w-3.5" />
+-            }
+-        </button>
+-    )
+-}
+-
+-
+ function SearchIcon(props: { className?: string }) {
+     return (
+         <svg
+@@ -497,28 +476,6 @@ function ChevronIcon(props: { className?: string; collapsed?: boolean }) {
+     )
+ }
+ 
+-function SessionPreviewArrowIcon(props: { direction: 'up' | 'down'; className?: string }) {
+-    return (
+-        <svg
+-            xmlns="http://www.w3.org/2000/svg"
+-            viewBox="0 0 24 24"
+-            fill="none"
+-            stroke="currentColor"
+-            strokeWidth="2"
+-            strokeLinecap="round"
+-            strokeLinejoin="round"
+-            className={props.className}
+-            aria-hidden="true"
+-        >
+-            {props.direction === 'up' ? (
+-                <path d="M12 19V5m-6 6 6-6 6 6" />
+-            ) : (
+-                <path d="M12 5v14m6-6-6 6-6-6" />
+-            )}
+-        </svg>
+-    )
+-}
+-
+ export { getSessionTitle } from '@/lib/sessionTitle'
+ export { sessionMatchesQuery } from '@/lib/sessionListSearch'
+ 
+@@ -1184,7 +1141,6 @@ export function SessionList(props: {
+         machinesById = {},
+         onNewSessionInDirectory
+     } = props
+-    const { sessionPreviewLimit } = useSessionPreviewLimit()
+     const { sessionListStatusMode } = useSessionListStatusMode()
+     const { showActiveSessionsOnly } = useShowActiveSessionsOnly()
+     const lastSeenVersion = useSessionLastSeenVersion()
+@@ -1371,121 +1327,28 @@ export function SessionList(props: {
+     const runningSessionTotal = runningSessions.working.length
+         + runningSessions.pending.length
+     const activeSessionTotal = runningSessions.active.length
+-    const groups = useMemo(
++    // Chats are listed individually (no directory dropdowns); the directory is
++    // secondary row metadata. Pinned first, then attention/active, then recent.
++    const chatSessions = useMemo(
+         () => {
+-            const grouped = groupSessionsByDirectory(
+-                machineFilteredSessions.filter((session) => {
+-                    if (session.globalPinned) return false
+-                    if (pinInProgressSessions && !session.pinned && isPinnedInProgressSession(session)) return false
+-                    return true
+-                })
+-            )
++            const chats = machineFilteredSessions.filter((session) => {
++                if (session.globalPinned) return false
++                if (pinInProgressSessions && !session.pinned && isPinnedInProgressSession(session)) return false
++                return true
++            })
+             if (searchScoreIndex && hasTextQuery) {
+-                return rankSessionGroupsBySearchRelevance(grouped, searchScoreIndex)
++                // Project pins stay above the divider; relevance orders each side.
++                const ranked = sortSessionsBySearchRelevance(chats, searchScoreIndex)
++                return [...ranked.filter(s => s.pinned), ...ranked.filter(s => !s.pinned)]
+             }
+-            return grouped
++            return sortChatSessions(chats)
+         },
+         [machineFilteredSessions, pinInProgressSessions, searchScoreIndex, hasTextQuery]
+     )
+-    // Directory groups whose rows all floated to the pinned sections still
+-    // render an action-only header so copy-path / new-session-in-directory
+-    // stay available (no rows to group, but the project itself is live).
+-    // Based on the same machineFilteredSessions set as `groups` so machine /
+-    // unread filters stay consistent.
+-    const allDirectoryGroups = useMemo(
+-        () => groupSessionsByDirectory(
+-            machineFilteredSessions.filter((session) => !session.globalPinned)
+-        ),
+-        [machineFilteredSessions]
+-    )
+-    const actionOnlyGroups = useMemo(() => {
+-        if (!pinInProgressSessions) {
+-            return []
+-        }
+-        const visibleKeys = new Set(groups.map((group) => group.key))
+-        return allDirectoryGroups.filter((group) => !visibleKeys.has(group.key))
+-    }, [groups, allDirectoryGroups, pinInProgressSessions])
+-    const [collapseOverrides, setCollapseOverrides] = useState<Map<string, boolean>>(
+-        () => new Map()
+-    )
+     const [runningSectionCollapsed, setRunningSectionCollapsed] = useState(false)
+     const [activeSectionCollapsed, setActiveSectionCollapsed] = useState(false)
+     const [pinnedSectionCollapsed, setPinnedSectionCollapsed] = useState(false)
+-    const autoExpandedSelectedSessionKeyRef = useRef<string | null>(null)
+-    const isGroupCollapsed = (group: SessionGroup): boolean => {
+-        if (isFiltering) return false
+-        const override = collapseOverrides.get(group.key)
+-        if (override !== undefined) return override
+-        const hasSelectedSession = selectedSessionId
+-            ? group.sessions.some(session => session.id === selectedSessionId)
+-            : false
+-        return !group.hasActiveSession && !group.hasPinnedSession && !hasSelectedSession
+-    }
+-
+-    const toggleGroup = (groupKey: string, isCollapsed: boolean) => {
+-        setCollapseOverrides(prev => {
+-            const next = new Map(prev)
+-            next.set(groupKey, !isCollapsed)
+-            return next
+-        })
+-    }
+-
+-    // Per-group reveal cap for paginated session previews. Absent = the configured
+-    // preview limit; expand/collapse controls move the cap by one preview-sized batch.
+-    const [sessionVisibleCounts, setSessionVisibleCounts] = useState<Map<string, number>>(
+-        () => new Map()
+-    )
+-
+-    const getGroupVisibleCount = (group: SessionGroup): number => {
+-        return sessionVisibleCounts.get(group.key) ?? sessionPreviewLimit
+-    }
+-
+-    const showMoreSessions = (group: SessionGroup) => {
+-        setSessionVisibleCounts(prev => {
+-            const next = new Map(prev)
+-            const currentLimit = Math.min(
+-                prev.get(group.key) ?? sessionPreviewLimit,
+-                group.sessions.length
+-            )
+-            const currentVisibleCount = getVisibleSessionPreview(group.sessions, {
+-                selectedSessionId,
+-                limit: currentLimit
+-            }).length
+-            next.set(group.key, getNextSessionVisibleCount(
+-                Math.max(currentLimit, currentVisibleCount),
+-                sessionPreviewLimit,
+-                group.sessions.length
+-            ))
+-            return next
+-        })
+-    }
+-
+-    const showFewerSessions = (group: SessionGroup) => {
+-        setSessionVisibleCounts(prev => {
+-            const next = new Map(prev)
+-            const current = Math.min(
+-                prev.get(group.key) ?? sessionPreviewLimit,
+-                group.sessions.length
+-            )
+-            const previous = getPreviousSessionVisibleCount(current, sessionPreviewLimit)
+-            if (previous <= sessionPreviewLimit) {
+-                next.delete(group.key)
+-            } else {
+-                next.set(group.key, previous)
+-            }
+-            return next
+-        })
+-    }
+-
+-    const getVisibleGroupSessions = (group: SessionGroup): SessionSummary[] => {
+-        return getVisibleSessionPreview(
+-            group.sessions,
+-            {
+-                selectedSessionId,
+-                limit: getGroupVisibleCount(group)
+-            }
+-        )
+-    }
++    const showChatMachineLabel = showMachineFilterBar && activeMachineFilter === null
+ 
+     const renderPinnedSection = ({
+         sectionKey,
+@@ -1575,227 +1438,49 @@ export function SessionList(props: {
+         )
+     }
+ 
+-    const renderActionOnlyGroupHeader = (group: SessionGroup) => {
+-        // With multiple machines in the unfiltered view, disambiguate
+-        // same-named directories by suffixing the machine label.
+-        const groupTitle = showMachineFilterBar && activeMachineFilter === null
+-            ? `${group.displayName} · ${resolveMachineLabel(group.machineId)}`
+-            : group.displayName
+-        return (
+-            <div key={group.key} data-session-scroll-anchor>
+-                <div
+-                    className="group/project sticky top-0 z-10 flex items-center gap-2 bg-[var(--app-bg)] py-1.5 pl-2 pr-2 text-left rounded-lg transition-colors hover:bg-[var(--app-secondary-bg)] min-w-0 w-full select-none"
+-                    title={group.directory}
+-                >
+-                    <span className="font-medium text-sm truncate flex-1">
+-                        {groupTitle}
+-                    </span>
+-                    <CopyPathButton path={group.directory} className="opacity-0 group-hover/project:opacity-100 transition-opacity duration-150" />
+-                    {onNewSessionInDirectory && group.directory !== 'Other' ? (
+-                        <button
+-                            type="button"
+-                            onClick={(event) => {
+-                                event.stopPropagation()
+-                                onNewSessionInDirectory({
+-                                    machineId: group.machineId,
+-                                    directory: group.directory
+-                                })
+-                            }}
+-                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-70 transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-link)] hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+-                            title={t('sessions.group.new')}
+-                            aria-label={t('sessions.group.new')}
+-                        >
+-                            <PlusIcon className="h-3.5 w-3.5" />
+-                        </button>
+-                    ) : null}
+-                </div>
+-            </div>
+-        )
+-    }
+-
+-    const renderDirectoryGroup = (group: SessionGroup) => {
+-        const isCollapsed = isGroupCollapsed(group)
+-        const visibleGroupSessions = getVisibleGroupSessions(group)
+-        const hiddenSessionCount = group.sessions.length - visibleGroupSessions.length
+-        const currentLimit = Math.min(
+-            getGroupVisibleCount(group),
+-            group.sessions.length
+-        )
+-        const previousLimit = getPreviousSessionVisibleCount(currentLimit, sessionPreviewLimit)
+-        const previousGroupSessions = getVisibleSessionPreview(group.sessions, {
+-            selectedSessionId,
+-            limit: previousLimit
+-        })
+-        const collapseCount = visibleGroupSessions.length - previousGroupSessions.length
+-        const canShowFewerSessions = previousLimit < currentLimit && collapseCount > 0
+-        const expandCount = Math.min(sessionPreviewLimit, hiddenSessionCount)
+-        const canStartInGroupDirectory = group.directory !== 'Other'
+-        // With multiple machines in the unfiltered view, disambiguate
+-        // same-named directories by suffixing the machine label.
+-        const groupTitle = showMachineFilterBar && activeMachineFilter === null
+-            ? `${group.displayName} · ${resolveMachineLabel(group.machineId)}`
+-            : group.displayName
++    const renderChatList = () => {
++        if (chatSessions.length === 0) {
++            return null
++        }
+         return (
+-            <div key={group.key} data-session-scroll-anchor>
+-                <div
+-                    className="group/project sticky top-0 z-10 flex items-center gap-2 bg-[var(--app-bg)] py-1.5 pl-2 pr-2 text-left rounded-lg transition-colors hover:bg-[var(--app-secondary-bg)] cursor-pointer min-w-0 w-full select-none"
+-                    onClick={() => toggleGroup(group.key, isCollapsed)}
+-                    title={group.directory}
+-                >
+-                    <ChevronIcon className="h-3.5 w-3.5 text-[var(--app-hint)] shrink-0" collapsed={isCollapsed} />
+-                    <span className="font-medium text-sm truncate flex-1">
+-                        {groupTitle}
++            <div key="chats-section" data-testid="session-chat-list">
++                <div className="flex min-w-0 w-full select-none items-center gap-2 py-1.5 pl-2 pr-2">
++                    <span className="min-w-0 flex-1 truncate text-sm font-medium">
++                        {t('sessions.chatsSection')}
+                     </span>
+-                    <CopyPathButton path={group.directory} className="opacity-0 group-hover/project:opacity-100 transition-opacity duration-150" />
+-                    {onNewSessionInDirectory && canStartInGroupDirectory ? (
+-                        <button
+-                            type="button"
+-                            onClick={(event) => {
+-                                event.stopPropagation()
+-                                onNewSessionInDirectory({
+-                                    machineId: group.machineId,
+-                                    directory: group.directory
+-                                })
+-                            }}
+-                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-70 transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-link)] hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+-                            title={t('sessions.group.new')}
+-                            aria-label={t('sessions.group.new')}
+-                        >
+-                            <PlusIcon className="h-3.5 w-3.5" />
+-                        </button>
+-                    ) : null}
+-                    <span className="text-[11px] tabular-nums text-[var(--app-hint)] shrink-0">
+-                        ({group.sessions.length})
++                    <span className="shrink-0 text-[11px] tabular-nums text-[var(--app-hint)]">
++                        ({chatSessions.length})
+                     </span>
+                 </div>
+-
+-                {/* Sessions */}
+-                <div className="collapsible-panel" data-open={!isCollapsed || undefined}>
+-                    <div className="collapsible-inner">
+-                    <div className="flex flex-col gap-0.5 ml-3 pl-1 py-1">
+-                        {visibleGroupSessions.map((s, index) => (
+-                            <div key={s.id} className="contents">
+-                                {shouldShowPinnedDivider(visibleGroupSessions, index) ? (
+-                                    <div
+-                                        data-testid="session-pin-divider"
+-                                        className="ml-2.5 mr-2 my-1 border-t border-[var(--app-border)]"
+-                                        aria-hidden="true"
+-                                    />
+-                                ) : null}
+-                                <SessionItem
+-                                    session={s}
+-                                    onSelect={props.onSelect}
+-                                    showPath={false}
+-                                    api={api}
+-                                    titleSuggestionAvailable={titleSuggestionAvailable}
+-                                    selected={s.id === selectedSessionId}
+-                                    showDetailedStatus={showDetailedStatus}
+-                                    lastSeenVersion={lastSeenVersion}
++                <div className="flex flex-col gap-0.5 py-1">
++                    {chatSessions.map((s, index) => (
++                        <div key={s.id} className="contents">
++                            {shouldShowPinnedDivider(chatSessions, index) ? (
++                                <div
++                                    data-testid="session-pin-divider"
++                                    className="ml-2.5 mr-2 my-1 border-t border-[var(--app-border)]"
++                                    aria-hidden="true"
+                                 />
+-                            </div>
+-                        ))}
+-                        {group.sessions.length > sessionPreviewLimit && (hiddenSessionCount > 0 || canShowFewerSessions) ? (
+-                            <div className="ml-2.5 mr-2 my-1 flex gap-1.5">
+-                                {canShowFewerSessions ? (
+-                                    <button
+-                                        type="button"
+-                                        onClick={() => showFewerSessions(group)}
+-                                        className="flex min-w-0 flex-1 items-center justify-center gap-1 rounded-md border border-dashed border-[var(--app-border)] px-2 py-1 text-center text-xs text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]"
+-                                    >
+-                                        <SessionPreviewArrowIcon direction="up" className="h-3 w-3 shrink-0" />
+-                                        {t('sessions.group.collapse', { n: collapseCount })}
+-                                    </button>
+-                                ) : null}
+-                                {hiddenSessionCount > 0 ? (
+-                                    <button
+-                                        type="button"
+-                                        onClick={() => showMoreSessions(group)}
+-                                        className="flex min-w-0 flex-1 items-center justify-center gap-1 rounded-md border border-dashed border-[var(--app-border)] px-2 py-1 text-center text-xs text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]"
+-                                    >
+-                                        <SessionPreviewArrowIcon direction="down" className="h-3 w-3 shrink-0" />
+-                                        {t('sessions.group.expand', { n: expandCount })}
+-                                    </button>
+-                                ) : null}
+-                            </div>
+-                        ) : null}
+-                    </div>
+-                    </div>
++                            ) : null}
++                            <SessionItem
++                                session={s}
++                                onSelect={props.onSelect}
++                                showPath={false}
++                                api={api}
++                                titleSuggestionAvailable={titleSuggestionAvailable}
++                                selected={s.id === selectedSessionId}
++                                showDetailedStatus={showDetailedStatus}
++                                projectLabel={getPathDisplayName(s.metadata?.worktree?.basePath ?? s.metadata?.path ?? 'Other')}
++                                machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
++                                lastSeenVersion={lastSeenVersion}
++                            />
++                        </div>
++                    ))}
+                 </div>
+             </div>
+         )
+     }
+ 
+-    // Auto-expand group containing the selected session only when
+-    // the selected-session/group pair changes. Without this guard, every live
+-    // session-list refresh (for example tool-call updates from a running selected
+-    // session) reopens a path the user just collapsed.
+-    useEffect(() => {
+-        if (!selectedSessionId) {
+-            autoExpandedSelectedSessionKeyRef.current = null
+-            return
+-        }
+-
+-        // Pinned "in progress" sessions are not rendered inside directory
+-        // groups, so only auto-expand when the selected session actually lives
+-        // in a visible group. Using `allGroups` here would expand the group
+-        // below whenever a running session is opened.
+-        const group = groups.find(g =>
+-            g.sessions.some(s => s.id === selectedSessionId)
+-        )
+-        if (!group) {
+-            // The selected session is not rendered inside any directory group
+-            // (e.g. it moved to the pinned "in progress" section). Drop the
+-            // guard so it auto-expands again when it transitions back into a
+-            // group later.
+-            autoExpandedSelectedSessionKeyRef.current = null
+-            return
+-        }
+-
+-        const autoExpandKey = `${selectedSessionId}::${group.key}`
+-        if (autoExpandedSelectedSessionKeyRef.current === autoExpandKey) return
+-        autoExpandedSelectedSessionKeyRef.current = autoExpandKey
+-
+-        setCollapseOverrides(prev => expandSelectedSessionCollapseOverrides(prev, group))
+-    }, [selectedSessionId, groups])
+-
+-    // Clean up stale collapse overrides
+-    useEffect(() => {
+-        setCollapseOverrides(prev => {
+-            if (prev.size === 0) return prev
+-            const next = new Map(prev)
+-            const knownKeys = new Set<string>()
+-            for (const g of allGroups) {
+-                knownKeys.add(g.key)
+-                knownKeys.add(`sessions::${g.key}`)
+-            }
+-            let changed = false
+-            for (const key of next.keys()) {
+-                if (!knownKeys.has(key)) {
+-                    next.delete(key)
+-                    changed = true
+-                }
+-            }
+-            return changed ? next : prev
+-        })
+-    }, [allGroups])
+-
+-    // Clean up reveal caps for groups that no longer exist.
+-    useEffect(() => {
+-        setSessionVisibleCounts(prev => {
+-            if (prev.size === 0) return prev
+-            const knownKeys = new Set(allGroups.map(g => g.key))
+-            const next = new Map(prev)
+-            let changed = false
+-            for (const key of next.keys()) {
+-                if (!knownKeys.has(key)) {
+-                    next.delete(key)
+-                    changed = true
+-                }
+-            }
+-            return changed ? next : prev
+-        })
+-    }, [allGroups])
+-
+     // The search control unmounts when the list empties; reset the expansion so
+     // it cannot suppress header actions (or re-expand on its own when sessions
+     // return) while no search control is rendered.
+@@ -2017,7 +1702,7 @@ export function SessionList(props: {
+                     />
+                 ) : null}
+ 
+-                {props.sessions.length > 0 && (isFiltering || activeMachineFilter !== null || showUnreadOnly) && groups.length === 0 && runningSessionTotal === 0 && activeSessionTotal === 0 && globalPinnedSessions.length === 0 ? (
++                {props.sessions.length > 0 && (isFiltering || activeMachineFilter !== null || showUnreadOnly) && chatSessions.length === 0 && runningSessionTotal === 0 && activeSessionTotal === 0 && globalPinnedSessions.length === 0 ? (
+                     <div className="px-4 py-8 text-center text-sm text-[var(--app-hint)]">
+                         {t('sessions.search.noResults')}
+                     </div>
+@@ -2094,8 +1779,7 @@ export function SessionList(props: {
+                     count: activeSessionTotal,
+                     bucketKeys: ['active'],
+                 })}
+-                {groups.map(renderDirectoryGroup)}
+-                {actionOnlyGroups.map(renderActionOnlyGroupHeader)}
++                {renderChatList()}
+             </SessionListScrollAnchor>
+             </div>
+             </div>
+diff --git a/web/src/lib/locales/en.ts b/web/src/lib/locales/en.ts
+index fb62fac..e469d4c 100644
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -93,6 +93,7 @@ export default {
+   'sessions.group.expand': 'Expand {n}',
+   'sessions.group.collapse': 'Collapse {n}',
+   'sessions.runningSection': 'In progress',
++  'sessions.chatsSection': 'Chats',
+   'sessions.activeSection': 'Active sessions',
+   'sessions.group.new': 'New session in this directory',
+   'sessions.machineFilter.label': 'Filter sessions by machine',
+diff --git a/web/src/lib/locales/zh-CN.ts b/web/src/lib/locales/zh-CN.ts
+index 1633362..239556f 100644
+--- a/web/src/lib/locales/zh-CN.ts
++++ b/web/src/lib/locales/zh-CN.ts
+@@ -93,6 +93,7 @@ export default {
+   'sessions.group.expand': '展开 {n} 个',
+   'sessions.group.collapse': '收起 {n} 个',
+   'sessions.runningSection': '进行中',
++  'sessions.chatsSection': '会话',
+   'sessions.activeSection': '活跃会话',
+   'sessions.group.new': '在此目录新建会话',
+   'sessions.machineFilter.label': '按机器筛选会话',
+diff --git a/web/src/router.tsx b/web/src/router.tsx
+index 0554a68..574e450 100644
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -52,6 +52,7 @@ import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
+ import { refreshSessionDetailPreservingActive } from '@/lib/session-detail-optimistic'
+ import { inactiveSessionCanResume, resolveCursorReopenGate } from '@/lib/sessionResume'
+ import { initializeSessionLastSeen } from '@/lib/sessionLastSeen'
++import { ManagerShortcut } from '@/components/ManagerShortcut'
+ import { useSelectedSessionSeen } from '@/hooks/useSelectedSessionSeen'
+ import { useSessionBrowserTitle } from '@/hooks/useSessionBrowserTitle'
+ import { clearCodexImportedSession } from '@/lib/codexImportedSessions'
+@@ -234,9 +235,11 @@ function SessionsPage() {
+                         </div>
+                     ) : null}
+                     {import.meta.env.VITE_MANAGER_SESSION_ID && (
+-                        <a className="m-3 rounded-xl bg-[var(--app-link)] px-4 py-3 text-center font-semibold text-white" href={`/sessions/${import.meta.env.VITE_MANAGER_SESSION_ID}`}>
+-                            ★ Open your persistent manager
+-                        </a>
++                        <ManagerShortcut
++                            sessionId={import.meta.env.VITE_MANAGER_SESSION_ID}
++                            selected={selectedSessionId === import.meta.env.VITE_MANAGER_SESSION_ID}
++                            onOpen={(sessionId) => navigate(getSessionListSelectionNavigation(sessionId))}
++                        />
+                     )}
+                     <SessionList
+                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}

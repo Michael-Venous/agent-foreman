@@ -1,0 +1,332 @@
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -1,7 +1,7 @@
+ import * as Popover from '@radix-ui/react-popover'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import { ProviderHandoffDialog, HandoffDraftBanner } from '@/components/ProviderHandoff'
+-import { useEffect, useId, useMemo, useRef, useState } from 'react'
++import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from 'react'
+ import { useIsMutating, useQueryClient } from '@tanstack/react-query'
+ import type { Session } from '@/types/api'
+ import type { ApiClient } from '@/api/client'
+@@ -134,6 +134,7 @@
+ export function SessionHeader(props: {
+     session: Session
+     serviceTier?: string | null
++    headerPanels?: ReactNode
+     onBack?: () => void
+     onToggleFiles?: () => void
+     filesActive?: boolean
+@@ -359,9 +360,9 @@
+         setMenuOpen((open) => !open)
+     }
+ 
+-    // In Telegram, don't render header (Telegram provides its own)
++    // Telegram supplies navigation chrome, but still needs the read-only panels.
+     if (isTelegramApp()) {
+-        return null
++        return props.headerPanels ? <div className="flex shrink-0 items-center justify-end border-b border-[var(--app-border)] px-2">{props.headerPanels}</div> : null
+     }
+ 
+     return (
+@@ -443,6 +444,7 @@
+                     </Popover.Root>
+                     </div>
+                     <div className="flex shrink-0 items-center justify-end">
++                    {props.headerPanels}
+                     <button type="button" aria-label="Pin current chat" aria-pressed={chatPinned}
+                         title={chatPinned ? 'Chat pinned: node clicks keep this chat' : 'Keep this chat open when clicking nodes'}
+                         onClick={toggleChatPinned} className={headerToggleClass(chatPinned)}>
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1936,6 +1936,17 @@
+             <SessionHeader
+                 session={props.session}
+                 serviceTier={effectiveCodexServiceTier}
++                headerPanels={<>
++                    <GoalBanner api={props.api} sessionId={props.session.id} running={Boolean(props.session.thinking)} />
++                    <SessionActivityPanel
++                        api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
++                        metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])}
++                        count={props.session.backgroundTaskCount} processes={props.session.backgroundProcesses} status={sessionStatus}
++                        viewedSubagentId={viewedSubagentId} onViewSubagent={setViewedSubagentId}
++                        viewedBackgroundId={viewedBackgroundId} onViewBackground={setViewedBackgroundId}
++                        hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
++                    />
++                </>}
+                 onBack={props.onBack}
+                 onToggleFiles={props.session.metadata?.path ? handleToggleFiles : undefined}
+                 filesActive={false}
+@@ -1964,19 +1975,8 @@
+             />
+             <RunningBar running={Boolean(props.session.active && props.session.thinking)} managed={Boolean(managedSessions[props.session.id])} />
+             <SessionFailureBanner api={props.api} session={props.session} />
+-            <GoalBanner api={props.api} sessionId={props.session.id} running={Boolean(props.session.thinking)} />
+ 
+             <CursorMigrationBanner metadata={props.session.metadata} />
+-
+-            <SessionActivityPanel
+-                api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
+-                metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])}
+-                count={props.session.backgroundTaskCount} processes={props.session.backgroundProcesses} status={sessionStatus}
+-                viewedSubagentId={viewedSubagentId} onViewSubagent={setViewedSubagentId}
+-                viewedBackgroundId={viewedBackgroundId} onViewBackground={setViewedBackgroundId}
+-                hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+-            />
+-
+             </div>
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+diff --git a/web/src/components/GoalBanner.tsx b/web/src/components/GoalBanner.tsx
+--- a/web/src/components/GoalBanner.tsx
++++ b/web/src/components/GoalBanner.tsx
+@@ -1,4 +1,5 @@
+ import { useState } from 'react'
++import { ChatHeaderPopover } from './ChatHeaderPopover'
+ import { useQuery } from '@tanstack/react-query'
+ import type { ApiClient, SessionGoal } from '@/api/client'
+ 
+@@ -38,28 +39,17 @@
+         goal.tokensUsed ? `${goal.tokensUsed.toLocaleString()} tokens` : null,
+     ].filter(Boolean).join(' · ')
+     return (
+-        <div data-testid="goal-banner" className="shrink-0 border-b border-[var(--app-border)] px-3 py-1.5">
+-            <button
+-                type="button"
+-                aria-expanded={open}
+-                title={deliveryNote}
+-                onClick={() => setOpen(value => !value)}
+-                className="flex w-full min-w-0 items-center gap-2 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] rounded"
+-            >
+-                <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0 text-[var(--app-hint)]" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+-                    <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.5" fill="currentColor" />
+-                </svg>
+-                <span className="shrink-0 font-semibold">Saved goal</span>
+-                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${status.className}`}>{status.label}</span>
+-                <span className={`min-w-0 flex-1 text-[var(--app-hint)] ${open ? '' : 'truncate'}`}>{open ? null : goal.objective}</span>
+-            </button>
+-            {open ? (
+-                <div className="mt-1.5 max-h-48 overflow-y-auto whitespace-pre-wrap break-words pl-6 text-xs text-[var(--app-fg)]">
+-                    {goal.objective}
+-                    <p className="mt-1 text-[var(--app-hint)]">{deliveryNote}</p>
+-                    {usage ? <div className="mt-1 text-[11px] text-[var(--app-hint)]">{usage}</div> : null}
+-                </div>
+-            ) : null}
+-        </div>
++        <ChatHeaderPopover label={`Saved goal · ${status.label}`} title="Saved goal" tooltip={deliveryNote}
++            open={open} onOpenChange={setOpen}
++            icon={<svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
++                <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.5" fill="currentColor" />
++            </svg>}>
++            <div data-testid="goal-banner" className="space-y-2 text-xs">
++                <span className={`inline-block rounded-full px-2 py-0.5 text-[11px] font-medium ${status.className}`}>{status.label}</span>
++                <p className="whitespace-pre-wrap break-words text-sm">{goal.objective}</p>
++                <p className="text-[var(--app-hint)]">{deliveryNote}</p>
++                {usage ? <div className="text-[11px] text-[var(--app-hint)]">{usage}</div> : null}
++            </div>
++        </ChatHeaderPopover>
+     )
+ }
+diff --git a/web/src/components/GoalBanner.test.tsx b/web/src/components/GoalBanner.test.tsx
+--- a/web/src/components/GoalBanner.test.tsx
++++ b/web/src/components/GoalBanner.test.tsx
+@@ -14,7 +14,7 @@
+ describe('GoalBanner', () => {
+     it('shows the native goal with its status and expands to full detail', async () => {
+         const api = renderBanner({ objective: 'Finish the SampleSpace outreach deck and draft follow-ups', status: 'active', source: 'codex', updatedAt: 1, tokensUsed: 7009, timeUsedSeconds: 125 })
+-        expect(await screen.findByText('Active')).toBeInTheDocument()
++        expect(await screen.findByRole('button', { name: 'Saved goal · Active' })).toBeInTheDocument()
+         expect(api.getSessionGoal).toHaveBeenCalledWith('s1')
+         const toggle = screen.getByRole('button', { name: /Saved goal/ })
+         expect(toggle).toHaveAttribute('aria-expanded', 'false')
+@@ -25,11 +25,11 @@
+     })
+     it('labels a completed Claude goal and renders nothing without a goal', async () => {
+         renderBanner({ objective: 'Tidy docs', status: 'complete', source: 'claude', updatedAt: 1 })
+-        expect(await screen.findByText('Complete')).toBeInTheDocument()
++        expect(await screen.findByRole('button', { name: 'Saved goal · Complete' })).toBeInTheDocument()
+         cleanup()
+         renderBanner(null)
+         await new Promise(resolve => setTimeout(resolve, 20))
+-        expect(screen.queryByTestId('goal-banner')).toBeNull()
++        expect(screen.queryByRole('button', { name: /Saved goal/ })).toBeNull()
+     })
+ })
+ 
+diff --git a/web/src/components/SessionActivityPanel.tsx b/web/src/components/SessionActivityPanel.tsx
+--- a/web/src/components/SessionActivityPanel.tsx
++++ b/web/src/components/SessionActivityPanel.tsx
+@@ -7,6 +7,7 @@
+ import { collectBackgroundTasks } from '@/chat/backgroundTaskViews'
+ import { BackgroundTasksPanel } from './BackgroundTasksPanel'
+ import { SubagentsPanel, collectSubagents } from './SubagentsPanel'
++import { ChatHeaderPopover } from './ChatHeaderPopover'
+ import { ChecklistList } from './ToolCard/checklist'
+ 
+ /** One activity entry point; live counts and loaded history have distinct labels. */
+@@ -30,14 +31,15 @@
+     const state = !props.active ? `Agent offline${verified ? ` · ${verified} verified background process${verified === 1 ? '' : 'es'}` : ''}` : `${props.thinking ? 'Agent working' : runningTasks > 0 || runningAgents > 0 ? 'Background' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
+     const todos = props.status?.tasks ?? []
+     const hasHistory = verified > 0 || agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
+-    return <section aria-label="Chat activity" className="shrink-0 border-b border-[var(--app-border)]">
+-        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}
+-            className="flex min-h-10 w-full min-w-0 items-center gap-2 px-3 text-left text-xs text-[var(--app-hint)]">
+-            <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span className="font-medium text-[var(--app-fg)]">Activity</span>
+-            {props.managed ? <span title="Managed by Manager" className="shrink-0 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">Managed</span> : null}
+-            <span className={`ml-auto truncate ${props.active && props.thinking ? 'text-[var(--app-badge-success-text)]' : ''}`}>{state}</span>
+-        </button>
+-        <div hidden={!expanded} className="max-h-[min(50dvh,24rem)] space-y-4 overflow-y-auto px-3 pb-3">
++    return <ChatHeaderPopover label={`Activity · ${props.managed ? 'Managed · ' : ''}${state}`} title="Activity"
++        open={expanded} onOpenChange={setExpanded}
++        icon={<svg aria-hidden="true" viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4" /></svg>}
++        badge={runningTasks + runningAgents > 0 ? <span aria-hidden="true" className="absolute -right-0.5 -top-0.5 rounded-full bg-[var(--app-secondary-bg)] px-1 text-[9px] leading-3">{Math.min(99, runningTasks + runningAgents)}</span> : undefined}>
++        <section aria-label="Chat activity" className="space-y-3">
++            <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--app-hint)]">
++                {props.managed ? <span title="Managed by Manager" className="shrink-0 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">Managed</span> : null}
++                <span className={props.active && props.thinking ? 'text-[var(--app-badge-success-text)]' : ''}>{state}</span>
++            </div>
+             {props.active && !props.thinking && (runningTasks > 0 || runningAgents > 0) ? <p className="text-xs text-[var(--app-hint)]">The agent's turn has finished. Runtime counts may lag task completion; individual records show the available evidence.</p> : null}
+             {props.status?.goal ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Goal · {props.status.goal.status}</h3><p className="break-words text-sm">{props.status.goal.objective}</p></div> : null}
+             {todos.length ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Checklist · {todos.filter(task => task.status === 'completed').length}/{todos.length}</h3>
+@@ -50,6 +52,6 @@
+             {!hasHistory && !runningTasks ? <p className="text-sm text-[var(--app-hint)]">No activity in the loaded chat history.</p> : null}
+             {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
+                 className="min-h-9 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
+-        </div>
+-    </section>
++        </section>
++    </ChatHeaderPopover>
+ }
+diff --git a/web/src/components/SessionActivityPanel.test.tsx b/web/src/components/SessionActivityPanel.test.tsx
+--- a/web/src/components/SessionActivityPanel.test.tsx
++++ b/web/src/components/SessionActivityPanel.test.tsx
+@@ -27,7 +27,7 @@
+         const getBackgroundTaskOutput = vi.fn().mockResolvedValue({ text: 'Frame 42', truncated: false, size: 8, modifiedAt: 100 })
+         render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
+         expect(screen.getAllByRole('button')).toHaveLength(1)
+-        expect(screen.getByText('Managed')).toBeInTheDocument()
++        expect(screen.queryByRole('dialog', { name: 'Activity' })).toBeNull()
+         expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toHaveAttribute('aria-expanded', 'false')
+         expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+@@ -36,7 +36,7 @@
+         expect(screen.getAllByRole('button', { name: 'Load earlier activity' })).toHaveLength(1)
+         fireEvent.click(screen.getByRole('button', { name: 'View background task: task' }))
+         expect(await screen.findByText('Frame 42')).toBeInTheDocument()
+-        expect(screen.getByRole('dialog')).toHaveTextContent('render scene')
++        expect(screen.getByRole('dialog', { name: 'Background task' })).toHaveTextContent('render scene')
+     })
+     it('keeps working agent turns distinct from their background tasks', () => {
+         render(<Harness thinking />)
+diff --git a/web/src/components/ChatHeaderPopover.tsx b/web/src/components/ChatHeaderPopover.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/ChatHeaderPopover.tsx
+@@ -0,0 +1,37 @@
++import * as Popover from '@radix-ui/react-popover'
++import type { ReactNode } from 'react'
++
++/** Read-only header panels overlay the thread without shrinking or remounting it. */
++export function ChatHeaderPopover(props: {
++    label: string
++    title: string
++    tooltip?: string
++    open: boolean
++    onOpenChange: (open: boolean) => void
++    icon: ReactNode
++    badge?: ReactNode
++    children: ReactNode
++}) {
++    return <Popover.Root open={props.open} onOpenChange={props.onOpenChange}>
++        <Popover.Trigger asChild>
++            <button type="button" aria-label={props.label} title={props.tooltip ?? props.label}
++                className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)] data-[state=open]:bg-[var(--app-secondary-bg)] data-[state=open]:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]">
++                {props.icon}{props.badge}
++            </button>
++        </Popover.Trigger>
++        <Popover.Portal>
++            <Popover.Content side="bottom" align="end" sideOffset={6} collisionPadding={8}
++                aria-label={props.title}
++                className="z-40 w-96 max-w-[calc(100vw-16px)] max-h-[min(70dvh,var(--radix-popover-content-available-height))] overflow-y-auto rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-[var(--app-fg)] shadow-xl">
++                <div className="mb-2 flex items-center justify-between gap-2">
++                    <h2 className="text-sm font-semibold">{props.title}</h2>
++                    <Popover.Close aria-label={`Collapse ${props.title.toLowerCase()}`} title="Collapse"
++                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]">
++                        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 12h14" /></svg>
++                    </Popover.Close>
++                </div>
++                {props.children}
++            </Popover.Content>
++        </Popover.Portal>
++    </Popover.Root>
++}
+diff --git a/web/src/components/ChatHeaderPopover.test.tsx b/web/src/components/ChatHeaderPopover.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/ChatHeaderPopover.test.tsx
+@@ -0,0 +1,52 @@
++import { fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { useState } from 'react'
++import { describe, expect, it } from 'vitest'
++import { ChatHeaderPopover } from './ChatHeaderPopover'
++
++function Harness({ step = 'Rendering' }: { step?: string }) {
++    const [open, setOpen] = useState(false)
++    return <>
++        <input aria-label="Chat draft" defaultValue="Keep this draft" />
++        <ChatHeaderPopover label="Activity" title="Activity" open={open} onOpenChange={setOpen} icon={<span aria-hidden="true">A</span>}>
++            <p>{step}</p>
++        </ChatHeaderPopover>
++    </>
++}
++
++describe('header activity popouts', () => {
++    it('stays open through live updates and collapses without replacing the conversation', async () => {
++        const view = render(<Harness />)
++        const draft = screen.getByRole('textbox', { name: 'Chat draft' })
++        fireEvent.change(draft, { target: { value: 'An edited draft' } })
++        const trigger = screen.getByRole('button', { name: 'Activity' })
++        expect(trigger).toHaveAttribute('aria-expanded', 'false')
++        expect(screen.queryByRole('dialog')).toBeNull()
++        fireEvent.click(trigger)
++        const panel = screen.getByRole('dialog', { name: 'Activity' })
++        view.rerender(<Harness step="Reviewing frames" />)
++        expect(screen.getByRole('dialog', { name: 'Activity' })).toBe(panel)
++        expect(panel).toHaveTextContent('Reviewing frames')
++        expect(screen.getByRole('textbox')).toBe(draft)
++        expect(draft).toHaveValue('An edited draft')
++        fireEvent.click(screen.getByRole('button', { name: 'Collapse activity' }))
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++        expect(trigger).toHaveAttribute('aria-expanded', 'false')
++        await waitFor(() => expect(trigger).toHaveFocus())
++    })
++
++    it('dismisses with Escape or an outside interaction and can reopen from its header trigger', async () => {
++        render(<Harness />)
++        const trigger = screen.getByRole('button', { name: 'Activity' })
++        fireEvent.click(trigger)
++        fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++        fireEvent.click(trigger)
++        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        // Radix installs outside-pointer handling on the next tick.
++        await new Promise(resolve => setTimeout(resolve, 0))
++        fireEvent.pointerDown(screen.getByRole('textbox'), { pointerType: 'mouse', button: 0 })
++        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++        fireEvent.click(trigger)
++        expect(screen.getByRole('dialog')).toHaveTextContent('Rendering')
++    })
++})
+diff --git a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+@@ -908,6 +908,7 @@
+     const client = new QueryClient()
+     client.setQueryData(['session-goal', 'session-1'], { objective: 'Earlier objective', status: 'active', source: 'codex', updatedAt: now - 1000 })
+     render(<QueryClientProvider client={client}><GoalBanner api={null} sessionId="session-1" running /><QueuedMessagesBar sessionId="session-1" api={null} pendingSchedule={null} pendingScheduleRevision={0} canSteer onEdit={vi.fn()} /></QueryClientProvider>)
++    fireEvent.click(screen.getByRole('button', { name: 'Saved goal · Active' }))
+     await act(async () => { client.setQueryData(['session-goal', 'session-1'], { objective: 'New objective', status: 'active', source: 'codex', updatedAt: now }) })
+     expect(await screen.findByText('New objective')).toBeTruthy()
+     expect(screen.getByText('Use the corrected scope')).toBeTruthy()

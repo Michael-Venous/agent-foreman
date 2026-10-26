@@ -1,0 +1,134 @@
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -41,6 +41,7 @@
+ type ScrollAnchor = {
+     id: string
+     topOffset: number
++    fallbacks?: { id: string; topOffset: number }[]
+ }
+ 
+ type PendingScrollRestore = {
+@@ -225,28 +226,38 @@
+ 
+ export function captureScrollAnchor(viewport: HTMLElement): ScrollAnchor | null {
+     const viewportRect = viewport.getBoundingClientRect()
+-    const messages = Array.from(viewport.querySelectorAll<HTMLElement>(MESSAGE_ANCHOR_SELECTOR))
+-    for (const message of messages) {
++    const visible: { id: string; topOffset: number }[] = []
++    for (const message of viewport.querySelectorAll<HTMLElement>(MESSAGE_ANCHOR_SELECTOR)) {
+         const rect = message.getBoundingClientRect()
+         if (rect.bottom > viewportRect.top && rect.top < viewportRect.bottom) {
+-            return {
+-                id: message.id,
+-                topOffset: rect.top - viewportRect.top
+-            }
+-        }
++            visible.push({ id: message.id, topOffset: rect.top - viewportRect.top })
++            if (visible.length >= 8) break
++        } else if (visible.length && rect.top >= viewportRect.bottom) break
+     }
+-    return null
++    return visible.length ? { ...visible[0]!, ...(visible.length > 1 ? { fallbacks: visible.slice(1) } : {}) } : null
++}
++
++/** Freeze the pre-prepend geometry once the store is applying its new page. */
++export function updatePendingScrollBaseline(pending: PendingScrollRestore, viewport: HTMLElement, phase: HistoryLoaderState['phase']): void {
++    if (phase !== 'loading' && phase !== 'backoff') return
++    pending.anchor = captureScrollAnchor(viewport)
++    pending.scrollTop = viewport.scrollTop
++    pending.scrollHeight = viewport.scrollHeight
+ }
+ 
+ export function restoreScrollAnchor(viewport: HTMLElement, anchor: ScrollAnchor): boolean {
+-    const target = document.getElementById(anchor.id)
+-    if (!target || !viewport.contains(target)) {
+-        return false
++    // Normalization can merge the first visible tool group into older content,
++    // replacing its id. Another visible message is safer than total-height delta
++    // when the bounded history window simultaneously evicts newer rows.
++    for (const candidate of [anchor, ...(anchor.fallbacks ?? [])]) {
++        const target = document.getElementById(candidate.id)
++        if (!target || !viewport.contains(target)) continue
++        const viewportRect = viewport.getBoundingClientRect()
++        const targetRect = target.getBoundingClientRect()
++        viewport.scrollTop += targetRect.top - viewportRect.top - candidate.topOffset
++        return true
+     }
+-    const viewportRect = viewport.getBoundingClientRect()
+-    const targetRect = target.getBoundingClientRect()
+-    viewport.scrollTop += targetRect.top - viewportRect.top - anchor.topOffset
+-    return true
++    return false
+ }
+ 
+ export function hasAppliedHistoryVersion(
+@@ -862,9 +873,7 @@
+             // the eventual prepend will preserve that row instead.
+             const pending = pendingScrollRef.current
+             if (pending && historyLoaderRef.current.runId === pending.runId) {
+-                pending.anchor = captureScrollAnchor(viewport)
+-                pending.scrollTop = viewport.scrollTop
+-                pending.scrollHeight = viewport.scrollHeight
++                updatePendingScrollBaseline(pending, viewport, historyLoaderRef.current.phase)
+             }
+ 
+             const needsCoverage = needsViewportCoverageRef.current()
+@@ -1376,6 +1385,9 @@
+                     if (current.source !== 'consumer' && !needsViewportCoverage()) {
+                         return false
+                     }
++                    // Capture after network wait/reflow, immediately before the
++                    // store mutates. Post-prepend scroll events must not rewrite it.
++                    updatePendingScrollBaseline(pending, viewport, current.phase)
+                     pending.targetHistoryVersion = historyVersion
+                     historyLoaderRef.current = { ...current, phase: 'awaiting-render' }
+                     return true
+--- a/web/src/components/AssistantChat/HappyThread.test.tsx
++++ b/web/src/components/AssistantChat/HappyThread.test.tsx
+@@ -5,6 +5,7 @@
+ import {
+     ConversationOutlinePanel,
+     captureScrollAnchor,
++    updatePendingScrollBaseline,
+     getHistoryCoverageRetryDelay,
+     getPullToLoadState,
+     getScrollIntent,
+@@ -560,3 +561,38 @@
+         expect(prependMissingUserSnapshot([user], fallback)).toEqual([user])
+     })
+ })
++
++describe('prepend scroll baseline and surviving visible anchors', () => {
++    it('recaptures reflow before apply and freezes it against post-prepend scroll events', () => {
++        const viewport=document.createElement('div'), list=document.createElement('div'), message=document.createElement('div')
++        list.className='happy-thread-messages';message.id='reading-anchor';list.append(message);viewport.append(list);document.body.append(viewport)
++        let top=120
++        vi.spyOn(viewport,'getBoundingClientRect').mockReturnValue(rect({top:100,bottom:500}))
++        vi.spyOn(message,'getBoundingClientRect').mockImplementation(()=>rect({top,bottom:top+80}))
++        Object.defineProperty(viewport,'scrollHeight',{configurable:true,value:1000});viewport.scrollTop=200
++        const pending={runId:1,anchor:captureScrollAnchor(viewport),scrollTop:200,scrollHeight:900,targetHistoryVersion:null}
++        // Layout changed while waiting for the network, without a scroll event.
++        top=150;updatePendingScrollBaseline(pending,viewport,'loading')
++        expect(pending.anchor?.topOffset).toBe(50);expect(pending.scrollHeight).toBe(1000)
++        // New content has arrived; its scroll event must not redefine our target.
++        top=350;Object.defineProperty(viewport,'scrollHeight',{configurable:true,value:1200})
++        updatePendingScrollBaseline(pending,viewport,'awaiting-render')
++        expect(pending.anchor?.topOffset).toBe(50);expect(pending.scrollHeight).toBe(1000)
++        expect(restoreScrollAnchor(viewport,pending.anchor!)).toBe(true)
++        expect(viewport.scrollTop).toBe(400)
++        viewport.remove()
++    })
++    it('preserves the next visible message if prepend normalization replaces a tool group id and trims the tail', () => {
++        const viewport=document.createElement('div'),list=document.createElement('div'),group=document.createElement('div'),next=document.createElement('div')
++        list.className='happy-thread-messages';group.id='old-tool-group';next.id='stable-user';list.append(group,next);viewport.append(list);document.body.append(viewport)
++        let nextTop=240
++        vi.spyOn(viewport,'getBoundingClientRect').mockReturnValue(rect({top:100,bottom:500}))
++        vi.spyOn(group,'getBoundingClientRect').mockReturnValue(rect({top:80,bottom:220}))
++        vi.spyOn(next,'getBoundingClientRect').mockImplementation(()=>rect({top:nextTop,bottom:nextTop+60}))
++        viewport.scrollTop=200;const anchor=captureScrollAnchor(viewport)!
++        group.id='merged-older-tool-group';nextTop=440
++        // Net document-height change could be zero after tail eviction.
++        expect(restoreScrollAnchor(viewport,anchor)).toBe(true);expect(viewport.scrollTop).toBe(400)
++        viewport.remove()
++    })
++})

@@ -1,0 +1,28 @@
+--- a/web/src/components/AssistantChat/NativeReadyMessages.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.tsx
+@@ -26,10 +26,11 @@
+             <p className="line-clamp-2 whitespace-pre-wrap break-words">{message.text}</p>
+             <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+                 <span className="text-[var(--app-hint)]">{message.state === 'waiting' ? 'When Claude is ready · tap again to interrupt' : message.state === 'sending' ? 'Sending now…' : 'Delivery unconfirmed · check the conversation before retrying'}</span>
+-                {message.state === 'waiting' && message.canCancel && props.api ? <><button disabled={pending || props.busy} onClick={() => void cancel(message.localId, true)}>Edit</button><button disabled={pending || props.busy} onClick={() => void cancel(message.localId, false)}>Cancel</button></> : null}
++                {message.state === 'waiting' && props.api ? <><button type="button" title={!message.canCancel ? "Resume this chat to enable queue editing" : undefined} className="min-h-8 rounded-md px-2 text-[var(--app-link)] disabled:opacity-40" disabled={!message.canCancel || pending || props.busy} onClick={() => void cancel(message.localId, true)}>Edit</button><button type="button" title={!message.canCancel ? "Resume this chat to enable queue editing" : undefined} className="min-h-8 rounded-md px-2 text-[var(--app-link)] disabled:opacity-40" disabled={!message.canCancel || pending || props.busy} onClick={() => void cancel(message.localId, false)}>Cancel</button></> : null}
+                 {message.state === 'waiting' ? <button type="button" title="Send now; Claude may also process other waiting messages." disabled={props.busy || pending} onClick={() => props.onInterrupt(message.localId)}
+                     className="min-h-8 rounded-md px-2 text-[var(--app-link)] disabled:opacity-40">Interrupt & send</button> : null}
+             </div>
++            {message.state === 'waiting' && !message.canCancel ? <p className="mt-1 text-[var(--app-hint)]">Edit/Cancel require a normal stop and resume to load the updated controller. This waiting message cannot be withdrawn by the current controller.</p> : null}
+         </div>)}
+     </div>
+ }
+--- a/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
++++ b/web/src/components/AssistantChat/NativeReadyMessages.test.tsx
+@@ -30,3 +30,10 @@
+     await waitFor(() => expect(composer.setText).toHaveBeenCalledWith('full message'))
+     expect(api.cancelNativeReadyMessage).toHaveBeenCalledWith('session', 'local')
+ })
++
++it('explains unavailable editing on an older controller instead of hiding the controls', () => {
++    render(<NativeReadyMessages api={{} as any} sessionId="session" messages={[{ localId: 'old', text: 'waiting', state: 'waiting' }]} busy={false} onInterrupt={() => {}} />)
++    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled()
++    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
++    expect(screen.getByText(/updated controller/)).toBeInTheDocument()
++})

@@ -1,0 +1,455 @@
+diff --git a/hub/src/sync/backgroundTasks.test.ts b/hub/src/sync/backgroundTasks.test.ts
+new file mode 100644
+index 0000000..69eaa67
+--- /dev/null
++++ b/hub/src/sync/backgroundTasks.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from 'bun:test'
++import { BackgroundTaskTracker, extractBackgroundTaskDelta } from './backgroundTasks'
++
++export const taskStart = (id: string) => ({ role: 'agent', content: { type: 'output', data: {
++    type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}. Output is being written to: /tmp/task.output` }] }
++} } })
++export const taskEnd = (id: string, status = 'completed') => ({ role: 'agent', content: { type: 'output', data: {
++    type: 'user', message: { role: 'user', content: [{ type: 'text', text: `<task-notification><task-id>${id}</task-id><status>${status}</status></task-notification>` }] }
++} } })
++
++describe('native background tasks', () => {
++    it('reads Claude tool results in native user messages', () => {
++        expect(extractBackgroundTaskDelta(taskStart('bc5ndzhly'))).toMatchObject({ started: 1, startedIds: ['bc5ndzhly'] })
++    })
++    it('does not interpret ordinary user messages as task events', () => {
++        expect(extractBackgroundTaskDelta({ ...taskStart('fake'), role: 'user' })).toBeNull()
++    })
++    it('tracks identities through duplicate starts and unrelated or repeated completions', () => {
++        const tracker = new BackgroundTaskTracker()
++        const apply = (event: unknown) => tracker.apply(extractBackgroundTaskDelta(event)!)
++        expect(apply(taskStart('a'))).toBe(1)
++        expect(apply(taskStart('a'))).toBe(1)
++        expect(apply(taskStart('b'))).toBe(2)
++        expect(apply(taskEnd('other'))).toBe(2)
++        expect(apply(taskEnd('a', 'failed'))).toBe(1)
++        expect(apply(taskEnd('a'))).toBe(1)
++        expect(apply(taskStart('a'))).toBe(1)
++        expect(apply(taskEnd('b', 'stopped'))).toBe(0)
++    })
++    it('supports structured native task lifecycle events', () => {
++        const event = (subtype: string) => ({ role: 'agent', content: { type: 'output', data: { type: 'system', subtype, task_id: 'native', status: 'completed' } } })
++        expect(extractBackgroundTaskDelta(event('task_started'))?.startedIds).toEqual(['native'])
++        expect(extractBackgroundTaskDelta(event('task_notification'))?.completedIds).toEqual(['native'])
++    })
++    it('ignores nonterminal task progress notifications', () => {
++        expect(extractBackgroundTaskDelta(taskEnd('a', 'running'))).toBeNull()
++    })
++})
+diff --git a/hub/src/sync/backgroundTasks.ts b/hub/src/sync/backgroundTasks.ts
+index 526a08d..6c969c0 100644
+--- a/hub/src/sync/backgroundTasks.ts
++++ b/hub/src/sync/backgroundTasks.ts
+@@ -1,91 +1,63 @@
+ import { isObject } from '@hapi/protocol'
+ import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+ 
+-/**
+- * Extract background task start/completion signals from a message.
+- *
+- * Uses role-aware parsing to avoid false positives:
+- *  - Started:   agent-role output with tool_result containing
+- *               "Command running in background with ID:"
+- *  - Completed: agent-role output wrapping a user-type message (system-injected)
+- *               starting with "<task-notification>"
+- *
+- * Both signals arrive as { role: 'agent', content: { type: 'output', data: {...} } }
+- * because the CLI wraps all messages in agent envelopes.
+- */
+-export function extractBackgroundTaskDelta(messageContent: unknown): { started: number; completed: number } | null {
+-    const record = unwrapRoleWrappedRecordEnvelope(messageContent)
+-    if (!record || record.role !== 'agent') return null
+-    if (!isObject(record.content) || record.content.type !== 'output') return null
+-
+-    const data = isObject(record.content.data) ? record.content.data : null
+-    if (!data) return null
+-
+-    const started = countTaskStarts(record.content)
+-    const completed = data.type === 'user' ? countTaskCompletions(data) : 0
+-
+-    if (started === 0 && completed === 0) return null
+-    return { started, completed }
++export type BackgroundTaskDelta = {
++    started: number
++    completed: number
++    startedIds?: string[]
++    completedIds?: string[]
+ }
+ 
+-/**
+- * Count background task starts from tool_result blocks.
+- */
+-function countTaskStarts(content: Record<string, unknown>): number {
+-    const data = isObject(content.data) ? content.data : null
+-    if (!data) return 0
+-
+-    // Direct tool_result
+-    if (data.type === 'tool_result') {
+-        return isBackgroundStartResult(data) ? 1 : 0
++/** Only native agent output may report tasks; ordinary user text is not evidence. */
++export function extractBackgroundTaskDelta(messageContent: unknown): BackgroundTaskDelta | null {
++    const record = unwrapRoleWrappedRecordEnvelope(messageContent)
++    if (!record || record.role !== 'agent' || !isObject(record.content) || record.content.type !== 'output') return null
++    const data = record.content.data
++    if (!isObject(data)) return null
++    const startedIds = new Set<string>()
++    const completedIds = new Set<string>()
++    let anonymousCompleted = 0
++    const textOf = (value: unknown): string => typeof value === 'string' ? value
++        : Array.isArray(value) ? value.map(part => isObject(part) && part.type === 'text' && typeof part.text === 'string' ? part.text : '').join('\n') : ''
++    const start = (block: unknown) => {
++        if (!isObject(block) || block.type !== 'tool_result' || block.is_error === true) return
++        for (const match of textOf(block.content).matchAll(/Command running in background with ID:\s*([\w-]+)/g)) startedIds.add(match[1])
+     }
+-
+-    // Assistant message with content array containing tool_result blocks
+-    if (data.type === 'assistant') {
+-        const message = isObject(data.message) ? data.message : null
+-        const modelContent = message?.content
+-        if (!Array.isArray(modelContent)) return 0
+-
+-        let count = 0
+-        for (const block of modelContent) {
+-            if (isObject(block) && block.type === 'tool_result' && isBackgroundStartResult(block)) {
+-                count++
++    if (data.type === 'tool_result') start(data)
++    if ((data.type === 'user' || data.type === 'assistant') && isObject(data.message) && Array.isArray(data.message.content)) {
++        data.message.content.forEach(start)
++    }
++    if (data.type === 'user') {
++        const text = textOf(isObject(data.message) ? data.message.content : data.content).trimStart()
++        if (text.startsWith('<task-notification>')) {
++            const status = text.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
++            if (!status || ['completed', 'failed', 'stopped', 'cancelled'].includes(status)) {
++                const id = text.match(/<task-id>\s*([^<]+?)\s*<\/task-id>/)?.[1]
++                if (id) completedIds.add(id)
++                else anonymousCompleted++
+             }
+         }
+-        return count
+     }
+-
+-    return 0
+-}
+-
+-function isBackgroundStartResult(block: Record<string, unknown>): boolean {
+-    const text = typeof block.content === 'string'
+-        ? block.content
+-        : Array.isArray(block.content)
+-            ? block.content.map((c: unknown) => isObject(c) && typeof c.text === 'string' ? c.text : '').join('')
+-            : ''
+-    return text.includes('Command running in background with ID:')
+-}
+-
+-/**
+- * Count task completions from system-injected user messages.
+- *
+- * These arrive as: { type: 'user', message: { content: '<task-notification>...' } }
+- * inside the agent output envelope.
+- */
+-function countTaskCompletions(data: Record<string, unknown>): number {
+-    // { type: 'user', message: { content: '<task-notification>...' } }
+-    if (isObject(data.message)) {
+-        const msg = data.message as Record<string, unknown>
+-        if (typeof msg.content === 'string' && msg.content.trimStart().startsWith('<task-notification>')) {
+-            return 1
+-        }
++    if (data.type === 'system' && typeof data.task_id === 'string') {
++        if (data.subtype === 'task_started') startedIds.add(data.task_id)
++        if (data.subtype === 'task_notification' && ['completed', 'failed', 'stopped', 'cancelled'].includes(String(data.status))) completedIds.add(data.task_id)
+     }
++    if (!startedIds.size && !completedIds.size && !anonymousCompleted) return null
++    return { started: startedIds.size, completed: completedIds.size + anonymousCompleted, startedIds: [...startedIds], completedIds: [...completedIds] }
++}
+ 
+-    // { type: 'user', uuid: '...', content: '<task-notification>...' }
+-    if (typeof data.content === 'string' && data.content.trimStart().startsWith('<task-notification>')) {
+-        return 1
++/** Identity-based accounting prevents replayed or unrelated notifications changing the count. */
++export class BackgroundTaskTracker {
++    private active = new Set<string>()
++    private completed = new Set<string>()
++    private anonymous = 0
++
++    apply(delta: BackgroundTaskDelta): number {
++        for (const id of delta.startedIds ?? []) if (!this.completed.has(id)) this.active.add(id)
++        for (const id of delta.completedIds ?? []) { this.active.delete(id); this.completed.add(id) }
++        this.anonymous = Math.max(0, this.anonymous + delta.started - (delta.startedIds?.length ?? 0)
++            - delta.completed + (delta.completedIds?.length ?? 0))
++        return this.count
+     }
+-
+-    return 0
++    get count(): number { return this.active.size + this.anonymous }
+ }
+diff --git a/hub/src/sync/sessionCache.backgroundTasks.test.ts b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+new file mode 100644
+index 0000000..8dbe6fd
+--- /dev/null
++++ b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from 'bun:test'
++import { Store } from '../store'
++import type { EventPublisher } from './eventPublisher'
++import { SessionCache } from './sessionCache'
++import { extractBackgroundTaskDelta } from './backgroundTasks'
++import { taskStart, taskEnd } from './backgroundTasks.test'
++
++describe('SessionCache background task recovery', () => {
++    it('restores only unfinished tasks belonging to the active controller and keeps live accounting consistent', () => {
++        const store = new Store(':memory:')
++        const publisher = { emit: () => {} } as unknown as EventPublisher
++        const cache = new SessionCache(store, publisher)
++        const session = cache.getOrCreateSession('background', { path: '/tmp', host: 'test' }, null, 'default')
++        store.messages.addMessage(session.id, taskStart('imported'), 'imported', undefined, session.createdAt - 1000)
++        store.messages.addMessage(session.id, taskStart('finished'), 'start-finished')
++        store.messages.addMessage(session.id, taskEnd('finished'), 'end-finished')
++        store.messages.addMessage(session.id, taskStart('live'), 'start-live')
++        store.messages.addMessage(session.id, taskStart('live'), 'duplicate-live')
++        const restarted = new SessionCache(store, publisher)
++        restarted.reloadAll()
++        expect(restarted.getSession(session.id)?.backgroundTaskCount).toBe(0)
++        // Live controllers reattach even when their persisted active flag is false.
++        restarted.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: false })
++        expect(restarted.getSession(session.id)?.backgroundTaskCount).toBe(1)
++        restarted.applyBackgroundTaskDelta(session.id, extractBackgroundTaskDelta(taskEnd('live'))!)
++        expect(restarted.getSession(session.id)?.backgroundTaskCount).toBe(0)
++    })
++    it('does not restore historical tasks for a disconnected session', () => {
++        const store = new Store(':memory:')
++        const publisher = { emit: () => {} } as unknown as EventPublisher
++        const cache = new SessionCache(store, publisher)
++        const session = cache.getOrCreateSession('inactive', { path: '/tmp', host: 'test' }, null, 'default')
++        store.messages.addMessage(session.id, taskStart('old'))
++        const restarted = new SessionCache(store, publisher)
++        restarted.reloadAll()
++        expect(restarted.getSession(session.id)?.backgroundTaskCount).toBe(0)
++    })
++})
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+index 7ae05e1..a9ac7bd 100644
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -4,7 +4,7 @@ import type { Store } from '../store'
+ import { clampAliveTime } from './aliveTime'
+ import { EventPublisher } from './eventPublisher'
+ import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
+-import { extractBackgroundTaskDelta } from './backgroundTasks'
++import { extractBackgroundTaskDelta, BackgroundTaskTracker, type BackgroundTaskDelta } from './backgroundTasks'
+ 
+ const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
+ // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
+@@ -16,6 +16,7 @@ type RuntimeConfigKey = 'permissionMode' | 'model' | 'modelReasoningEffort' | 'e
+ 
+ export class SessionCache {
+     private readonly sessions: Map<string, Session> = new Map()
++    private readonly backgroundTasks = new Map<string, BackgroundTaskTracker>()
+     private readonly lastBroadcastAtBySessionId: Map<string, number> = new Map()
+     private readonly todoBackfillAttemptedSessionIds: Set<string> = new Set()
+     private readonly deduplicateInProgress: Set<string> = new Set()
+@@ -126,6 +127,7 @@ export class SessionCache {
+     refreshSession(sessionId: string): Session | null {
+         let stored = this.store.sessions.getSession(sessionId)
+         if (!stored) {
++            this.backgroundTasks.delete(sessionId)
+             const existed = this.sessions.delete(sessionId)
+             this.pendingThinkingUntilBySessionId.delete(sessionId)
+             this.runtimeConfigUpdatedAtBySessionId.delete(sessionId)
+@@ -199,7 +201,7 @@ export class SessionCache {
+             thinking: existing?.thinking ?? false,
+             thinkingAt: existing?.thinkingAt ?? 0,
+             activeTurnStartedAt: existing?.activeTurnStartedAt ?? null,
+-            backgroundTaskCount: existing?.backgroundTaskCount ?? 0,
++            backgroundTaskCount: existing?.backgroundTaskCount ?? (stored.active ? this.restoreBackgroundTasks(sessionId, stored.createdAt) : 0),
+             todos,
+             teamState,
+             todosUpdatedAt: stored.todosUpdatedAt ?? 0,
+@@ -252,6 +254,9 @@ export class SessionCache {
+ 
+         const wasActive = session.active
+         session.active = true
++        if (!this.backgroundTasks.has(session.id)) {
++            session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
++        }
+         session.activeAt = Math.max(session.activeAt, t)
+ 
+         this.lastBroadcastAtBySessionId.set(session.id, Date.now())
+@@ -262,7 +267,8 @@ export class SessionCache {
+             data: {
+                 active: true,
+                 activeAt: session.activeAt,
+-                thinking: session.thinking
++                thinking: session.thinking,
++                backgroundTaskCount: session.backgroundTaskCount
+             } satisfies SessionPatch
+         })
+ 
+@@ -388,6 +394,9 @@ export class SessionCache {
+             && this.store.messages.getImmediateQueuedLocalMessages(session.id).length > 0
+ 
+         session.active = true
++        if (!this.backgroundTasks.has(session.id)) {
++            session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
++        }
+         session.activeAt = Math.max(session.activeAt, t)
+         session.thinking = requestedThinking || preserveQueuedThinking
+         session.thinkingAt = t
+@@ -468,6 +477,7 @@ export class SessionCache {
+                     active: true,
+                     activeAt: session.activeAt,
+                     thinking: session.thinking,
++                    backgroundTaskCount: session.backgroundTaskCount,
+                     activeTurnStartedAt: session.activeTurnStartedAt,
+                     permissionMode: session.permissionMode,
+                     model: session.model,
+@@ -530,18 +540,32 @@ export class SessionCache {
+         }
+     }
+ 
+-    applyBackgroundTaskDelta(sessionId: string, delta: { started: number; completed: number }): void {
++    private restoreBackgroundTasks(sessionId: string, since: number): number {
++        const tracker = new BackgroundTaskTracker()
++        // Imported transcript history predating this HAPI controller must not
++        // resurrect background processes from an earlier invocation.
++        for (const message of this.store.messages.getAllMessages(sessionId)) {
++            if (message.createdAt < since) continue
++            const delta = extractBackgroundTaskDelta(message.content)
++            if (delta) tracker.apply(delta)
++        }
++        this.backgroundTasks.set(sessionId, tracker)
++        return tracker.count
++    }
++
++    applyBackgroundTaskDelta(sessionId: string, delta: BackgroundTaskDelta): void {
+         const session = this.sessions.get(sessionId)
+         if (!session) return
+-
+-        const prev = session.backgroundTaskCount ?? 0
+-        const next = Math.max(0, prev + delta.started - delta.completed)
+-        if (next === prev) return
+-
++        let tracker = this.backgroundTasks.get(sessionId)
++        if (!tracker) {
++            tracker = new BackgroundTaskTracker()
++            this.backgroundTasks.set(sessionId, tracker)
++        }
++        const next = tracker.apply(delta)
++        if (next === (session.backgroundTaskCount ?? 0)) return
+         session.backgroundTaskCount = next
+         this.publisher.emit({
+-            type: 'session-updated',
+-            sessionId,
++            type: 'session-updated', sessionId,
+             data: { backgroundTaskCount: next } satisfies SessionPatch
+         })
+     }
+@@ -625,6 +649,7 @@ export class SessionCache {
+         session.thinkingAt = t
+         session.activeTurnStartedAt = null
+         session.backgroundTaskCount = 0
++        this.backgroundTasks.delete(session.id)
+         this.pendingThinkingUntilBySessionId.delete(session.id)
+ 
+         this.publisher.emit({
+@@ -1077,6 +1102,7 @@ export class SessionCache {
+             throw new Error('Failed to delete session')
+         }
+ 
++        this.backgroundTasks.delete(sessionId)
+         this.sessions.delete(sessionId)
+         this.lastBroadcastAtBySessionId.delete(sessionId)
+         this.todoBackfillAttemptedSessionIds.delete(sessionId)
+@@ -1324,6 +1350,7 @@ export class SessionCache {
+                 throw new Error('Failed to delete old session during merge')
+             }
+ 
++            this.backgroundTasks.delete(oldSessionId)
+             const existed = this.sessions.delete(oldSessionId)
+             if (existed) {
+                 this.publisher.emit({ type: 'session-removed', sessionId: oldSessionId, namespace })
+diff --git a/web/src/components/SessionRowSummary.test.tsx b/web/src/components/SessionRowSummary.test.tsx
+index 8e6cbec..eb2a8ba 100644
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -50,11 +50,13 @@ describe('SessionRowSummary background status', () => {
+         renderSummary(false)
+ 
+         expect(screen.getByText('Running', { exact: true })).toBeInTheDocument()
++        expect(screen.getByTestId('activity-progress')).toHaveAttribute('aria-label', 'Background tasks running')
+         expect(screen.queryByRole('tooltip', { hidden: true })).not.toBeInTheDocument()
+     })
+ 
+     it('shows a detailed background dot with the task-count tooltip in Extended mode', () => {
+         renderSummary(true)
++        expect(screen.getByTestId('activity-progress')).toBeInTheDocument()
+ 
+         expect(screen.queryByText('Running', { exact: true })).not.toBeInTheDocument()
+         const tooltip = screen.getByRole('tooltip', { hidden: true })
+@@ -132,7 +134,7 @@ describe('SessionRowSummary background status', () => {
+         expect(screen.queryByRole('tooltip', { hidden: true })).not.toBeInTheDocument()
+     })
+ 
+-    it('shows an explicit unread dot before the thinking spinner', () => {
++    it('keeps the progress circle visible alongside explicit unread attention', () => {
+         const session = makeSummary({
+             id: 'selected-thinking-unread',
+             thinking: true,
+@@ -153,5 +155,13 @@ describe('SessionRowSummary background status', () => {
+         )
+ 
+         expect(screen.getByRole('tooltip', { hidden: true })).toHaveTextContent('New activity')
++        expect(screen.getByTestId('activity-progress')).toHaveAttribute('aria-label', 'Running')
++    })
++
++    it('does not spin for connected but idle sessions or disconnected background history', () => {
++        const view = render(<I18nProvider><SessionRowSummary session={makeSummary({ backgroundTaskCount: 0 })} /></I18nProvider>)
++        expect(screen.queryByTestId('activity-progress')).not.toBeInTheDocument()
++        view.rerender(<I18nProvider><SessionRowSummary session={makeSummary({ active: false, thinking: true })} /></I18nProvider>)
++        expect(screen.queryByTestId('activity-progress')).not.toBeInTheDocument()
+     })
+ })
+diff --git a/web/src/components/SessionRowSummary.tsx b/web/src/components/SessionRowSummary.tsx
+index 6e9895e..8f9b89c 100644
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -177,6 +177,17 @@ export function SessionRowSummary(props: {
+                     >
+                         {sessionName}
+                     </div>
++                    {s.active && (s.thinking || (s.backgroundTaskCount ?? 0) > 0) ? (
++                        managed ? (
++                            <span className="inline-flex shrink-0" title="Manager is running this chat" aria-label="Manager is running this chat" data-testid="managed-running">
++                                <LoaderIcon className="h-3.5 w-3.5 animate-spin text-violet-500" />
++                            </span>
++                        ) : (
++                            <span data-testid="activity-progress" className="inline-flex shrink-0" title={s.thinking ? "Running" : "Background tasks running"} aria-label={s.thinking ? "Running" : "Background tasks running"}>
++                                <LoaderIcon className="h-3.5 w-3.5 animate-spin-slow text-[var(--app-badge-success-text)]" />
++                            </span>
++                        )
++                    ) : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+@@ -190,16 +201,6 @@ export function SessionRowSummary(props: {
+                             title={attentionLabel ?? undefined}
+                             aria-label={attentionLabel ?? undefined}
+                         />
+-                    ) : s.active && s.thinking ? (
+-                        managed ? (
+-                            <span className="inline-flex shrink-0" title="Manager is running this chat" aria-label="Manager is running this chat" data-testid="managed-running">
+-                                <LoaderIcon className="h-3.5 w-3.5 animate-spin text-violet-500" />
+-                            </span>
+-                        ) : (
+-                            <span className="inline-flex shrink-0" title="Running" aria-label="Running">
+-                                <LoaderIcon className="h-3.5 w-3.5 animate-spin-slow text-[var(--app-badge-success-text)]" />
+-                            </span>
+-                        )
+                     ) : urgentAttention && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}

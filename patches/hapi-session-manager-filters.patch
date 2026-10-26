@@ -1,0 +1,100 @@
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -12,10 +12,15 @@
+     managed?: Record<string, ManagedSession>; machineLabels?: Record<string, string>;
+ }) {
+     const [open, setOpen] = useState(false)
++    const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
++    const [managedOnly, setManagedOnly] = useState(false)
+     const { entries, dismiss } = useSessionManager(props.sessions)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+         Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+-    const clearable = rows.filter(e => !sessionHasWork(e.session))
++    const visibleRows = rows.filter(e => (!managedOnly || Boolean(props.managed?.[e.session.id]))
++        && (activityFilter === 'all' || (activityFilter === 'active' ? sessionHasWork(e.session) : !sessionHasWork(e.session))))
++    const filtered = managedOnly || activityFilter !== 'all'
++    const clearable = visibleRows.filter(e => !sessionHasWork(e.session))
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+         <button type="button" onClick={() => setOpen(true)} aria-label="Session Manager"
+@@ -25,12 +30,23 @@
+         </button>
+         <Dialog open={open} onOpenChange={setOpen}><DialogContent className="flex max-h-[85dvh] max-w-2xl flex-col">
+             <DialogHeader><DialogTitle>Session Manager</DialogTitle><DialogDescription>All providers and machines, regardless of sidebar filters. Open a chat to see its Activity. Clearing only hides a row; it never stops work or deletes history.</DialogDescription></DialogHeader>
++            <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
++                <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
++                    {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
++                        onClick={() => setActivityFilter(value)} className={`min-h-9 rounded-md px-3 text-sm ${activityFilter === value ? 'bg-[var(--app-bg)] font-medium text-[var(--app-fg)] shadow-sm' : 'text-[var(--app-hint)]'}`}>
++                        {value === 'all' ? 'All' : value === 'active' ? 'Active' : 'Inactive'}
++                    </button>)}
++                </div>
++                <button type="button" aria-pressed={managedOnly} onClick={() => setManagedOnly(value => !value)}
++                    className={`min-h-10 rounded-lg border px-3 text-sm ${managedOnly ? 'border-violet-500 bg-violet-500/15 text-[var(--app-fg)]' : 'border-[var(--app-border)] text-[var(--app-hint)]'}`}>Managed</button>
++            </div>
++            <p className="text-xs text-[var(--app-hint)]">Active: running, background or awaiting input. Inactive: idle or offline. Managed can be combined with either.</p>
+             <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+-                <span>{working} working or awaiting input · {rows.length} listed</span>
+-                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">Clear idle / inactive</button>
++                <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} working or awaiting input · ${rows.length} listed`}</span>
++                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">{filtered ? 'Clear shown idle / inactive' : 'Clear idle / inactive'}</button>
+             </div>
+             <div className="min-h-0 overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+-                {rows.map(({ session, missing }) => <div key={session.id} className="flex min-w-0 items-center gap-1 border-b border-[var(--app-divider)] py-1">
++                {visibleRows.map(({ session, missing }) => <div key={session.id} className="flex min-w-0 items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1">
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); setOpen(false) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={Boolean(props.managed?.[session.id])} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+@@ -39,6 +55,7 @@
+                     </div>
+                     <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Dismiss from this list only" onClick={() => dismiss([session.id])} className="h-10 w-10 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                 </div>)}
++                {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions match these filters. Retained sessions are still in All.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions to show. Running, background and awaiting-input sessions appear here as they are observed.</p>}
+             </div>
+             <p className="text-xs text-[var(--app-hint)]">Finished and inactive sessions stay here until cleared. Reloading or restarting this HAPI page resets the list; currently working sessions reappear. Closing this panel or reconnecting does not reset it. Dismissed sessions return when they start new work.</p>
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -43,3 +43,43 @@
+         await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+     })
+ })
++
++describe('Session Manager filters', () => {
++    it('defaults to All, combines Managed with activity, and preserves hidden retained rows', async () => {
++        const client = new QueryClient(); const select = vi.fn()
++        const view = (sessions: SessionSummary[]) => <QueryClientProvider client={client}><I18nProvider><SessionManagerButton sessions={sessions} onSelect={select} managed={{ Codex: { role: 'worker', worker: 'w', project: 'p', watch: 'events' } }} /></I18nProvider></QueryClientProvider>
++        const { rerender } = render(view([session('Codex'), session('Claude')]))
++        expect(screen.queryByRole('group', { name: 'Session filters' })).toBeNull()
++        open(); await screen.findByRole('button', { name: 'Open Codex' })
++        expect(screen.getByRole('group', { name: 'Session filters' }).closest('[role=dialog]')).toBeTruthy()
++        expect(screen.getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
++        rerender(view([session('Codex', true, false), session('Claude')]))
++        await screen.findByText('Idle · retained until cleared')
++        fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++        expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        await screen.findByText(/No sessions match/)
++        fireEvent.click(screen.getByRole('button', { name: 'Inactive' }))
++        expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'All' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
++        expect(select).not.toHaveBeenCalled()
++    })
++    it('filtered clearing dismisses only visible idle rows', async () => {
++        const client = new QueryClient()
++        const view = (sessions: SessionSummary[]) => <QueryClientProvider client={client}><I18nProvider><SessionManagerButton sessions={sessions} onSelect={vi.fn()} managed={{ Codex: { role: 'manager' } }} /></I18nProvider></QueryClientProvider>
++        const { rerender } = render(view([session('Codex'), session('Claude')]))
++        open(); await screen.findByRole('button', { name: 'Open Codex' })
++        rerender(view([session('Codex', false, false), session('Claude', true, false)]))
++        await screen.findByText('Inactive · retained until cleared')
++        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        fireEvent.click(screen.getByRole('button', { name: 'Clear shown idle / inactive' }))
++        await screen.findByText(/No sessions match/)
++        fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++        expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
++        expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
++    })
++})

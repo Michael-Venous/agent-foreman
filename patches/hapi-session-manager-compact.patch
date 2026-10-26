@@ -1,0 +1,116 @@
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,7 +1,7 @@
+ import { useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ManagedSession } from '@/api/client'
+-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { sessionHasWork } from '@/lib/sessionManager'
+@@ -28,8 +28,8 @@
+             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+             <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{rows.length}</span>
+         </button>
+-        <Dialog open={open} onOpenChange={setOpen}><DialogContent className="flex max-h-[85dvh] max-w-2xl flex-col">
+-            <DialogHeader><DialogTitle>Session Manager</DialogTitle><DialogDescription>All providers and machines, regardless of sidebar filters. Open a chat to see its Activity. Clearing only hides a row; it never stops work or deletes history.</DialogDescription></DialogHeader>
++        <Dialog open={open} onOpenChange={setOpen}><DialogContent aria-describedby={undefined} className="flex max-h-[85dvh] max-w-2xl flex-col">
++            <DialogHeader><DialogTitle>Session Manager</DialogTitle></DialogHeader>
+             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+                 <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+                     {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+@@ -40,10 +40,9 @@
+                 <button type="button" aria-pressed={managedOnly} onClick={() => setManagedOnly(value => !value)}
+                     className={`min-h-10 rounded-lg border px-3 text-sm ${managedOnly ? 'border-violet-500 bg-violet-500/15 text-[var(--app-fg)]' : 'border-[var(--app-border)] text-[var(--app-hint)]'}`}>Managed</button>
+             </div>
+-            <p className="text-xs text-[var(--app-hint)]">Active: running, background or awaiting input. Inactive: idle or offline. Managed can be combined with either.</p>
+             <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+-                <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} working or awaiting input · ${rows.length} listed`}</span>
+-                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">{filtered ? 'Clear shown idle / inactive' : 'Clear idle / inactive'}</button>
++                <span>{filtered ? `${visibleRows.length} of ${rows.length} shown` : `${working} active · ${rows.length} listed`}</span>
++                <button type="button" disabled={!clearable.length} onClick={() => dismiss(clearable.map(e => e.session.id))} className="min-h-9 shrink-0 text-[var(--app-link)] disabled:opacity-40">{filtered ? 'Clear shown inactive' : 'Clear inactive'}</button>
+             </div>
+             <div className="min-h-0 overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {visibleRows.map(({ session, missing }) => <div key={session.id} className="flex min-w-0 items-center gap-1 border-b border-[var(--app-divider)] py-1">
+@@ -51,14 +50,13 @@
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); setOpen(false) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={Boolean(props.managed?.[session.id])} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+-                        {!sessionHasWork(session) && <p className="px-2 pb-1 text-xs text-[var(--app-hint)]">{missing ? 'Inactive · no longer in the current session list' : session.active ? 'Idle · retained until cleared' : 'Inactive · retained until cleared'}</p>}
++                        {!sessionHasWork(session) && <p className="px-2 pb-1 text-xs text-[var(--app-hint)]">{missing ? 'Unavailable' : session.active ? 'Idle' : 'Inactive'}</p>}
+                     </div>
+                     <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Dismiss from this list only" onClick={() => dismiss([session.id])} className="h-10 w-10 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                 </div>)}
+-                {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions match these filters. Retained sessions are still in All.</p>}
+-                {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions to show. Running, background and awaiting-input sessions appear here as they are observed.</p>}
++                {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
++                {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+             </div>
+-            <p className="text-xs text-[var(--app-hint)]">Finished and inactive sessions stay here until cleared. Reloading or restarting this HAPI page resets the list; currently working sessions reappear. Closing this panel or reconnecting does not reset it. Dismissed sessions return when they start new work.</p>
+         </DialogContent></Dialog>
+     </>
+ }
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -20,25 +20,25 @@
+         const { rerender } = render(fixture(client, [session('Codex'), session('Claude')], select)); open()
+         await screen.findByRole('button', { name: 'Open Codex' }); expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+         rerender(fixture(client, [session('Codex', false, false), session('Claude')], select))
+-        await screen.findByText('Inactive · retained until cleared')
+-        fireEvent.click(screen.getByRole('button', { name: 'Clear idle / inactive' }))
++        await screen.findByText('Inactive', { selector: 'p' })
++        fireEvent.click(screen.getByRole('button', { name: 'Clear inactive' }))
+         await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull())
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument(); expect(select).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: 'Dismiss Claude from Session Manager' }))
+-        await screen.findByText(/No sessions to show/); expect(select).not.toHaveBeenCalled()
++        await screen.findByText(/No sessions\./); expect(select).not.toHaveBeenCalled()
+     })
+     it('retains across sidebar unmount/navigation, resets with a fresh page cache', async () => {
+         const client = new QueryClient(); const first = render(fixture(client, [session('Codex')])); open()
+         await screen.findByRole('button', { name: 'Open Codex' }); first.unmount()
+         const second = render(fixture(client, [session('Codex', false, false)])); open()
+-        await screen.findByText('Inactive · retained until cleared'); second.unmount()
++        await screen.findByText('Inactive', { selector: 'p' }); second.unmount()
+         render(fixture(new QueryClient(), [session('Codex', false, false)])); open()
+-        await screen.findByText(/No sessions to show/)
++        await screen.findByText(/No sessions\./)
+     })
+     it('opens existing chat without sending/resuming; loading does not mark it inactive', async () => {
+         const client = new QueryClient(); const select = vi.fn(); const { rerender } = render(fixture(client, [session('Codex')], select)); open()
+         const row = await screen.findByRole('button', { name: 'Open Codex' })
+-        rerender(fixture(client, undefined, select)); expect(screen.queryByText(/Inactive ·/)).toBeNull()
++        rerender(fixture(client, undefined, select)); expect(screen.queryByText(/^Inactive$/, { selector: 'p' })).toBeNull()
+         fireEvent.click(row); expect(select).toHaveBeenCalledWith('Codex')
+         await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+     })
+@@ -54,12 +54,12 @@
+         expect(screen.getByRole('group', { name: 'Session filters' }).closest('[role=dialog]')).toBeTruthy()
+         expect(screen.getByRole('button', { name: 'All', pressed: true })).toBeInTheDocument()
+         rerender(view([session('Codex', true, false), session('Claude')]))
+-        await screen.findByText('Idle · retained until cleared')
++        await screen.findByText('Idle')
+         fireEvent.click(screen.getByRole('button', { name: 'Active' }))
+         expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()
+         fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+-        await screen.findByText(/No sessions match/)
++        await screen.findByText(/No matching sessions/)
+         fireEvent.click(screen.getByRole('button', { name: 'Inactive' }))
+         expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
+         fireEvent.click(screen.getByRole('button', { name: 'All' }))
+@@ -74,10 +74,10 @@
+         const { rerender } = render(view([session('Codex'), session('Claude')]))
+         open(); await screen.findByRole('button', { name: 'Open Codex' })
+         rerender(view([session('Codex', false, false), session('Claude', true, false)]))
+-        await screen.findByText('Inactive · retained until cleared')
++        await screen.findByText('Inactive', { selector: 'p' })
+         fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+-        fireEvent.click(screen.getByRole('button', { name: 'Clear shown idle / inactive' }))
+-        await screen.findByText(/No sessions match/)
++        fireEvent.click(screen.getByRole('button', { name: 'Clear shown inactive' }))
++        await screen.findByText(/No matching sessions/)
+         fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
+         expect(screen.queryByRole('button', { name: 'Open Codex' })).toBeNull()
+         expect(screen.getByRole('button', { name: 'Open Claude' })).toBeInTheDocument()

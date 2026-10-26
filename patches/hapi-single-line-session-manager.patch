@@ -1,0 +1,109 @@
+diff --git a/web/src/components/SessionManagerButton.tsx b/web/src/components/SessionManagerButton.tsx
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -26,8 +26,8 @@
+     const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Stopped'
+         : managementPaused ? (hasWork ? 'Management held' : 'On hold')
+         : hasWork || sessionFailureLabel(session) ? null : session.active ? 'Idle' : 'Inactive'
+-    return label ? <div className="col-start-1 row-start-2 flex min-w-0 items-center px-2 text-xs text-[var(--app-hint)]">
+-        <p>{label}</p>
++    return label ? <div className="min-w-0 max-w-24 shrink-0 text-xs text-[var(--app-hint)]">
++        <p className="truncate whitespace-nowrap" title={label}>{label}</p>
+     </div> : null
+ }
+ 
+@@ -75,20 +75,19 @@
+             {listError && <p role="alert" className="text-xs text-[var(--app-badge-error-text)]">{listError}</p>}
+             <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {pinnedCount > 0 && <button type="button" aria-label="Pinned sessions" aria-expanded={!pinnedCollapsed}
+-                    onClick={() => setPinnedCollapsed(!pinnedCollapsed)} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-2 text-left text-xs font-medium text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">
++                    onClick={() => setPinnedCollapsed(!pinnedCollapsed)} className="flex min-h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-xs font-medium text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">
+                     <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={`h-3.5 w-3.5 shrink-0 transition-transform ${pinnedCollapsed ? '-rotate-90' : ''}`}><path d="m4 6 4 4 4-4" /></svg>
+                     <span>Pinned</span><span className="ml-auto tabular-nums">{pinnedCount}</span>
+                 </button>}
+                 {displayedRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+                     {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+-                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-1 border-b border-[var(--app-divider)] py-0.5">
+-                    <div className="col-span-2 min-w-0 sm:col-span-1">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex min-h-10 w-full min-w-0 flex-col rounded-lg px-2 py-0.5 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+-                            <SessionRowSummary session={session} showPath alignActivityColumns managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
++                    <div className="min-w-0 border-b border-[var(--app-divider)]">
++                    <div className="flex min-w-0 items-center gap-1">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => props.onSelect(session.id)} className="flex h-8 min-w-0 flex-1 items-center rounded-lg px-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                            <SessionRowSummary session={session} showPath={false} singleLine alignActivityColumns managed={isManaged(session.id)} />
+                         </button>
+-                    </div>
+                     <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+-                    <div className="col-start-2 row-start-2 flex w-[7.5rem] items-center justify-end gap-1 sm:row-span-2 sm:row-start-1">
++                    <div className="flex shrink-0 items-center justify-end gap-1">
+                         {props.managed?.[session.id]?.role === 'worker' && isManaged(session.id) && <button type="button" disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+@@ -98,8 +97,8 @@
+                                     await client.invalidateQueries({ queryKey: ['managed-sessions'] })
+                                 } catch (error) { setErrors(old => ({ ...old, [session.id]: error instanceof Error ? error.message : 'Unmanage failed' })) }
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+-                            }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Unmanage</button>}
+-                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing || adding !== null} onClick={() => dismiss([session.id])} className="h-10 w-10 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++                            }} className="h-8 shrink-0 whitespace-nowrap rounded-lg px-2 text-xs text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Unmanage</button>}
++                        {stopped ? <button type="button" aria-label={`Dismiss ${getSessionTitle(session)} from Session Manager`} title="Clear" disabled={clearing || adding !== null} onClick={() => dismiss([session.id])} className="h-8 w-8 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
+                         : <button type="button" aria-label={`Stop ${getSessionTitle(session)}`} disabled={pending[session.id] || !props.api}
+                             onClick={async () => {
+                                 setPending(old => ({ ...old, [session.id]: true })); setErrors(old => ({ ...old, [session.id]: '' }))
+@@ -109,9 +108,10 @@
+                                     await client.invalidateQueries({ queryKey: ['manual-pause', session.id] })
+                                 } catch (error) { setErrors(old => ({ ...old, [session.id]: error instanceof Error ? error.message : 'Stop failed' })) }
+                                 finally { setPending(old => ({ ...old, [session.id]: false })) }
+-                            }} className="min-h-10 rounded-lg px-2 text-xs text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Stop</button>}
++                            }} className="h-8 shrink-0 whitespace-nowrap rounded-lg px-2 text-xs text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Stop</button>}
+                     </div>
+-                    {errors[session.id] && <p role="alert" className="col-span-2 w-full break-words text-xs text-[var(--app-badge-error-text)]">{errors[session.id]}</p>}
++                    </div>
++                    {errors[session.id] && <p role="alert" className="w-full break-words text-xs text-[var(--app-badge-error-text)]">{errors[session.id]}</p>}
+                 </div></Fragment>)}
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+diff --git a/web/src/components/SessionRowSummary.tsx b/web/src/components/SessionRowSummary.tsx
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -111,6 +111,8 @@
+     machineLabel?: string
+     /** Stable status/time columns in the Session Manager. */
+     alignActivityColumns?: boolean
++    /** One-line Session Manager row; the full title and path stay in the title tooltip. */
++    singleLine?: boolean
+ }) {
+     const {
+         session: s,
+@@ -127,6 +129,7 @@
+         projectLabel,
+         machineLabel,
+         alignActivityColumns = false,
++        singleLine = false,
+     } = props
+     const { t } = useTranslation()
+     const sessionName = getSessionTitle(s)
+@@ -171,12 +174,12 @@
+ 
+     return (
+         <div className={`flex w-full min-w-0 flex-col gap-1 ${className ?? ''}`}>
+-            <div className={`grid ${alignActivityColumns ? 'grid-cols-[minmax(0,1fr)_4.5rem_3.5rem]' : 'grid-cols-[minmax(9rem,1fr)_minmax(0,max-content)]'} items-center gap-2 ${!s.active ? 'opacity-50' : ''}`}>
++            <div className={`grid ${alignActivityColumns ? (singleLine ? 'grid-cols-[minmax(0,1fr)_auto_auto]' : 'grid-cols-[minmax(0,1fr)_4.5rem_3.5rem]') : 'grid-cols-[minmax(9rem,1fr)_minmax(0,max-content)]'} items-center gap-2 ${!s.active ? 'opacity-50' : ''}`}>
+                 <div className="flex min-w-0 items-center gap-2">
+                     <AgentFlavorIcon flavor={s.metadata?.flavor} className="h-4 w-4 shrink-0 -translate-y-px" />
+                     <div
+                         className={`min-w-0 flex-1 truncate text-sm font-medium ${s.active ? 'text-[var(--app-fg)]' : 'text-[var(--app-hint)]'}`}
+-                        title={sessionName}
++                        title={singleLine ? [sessionName, s.metadata?.path].filter(Boolean).join('\n') : sessionName}
+                     >
+                         {sessionName}
+                     </div>
+@@ -272,7 +275,7 @@
+                     ) : null}
+                 </div>
+             </div>
+-            {projectLabel || machineLabel ? (
++            {singleLine ? null : projectLabel || machineLabel ? (
+                 <div className="truncate text-xs text-[var(--app-hint)]" title={[projectLabel, machineLabel].filter(Boolean).join(' · ')}>
+                     {[projectLabel, machineLabel].filter(Boolean).join(' · ')}
+                 </div>

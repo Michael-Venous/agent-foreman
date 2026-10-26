@@ -1,0 +1,1369 @@
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -329,7 +329,18 @@
+ })
+ export type SessionFailure = z.infer<typeof SessionFailureSchema>
+ 
++/** Locally verified, identity-bound detached process; never inferred from prose. */
++export const BackgroundProcessSchema = z.object({
++    id: z.string().min(1).max(200),
++    pid: z.number().int().positive(),
++    command: z.string().max(4096),
++    checkedAt: z.number().nonnegative()
++})
++export type BackgroundProcess = z.infer<typeof BackgroundProcessSchema>
++
+ export const SessionSchema = z.object({
++    backgroundProcesses: z.array(BackgroundProcessSchema).optional(),
++    backgroundTasksUpdatedAt: z.number().nonnegative().optional(),
+     lastFailure: SessionFailureSchema.nullable().optional(),
+     lastFailureAt: z.number().optional(),
+     hasConversationContent: z.boolean().optional(),
+@@ -400,6 +411,8 @@
+ })
+ 
+ export const SessionPatchSchema = z.object({
++    backgroundProcesses: z.array(BackgroundProcessSchema).optional(),
++    backgroundTasksUpdatedAt: z.number().nonnegative().optional(),
+     lastFailure: SessionFailureSchema.nullable().optional(),
+     lastFailureAt: z.number().optional(),
+     active: z.boolean().optional(),
+--- a/shared/src/types.ts
++++ b/shared/src/types.ts
+@@ -1,4 +1,5 @@
+ export type {
++    BackgroundProcess,
+     AgentState,
+     AgentStateCompletedRequest,
+     AgentStateRequest,
+--- a/shared/src/sessionSummary.ts
++++ b/shared/src/sessionSummary.ts
+@@ -46,6 +46,8 @@
+ }
+ 
+ export type SessionSummary = {
++    backgroundProcesses?: Session['backgroundProcesses']
++    backgroundTasksUpdatedAt?: number
+     lastFailure?: Session['lastFailure']
+     lastFailureAt?: number
+     hasConversationContent?: boolean
+@@ -207,6 +209,8 @@
+ 
+ export function toSessionSummary(session: Session): SessionSummary {
+     return {
++        ...(session.backgroundProcesses !== undefined ? { backgroundProcesses: session.backgroundProcesses } : {}),
++        ...(session.backgroundTasksUpdatedAt !== undefined ? { backgroundTasksUpdatedAt: session.backgroundTasksUpdatedAt } : {}),
+         lastFailure: session.lastFailure ?? null,
+         lastFailureAt: session.lastFailureAt ?? 0,
+         hasConversationContent: session.hasConversationContent ?? false,
+--- a/web/src/lib/sessionPatch.ts
++++ b/web/src/lib/sessionPatch.ts
+@@ -1,3 +1,4 @@
++import { acceptsBackgroundTasksPatch, sameBackgroundProcesses } from '@/lib/backgroundProcesses'
+ import { acceptsFailurePatch, sameSessionFailure } from '@/lib/sessionFailure'
+ import type { Session, SessionPatch } from '@/types/api'
+ 
+@@ -38,6 +39,8 @@
+         ) {
+             continue
+         }
++        if (['backgroundTaskCount', 'backgroundProcesses', 'backgroundTasksUpdatedAt'].includes(key) && !acceptsBackgroundTasksPatch(session, patch)) continue
++        if (key === 'backgroundProcesses' && sameBackgroundProcesses(session.backgroundProcesses, patch.backgroundProcesses)) continue
+         if ((key === 'lastFailure' || key === 'lastFailureAt') && !acceptsFailurePatch(session, patch)) continue
+         if (key === 'lastFailure' && sameSessionFailure(session.lastFailure, patch.lastFailure)) continue
+         if (current[key] !== value) {
+@@ -87,7 +90,11 @@
+     if (patch.permissionMode !== undefined) assign('permissionMode', patch.permissionMode)
+     if (patch.collaborationMode !== undefined) assign('collaborationMode', patch.collaborationMode)
+     if (patch.copilotAgentMode !== undefined) assign('copilotAgentMode', patch.copilotAgentMode)
+-    if (patch.backgroundTaskCount !== undefined) assign('backgroundTaskCount', patch.backgroundTaskCount)
++    if (acceptsBackgroundTasksPatch(session, patch)) {
++        if (patch.backgroundTaskCount !== undefined) assign('backgroundTaskCount', patch.backgroundTaskCount)
++        if (patch.backgroundProcesses !== undefined) assign('backgroundProcesses', patch.backgroundProcesses)
++        if (patch.backgroundTasksUpdatedAt !== undefined) assign('backgroundTasksUpdatedAt', patch.backgroundTasksUpdatedAt)
++    }
+     // Version gates: dual SSE can deliver duplicates out of order.
+     // Only mark changed when a strictly newer version lands —
+     // otherwise keep previous object identity (no redundant render).
+--- a/web/src/hooks/useSSE.ts
++++ b/web/src/hooks/useSSE.ts
+@@ -1,3 +1,4 @@
++import { acceptsBackgroundTasksPatch, preserveNewerBackgroundTasks, sameBackgroundProcesses } from '@/lib/backgroundProcesses'
+ import { acceptsFailurePatch, sameSessionFailure } from '@/lib/sessionFailure'
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import { useQueryClient } from '@tanstack/react-query'
+@@ -163,6 +164,8 @@
+         && current.lastFailureAt === next.lastFailureAt
+         && current.updatedAt === next.updatedAt
+         && current.backgroundTaskCount === next.backgroundTaskCount
++        && sameBackgroundProcesses(current.backgroundProcesses, next.backgroundProcesses)
++        && current.backgroundTasksUpdatedAt === next.backgroundTasksUpdatedAt
+         && current.model === next.model
+         && current.modelReasoningEffort === next.modelReasoningEffort
+         && current.effort === next.effort
+@@ -490,7 +493,7 @@
+                 const existingIndex = previous.sessions.findIndex((item) => item.id === session.id)
+                 const existing = existingIndex >= 0 ? previous.sessions[existingIndex] : undefined
+                 const summary = {
+-                    ...toSessionSummary(session),
++                    ...preserveNewerBackgroundTasks(existing, toSessionSummary(session)),
+                     futureScheduledMessageCount: existing?.futureScheduledMessageCount ?? 0,
+                     nextScheduledAt: existing?.nextScheduledAt ?? null
+                 }
+@@ -537,9 +540,11 @@
+                     updatedAt: patch.updatedAt !== undefined
+                         ? Math.max(current.updatedAt, patch.updatedAt)
+                         : current.updatedAt,
+-                    backgroundTaskCount: Object.prototype.hasOwnProperty.call(patch, 'backgroundTaskCount')
++                    backgroundTaskCount: acceptsBackgroundTasksPatch(current, patch) && Object.prototype.hasOwnProperty.call(patch, 'backgroundTaskCount')
+                         ? patch.backgroundTaskCount ?? 0
+                         : current.backgroundTaskCount,
++                    backgroundProcesses: acceptsBackgroundTasksPatch(current, patch) ? patch.backgroundProcesses ?? current.backgroundProcesses : current.backgroundProcesses,
++                    backgroundTasksUpdatedAt: acceptsBackgroundTasksPatch(current, patch) ? patch.backgroundTasksUpdatedAt ?? current.backgroundTasksUpdatedAt : current.backgroundTasksUpdatedAt,
+                     model: Object.prototype.hasOwnProperty.call(patch, 'model') ? patch.model ?? null : current.model,
+                     modelReasoningEffort: Object.prototype.hasOwnProperty.call(patch, 'modelReasoningEffort')
+                         ? patch.modelReasoningEffort ?? null
+@@ -746,7 +751,7 @@
+                     void queryClient.removeQueries({ queryKey: queryKeys.session(event.sessionId) })
+                     clearMessageWindow(event.sessionId)
+                 } else if (isSessionRecord(event.data) && event.data.id === event.sessionId) {
+-                    queryClient.setQueryData<SessionResponse>(queryKeys.session(event.sessionId), { session: event.data })
++                    queryClient.setQueryData<SessionResponse>(queryKeys.session(event.sessionId), previous => ({ session: preserveNewerBackgroundTasks(previous?.session, event.data as Session) }))
+                     upsertSessionSummary(event.data)
+                 } else {
+                     const patch = getSessionPatch(event.data)
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1457,12 +1457,14 @@
+             tasks: props.session.todos,
+             blocks: reconciled.blocks,
+             messages: normalizedMessages,
+-            backgroundTaskCount: props.session.backgroundTaskCount
++            backgroundTaskCount: props.session.backgroundTaskCount,
++            backgroundProcesses: props.session.backgroundProcesses
+         }),
+         [
+             reduced.latestGoal,
+             props.session.todos,
+             props.session.backgroundTaskCount,
++            props.session.backgroundProcesses,
+             reconciled.blocks,
+             normalizedMessages
+         ]
+@@ -1968,7 +1970,7 @@
+             <SessionActivityPanel
+                 api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
+                 metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])}
+-                count={props.session.backgroundTaskCount} status={sessionStatus}
++                count={props.session.backgroundTaskCount} processes={props.session.backgroundProcesses} status={sessionStatus}
+                 viewedSubagentId={viewedSubagentId} onViewSubagent={setViewedSubagentId}
+                 viewedBackgroundId={viewedBackgroundId} onViewBackground={setViewedBackgroundId}
+                 hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+--- a/web/src/components/SessionActivityPanel.tsx
++++ b/web/src/components/SessionActivityPanel.tsx
+@@ -1,3 +1,4 @@
++import type { BackgroundProcess } from '@hapi/protocol/types'
+ import { useMemo, useState } from 'react'
+ import type { ApiClient } from '@/api/client'
+ import type { ChatBlock, NormalizedMessage } from '@/chat/types'
+@@ -12,6 +13,7 @@
+ export function SessionActivityPanel(props: {
+     api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
+     managed?: boolean;
++    processes?: readonly BackgroundProcess[];
+     metadata: SessionMetadataSummary | null; active: boolean; thinking: boolean; count?: number; status: SessionStatusData | null;
+     viewedSubagentId: string | null; onViewSubagent: (id: string | null) => void;
+     viewedBackgroundId: string | null; onViewBackground: (id: string | null) => void;
+@@ -19,13 +21,15 @@
+ }) {
+     const [expanded, setExpanded] = useState(false)
+     const agents = useMemo(() => collectSubagents(props.blocks), [props.blocks])
+-    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, props.count), [props.blocks, props.messages, props.active, props.count])
++    const verified = props.processes?.length ?? 0
++    const nativeCount = props.count === undefined ? undefined : Math.max(0, props.count - verified)
++    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount), [props.blocks, props.messages, props.active, nativeCount])
+     const runningAgents = props.active ? agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length : 0
+-    const runningTasks = props.active ? (props.count ?? 0) + tasks.filter(task => task.provider === 'codex' && task.state === 'running').length : 0
++    const runningTasks = props.active ? Math.max(props.count ?? 0, verified + tasks.filter(task => task.provider === 'codex' && task.state === 'running').length) : 0
+     const summary = [runningTasks ? `Runtime reports ${runningTasks} background task${runningTasks === 1 ? '' : 's'}` : null, runningAgents ? `${runningAgents} subagent${runningAgents === 1 ? '' : 's'}` : null].filter(Boolean)
+-    const state = !props.active ? 'Offline' : `${props.thinking ? 'Agent working' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
++    const state = !props.active ? `Agent offline${verified ? ` · ${verified} verified background process${verified === 1 ? '' : 'es'}` : ''}` : `${props.thinking ? 'Agent working' : runningTasks > 0 || runningAgents > 0 ? 'Background' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
+     const todos = props.status?.tasks ?? []
+-    const hasHistory = agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
++    const hasHistory = verified > 0 || agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
+     return <section aria-label="Chat activity" className="shrink-0 border-b border-[var(--app-border)]">
+         <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}
+             className="flex min-h-10 w-full min-w-0 items-center gap-2 px-3 text-left text-xs text-[var(--app-hint)]">
+@@ -40,8 +44,8 @@
+                 <ChecklistList items={todos.map(task => ({ id: task.id || undefined, text: task.content, status: task.status }))} /></div> : null}
+             {agents.length ? <SubagentsPanel embedded blocks={props.blocks} metadata={props.metadata} viewedId={props.viewedSubagentId} onView={props.onViewSubagent}
+                 hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
+-            {tasks.length || runningTasks ? <BackgroundTasksPanel embedded visible={expanded} api={props.api} sessionId={props.sessionId} blocks={props.blocks} messages={props.messages}
+-                active={props.active} count={props.count} viewedId={props.viewedBackgroundId} onView={props.onViewBackground}
++            {tasks.length || runningTasks || verified ? <BackgroundTasksPanel embedded visible={expanded} api={props.api} sessionId={props.sessionId} blocks={props.blocks} messages={props.messages}
++                active={props.active} count={props.count} processes={props.processes} viewedId={props.viewedBackgroundId} onView={props.onViewBackground}
+                 hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
+             {!hasHistory && !runningTasks ? <p className="text-sm text-[var(--app-hint)]">No activity in the loaded chat history.</p> : null}
+             {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
+--- a/web/src/components/BackgroundTasksPanel.tsx
++++ b/web/src/components/BackgroundTasksPanel.tsx
+@@ -1,3 +1,4 @@
++import type { BackgroundProcess } from '@hapi/protocol/types'
+ import { useEffect, useMemo, useState } from 'react'
+ import { useQueries, useQueryClient } from '@tanstack/react-query'
+ import type { ApiClient } from '@/api/client'
+@@ -9,11 +10,13 @@
+ export function BackgroundTasksPanel(props: {
+     embedded?: boolean; visible?: boolean;
+     api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
+-    active: boolean; count?: number; viewedId: string | null; onView: (id: string | null) => void;
++    active: boolean; count?: number; processes?: readonly BackgroundProcess[]; viewedId: string | null; onView: (id: string | null) => void;
+     hasMore: boolean; loadingMore: boolean; onLoadEarlier: () => void
+ }) {
+     const [expanded, setExpanded] = useState(false)
+-    const recordedTasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, props.count), [props.blocks, props.messages, props.active, props.count])
++    const processes = props.processes ?? []
++    const nativeCount = props.count === undefined ? undefined : Math.max(0, props.count - processes.length)
++    const recordedTasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount), [props.blocks, props.messages, props.active, nativeCount])
+     const client = useQueryClient()
+     const listVisible = props.visible !== false && (props.embedded || expanded)
+     const canRead = typeof props.api.getBackgroundTaskOutput === 'function'
+@@ -25,7 +28,7 @@
+         enabled: canRead && task.liveOutput && task.id === props.viewedId,
+         staleTime: 30_000, retry: false, refetchOnWindowFocus: false,
+         refetchInterval: (query: { state: { error: unknown } }) =>
+-            props.active && (props.count ?? 0) > 0 && task.id === props.viewedId && (task.state === 'running' || task.state === 'unknown')
++            props.active && (nativeCount ?? 0) > 0 && task.id === props.viewedId && (task.state === 'running' || task.state === 'unknown')
+                 ? query.state.error ? 30_000 : 2000 : false as const,
+     })) })
+     useEffect(() => {
+@@ -44,7 +47,7 @@
+                     const key = ['background-task-output', props.sessionId, task.id]
+                     const state = client.getQueryState(key)
+                     const last = Math.max(attempted.get(task.id) ?? 0, state?.dataUpdatedAt ?? 0, state?.errorUpdatedAt ?? 0)
+-                    return state?.fetchStatus !== 'fetching' && (!last || (props.active && (props.count ?? 0) > 0 && Date.now() - last >= 30_000))
++                    return state?.fetchStatus !== 'fetching' && (!last || (props.active && (nativeCount ?? 0) > 0 && Date.now() - last >= 30_000))
+                 })
+                 .sort((a, b) => (attempted.get(a.id) ?? 0) - (attempted.get(b.id) ?? 0)).slice(0, 4)
+             for (const task of candidates) {
+@@ -59,7 +62,7 @@
+         }
+         void refresh()
+         return () => { disposed = true; clearTimeout(timer) }
+-    }, [client, canRead, listVisible, recordedTasks, props.api, props.sessionId, props.active, props.count, props.viewedId])
++    }, [client, canRead, listVisible, recordedTasks, props.api, props.sessionId, props.active, nativeCount, props.viewedId])
+     const tasks = recordedTasks.map((task, index) => ({ ...task,
+         outputExitCode: backgroundOutputExitCode(outputs[index]?.data?.text ?? '') }))
+     const taskLabel = (task: typeof tasks[number]) => task.outputExitCode !== null && (task.state === 'unknown' || task.state === 'running')
+@@ -70,16 +73,20 @@
+     const liveOutput = query?.data
+     const loading = query?.isFetching ?? false
+     const error = query?.error instanceof Error ? query.error.message : null
+-    const running = props.active ? (props.count ?? 0) + tasks.filter(t => t.provider === 'codex' && t.state === 'running').length : 0
++    const running = props.active ? Math.max(props.count ?? 0, processes.length + tasks.filter(t => t.provider === 'codex' && t.state === 'running').length) : 0
+     return <div className={props.embedded ? "min-w-0" : "shrink-0 border-b border-[var(--app-border)] px-3 py-1"}>
+-        {props.embedded ? <h3 className="mb-2 text-xs font-medium text-[var(--app-hint)]">Background tasks · {tasks.length} recorded</h3> : <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
++        {props.embedded ? <h3 className="mb-2 text-xs font-medium text-[var(--app-hint)]">Background tasks · {tasks.length} recorded{processes.length ? ` · ${processes.length} verified` : ''}</h3> : <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
+             className="flex min-h-8 w-full items-center gap-2 text-left text-sm text-[var(--app-hint)]">
+             <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>Background tasks ({tasks.length})</span>
+             {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">Runtime reports {running} pending</span> : null}
+         </button>}
+         {props.embedded || expanded ? <div className={props.embedded ? "space-y-1" : "max-h-52 space-y-1 overflow-y-auto pb-2"}>
+-            {!tasks.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
+-            {props.active && (props.count ?? 0) > tasks.length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
++            {!tasks.length && !processes.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
++            {props.active && (props.count ?? 0) > tasks.length + processes.length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
++            {processes.map(process => <details key={process.id} className="rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-sm" data-verified-background-process={process.id}>
++                <summary className="flex min-h-9 cursor-pointer items-center gap-2"><span className="min-w-0 flex-1"><code className="block truncate">{process.command}</code><span className="block text-xs text-[var(--app-hint)]">PID {process.pid}</span></span><span className="shrink-0 text-xs text-[var(--app-badge-success-text)]">Running (verified)</span></summary>
++                <div className="mt-2 space-y-1"><CodeBlock code={process.command} language="bash" /><p className="text-xs text-[var(--app-hint)]">Verified locally at {new Date(process.checkedAt).toLocaleTimeString()}. This process can outlive the agent's turn or Stop.</p></div>
++            </details>)}
+             {tasks.map(task => <button type="button" key={task.id} onClick={() => props.onView(task.id)} aria-label={`View background task: ${task.id}`}
+                 className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
+                 <span className="min-w-0 flex-1"><code className="block truncate">{task.command}</code><span className="block text-xs text-[var(--app-hint)]">{task.id}</span></span>
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -788,7 +788,7 @@
+                             <span className="flex min-w-0 items-center gap-1.5"><span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} /><span className="truncate text-sm font-medium text-[var(--app-fg)]">{name}</span></span>
+                             <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--app-hint)]">
+                                 {id === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 font-medium text-violet-500">Overseer</span>}
+-                                <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}</span>
++                                <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
+                             </span>
+                         </button>
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -181,6 +181,7 @@
+                         {sessionName}
+                     </div>
+                     {!alignActivityColumns ? activity : null}
++                    {!s.thinking && (!s.active || failure) && (s.backgroundProcesses?.length ?? 0) > 0 ? <span className="shrink-0 text-[11px] text-[var(--app-hint)]" title="Verified background processes continue independently of the agent turn">Background · {s.backgroundProcesses!.length}</span> : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+                             attention={attention}
+--- a/web/src/components/SessionActivityPanel.test.tsx
++++ b/web/src/components/SessionActivityPanel.test.tsx
+@@ -2,6 +2,7 @@
+ import { useState } from 'react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { BackgroundProcess } from '@hapi/protocol/types'
+ import type { ApiClient } from '@/api/client'
+ import type { ToolCallBlock } from '@/chat/types'
+ import { I18nProvider } from '@/lib/i18n-context'
+@@ -13,12 +14,12 @@
+     id: 'start', name: 'Bash', state: 'completed', input: { command: 'render scene' },
+     result: 'Command running in background with ID: task. Output is being written to: /tmp/task.output.',
+     createdAt: 100, startedAt: 100, completedAt: 110, execStartedAt: null, execCompletedAt: null, description: null } }
+-function Harness({ count = 1, empty = false, thinking = false, load = vi.fn(), api = {} as ApiClient }: { count?: number; empty?: boolean; thinking?: boolean; load?: () => void; api?: ApiClient }) {
++function Harness({ count = 1, empty = false, thinking = false, active = true, processes, blocked = false, load = vi.fn(), api = {} as ApiClient }: { count?: number; empty?: boolean; thinking?: boolean; active?: boolean; processes?: BackgroundProcess[]; blocked?: boolean; load?: () => void; api?: ApiClient }) {
+     const [client] = useState(() => new QueryClient())
+     const [agent, setAgent] = useState<string | null>(null)
+     const [task, setTask] = useState<string | null>(null)
+     return <QueryClientProvider client={client}><I18nProvider><SessionActivityPanel api={api} sessionId="parent" blocks={empty ? [] : [block]} messages={[]} metadata={null}
+-        active managed thinking={thinking} count={count} status={null} viewedSubagentId={agent} onViewSubagent={setAgent}
++        active={active} processes={processes} managed thinking={thinking} count={count} status={blocked ? { goal: { id: 'g', status: 'blocked', objective: 'Wait for renderer' }, tasks: [], subagents: [], terminals: [], undiscoveredTerminalCount: 0, possibleTerminalCommands: [] } as never : null} viewedSubagentId={agent} onViewSubagent={setAgent}
+         viewedBackgroundId={task} onViewBackground={setTask} hasMore loadingMore={false} onLoadEarlier={load} /></I18nProvider></QueryClientProvider>
+ }
+ describe('unified activity panel', () => {
+@@ -27,7 +28,7 @@
+         render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
+         expect(screen.getAllByRole('button')).toHaveLength(1)
+         expect(screen.getByText('Managed')).toBeInTheDocument()
+-        expect(screen.getByRole('button', { name: /Activity.*Agent idle.*1 background task/ })).toHaveAttribute('aria-expanded', 'false')
++        expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toHaveAttribute('aria-expanded', 'false')
+         expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
+         fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
+         expect(screen.queryByText(/Subagents/)).not.toBeInTheDocument()
+@@ -60,3 +61,41 @@
+         expect(load).toHaveBeenCalledTimes(1)
+     })
+ })
++
++
++describe('verified detached background processes', () => {
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: 1000 }]
++    it('shows verified process details despite native goal blocked and no native task receipt', () => {
++        const getBackgroundTaskOutput = vi.fn()
++        render(<Harness empty count={1} processes={processes} blocked api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
++        expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++        expect(screen.getByText('Goal · blocked')).toBeInTheDocument()
++        expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++        expect(screen.getByText('PID 123')).toBeInTheDocument()
++        expect(screen.getAllByText('render beach.blend').length).toBeGreaterThan(0)
++        expect(screen.queryByText(/no command details/)).toBeNull()
++        expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
++    })
++    it('keeps offline controller separate from verified jobs and clears them on a fresh empty snapshot', () => {
++        const view = render(<Harness empty active={false} count={0} processes={processes} />)
++        expect(screen.getByRole('button', { name: /Agent offline.*1 verified background process/ })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++        expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++        view.rerender(<Harness empty active={false} count={0} processes={[]} />)
++        expect(screen.queryByText('Running (verified)')).toBeNull()
++        expect(screen.getByRole('button', { name: /Activity.*Agent offline$/ })).toBeInTheDocument()
++    })
++})
++
++
++it('counts verified jobs once without promoting old native receipts or inventing terminal details', () => {
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: 1000 }]
++    render(<Harness count={1} processes={processes} />)
++    expect(screen.getByRole('button', { name: /Activity.*Background.*1 background task/ })).toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: /2 background tasks/ })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++    expect(screen.getByText('Running (verified)')).toBeInTheDocument()
++    expect(screen.queryByText('Last reported running')).toBeNull()
++    expect(screen.queryByText(/no command details/)).toBeNull()
++})
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -204,3 +204,25 @@
+         expect(screen.getByText('Running')).toBeInTheDocument()
+     })
+ })
++
++
++it('shows verified detached work as Background without claiming active inference', () => {
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    const view = render(<I18nProvider><SessionRowSummary session={makeSummary({ thinking: false, backgroundTaskCount: 1, backgroundProcesses: processes })} /></I18nProvider>)
++    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(screen.queryByText('Running')).toBeNull()
++    view.rerender(<I18nProvider><SessionRowSummary session={makeSummary({ active: false, backgroundTaskCount: 0, backgroundProcesses: processes })} /></I18nProvider>)
++    expect(screen.getByText('Background · 1')).toHaveAttribute('title', 'Verified background processes continue independently of the agent turn')
++})
++
++
++it('shows failure and verified background work together while a turn is idle', () => {
++    const failure = { kind: 'capacity' as const, message: 'Capacity', at: 10 }
++    const session = makeSummary({ lastFailure: failure, backgroundTaskCount: 1, backgroundProcesses: [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }] })
++    const view = render(<I18nProvider><SessionRowSummary session={session} /></I18nProvider>)
++    expect(screen.getByText('Capacity')).toBeInTheDocument()
++    expect(screen.getByText('Background · 1')).toBeInTheDocument()
++    view.rerender(<I18nProvider><SessionRowSummary session={{ ...session, thinking: true }} /></I18nProvider>)
++    expect(screen.getByText('Running')).toBeInTheDocument()
++    expect(screen.queryByText('Background · 1')).toBeNull()
++})
+--- a/web/src/components/NodeGraphFailureStatus.test.ts
++++ b/web/src/components/NodeGraphFailureStatus.test.ts
+@@ -15,3 +15,12 @@
+         expect(nodeStatus({ ...failed, manualPausedAt: 12 } as SessionSummary)).toBe('Stopped')
+     })
+ })
++
++
++it('shows aggregate verified background work without overriding Stop or a new inference turn', () => {
++    const process = { id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }
++    const session = { ...failed, lastFailure: null, backgroundTaskCount: 1, backgroundProcesses: [process] }
++    expect(nodeStatus(session)).toBe('Background')
++    expect(nodeStatus({ ...session, thinking: true })).toBe('Running')
++    expect(nodeStatus({ ...session, manualPausedAt: 12 } as SessionSummary)).toBe('Stopped')
++})
+--- a/web/src/hooks/useSSE.test.ts
++++ b/web/src/hooks/useSSE.test.ts
+@@ -95,6 +95,16 @@
+         expect(summaries()[0].lastFailure).toBeNull()
+         expect(session().lastFailure).toBeNull()
+         expect(summaries()[0].lastFailureAt).toBe(20)
++        const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++        emit({ backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 1000 })
++        expect(summaries()[0].backgroundProcesses).toEqual(processes)
++        expect(session().backgroundProcesses).toEqual(processes)
++        emit({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 2000 })
++        expect(summaries()[0].backgroundProcesses).toEqual([])
++        expect(session().backgroundProcesses).toEqual([])
++        emit({ backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 1000, thinking: false })
++        expect(summaries()[0]).toMatchObject({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 2000, thinking: false })
++        expect(session()).toMatchObject({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 2000, thinking: false })
+         unmount(); client.clear()
+     })
+ 
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -395,3 +395,29 @@
+         expect(controls.abortSession).not.toHaveBeenCalled()
+     })
+ })
++
++
++it('retains verified background work in Active without conflicting idle status or resuming it', async () => {
++    const client = new QueryClient()
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    render(fixture(client, [{ ...session('Codex', true, false), backgroundTaskCount: 1, backgroundProcesses: processes }]))
++    open(); await screen.findByRole('button', { name: 'Open Codex' })
++    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(screen.queryByText('Idle', { selector: 'p' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    expect(screen.getByRole('button', { name: 'Open Codex' })).toBeInTheDocument()
++    expect(controls.abortSession).not.toHaveBeenCalled()
++})
++
++it('retains the manual Stop label while verified detached jobs remain visible', async () => {
++    const client = new QueryClient()
++    const getManualPause = vi.fn(async () => ({ pausedAt: 123 }))
++    const localApi = { ...controls, getManualPause } as unknown as ApiClient
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    render(<QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={localApi} sessions={[{ ...session('Codex', true, false), backgroundTaskCount: 1, backgroundProcesses: processes }]} onSelect={vi.fn()} /></I18nProvider></QueryClientProvider>)
++    open()
++    expect(await screen.findByText('Stopped', { selector: 'p' })).toBeInTheDocument()
++    expect(screen.getByText('Background')).toBeInTheDocument()
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
+--- /dev/null
++++ b/web/src/lib/backgroundProcesses.test.ts
+@@ -0,0 +1,44 @@
++import { preserveNewerBackgroundTasks } from './backgroundProcesses'
++import { describe, expect, it } from 'vitest'
++import { BackgroundProcessSchema, SessionPatchSchema } from '@hapi/protocol/schemas'
++import { toSessionSummary } from '@hapi/protocol'
++import type { Session } from '@/types/api'
++import { applySessionDetailPatch } from './sessionPatch'
++import { isRenderIrrelevantPatch } from '@/hooks/useSSE'
++const processes = [{ id: 'boot:123:456', pid: 123, command: 'render beach.blend', checkedAt: 1000 }]
++const session = { id: 's', active: true, thinking: false, activeAt: 0, updatedAt: 0, metadata: null, agentState: null, backgroundTaskCount: 0, metadataVersion: 0, agentStateVersion: 0 } as unknown as Session
++
++describe('verified process wire contract', () => {
++    it('retains identity, command, PID and verification time in patches, details and summaries', () => {
++        const patch = SessionPatchSchema.parse({ backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 10 })
++        const detail = applySessionDetailPatch(session, patch)!
++        expect(detail.backgroundProcesses).toEqual(processes)
++        expect(toSessionSummary(detail).backgroundProcesses).toEqual(processes)
++        const clear = applySessionDetailPatch(detail, { backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 20 })!
++        expect(clear.backgroundProcesses).toEqual([])
++        expect(toSessionSummary(clear).backgroundProcesses).toEqual([])
++        expect(isRenderIrrelevantPatch(toSessionSummary(detail), toSessionSummary(clear))).toBe(false)
++        expect(isRenderIrrelevantPatch(toSessionSummary(detail), { ...toSessionSummary(detail), backgroundProcesses: processes.map(p => ({ ...p })) })).toBe(true)
++    })
++    it('rejects invalid process identities rather than displaying unverifiable process rows', () => {
++        for (const value of [{ ...processes[0], pid: -1 }, { ...processes[0], id: '' }, { ...processes[0], checkedAt: -1 }]) expect(BackgroundProcessSchema.safeParse(value).success).toBe(false)
++    })
++})
++
++
++it('rejects stale background resurrection after an empty clear while merging unrelated state', () => {
++    const started = applySessionDetailPatch(session, { backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 10 })!
++    const cleared = applySessionDetailPatch(started, { backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 20 })!
++    expect(applySessionDetailPatch(cleared, { backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 10 })).toBeNull()
++    const later = applySessionDetailPatch(cleared, { backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 10, thinking: true })!
++    expect(later).toMatchObject({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 20, thinking: true })
++    expect(toSessionSummary(later).backgroundTasksUpdatedAt).toBe(20)
++    expect(applySessionDetailPatch(cleared, { backgroundTaskCount: 99 })).toBeNull()
++})
++
++
++it('preserves the latest empty background snapshot while merging a buffered full session', () => {
++    const current = { ...session, backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 20 }
++    const buffered = { ...session, backgroundProcesses: processes, backgroundTaskCount: 1, backgroundTasksUpdatedAt: 10, thinking: true }
++    expect(preserveNewerBackgroundTasks(current as Session, buffered as Session)).toMatchObject({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 20, thinking: true })
++})
+--- a/web/src/chat/sessionStatus.ts
++++ b/web/src/chat/sessionStatus.ts
+@@ -1,4 +1,5 @@
+ import { claudeBackgroundTaskReceipt, isObject } from '@hapi/protocol'
++import type { BackgroundProcess } from '@hapi/protocol/types'
+ import type { ThreadGoal, TodoItem } from '@/types/api'
+ import type { ChatBlock, NormalizedMessage, ToolCallBlock } from '@/chat/types'
+ import { isSubagentToolName } from '@/chat/subagentTool'
+@@ -153,17 +154,19 @@
+     blocks: readonly ChatBlock[]
+     messages: readonly NormalizedMessage[]
+     backgroundTaskCount?: number
++    backgroundProcesses?: readonly BackgroundProcess[]
+ }): SessionStatusData | null {
+     const tools = collectToolBlocks(args.blocks)
+     const detectedTerminals = buildBackgroundTerminals(tools, args.messages)
+-    const terminals = args.backgroundTaskCount === undefined
++    const nativeCount = args.backgroundTaskCount === undefined ? undefined : Math.max(0, args.backgroundTaskCount - (args.backgroundProcesses?.length ?? 0))
++    const terminals = nativeCount === undefined
+         ? [...detectedTerminals.confirmed, ...detectedTerminals.uncertain]
+-        : args.backgroundTaskCount > 0
+-            ? detectedTerminals.confirmed.slice(-args.backgroundTaskCount)
++        : nativeCount > 0
++            ? detectedTerminals.confirmed.slice(-nativeCount)
+             : []
+-    const undiscoveredTerminalCount = args.backgroundTaskCount === undefined
++    const undiscoveredTerminalCount = nativeCount === undefined
+         ? 0
+-        : Math.max(0, args.backgroundTaskCount - terminals.length)
++        : Math.max(0, nativeCount - terminals.length)
+     const possibleTerminalCommands = undiscoveredTerminalCount > 0
+         ? detectedTerminals.uncertain.map((terminal) => terminal.command)
+         : []
+--- a/web/src/chat/sessionStatus.test.ts
++++ b/web/src/chat/sessionStatus.test.ts
+@@ -160,3 +160,13 @@
+         expect(buildSessionStatusData({ goal: null, tasks: [], blocks: [toolBlock({ name: 'Bash', tool: { result: output } })], messages: [] })).toBeNull()
+     }
+ })
++
++
++it('does not count verified external processes as undiscovered native terminals', () => {
++    const args = { goal: null, tasks: [], blocks: [], messages: [], backgroundTaskCount: 2, backgroundProcesses: [
++        { id: 'boot:123:456', pid: 123, command: 'render a', checkedAt: 1000 },
++        { id: 'boot:124:456', pid: 124, command: 'render b', checkedAt: 1000 }
++    ] }
++    expect(buildSessionStatusData(args)).toBeNull()
++    expect(buildSessionStatusData({ ...args, backgroundTaskCount: 3 })).toMatchObject({ terminals: [], undiscoveredTerminalCount: 1 })
++})
+--- a/web/src/chat/backgroundTaskViews.ts
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -38,7 +38,7 @@
+     if (isObject(block.tool.input) && Array.isArray(block.tool.input.command)) return block.tool.input.command.join(' ')
+     return block.tool.description ?? block.tool.name
+ }
+-export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, _count?: number): BackgroundTaskView[] {
++export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, count?: number): BackgroundTaskView[] {
+     const found = new Map<string, BackgroundTaskView>()
+     const all = tools(blocks)
+     for (const block of all) {
+@@ -51,7 +51,7 @@
+         if (existing) continue
+         found.set(id, { id, provider, block, command: command(block),
+             cwd: getInputStringAny(block.tool.input, ['cwd', 'workdir']),
+-            state: active && provider === 'codex' ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
++            state: active && count !== 0 && provider === 'codex' ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
+             liveOutput: Boolean(provider === 'claude' && /Output is being written to:/.test(output)) })
+     }
+     for (const block of all) {
+@@ -73,7 +73,7 @@
+         if (status === 'completed') {
+             const code = output.match(/<exit_code>\s*(-?\d+)\s*<\/exit_code>/)?.[1]
+             task.state = code && code !== '0' ? 'failed' : 'completed'
+-        } else if (status === 'running') task.state = active ? 'running' : 'unknown'
++        } else if (status === 'running') task.state = active && count !== 0 ? 'running' : 'unknown'
+         else if (status === 'failed') task.state = 'failed'
+         else if (status === 'stopped' || status === 'cancelled' || status === 'killed' || (block.tool.name === 'TaskStop' && /Successfully stopped task/i.test(output))) task.state = 'stopped'
+     }
+--- a/web/src/chat/backgroundTaskViews.test.ts
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -61,3 +61,10 @@
+     const outputs = [`--- a/test.ts\n+++ b/test.ts\n+const start = '${start}'`, `import { test } from 'vitest'\nconst start = '${start}'`, `file.ts:42:${start}`, "const output = 'Process running with session ID 42'", 'source:\nProcess running with session ID 42']
+     for (const output of outputs) expect(collectBackgroundTasks([block('read-source', { command: 'cat test.ts' }, output)], [], true, 0)).toEqual([])
+ })
++
++
++it('does not mark historical Codex task receipts running when the native-only count is zero', () => {
++    const task = block('old', { command: 'old command' }, 'Process running with session ID 42')
++    expect(collectBackgroundTasks([task], [], true, 0)[0].state).toBe('unknown')
++    expect(collectBackgroundTasks([task], [], true, 1)[0].state).toBe('running')
++})
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1128,3 +1128,16 @@
+         expect((await api.getNodeGraph()).graph).toEqual(before.graph)
+     })
+ })
++
++
++it('keeps verified detached work visible alongside capacity, offline and manual Stop states', async () => {
++    const processes = [{ id: 'boot:123:456', pid: 123, command: 'render', checkedAt: 1000 }]
++    const api = makeApi()
++    api.getNodeGraph.mockImplementation(async () => ({ ...initial(), pausedAt: { C: 123 } }))
++    const list = sessions.map(s => s.id === 'B' ? { ...s, thinking: false, backgroundTaskCount: 1, backgroundProcesses: processes, lastFailure: { kind: 'capacity' as const, message: 'Capacity', at: 10 } } : s.id === 'C' ? { ...s, backgroundProcesses: processes } : s.id === 'L' ? { ...s, backgroundProcesses: processes } : s)
++    setup(api, list)
++    expect(within(await screen.findByRole('button', { name: 'Node Bravo' })).getByText(/Capacity.*1 background verified/)).toBeInTheDocument()
++    expect(within(screen.getByRole('button', { name: 'Node Charlie' })).getByText(/Stopped.*1 background verified/)).toBeInTheDocument()
++    expect(within(screen.getByRole('button', { name: 'Node Lone one' })).getByText(/Inactive.*1 background verified/)).toBeInTheDocument()
++    expect(api.abortSession).not.toHaveBeenCalled()
++})
+--- /dev/null
++++ b/web/src/lib/backgroundProcesses.ts
+@@ -0,0 +1,18 @@
++import type { Session, SessionPatch } from '@/types/api'
++
++/** Empty snapshots have no process timestamps, so count/list share a hub watermark. */
++export function acceptsBackgroundTasksPatch(current: Pick<Session, 'backgroundTasksUpdatedAt'>, patch: Pick<SessionPatch, 'backgroundTasksUpdatedAt'>): boolean {
++    return current.backgroundTasksUpdatedAt == null || (patch.backgroundTasksUpdatedAt != null && patch.backgroundTasksUpdatedAt >= current.backgroundTasksUpdatedAt)
++}
++
++export function sameBackgroundProcesses(a: Session['backgroundProcesses'], b: Session['backgroundProcesses']): boolean {
++    return a === b || JSON.stringify(a ?? []) === JSON.stringify(b ?? [])
++}
++
++
++type BackgroundSnapshot = Pick<Session, 'backgroundTaskCount' | 'backgroundProcesses' | 'backgroundTasksUpdatedAt'>
++/** Full SSE snapshots can also arrive after a newer empty background clear. */
++export function preserveNewerBackgroundTasks<T extends BackgroundSnapshot>(current: T | undefined, incoming: T): T {
++    if (!current || acceptsBackgroundTasksPatch(current, incoming)) return incoming
++    return { ...incoming, backgroundTaskCount: current.backgroundTaskCount, backgroundProcesses: current.backgroundProcesses, backgroundTasksUpdatedAt: current.backgroundTasksUpdatedAt }
++}
+--- /dev/null
++++ b/hub/src/sync/localProcesses.ts
+@@ -0,0 +1,69 @@
++import { readdir, readFile, stat } from 'node:fs/promises'
++import { basename, join } from 'node:path'
++
++export type LocalProcessTarget = { sessionId: string; nativeId: string; controllerPid?: number }
++export type VerifiedLocalProcess = { id: string; pid: number; command: string; checkedAt: number }
++
++type Identity = { pid: number; parent: number; start: string; state: string }
++function identity(text: string, pid: number): Identity | null {
++    const close = text.lastIndexOf(')')
++    if (close < 0 || Number(text.slice(0, text.indexOf(' '))) !== pid) return null
++    const fields = text.slice(close + 2).trim().split(/\s+/)
++    const parent = Number(fields[1]), start = fields[19]
++    if (!Number.isInteger(parent) || !/^\d+$/.test(start ?? '') || ['Z', 'X', 'x'].includes(fields[0])) return null
++    return { pid, parent, start, state: fields[0] }
++}
++
++/** Read-only local Codex execution evidence; no commands, logs or environment values are exposed. */
++export async function scanLocalProcesses(targets: LocalProcessTarget[], options: { procRoot?: string; uid?: number } = {}): Promise<Map<string, VerifiedLocalProcess[]>> {
++    const root = options.procRoot ?? '/proc', uid = options.uid ?? process.getuid?.()
++    const result = new Map(targets.map(target => [target.sessionId, [] as VerifiedLocalProcess[]]))
++    if (!targets.length || uid === undefined) return result
++    const boot = (await readFile(join(root, 'sys/kernel/random/boot_id'), 'utf8')).trim()
++    if (!/^[0-9a-f-]{36}$/i.test(boot)) throw new Error('Local process boot identity unavailable')
++    const bySession = new Map(targets.map(target => [target.sessionId, target]))
++    const entries = (await readdir(root)).filter(name => /^[1-9]\d*$/.test(name))
++    const found = new Map<number, Identity & { sessionId: string; command: string }>()
++    let cursor = 0
++    // Bound filesystem concurrency and inspect only this OS user's processes.
++    await Promise.all(Array.from({ length: Math.min(24, entries.length) }, async () => {
++        while (cursor < entries.length) {
++            const name = entries[cursor++], pid = Number(name), path = join(root, name)
++            try {
++                if ((await stat(path)).uid !== uid) continue
++                const before = identity(await readFile(join(path, 'stat'), 'utf8'), pid)
++                if (!before) continue
++                const environment = (await readFile(join(path, 'environ'))).toString().split('\0')
++                // CODEX_THREAD_ID is set for exec jobs, not the shared app-server.
++                const sessionIds = environment.filter(value => value.startsWith('HAPI_SESSION_ID=')).map(value => value.slice(16))
++                const threadIds = environment.filter(value => value.startsWith('CODEX_THREAD_ID=')).map(value => value.slice(16))
++                if (sessionIds.length !== 1 || threadIds.length !== 1) continue
++                const target = bySession.get(sessionIds[0])
++                if (!target || target.nativeId !== threadIds[0] || target.controllerPid === pid) continue
++                const argv = (await readFile(join(path, 'cmdline'))).toString().split('\0').filter(Boolean)
++                if (!argv.length) continue
++                const executable = basename(argv[0])
++                // Infrastructure is not work even if a future runtime inherits these markers.
++                if (/^codex(?:-|$)/.test(executable) && argv[1] === 'app-server') continue
++                const comm = (await readFile(join(path, 'comm'), 'utf8')).trim().slice(0, 80)
++                const script = ['bash', 'sh', 'zsh', 'python', 'python3'].includes(executable)
++                    && argv[1] && !argv[1].startsWith('-') ? basename(argv[1]).slice(0, 100) : null
++                const after = identity(await readFile(join(path, 'stat'), 'utf8'), pid)
++                if (!after || before.start !== after.start || before.parent !== after.parent
++                    || (await stat(path)).uid !== uid) continue
++                found.set(pid, { ...after, sessionId: target.sessionId, command: script ? `${comm} · ${script}` : comm || executable })
++            } catch { /* Exited/inaccessible/replaced processes are not live evidence. */ }
++        }
++    }))
++    const checkedAt = Date.now()
++    for (const item of found.values()) {
++        const parent = found.get(item.parent)
++        if (parent?.sessionId === item.sessionId) continue // One job, not every render subprocess.
++        const children = [...found.values()].filter(child => child.sessionId === item.sessionId && child.parent === item.pid)
++        const child = children.find(child => child.command !== item.command)
++        result.get(item.sessionId)!.push({ id: `${boot}:${item.pid}:${item.start}`, pid: item.pid,
++            command: child ? `${item.command} → ${child.command}` : item.command, checkedAt })
++    }
++    for (const jobs of result.values()) jobs.sort((a, b) => a.pid - b.pid)
++    return result
++}
+--- /dev/null
++++ b/hub/src/sync/localProcesses.test.ts
+@@ -0,0 +1,148 @@
++import { afterEach, describe, expect, it, spyOn } from 'bun:test'
++import * as fs from 'node:fs/promises'
++import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { scanLocalProcesses } from './localProcesses'
++
++const owned = process.getuid?.() ?? 0
++const BOOT_A = '11111111-1111-4111-8111-111111111111'
++const BOOT_B = '1d767691-b72a-5b31-ae89-b6f3a12c6a5d'
++const roots: string[] = []
++afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))) })
++
++async function fixture(boot = BOOT_A) {
++    const root = await mkdtemp(join(tmpdir(), 'hapi-proc-test-'))
++    roots.push(root)
++    await mkdir(join(root, 'sys/kernel/random'), { recursive: true })
++    await writeFile(join(root, 'sys/kernel/random/boot_id'), boot + '\n')
++    const process = async (pid: number, options: {
++        session?: string; native?: string; parent?: number; state?: string;
++        start?: number; argv?: string[]; comm?: string
++    } = {}) => {
++        const dir = join(root, String(pid))
++        await mkdir(dir, { recursive: true })
++        const fields = Array.from({ length: 50 }, () => '0')
++        fields[0] = options.state ?? 'S'
++        fields[1] = String(options.parent ?? 1)
++        fields[19] = String(options.start ?? pid * 100)
++        await writeFile(join(dir, 'stat'), `${pid} (${options.comm ?? 'bash'}) ${fields.join(' ')}\n`)
++        const env = ['PRIVATE_TEST_KEY=must-not-be-returned']
++        if (options.session !== undefined) env.push('HAPI_SESSION_ID=' + options.session)
++        if (options.native !== undefined) env.push('CODEX_THREAD_ID=' + options.native)
++        await writeFile(join(dir, 'environ'), env.join('\0') + '\0')
++        await writeFile(join(dir, 'cmdline'), (options.argv ?? ['/usr/bin/bash', '/private/work/render-job.sh', '--secret-argument']).join('\0') + '\0')
++        await writeFile(join(dir, 'comm'), (options.comm ?? 'bash') + '\n')
++        return dir
++    }
++    const scan = (targets = [{ sessionId: 'session-a', nativeId: 'thread-a' }], uid = owned) => scanLocalProcesses(targets, { procRoot: root, uid })
++    return { root, process, scan }
++}
++const jobs = <T>(result: Map<string, T[]>, session = 'session-a') => result.get(session) ?? []
++
++describe('verified local Codex execution process discovery', () => {
++    it('returns one verified root per connected family and exposes no argv or environment values', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a' })
++        await f.process(101, { session: 'session-a', native: 'thread-a', parent: 100, argv: ['/usr/bin/blender', '/private/scene.blend'] })
++        await f.process(102, { session: 'session-a', native: 'thread-a', parent: 101 })
++        const result = await f.scan()
++        expect(jobs(result)).toHaveLength(1)
++        const job = jobs(result)[0]!
++        expect(job.pid).toBe(100)
++        expect(job.id).toBeTruthy()
++        expect(job.checkedAt).toBeGreaterThan(0)
++        expect(job.command).toMatch(/bash|render-job\.sh/)
++        const encoded = JSON.stringify([...result])
++        expect(encoded).not.toContain('must-not-be-returned')
++        expect(encoded).not.toContain('--secret-argument')
++        expect(encoded).not.toContain('/private/')
++    })
++    it('keeps independent jobs distinct and never attributes other sessions or native threads', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a' })
++        await f.process(200, { session: 'session-a', native: 'thread-a' })
++        await f.process(300, { session: 'session-b', native: 'thread-b' })
++        await f.process(400, { session: 'session-a', native: 'thread-old' })
++        await f.process(500, { session: 'session-other', native: 'thread-a' })
++        const result = await f.scan([{ sessionId: 'session-a', nativeId: 'thread-a' }, { sessionId: 'session-b', nativeId: 'thread-b' }])
++        expect(jobs(result).map(job => job.pid).sort()).toEqual([100, 200])
++        expect(jobs(result, 'session-b').map(job => job.pid)).toEqual([300])
++    })
++    it('fails closed on incomplete identity markers and rejects zombie processes', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a' })
++        await f.process(101, { native: 'thread-a' })
++        await f.process(102, { session: 'session-a', native: 'thread-a', state: 'Z' })
++        await f.process(103, { session: '', native: 'thread-a' })
++        expect(jobs(await f.scan())).toEqual([])
++    })
++    it('does not inspect another UID as the requested local process owner', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a' })
++        expect(jobs(await f.scan(undefined, owned + 1))).toEqual([])
++        expect(jobs(await f.scan())).toHaveLength(1)
++    })
++    it('excludes exact controller and Codex app-server infrastructure without blacklisting user programs by name', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a', argv: ['/usr/bin/hapi'], comm: 'hapi' })
++        await f.process(101, { session: 'session-a', native: 'thread-a', argv: ['/usr/bin/codex', 'app-server', '--listen', 'stdio://'], comm: 'codex' })
++        await f.process(102, { session: 'session-a', native: 'thread-a', argv: ['/tmp/tools/codex-worker', 'app-server'], comm: 'codex-worker' })
++        await f.process(103, { session: 'session-a', native: 'thread-a', argv: ['/private/project/codex', 'user-job'], comm: 'codex' })
++        const result = await scanLocalProcesses([{ sessionId: 'session-a', nativeId: 'thread-a', controllerPid: 100 }], { procRoot: f.root, uid: owned })
++        expect(jobs(result).map(job => job.pid)).toEqual([103])
++    })
++    it('drops an exited or unreadable process on the next observation and leaves unrelated live jobs intact', async () => {
++        const f = await fixture()
++        const one = await f.process(100, { session: 'session-a', native: 'thread-a' })
++        const two = await f.process(200, { session: 'session-a', native: 'thread-a' })
++        expect(jobs(await f.scan())).toHaveLength(2)
++        await rm(one, { recursive: true })
++        await rm(join(two, 'environ'))
++        expect(jobs(await f.scan())).toEqual([])
++        await f.process(300, { session: 'session-a', native: 'thread-a' })
++        expect(jobs(await f.scan()).map(job => job.pid)).toEqual([300])
++    })
++    it('changes identity when PID start time or machine boot changes', async () => {
++        const f = await fixture(BOOT_A)
++        await f.process(100, { session: 'session-a', native: 'thread-a', start: 500 })
++        const first = jobs(await f.scan())[0]!
++        await f.process(100, { session: 'session-a', native: 'thread-a', start: 600 })
++        const reused = jobs(await f.scan())[0]!
++        expect(reused.id).not.toBe(first.id)
++        await writeFile(join(f.root, 'sys/kernel/random/boot_id'), BOOT_B + '\n')
++        const rebooted = jobs(await f.scan())[0]!
++        expect(rebooted.id).not.toBe(reused.id)
++        expect(rebooted.pid).toBe(first.pid)
++    })
++    it('rejects a PID whose start identity changes while its evidence is being read', async () => {
++        const f = await fixture()
++        const dir = await f.process(100, { session: 'session-a', native: 'thread-a', start: 500 })
++        const originalRead = fs.readFile
++        let statReads = 0
++        const replacement = async (...args: Parameters<typeof fs.readFile>) => {
++            const value = await originalRead(...args)
++            if (String(args[0]) === join(dir, 'stat') && ++statReads === 1) {
++                await f.process(100, { session: 'session-a', native: 'thread-a', start: 600 })
++            }
++            return value
++        }
++        const spy = spyOn(fs, 'readFile').mockImplementation(replacement as typeof fs.readFile)
++        try {
++            expect(jobs(await f.scan())).toEqual([])
++            expect(statReads).toBe(2)
++        } finally { spy.mockRestore() }
++    })
++    it('does not collapse a matching child into a parent belonging to another session', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-b', native: 'thread-b' })
++        await f.process(101, { session: 'session-a', native: 'thread-a', parent: 100 })
++        expect(jobs(await f.scan()).map(job => job.pid)).toEqual([101])
++    })
++    it('requires a boot identity instead of falling back to PID-only attribution', async () => {
++        const f = await fixture()
++        await f.process(100, { session: 'session-a', native: 'thread-a' })
++        await rm(join(f.root, 'sys/kernel/random/boot_id'))
++        await expect(f.scan()).rejects.toThrow()
++    })
++})
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -10,6 +10,7 @@
+ import { extractBackgroundTaskDelta, BackgroundTaskTracker, type BackgroundTaskDelta } from './backgroundTasks'
+ 
+ import { ClaudeTaskCompletionReader } from './claudeTaskCompletion'
++import { scanLocalProcesses, type LocalProcessTarget, type VerifiedLocalProcess } from './localProcesses'
+ 
+ const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
+ // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
+@@ -23,6 +24,10 @@
+     private readonly sessions: Map<string, Session> = new Map()
+     private readonly nativeTaskReaders = new Map<string, { nativeId: string; reader: ClaudeTaskCompletionReader; busy: boolean; checkedAt: number }>()
+     private readonly backgroundTasks = new Map<string, BackgroundTaskTracker>()
++    private processProbeBusy = false
++    private processProbeAt = 0
++    private processProbeGeneration = 0
++    private readonly processBindings = new Map<string, string>()
+     private readonly lastBroadcastAtBySessionId: Map<string, number> = new Map()
+     private readonly todoBackfillAttemptedSessionIds: Set<string> = new Set()
+     private readonly deduplicateInProgress: Set<string> = new Set()
+@@ -32,7 +37,8 @@
+ 
+     constructor(
+         private readonly store: Store,
+-        private readonly publisher: EventPublisher
++        private readonly publisher: EventPublisher,
++        private readonly processProbe = scanLocalProcesses
+     ) {
+     }
+ 
+@@ -135,6 +141,7 @@
+         let stored = this.store.sessions.getSession(sessionId)
+         if (!stored) {
+             this.backgroundTasks.delete(sessionId)
++            this.processBindings.delete(sessionId)
+             this.nativeTaskReaders.delete(sessionId)
+             const existed = this.sessions.delete(sessionId)
+             this.pendingThinkingUntilBySessionId.delete(sessionId)
+@@ -217,6 +224,8 @@
+             thinkingAt: existing?.thinkingAt ?? 0,
+             activeTurnStartedAt: existing?.activeTurnStartedAt ?? null,
+             backgroundTaskCount: existing?.backgroundTaskCount ?? (stored.active ? this.restoreBackgroundTasks(sessionId, stored.createdAt) : 0),
++            backgroundProcesses: existing?.backgroundProcesses ?? [],
++            backgroundTasksUpdatedAt: existing?.backgroundTasksUpdatedAt ?? this.store.nextBackgroundTasksVersion(sessionId),
+             todos,
+             teamState,
+             todosUpdatedAt: stored.todosUpdatedAt ?? 0,
+@@ -289,6 +298,7 @@
+         for (const session of sessions) {
+             this.refreshSession(session.id)
+         }
++        this.reconcileLocalProcesses()
+     }
+ 
+     setSessionPinned(sessionId: string, pinned: boolean): void {
+@@ -310,7 +320,8 @@
+         const wasActive = session.active
+         session.active = true
+         if (!this.backgroundTasks.has(session.id)) {
+-            session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
++            this.restoreBackgroundTasks(session.id, session.createdAt)
++            this.publishBackgroundCount(session)
+         }
+         this.reconcileNativeTasks(session)
+         session.activeAt = Math.max(session.activeAt, t)
+@@ -324,7 +335,8 @@
+                 active: true,
+                 activeAt: session.activeAt,
+                 thinking: session.thinking,
+-                backgroundTaskCount: session.backgroundTaskCount
++                backgroundTaskCount: session.backgroundTaskCount,
++                backgroundTasksUpdatedAt: session.backgroundTasksUpdatedAt
+             } satisfies SessionPatch
+         })
+ 
+@@ -391,7 +403,12 @@
+         }
+         if (patch.permissionMode !== undefined) session.permissionMode = patch.permissionMode
+         if (patch.collaborationMode !== undefined) session.collaborationMode = patch.collaborationMode
+-        if (patch.backgroundTaskCount !== undefined) session.backgroundTaskCount = patch.backgroundTaskCount
++        if (patch.backgroundTasksUpdatedAt === undefined ? !session.backgroundTasksUpdatedAt
++            : patch.backgroundTasksUpdatedAt > (session.backgroundTasksUpdatedAt ?? 0)) {
++            if (patch.backgroundTaskCount !== undefined) session.backgroundTaskCount = patch.backgroundTaskCount
++            if (patch.backgroundProcesses !== undefined) session.backgroundProcesses = patch.backgroundProcesses
++            if (patch.backgroundTasksUpdatedAt !== undefined) session.backgroundTasksUpdatedAt = patch.backgroundTasksUpdatedAt
++        }
+         if (patch.todos !== undefined) {
+             session.todos = patch.todos.value
+             session.todosUpdatedAt = patch.todos.version
+@@ -452,7 +469,8 @@
+ 
+         session.active = true
+         if (!this.backgroundTasks.has(session.id)) {
+-            session.backgroundTaskCount = this.restoreBackgroundTasks(session.id, session.createdAt)
++            this.restoreBackgroundTasks(session.id, session.createdAt)
++            this.publishBackgroundCount(session)
+         }
+         this.reconcileNativeTasks(session)
+         session.activeAt = Math.max(session.activeAt, t)
+@@ -536,6 +554,7 @@
+                     activeAt: session.activeAt,
+                     thinking: session.thinking,
+                     backgroundTaskCount: session.backgroundTaskCount,
++                    backgroundTasksUpdatedAt: session.backgroundTasksUpdatedAt,
+                     activeTurnStartedAt: session.activeTurnStartedAt,
+                     permissionMode: session.permissionMode,
+                     model: session.model,
+@@ -620,6 +639,69 @@
+             .finally(() => { current.busy = false })
+     }
+ 
++    /** A single bounded local scan, shared across sessions; never invokes an agent. */
++    reconcileLocalProcesses(now = Date.now()): void {
++        const machine = process.env.HAPI_LOCAL_CATALOG_MACHINE
++        const targets: LocalProcessTarget[] = process.platform !== 'linux' || !machine ? [] : this.getSessions()
++            .filter(session => session.namespace === 'default' && session.metadata?.machineId === machine
++                && session.metadata?.flavor === 'codex' && Boolean(session.metadata?.codexSessionId))
++            .map(session => ({ sessionId: session.id, nativeId: session.metadata!.codexSessionId!,
++                controllerPid: session.metadata?.hostPid }))
++        const wanted = new Map(targets.map(target => [target.sessionId, target.nativeId]))
++        // Configuration/binding changes must clear old claims before any late read returns.
++        for (const session of this.sessions.values()) {
++            if (session.backgroundProcesses?.length && wanted.get(session.id) !== this.processBindings.get(session.id)) this.setBackgroundProcesses(session, [])
++        }
++        if (this.processProbeBusy) {
++            if (now - this.processProbeAt <= 15_000) return
++            this.processProbeGeneration++ // Timed-out reads cannot resurrect an old snapshot.
++            this.processProbeBusy = false
++            for (const session of this.sessions.values()) this.setBackgroundProcesses(session, [])
++        }
++        if (!targets.length || now - this.processProbeAt < 5000) return
++        this.processProbeBusy = true
++        this.processProbeAt = now
++        const generation = ++this.processProbeGeneration
++        void this.processProbe(targets).then(found => {
++            if (generation !== this.processProbeGeneration) return
++            for (const target of targets) {
++                const session = this.sessions.get(target.sessionId)
++                if (!session || session.metadata?.codexSessionId !== target.nativeId
++                    || session.metadata.machineId !== machine || session.metadata.flavor !== 'codex'
++                    || process.env.HAPI_LOCAL_CATALOG_MACHINE !== machine || session.namespace !== 'default') continue
++                const checkedNow = Date.now()
++                this.setBackgroundProcesses(session, (found.get(target.sessionId) ?? [])
++                    .filter(job => checkedNow >= job.checkedAt && checkedNow - job.checkedAt <= 15_000))
++            }
++        }).catch(() => {
++            if (generation !== this.processProbeGeneration) return
++            // A failed probe is not evidence that a process is still running.
++            for (const target of targets) {
++                const session = this.sessions.get(target.sessionId)
++                if (session) this.setBackgroundProcesses(session, [])
++            }
++        }).finally(() => { if (generation === this.processProbeGeneration) this.processProbeBusy = false })
++    }
++
++    private setBackgroundProcesses(session: Session, jobs: VerifiedLocalProcess[]): void {
++        if (jobs.length && session.metadata?.codexSessionId) this.processBindings.set(session.id, session.metadata.codexSessionId)
++        else this.processBindings.delete(session.id)
++        if (!jobs.length && !session.backgroundProcesses?.length) return
++        session.backgroundProcesses = jobs
++        this.publishBackgroundCount(session, true)
++    }
++
++    private publishBackgroundCount(session: Session, includeProcesses = false): void {
++        const next = (this.backgroundTasks.get(session.id)?.count ?? 0) + (session.backgroundProcesses?.length ?? 0)
++        if (!includeProcesses && next === (session.backgroundTaskCount ?? 0)) return
++        session.backgroundTaskCount = next
++        session.backgroundTasksUpdatedAt = this.store.nextBackgroundTasksVersion(session.id,
++            Math.max(Date.now(), (session.backgroundTasksUpdatedAt ?? 0) + 1))
++        this.publisher.emit({ type: 'session-updated', sessionId: session.id, namespace: session.namespace,
++            data: { backgroundTaskCount: next, backgroundTasksUpdatedAt: session.backgroundTasksUpdatedAt,
++                ...(includeProcesses ? { backgroundProcesses: session.backgroundProcesses ?? [] } : {}) } satisfies SessionPatch })
++    }
++
+     private restoreBackgroundTasks(sessionId: string, since: number): number {
+         const tracker = new BackgroundTaskTracker()
+         // Imported transcript history predating this HAPI controller must not
+@@ -641,13 +723,8 @@
+             tracker = new BackgroundTaskTracker()
+             this.backgroundTasks.set(sessionId, tracker)
+         }
+-        const next = tracker.apply(delta)
+-        if (next === (session.backgroundTaskCount ?? 0)) return
+-        session.backgroundTaskCount = next
+-        this.publisher.emit({
+-            type: 'session-updated', sessionId, namespace: session.namespace,
+-            data: { backgroundTaskCount: next } satisfies SessionPatch
+-        })
++        tracker.apply(delta)
++        this.publishBackgroundCount(session)
+     }
+ 
+     recordSessionActivity(sessionId: string, updatedAt: number): void {
+@@ -728,19 +805,21 @@
+         session.thinking = false
+         session.thinkingAt = t
+         session.activeTurnStartedAt = null
+-        session.backgroundTaskCount = 0
+         this.backgroundTasks.delete(session.id)
++        this.publishBackgroundCount(session)
+         this.nativeTaskReaders.delete(session.id)
+         this.pendingThinkingUntilBySessionId.delete(session.id)
+ 
+         this.publisher.emit({
+             type: 'session-updated',
+             sessionId: session.id,
+-            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: 0 } satisfies SessionPatch
++            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: session.backgroundTaskCount,
++                backgroundTasksUpdatedAt: session.backgroundTasksUpdatedAt } satisfies SessionPatch
+         })
+     }
+ 
+     expireInactive(now: number = Date.now()): string[] {
++        this.reconcileLocalProcesses(now)
+         const sessionTimeoutMs = 30_000
+         const expired: string[] = []
+ 
+--- /dev/null
++++ b/hub/src/sync/sessionCache.localProcesses.test.ts
+@@ -0,0 +1,158 @@
++import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
++import { Store } from '../store'
++import type { EventPublisher } from './eventPublisher'
++import { SessionCache } from './sessionCache'
++import type { LocalProcessTarget, VerifiedLocalProcess } from './localProcesses'
++
++const nativeId = '013afe14-c808-5a9d-beaf-890cf73b4b32'
++let previous: string | undefined
++beforeEach(() => { previous = process.env.HAPI_LOCAL_CATALOG_MACHINE; process.env.HAPI_LOCAL_CATALOG_MACHINE = 'machine-local' })
++afterEach(() => { if (previous === undefined) delete process.env.HAPI_LOCAL_CATALOG_MACHINE; else process.env.HAPI_LOCAL_CATALOG_MACHINE = previous })
++const tick = () => new Promise(resolve => setTimeout(resolve, 0))
++function setup() {
++    const store = new Store(':memory:'), events: unknown[] = []
++    let jobs: VerifiedLocalProcess[] = [], reject = false, calls = 0
++    const probe = async (targets: LocalProcessTarget[]) => {
++        calls++
++        if (reject) throw new Error('proc unavailable')
++        return new Map(targets.map(target => [target.sessionId, jobs]))
++    }
++    const cache = new SessionCache(store, { emit: (event: unknown) => events.push(event) } as unknown as EventPublisher, probe)
++    const session = cache.getOrCreateSession('local-process', { path: '/tmp', host: 'test', flavor: 'codex', machineId: 'machine-local', codexSessionId: nativeId }, null, 'default')
++    return { store, events, cache, session, jobs: (next: VerifiedLocalProcess[]) => { jobs = next }, reject: () => { reject = true }, calls: () => calls }
++}
++const liveJob = (): VerifiedLocalProcess => ({ id: 'boot:123:456', pid: 123, command: 'bash → render.sh', checkedAt: Date.now() })
++
++describe('SessionCache verified local background work', () => {
++    it('reconstructs verified work on hub reload without native task receipts or worker messages', async () => {
++        const f = setup()
++        try {
++            f.store.sessions.setSessionActive(f.session.id, true, Date.now(), 'default')
++            const job = liveJob()
++            const cache = new SessionCache(f.store, { emit: () => {} } as unknown as EventPublisher,
++                async targets => new Map(targets.map(target => [target.sessionId, [job]])))
++            cache.reloadAll(); await tick()
++            expect(cache.getSession(f.session.id)).toMatchObject({ active: true, thinking: false, backgroundTaskCount: 1, backgroundProcesses: [job] })
++            expect(f.store.messages.getAllMessages(f.session.id)).toHaveLength(0)
++        } finally { f.store.close() }
++    })
++
++    it('publishes actual background work independently of conversational inference, then clears on exit', async () => {
++        const f = setup()
++        try {
++            f.cache.handleSessionAlive({ sid: f.session.id, time: Date.now(), thinking: false })
++            const job = liveJob(); f.jobs([job]); const now = Date.now()
++            f.cache.reconcileLocalProcesses(now); await tick()
++            expect(f.cache.getSession(f.session.id)).toMatchObject({ active: true, thinking: false, backgroundTaskCount: 1, backgroundProcesses: [job] })
++            expect(f.events).toContainEqual(expect.objectContaining({ type: 'session-updated', data: expect.objectContaining({ backgroundTaskCount: 1, backgroundProcesses: [job] }) }))
++            f.jobs([]); f.cache.reconcileLocalProcesses(now + 5001); await tick()
++            expect(f.cache.getSession(f.session.id)).toMatchObject({ thinking: false, backgroundTaskCount: 0, backgroundProcesses: [] })
++            expect(f.events).toContainEqual(expect.objectContaining({ type: 'session-updated', data: expect.objectContaining({ backgroundTaskCount: 0, backgroundProcesses: [] }) }))
++        } finally { f.store.close() }
++    })
++
++    it('does not overwrite native task accounting when a process ends or verification fails', async () => {
++        const f = setup()
++        try {
++            f.cache.applyBackgroundTaskDelta(f.session.id, { started: 1, completed: 0, startedIds: ['native-task'] })
++            f.jobs([liveJob()]); const now = Date.now(); f.cache.reconcileLocalProcesses(now); await tick()
++            expect(f.session.backgroundTaskCount).toBe(2)
++            f.cache.applyBackgroundTaskDelta(f.session.id, { started: 0, completed: 1, completedIds: ['native-task'] })
++            expect(f.session.backgroundTaskCount).toBe(1)
++            f.cache.applyBackgroundTaskDelta(f.session.id, { started: 1, completed: 0, startedIds: ['other-native'] })
++            f.reject(); f.cache.reconcileLocalProcesses(now + 5001); await tick()
++            expect(f.session.backgroundTaskCount).toBe(1)
++            expect(f.session.backgroundProcesses).toEqual([])
++        } finally { f.store.close() }
++    })
++
++    it('preserves Stop and still reports surviving jobs; no resume or process control exists', async () => {
++        const f = setup()
++        try {
++            f.cache.handleSessionAlive({ sid: f.session.id, time: Date.now(), thinking: false })
++            f.store.setManualPause(f.session.id, true)
++            const pause = f.store.getManualPause(f.session.id)
++            f.jobs([liveJob()]); const now = Date.now(); f.cache.reconcileLocalProcesses(now); await tick()
++            f.cache.handleSessionEnd({ sid: f.session.id, time: now })
++            expect(f.session).toMatchObject({ active: false, thinking: false, backgroundTaskCount: 1 })
++            expect(f.store.getManualPause(f.session.id)).toBe(pause)
++            f.jobs([]); f.cache.reconcileLocalProcesses(now + 5001); await tick()
++            expect(f.session).toMatchObject({ active: false, thinking: false, backgroundTaskCount: 0, backgroundProcesses: [] })
++            expect(f.store.getManualPause(f.session.id)).toBe(pause)
++        } finally { f.store.close() }
++    })
++
++    it('ignores remote/foreign/Claude sessions and removes claims when binding changes', async () => {
++        const f = setup()
++        try {
++            for (const [tag, metadata, namespace] of [
++                ['remote', { machineId: 'remote', flavor: 'codex', codexSessionId: nativeId }, 'default'],
++                ['foreign', { machineId: 'machine-local', flavor: 'codex', codexSessionId: nativeId }, 'other'],
++                ['claude', { machineId: 'machine-local', flavor: 'claude', claudeSessionId: nativeId }, 'default'],
++            ] as const) f.cache.getOrCreateSession(tag, { path: '/tmp', host: 'test', ...metadata }, null, namespace)
++            f.jobs([liveJob()]); const now = Date.now(); f.cache.reconcileLocalProcesses(now); await tick()
++            expect(f.cache.getSessions().filter(session => session.backgroundTaskCount)).toEqual([f.session])
++            f.session.metadata!.machineId = 'remote'
++            f.cache.reconcileLocalProcesses(now + 5001); await tick()
++            expect(f.session.backgroundProcesses).toEqual([])
++            expect(f.session.backgroundTaskCount).toBe(0)
++            expect(f.calls()).toBe(1)
++        } finally { f.store.close() }
++    })
++
++    it('coalesces cadence and rejects late results from a changed native binding', async () => {
++        const store = new Store(':memory:')
++        try {
++            let resolve: ((value: Map<string, VerifiedLocalProcess[]>) => void) | undefined, calls = 0
++            const cache = new SessionCache(store, { emit: () => {} } as unknown as EventPublisher, () => {
++                calls++; return new Promise<Map<string, VerifiedLocalProcess[]>>(done => { resolve = done })
++            })
++            const session = cache.getOrCreateSession('late', { path: '/tmp', host: 'test', flavor: 'codex', machineId: 'machine-local', codexSessionId: nativeId }, null, 'default')
++            const now = Date.now(); cache.reconcileLocalProcesses(now); cache.reconcileLocalProcesses(now + 1000)
++            expect(calls).toBe(1)
++            session.metadata!.codexSessionId = 'different-native'
++            resolve!(new Map([[session.id, [liveJob()]]]))
++            await tick()
++            expect(session.backgroundTaskCount).toBe(0)
++            expect(session.backgroundProcesses).toEqual([])
++        } finally { store.close() }
++    })
++
++    it('does not let stale count patches resurrect a cleared process snapshot', async () => {
++        const f = setup()
++        try {
++            const now = Date.now(), job = liveJob()
++            f.jobs([job]); f.cache.reconcileLocalProcesses(now); await tick()
++            const runningStamp = f.session.backgroundTasksUpdatedAt!
++            f.jobs([]); f.cache.reconcileLocalProcesses(now + 5001); await tick()
++            const clearedStamp = f.session.backgroundTasksUpdatedAt!
++            expect(clearedStamp).toBeGreaterThan(runningStamp)
++            f.cache.applySessionPatch(f.session.id, { backgroundTaskCount: 1, backgroundProcesses: [job], backgroundTasksUpdatedAt: runningStamp, thinking: true })
++            expect(f.session).toMatchObject({ backgroundTaskCount: 0, backgroundProcesses: [], backgroundTasksUpdatedAt: clearedStamp, thinking: true })
++            f.cache.applySessionPatch(f.session.id, { backgroundTaskCount: 1, backgroundProcesses: [job] })
++            expect(f.session.backgroundTaskCount).toBe(0)
++        } finally { f.store.close() }
++    })
++
++    it('expires a hung probe and prevents its late response resurrecting old evidence', async () => {
++        const store = new Store(':memory:')
++        try {
++            let resolve: ((value: Map<string, VerifiedLocalProcess[]>) => void) | undefined, calls = 0
++            const cache = new SessionCache(store, { emit: () => {} } as unknown as EventPublisher, targets => {
++                if (++calls === 1) return Promise.resolve(new Map(targets.map(target => [target.sessionId, [liveJob()]])))
++                return new Promise<Map<string, VerifiedLocalProcess[]>>(done => { if (calls === 2) resolve = done })
++            })
++            const current = cache.getOrCreateSession('hung', { path: '/tmp', host: 'test', flavor: 'codex', machineId: 'machine-local', codexSessionId: nativeId }, null, 'default')
++            const now = Date.now(); cache.reconcileLocalProcesses(now); await tick()
++            expect(current.backgroundTaskCount).toBe(1)
++            cache.reconcileLocalProcesses(now + 5001)
++            cache.reconcileLocalProcesses(now + 22_000)
++            expect(current.backgroundTaskCount).toBe(0)
++            expect(current.backgroundProcesses).toEqual([])
++            resolve!(new Map([[current.id, [liveJob()]]]))
++            await tick()
++            expect(current.backgroundProcesses).toEqual([])
++            expect(current.backgroundTaskCount).toBe(0)
++        } finally { store.close() }
++    })
++})
+--- a/hub/src/store/index.ts
++++ b/hub/src/store/index.ts
+@@ -93,6 +93,14 @@
+         else this.db.query('DELETE FROM manual_pauses WHERE session_id = ?').run(sessionId)
+     }
+ 
++    /** Persist only ordering, never PID/liveness claims. Restart invalidates old browser proof. */
++    nextBackgroundTasksVersion(sessionId: string, at: number = Date.now()): number {
++        const row = this.db.query(`INSERT INTO background_status_versions(session_id, version) VALUES (?, ?)
++            ON CONFLICT(session_id) DO UPDATE SET version = MAX(excluded.version, background_status_versions.version + 1)
++            RETURNING version`).get(sessionId, Math.max(0, Math.floor(at))) as { version: number }
++        return row.version
++    }
++
+     get dbPath(): string {
+         return this._dbPath
+     }
+@@ -123,6 +131,7 @@
+         this.db.exec('PRAGMA busy_timeout = 5000')
+         this.initSchema()
+         this.db.exec("CREATE TABLE IF NOT EXISTS manual_pauses (session_id TEXT PRIMARY KEY, paused_at INTEGER NOT NULL)")
++        this.db.exec('CREATE TABLE IF NOT EXISTS background_status_versions (session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE, version INTEGER NOT NULL)')
+ 
+         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
+             for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+--- /dev/null
++++ b/hub/src/store/backgroundStatus.test.ts
+@@ -0,0 +1,88 @@
++import { afterEach, describe, expect, it } from 'bun:test'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { Store } from './index'
++import { SessionCache } from '../sync/sessionCache'
++import type { EventPublisher } from '../sync/eventPublisher'
++import type { VerifiedLocalProcess } from '../sync/localProcesses'
++
++const dirs: string[] = []
++afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
++const path = () => {
++    const dir = mkdtempSync(join(tmpdir(), 'hapi-background-version-'))
++    dirs.push(dir)
++    return join(dir, 'state.db')
++}
++const session = (store: Store, tag = 'counter') => store.sessions.getOrCreateSession(tag, { path: '/tmp', host: 'test', flavor: 'codex' }, null, 'default')
++const tick = () => new Promise(resolve => setTimeout(resolve, 0))
++
++describe('persistent background status watermark', () => {
++    it('strictly increases across connections, equal timestamps and backwards clocks', () => {
++        const file = path(), first = new Store(file), second = new Store(file)
++        try {
++            const row = session(first)
++            const versions = [first.nextBackgroundTasksVersion(row.id, 1000),
++                second.nextBackgroundTasksVersion(row.id, 1000),
++                first.nextBackgroundTasksVersion(row.id, 10),
++                second.nextBackgroundTasksVersion(row.id, 0),
++                first.nextBackgroundTasksVersion(row.id, 9000)]
++            expect(versions).toEqual([1000, 1001, 1002, 1003, 9000])
++            for (let i = 1; i < versions.length; i++) expect(versions[i]).toBeGreaterThan(versions[i - 1]!)
++        } finally { first.close(); second.close() }
++    })
++    it('survives store recreation without carrying another session counter', () => {
++        const file = path()
++        let store = new Store(file)
++        const a = session(store, 'one'), b = session(store, 'two')
++        expect(store.nextBackgroundTasksVersion(a.id, 5000)).toBe(5000)
++        expect(store.nextBackgroundTasksVersion(b.id, 20)).toBe(20)
++        store.close(); store = new Store(file)
++        try {
++            expect(store.nextBackgroundTasksVersion(a.id, 1)).toBe(5001)
++            expect(store.nextBackgroundTasksVersion(b.id, 20)).toBe(21)
++        } finally { store.close() }
++    })
++    it('gives empty reloaded snapshots newer watermarks for local, remote and inactive sessions', async () => {
++        const previous = process.env.HAPI_LOCAL_CATALOG_MACHINE
++        process.env.HAPI_LOCAL_CATALOG_MACHINE = 'fixture-machine'
++        const file = path()
++        let store = new Store(file)
++        try {
++            const publisher = { emit: () => {} } as unknown as EventPublisher
++            const job: VerifiedLocalProcess = { id: 'boot:123:456', pid: 123, command: 'render.sh', checkedAt: Date.now() }
++            const first = new SessionCache(store, publisher, async targets => new Map(targets.map(target => [target.sessionId, [job]])))
++            const local = first.getOrCreateSession('local', { path: '/tmp', host: 'test', flavor: 'codex', machineId: 'fixture-machine', codexSessionId: 'native-local' }, null, 'default')
++            const remote = first.getOrCreateSession('remote', { path: '/tmp', host: 'remote', flavor: 'codex', machineId: 'remote-machine', codexSessionId: 'native-remote' }, null, 'default')
++            const native = first.getOrCreateSession('inactive-native', { path: '/tmp', host: 'remote', flavor: 'claude', machineId: 'remote-machine', claudeSessionId: 'native-claude' }, null, 'default')
++            first.applyBackgroundTaskDelta(remote.id, { started: 1, completed: 0, startedIds: ['old-remote-task'] })
++            first.applyBackgroundTaskDelta(native.id, { started: 1, completed: 0, startedIds: ['old-native-task'] })
++            first.reconcileLocalProcesses(); await tick()
++            const old = new Map([local, remote, native].map(current => {
++                expect(current.backgroundTaskCount).toBe(1)
++                // Stored sessions are inactive: the hub may restart after a controller vanished.
++                store.sessions.setSessionActive(current.id, false, Date.now(), 'default')
++                return [current.id, current.backgroundTasksUpdatedAt!] as const
++            }))
++            store.close(); store = new Store(file)
++            const snapshots: unknown[] = []
++            const reloaded = new SessionCache(store, { emit: (event: unknown) => snapshots.push(event) } as unknown as EventPublisher,
++                async targets => new Map(targets.map(target => [target.sessionId, []])))
++            reloaded.reloadAll(); await tick()
++            for (const id of old.keys()) {
++                const current = reloaded.getSession(id)!
++                expect(current.active).toBe(false)
++                expect(current.backgroundTaskCount).toBe(0)
++                expect(current.backgroundProcesses).toEqual([])
++                expect(current.backgroundTasksUpdatedAt).toBeGreaterThan(old.get(id)!)
++                expect(snapshots).toContainEqual(expect.objectContaining({ sessionId: id,
++                    data: expect.objectContaining({ backgroundTaskCount: 0, backgroundProcesses: [], backgroundTasksUpdatedAt: current.backgroundTasksUpdatedAt }) }))
++                expect(store.sessions.getSession(id)).not.toHaveProperty('backgroundProcesses')
++            }
++        } finally {
++            store.close()
++            if (previous === undefined) delete process.env.HAPI_LOCAL_CATALOG_MACHINE
++            else process.env.HAPI_LOCAL_CATALOG_MACHINE = previous
++        }
++    })
++})

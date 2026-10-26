@@ -1,0 +1,324 @@
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -513,21 +513,7 @@
+         setComposerText
+     ])
+     const dictation = useDictation(dictationConfig)
+-    const dictationActive = voiceInput.voiceMode === 'dictation'
+-    const effectiveVoiceStatus = dictationActive ? dictation.status : voiceStatus
+-    const effectiveVoiceToggle = dictationActive
+-        ? (dictation.supported ? dictation.toggle : undefined)
+-        : onVoiceToggle
+-    const previousVoiceModeRef = useRef(voiceInput.voiceMode)
+-    useEffect(() => {
+-        if (previousVoiceModeRef.current === voiceInput.voiceMode) return
+-        previousVoiceModeRef.current = voiceInput.voiceMode
+-        if (dictationActive && (voiceStatus === 'connected' || voiceStatus === 'connecting')) {
+-            onVoiceToggle?.()
+-        } else if (!dictationActive && (dictation.status === 'connected' || dictation.status === 'connecting')) {
+-            void dictation.toggle()
+-        }
+-    }, [dictationActive, voiceInput.voiceMode, voiceStatus, onVoiceToggle, dictation.status, dictation.toggle])
++    const dictationBusy = dictation.status === 'connected' || dictation.status === 'connecting'
+ 
+     const [isParkingScratchlist, setIsParkingScratchlist] = useState(false)
+     const parkInFlightRef = useRef(false)
+@@ -690,7 +676,7 @@
+     const hasAnyAttachments = hasAttachments || hasHiddenAttachments
+     const blocksScheduling =
+         hasAttachments || hasHiddenAttachments || hiddenAttachmentStatePending
+-    const canSend = (hasText || hasAnyAttachments) && attachmentsReady && !controlsDisabled
++    const canSend = (hasText || hasAnyAttachments) && attachmentsReady && !controlsDisabled && !dictationBusy
+ 
+     useEffect(() => {
+         if (!sessionId) return
+@@ -1147,6 +1133,8 @@
+     }, [pendingSendIntentRef])
+ 
+     const handleSend = useCallback(async (intent: ComposerSendIntent = 'default') => {
++        // Finish dictation before sending so its result cannot land in a new draft.
++        if (dictationBusy) return
+         // SessionChat preloads the ref only when restoring a rejected send:
+         // queue retries remain queue, while an ordinary fresh send always
+         // starts from the explicit/default argument. Capture it before the
+@@ -1245,6 +1233,7 @@
+         api,
+         attachments,
+         canSend,
++        dictationBusy,
+         draftHydration.hasStoredAttachments,
+         hasAttachments,
+         hasText,
+@@ -1650,7 +1639,7 @@
+         || showFastModeSettings
+     )
+     const showAbortButton = true
+-    const voiceEnabled = Boolean(effectiveVoiceToggle)
++    const voiceEnabled = voiceInput.voiceMode === 'assistant' && Boolean(onVoiceToggle) && !dictationBusy
+ 
+     // Generic model/effort value buttons. The current value label doubles as
+     // the button caption; clicking opens the settings sheet. Hidden on narrow
+@@ -2212,10 +2201,10 @@
+                         collaborationMode={collaborationMode}
+                         copilotAgentMode={copilotAgentMode}
+                         agentFlavor={agentFlavor}
+-                        voiceStatus={effectiveVoiceStatus}
++                        voiceStatus={voiceStatus}
+                     />
+ 
+-                    {dictationActive && dictation.partialTranscript ? (
++                    {dictation.partialTranscript ? (
+                         <div
+                             role="status"
+                             aria-live="polite"
+@@ -2225,7 +2214,7 @@
+                         </div>
+                     ) : null}
+ 
+-                    {dictationActive && dictation.error ? (
++                    {dictation.error ? (
+                         <div role="alert" className="mb-2 rounded-md bg-[var(--app-subtle-bg)] px-3 py-2 text-sm text-red-600">
+                             {dictation.error}
+                         </div>
+@@ -2414,11 +2403,11 @@
+                             isSwitching={isSwitching}
+                             onSwitch={handleSwitch}
+                             voiceEnabled={voiceEnabled}
+-                            dictationEnabled={dictationActive}
+-                            voiceStatus={effectiveVoiceStatus}
+-                            voiceMicMuted={dictationActive ? false : voiceMicMuted}
+-                            onVoiceToggle={effectiveVoiceToggle ?? (() => {})}
+-                            onVoiceMicToggle={dictationActive ? undefined : onVoiceMicToggle}
++                            dictation={props.voiceTranscriptionApi ? dictation : undefined}
++                            voiceStatus={voiceStatus}
++                            voiceMicMuted={voiceMicMuted}
++                            onVoiceToggle={onVoiceToggle ?? (() => {})}
++                            onVoiceMicToggle={onVoiceMicToggle}
+                             onSend={handleSend}
+                             pendingSchedule={pendingSchedule}
+                             onSchedule={handleUserSchedule}
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -578,32 +578,31 @@
+ }
+ 
+ export function DictationButton(props: {
+-    enabled: boolean
+-    canSend: boolean
+-    voiceEnabled: boolean
+-    voiceStatus: ConversationStatus
+-    controlsDisabled: boolean
+-    onVoiceToggle: () => void
++    supported: boolean
++    status: ConversationStatus
++    disabled: boolean
++    onToggle: () => void
+ }) {
+     const { t } = useTranslation()
+-    if (
+-        !props.enabled
+-        || !props.canSend
+-        || !props.voiceEnabled
+-        || props.voiceStatus === 'connecting'
+-        || props.voiceStatus === 'connected'
+-    ) return null
+-
++    const recording = props.status === 'connected'
++    const pending = props.status === 'connecting'
++    const label = recording ? 'Stop dictation' : pending ? 'Preparing transcript' : t('composer.dictate')
+     return (
+         <button
+             type="button"
+-            onClick={props.onVoiceToggle}
+-            disabled={props.controlsDisabled}
+-            aria-label={t('composer.dictate')}
+-            title={t('composer.dictate')}
+-            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-50"
+-        >
+-            <VoiceAssistantIcon />
++            onClick={props.onToggle}
++            disabled={pending || (!recording && (props.disabled || !props.supported))}
++            aria-label={label}
++            aria-pressed={recording}
++            title={!props.supported ? 'Dictation needs a configured provider and microphone access over HTTPS.' : label}
++            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${recording ? 'bg-red-600 text-white' : 'text-[var(--app-fg)]/60 hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'}`}
++        >
++            {pending ? <LoadingIcon /> : recording ? <StopIcon /> : (
++                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-5 w-5">
++                    <rect x="9" y="2" width="6" height="13" rx="3" />
++                    <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-4 0h8" />
++                </svg>
++            )}
+         </button>
+     )
+ }
+@@ -636,7 +635,11 @@
+     isSwitching: boolean
+     onSwitch: () => void
+     voiceEnabled: boolean
+-    dictationEnabled?: boolean
++    dictation?: {
++        supported: boolean
++        status: ConversationStatus
++        toggle: () => void
++    }
+     voiceStatus: ConversationStatus
+     voiceMicMuted?: boolean
+     onVoiceToggle: () => void
+@@ -875,15 +878,6 @@
+                 {props.statisticsButton}
+             </div>
+ 
+-            <DictationButton
+-                enabled={props.dictationEnabled ?? false}
+-                canSend={props.canSend}
+-                voiceEnabled={props.voiceEnabled}
+-                voiceStatus={props.voiceStatus}
+-                controlsDisabled={props.controlsDisabled}
+-                onVoiceToggle={props.onVoiceToggle}
+-            />
+-
+             {props.modelMenu ? <div className="ml-auto flex min-w-0 items-center gap-1">{props.modelMenu}</div> : null}
+ 
+             {props.nativePriorityFlavor && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
+@@ -921,6 +915,13 @@
+                 </Popover.Root>
+             ) : null}
+ 
++            {props.dictation ? <DictationButton
++                supported={props.dictation.supported}
++                status={props.dictation.status}
++                disabled={props.controlsDisabled || props.voiceStatus === 'connected' || props.voiceStatus === 'connecting'}
++                onToggle={props.dictation.toggle}
++            /> : null}
++
+             <UnifiedButton
+                 sendWhenReady={props.sendWhenReady}
+                 readyToInterrupt={props.readyToInterrupt}
+@@ -928,10 +929,9 @@
+                 canSend={props.canSend}
+                 voiceStatus={props.voiceStatus}
+                 voiceEnabled={props.voiceEnabled}
+-                controlsDisabled={props.controlsDisabled}
++                controlsDisabled={props.controlsDisabled || props.dictation?.status === 'connected' || props.dictation?.status === 'connecting'}
+                 onSend={props.onSend}
+                 onVoiceToggle={props.onVoiceToggle}
+-                voiceLabel={props.dictationEnabled ? t('composer.dictate') : undefined}
+                 /*
+                  * Derived, NOT raw scratchlistMode. Mirror SessionChat's
+                  * shouldRouteToScratchlist: amber + "Send to scratchlist"
+--- a/web/src/components/AssistantChat/ComposerButtons.test.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+@@ -168,18 +168,32 @@
+         const onVoiceToggle = vi.fn()
+         renderInProviders(
+             <DictationButton
+-                enabled
+-                canSend
+-                voiceEnabled
+-                voiceStatus="disconnected"
+-                controlsDisabled={false}
+-                onVoiceToggle={onVoiceToggle}
++                supported
++                status="disconnected"
++                disabled={false}
++                onToggle={onVoiceToggle}
+             />,
+         )
+ 
+         fireEvent.click(getButton('Dictate'))
+         expect(onVoiceToggle).toHaveBeenCalledOnce()
+     })
++    it('keeps Stop available if the session becomes disabled while recording', () => {
++        const toggle = vi.fn()
++        renderInProviders(<DictationButton supported status="connected" disabled onToggle={toggle} />)
++        fireEvent.click(getButton('Stop dictation'))
++        expect(toggle).toHaveBeenCalledOnce()
++    })
++    it('prevents duplicate starts while preparing the transcript and explains unsupported microphones', () => {
++        const toggle = vi.fn()
++        const view = renderInProviders(<DictationButton supported status="connecting" disabled={false} onToggle={toggle} />)
++        expect(getButton('Preparing transcript')).toBeDisabled()
++        view.rerender(<I18nProvider><DictationButton supported={false} status="disconnected" disabled={false} onToggle={toggle} /></I18nProvider>)
++        expect(getButton('Dictate')).toBeDisabled()
++        expect(getButton('Dictate').title).toContain('HTTPS')
++        expect(toggle).not.toHaveBeenCalled()
++    })
++
+ })
+ 
+ describe('ComposerExpandButton', () => {
+@@ -234,7 +248,7 @@
+                         isSwitching={false}
+                         onSwitch={noop}
+                         voiceEnabled
+-                        dictationEnabled
++                        dictation={{ supported: true, status: 'disconnected', toggle: noop }}
+                         voiceStatus="disconnected"
+                         onVoiceToggle={noop}
+                         onSend={noop}
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -1,4 +1,4 @@
+-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import type { ReactNode, TextareaHTMLAttributes } from 'react'
+ import { useRef, useState } from 'react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+@@ -156,6 +156,56 @@
+         runtime.snapshot.composer = { text: 'Change direction now', attachments: [] }
+         runtime.setSnapshot = updater => { runtime.snapshot = updater(runtime.snapshot) }
+     }
++    it('dictates beside Send in assistant mode, preserves edits and blocks send until transcription finishes', async () => {
++        draft()
++        localStorage.setItem('hapi-voice-mode', 'assistant')
++        const stopTrack = vi.fn()
++        vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) } })
++        class Recorder {
++            static isTypeSupported() { return true }
++            state = 'inactive'
++            mimeType = 'audio/webm'
++            ondataavailable: ((event: { data: Blob }) => void) | null = null
++            onstop: (() => void) | null = null
++            start() { this.state = 'recording' }
++            stop() { this.state = 'inactive'; this.ondataavailable?.({ data: new Blob(['audio']) }); this.onstop?.() }
++        }
++        vi.stubGlobal('MediaRecorder', Recorder)
++        let finish!: (value: { text: string }) => void
++        const api = {
++            fetchTranscriptionProviders: vi.fn(async () => ({ providers: [{ id: 'deepgram', label: 'Deepgram', modes: ['standard'] }] })),
++            transcribeVoice: vi.fn(() => new Promise<{ text: string }>(resolve => { finish = resolve })),
++        }
++        try {
++            function DictationHarness() {
++                const [snapshot, setSnapshot] = useState(runtime.snapshot)
++                runtime.snapshot = snapshot; runtime.setSnapshot = setSnapshot
++                return <HappyComposer active agentFlavor="codex" voiceTranscriptionApi={api as never} pendingSendIntentRef={runtime.pendingSendIntentRef as { current: ComposerSendIntent }} />
++            }
++            render(<I18nProvider><DictationHarness /></I18nProvider>)
++            await waitFor(() => expect(screen.getByRole('button', { name: 'Dictate' })).not.toBeDisabled())
++            await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Dictate' })) })
++            expect(screen.getByRole('button', { name: 'Stop dictation' })).not.toBeDisabled()
++            expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
++            fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
++            expect(runtime.sentIntents).toEqual([])
++            await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stop dictation' })) })
++            expect(screen.getByRole('button', { name: 'Preparing transcript' })).toBeDisabled()
++            fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
++            expect(runtime.sentIntents).toEqual([])
++            act(() => runtime.setSnapshot!(current => ({ ...current, composer: { ...current.composer, text: 'Edited while transcribing' } })))
++            await act(async () => { finish({ text: 'dictated words' }) })
++            expect(runtime.snapshot.composer.text).toBe('Edited while transcribing dictated words')
++            expect(runtime.sentIntents).toEqual([])
++            expect(api.transcribeVoice).toHaveBeenCalledOnce()
++            expect(stopTrack).toHaveBeenCalledOnce()
++            expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
++            expect(screen.getByRole('button', { name: 'Dictate' })).not.toBeDisabled()
++        } finally {
++            cleanup(); vi.unstubAllGlobals(); localStorage.removeItem('hapi-voice-mode')
++        }
++    })
++
+     it.each([
+         ['After current turn', 'queue'],
+         ['When ready', 'next'],

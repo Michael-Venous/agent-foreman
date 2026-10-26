@@ -1,0 +1,730 @@
+diff --git a/web/src/components/FloatingWindow.tsx b/web/src/components/FloatingWindow.tsx
+--- a/web/src/components/FloatingWindow.tsx
++++ b/web/src/components/FloatingWindow.tsx
+@@ -75,8 +75,8 @@
+ }
+ 
+ /** A movable, resizable window or draggable bubble on desktop and mobile. */
+-export function FloatingWindow({ config, title, children, count = 0, headerActions, bodyClassName = 'flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7' }: {
+-    config: FloatingWindowConfig; title?: ReactNode; children: ReactNode; count?: number; headerActions?: ReactNode; bodyClassName?: string
++export function FloatingWindow({ config, title, children, count = 0, headerCenter, headerActions, bodyClassName = 'flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7' }: {
++    config: FloatingWindowConfig; title?: ReactNode; children: ReactNode; count?: number; headerCenter?: ReactNode; headerActions?: ReactNode; bodyClassName?: string
+ }) {
+     const { name, unit, icon, size } = config
+     const { open, collapsed, bounds, bubble, setBounds, setBubble, setOpen, setCollapsed } = useFloatingWindow(config)
+@@ -196,13 +196,16 @@
+         onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setCollapsed(true) } }}
+         className="pointer-events-auto absolute flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
+         style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
+-        <header className="app-section-header app-window-chrome">
++        <header className="app-section-header app-window-chrome" style={headerCenter ? { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr)' } : undefined}>
+             <button ref={focusTarget} type="button" aria-label={`Move ${name}`} title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
+                 onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+                 <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">{title ?? name}</span>
+             </button>
+-            {headerActions}
+-            <button type="button" aria-label={`Collapse ${name}`} title="Collapse to bubble" onClick={() => setCollapsed(true)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">−</button>
++            {headerCenter ? <div className="flex min-w-0 items-center justify-center">{headerCenter}</div> : null}
++            <div className="flex min-w-0 items-center justify-end gap-1">
++                {headerActions}
++                <button type="button" aria-label={`Collapse ${name}`} title="Collapse to bubble" onClick={() => setCollapsed(true)} className={`${headerCenter ? 'h-8 w-8' : 'h-11 w-11'} shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]`}>−</button>
++            </div>
+         </header>
+         <div className={bodyClassName}>{children}</div>
+         <button type="button" aria-label={`Resize ${name}`} title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
+diff --git a/web/src/components/NodeGraphHost.test.tsx b/web/src/components/NodeGraphHost.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/NodeGraphHost.test.tsx
+@@ -0,0 +1,114 @@
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { createPortal } from 'react-dom'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { NodeGraphHost } from './NodeGraphHost'
++import { NODE_GRAPH_WINDOW } from './NodeGraphWindow'
++
++type HeaderTargets = { center: HTMLElement | null; actions: HTMLElement | null }
++type GraphProps = { headerTargets?: HeaderTargets; onOpenChat: (id: string) => void; visible?: boolean }
++const state = vi.hoisted(() => ({ navigate: vi.fn(), graphRender: vi.fn(), workspace: 'Current workspace', currentChat: 'current-chat' }))
++vi.mock('@tanstack/react-router', () => ({ useNavigate: () => state.navigate }))
++vi.mock('@/lib/app-context', () => ({ useAppContext: () => ({ api: {} }) }))
++vi.mock('@/hooks/queries/useSessions', () => ({ useSessions: () => ({ sessions: [{ id: state.currentChat }], isLoading: false }) }))
++vi.mock('@/hooks/useNodeGraph', () => ({
++    useNodeGraph: () => ({ data: { activeWorkspaceId: 'workspace', workspaces: [{ id: 'workspace', name: state.workspace }], graph: { nodes: [] } } }),
++}))
++vi.mock('./NodeGraphView', () => ({
++    NodeGraphView: (props: GraphProps) => {
++        state.graphRender(props)
++        const workspace = <select aria-label="Workspace"><option>{state.workspace}</option></select>
++        const actions = <button type="button">Graph options</button>
++        return <>
++            {props.headerTargets
++                ? <>{props.headerTargets.center && createPortal(workspace, props.headerTargets.center)}{props.headerTargets.actions && createPortal(actions, props.headerTargets.actions)}</>
++                : <div role="toolbar" aria-label="Inline graph toolbar">{workspace}{actions}</div>}
++            <section aria-label="Graph canvas">
++                <button onClick={() => props.onOpenChat(state.currentChat)}>Open current chat</button>
++                <button onClick={() => props.onOpenChat('another-chat')}>Open another chat</button>
++            </section>
++        </>
++    },
++}))
++
++beforeEach(() => {
++    vi.clearAllMocks()
++    state.workspace = 'Current workspace'
++    state.currentChat = 'current-chat'
++    vi.stubGlobal('innerWidth', 1200)
++    vi.stubGlobal('innerHeight', 900)
++    vi.stubGlobal('matchMedia', () => ({ matches: window.innerWidth <= 640, addEventListener() {}, removeEventListener() {} }))
++})
++afterEach(() => { cleanup(); vi.unstubAllGlobals() })
++
++function setup() {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++    client.setQueryData(NODE_GRAPH_WINDOW.key, { open: true, collapsed: false })
++    const tree = () => <QueryClientProvider client={client}><main aria-label="Current chat">{state.currentChat}</main><NodeGraphHost /></QueryClientProvider>
++    const view = render(tree())
++    return { client, ...view, refresh: () => view.rerender(tree()) }
++}
++
++describe('Nodes floating window integration', () => {
++    it('places graph controls in the real top header under a plain Nodes title', async () => {
++        const view = setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        const header = panel.querySelector('header')!
++        const workspace = await within(header).findByRole('combobox', { name: 'Workspace' })
++        const actions = within(header).getByRole('button', { name: 'Graph options' })
++        const targets = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
++        expect(targets.center?.contains(workspace)).toBe(true)
++        expect(targets.actions?.contains(actions)).toBe(true)
++        expect(workspace.closest('header')).toBe(header)
++        expect(actions.closest('header')).toBe(header)
++        expect(within(header).getByRole('button', { name: 'Move Nodes' })).toHaveTextContent('Nodes')
++        expect(header).not.toHaveTextContent('Nodes ·')
++        expect(panel.querySelectorAll('header')).toHaveLength(1)
++        expect(screen.queryByRole('toolbar', { name: 'Inline graph toolbar' })).toBeNull()
++        expect(within(screen.getByRole('region', { name: 'Graph canvas' })).queryByRole('combobox')).toBeNull()
++        expect(view.container.querySelector('[role=dialog]')).toBeNull()
++        // Workspace changes update the selector while keeping the same slots.
++        state.workspace = 'Other workspace'
++        view.refresh()
++        await waitFor(() => expect(workspace).toHaveTextContent('Other workspace'))
++        expect(screen.getByRole('dialog', { name: 'Nodes' })).toBe(panel)
++        const updated = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
++        expect(updated.center).toBe(targets.center)
++        expect(updated.actions).toBe(targets.actions)
++        expect(within(panel).getAllByRole('combobox', { name: 'Workspace' })).toHaveLength(1)
++    })
++
++    it.each([{ kind: 'desktop', width: 1200 }, { kind: 'mobile', width: 390 }])('keeps Nodes expanded when opening its current chat on $kind', async ({ width }) => {
++        vi.stubGlobal('innerWidth', width)
++        const view = setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        fireEvent.click(within(panel).getByRole('button', { name: 'Open current chat' }))
++        expect(state.navigate).toHaveBeenLastCalledWith({ to: '/sessions/$sessionId', params: { sessionId: 'current-chat' }, resetScroll: false })
++        expect(screen.getByRole('dialog', { name: 'Nodes' })).toBe(panel)
++        expect(screen.queryByLabelText('Nodes bubble')).toBeNull()
++        expect(view.client.getQueryData(NODE_GRAPH_WINDOW.key)).toMatchObject({ open: true, collapsed: false })
++        fireEvent.click(within(panel).getByRole('button', { name: 'Open another chat' }))
++        state.currentChat = 'another-chat'
++        view.refresh()
++        expect(state.navigate).toHaveBeenLastCalledWith({ to: '/sessions/$sessionId', params: { sessionId: 'another-chat' }, resetScroll: false })
++        expect(screen.getByRole('dialog', { name: 'Nodes' })).toBe(panel)
++        expect(screen.queryByLabelText('Nodes bubble')).toBeNull()
++    })
++
++    it('retains explicit collapse, expansion and bubble close with the new header slots', async () => {
++        const { client } = setup()
++        const panel = await screen.findByRole('dialog', { name: 'Nodes' })
++        expect(within(panel).queryByRole('button', { name: 'Close Nodes' })).toBeNull()
++        fireEvent.click(within(panel).getByRole('button', { name: 'Collapse Nodes' }))
++        await screen.findByLabelText('Nodes bubble')
++        expect(screen.queryByRole('dialog', { name: 'Nodes' })).toBeNull()
++        fireEvent.click(screen.getByRole('button', { name: 'Expand Nodes' }))
++        const expanded = await screen.findByRole('dialog', { name: 'Nodes' })
++        await within(expanded.querySelector('header')!).findByRole('combobox', { name: 'Workspace' })
++        fireEvent.click(within(expanded).getByRole('button', { name: 'Collapse Nodes' }))
++        await screen.findByLabelText('Nodes bubble')
++        fireEvent.click(screen.getByRole('button', { name: 'Close Nodes' }))
++        await waitFor(() => expect(screen.queryByLabelText('Nodes bubble')).toBeNull())
++        expect(client.getQueryData(NODE_GRAPH_WINDOW.key)).toMatchObject({ open: false })
++    })
++})
+diff --git a/web/src/components/NodeGraphHost.tsx b/web/src/components/NodeGraphHost.tsx
+--- a/web/src/components/NodeGraphHost.tsx
++++ b/web/src/components/NodeGraphHost.tsx
+@@ -1,8 +1,9 @@
+ import { useNavigate } from '@tanstack/react-router'
++import { useState } from 'react'
+ import { useAppContext } from '@/lib/app-context'
+ import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
+ import { useSessions } from '@/hooks/queries/useSessions'
+-import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import { useNodeGraph } from '@/hooks/useNodeGraph'
+ import { FloatingWindow } from './FloatingWindow'
+ import { NodeGraphView } from './NodeGraphView'
+ import { NODE_GRAPH_WINDOW, useNodeGraphWindow } from './NodeGraphWindow'
+@@ -19,9 +20,14 @@
+     const { sessions, isLoading } = useSessions(api)
+     const { collapsed } = useNodeGraphWindow()
+     const { data } = useNodeGraph(api)
+-    const name = activeWorkspaceName(data)
+-    return <FloatingWindow config={NODE_GRAPH_WINDOW} title={name ? `Nodes · ${name}` : 'Nodes'} count={data?.graph.nodes.length ?? 0} bodyClassName="flex min-h-0 flex-1 flex-col">
++    const [center, setCenter] = useState<HTMLDivElement | null>(null)
++    const [actions, setActions] = useState<HTMLDivElement | null>(null)
++    return <FloatingWindow config={NODE_GRAPH_WINDOW} title="Nodes" count={data?.graph.nodes.length ?? 0}
++        headerCenter={<div ref={setCenter} className="flex min-w-0 max-w-full items-center justify-center" />}
++        headerActions={<div ref={setActions} className="flex min-w-0 items-center" />}
++        bodyClassName="flex min-h-0 flex-1 flex-col">
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions} visible={!collapsed}
++            headerTargets={{ center, actions }}
+             onOpenChat={id => { void navigate(getSessionListSelectionNavigation(id)) }} />
+     </FloatingWindow>
+ }
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -112,11 +112,11 @@
+     return api
+ }
+ 
+-function setup(api = makeApi(), list: SessionSummary[] = sessions) {
++function setup(api = makeApi(), list: SessionSummary[] = sessions, headerTargets?: { center: HTMLElement | null; actions: HTMLElement | null }) {
+     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+     const onOpenChat = vi.fn()
+     const view = render(<QueryClientProvider client={client}><I18nProvider>
+-        <NodeGraphView api={api as unknown as ApiClient} sessions={list} onOpenChat={onOpenChat} />
++        <NodeGraphView api={api as unknown as ApiClient} sessions={list} onOpenChat={onOpenChat} headerTargets={headerTargets} />
+     </I18nProvider></QueryClientProvider>)
+     return { api, client, onOpenChat, view }
+ }
+@@ -679,19 +679,71 @@
+ })
+ 
+ describe('compact graph controls', () => {
+-    it('floats the workspace name inside the canvas without the old toolbar buttons or label', async () => {
++    it('puts compact workspace and grid controls above the canvas without dedicated Add buttons', async () => {
+         setup()
+         const workspace = await screen.findByRole('button', { name: 'Workspaces' })
+         expect(workspace.textContent).toBe('Default▾')
+-        expect(screen.getByRole('application', { name: 'Node graph' })).toContainElement(workspace)
++        expect(screen.getByRole('application', { name: 'Node graph' })).not.toContainElement(workspace)
++        expect(document.querySelector('[data-graph-header]')).toContainElement(workspace)
++        for (const name of ['Add frame', 'Add text box', 'Add junction']) expect(screen.queryByRole('button', { name })).toBeNull()
+         expect(screen.queryByRole('button', { name: 'Chats' })).toBeNull()
+         expect(screen.queryByRole('button', { name: '+ Add chats' })).toBeNull()
+         expect(screen.queryByText('Workspace', { exact: true })).toBeNull()
+     })
+ })
+ 
++it('uses external header slots without leaving workspace or grid controls inside the canvas', async () => {
++    const center = document.createElement('div'), actions = document.createElement('div')
++    document.body.append(center, actions)
++    try {
++        setup(makeApi(), sessions, { center, actions })
++        const workspace = await screen.findByRole('button', { name: 'Workspaces' })
++        expect(center).toContainElement(workspace)
++        expect(actions).toContainElement(screen.getByRole('button', { name: 'Grid settings' }))
++        expect(screen.getByRole('application')).not.toContainElement(workspace)
++        expect(document.querySelector('[data-graph-header]')).toBeNull()
++        fireEvent.click(workspace)
++        const popup = await screen.findByRole('group', { name: 'Workspace slots' })
++        expect(center).not.toContainElement(popup)
++        fireEvent.click(within(popup).getByRole('button', { name: 'Switch to Research' }))
++        expect(await screen.findByRole('dialog', { name: 'Switch to Research?' })).toBeInTheDocument()
++        expect(screen.queryByRole('group', { name: 'Workspace slots' })).toBeNull()
++    } finally { center.remove(); actions.remove() }
++})
++it('dismisses external header Grid and workspace popups with Escape without forwarding it to the window', async () => {
++    const center = document.createElement('div'), actions = document.createElement('div')
++    document.body.append(center, actions)
++    const windowKey = vi.fn()
++    window.addEventListener('keydown', windowKey)
++    try {
++        setup(makeApi(), sessions, { center, actions })
++        fireEvent.click(await screen.findByRole('button', { name: 'Grid settings' }))
++        const gridPopup = await screen.findByRole('dialog', { name: 'Grid settings' })
++        fireEvent.keyDown(within(gridPopup).getByRole('spinbutton', { name: 'Grid size' }), { key: 'Escape' })
++        await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Grid settings' })).toBeNull())
++        expect(windowKey).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: 'Workspaces' }))
++        const workspaces = await screen.findByRole('group', { name: 'Workspace slots' })
++        fireEvent.keyDown(within(workspaces).getByRole('textbox', { name: 'Preset name' }), { key: 'Escape' })
++        await waitFor(() => expect(screen.queryByRole('group', { name: 'Workspace slots' })).toBeNull())
++        expect(windowKey).not.toHaveBeenCalled()
++    } finally { window.removeEventListener('keydown', windowKey); center.remove(); actions.remove() }
++})
++it('does not briefly restore an old toolbar while external header targets are null', async () => {
++    setup(makeApi(), sessions, { center: null, actions: null })
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    expect(screen.queryByRole('button', { name: 'Workspaces' })).toBeNull()
++    expect(screen.queryByRole('button', { name: 'Grid settings' })).toBeNull()
++    expect(document.querySelector('[data-graph-header]')).toBeNull()
++})
++
++const selectAdd = async (name: string) => {
++    await screen.findByRole('button', { name: 'Node Alpha' })
++    fireEvent.keyDown(screen.getByRole('application'), { key: 'A', shiftKey: true })
++    fireEvent.click(within(await screen.findByRole('dialog', { name: 'Add node' })).getByRole('button', { name }))
++}
+ const addDecoration = async (kind: 'frame' | 'text', text: string) => {
+-    fireEvent.click(await screen.findByRole('button', { name: kind === 'frame' ? 'Add frame' : 'Add text box' }))
++    await selectAdd(kind === 'frame' ? 'Frame' : 'Text box')
+     const dialog = await screen.findByRole('dialog', { name: kind === 'frame' ? 'Frame' : 'Text box' })
+     fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: text } })
+     fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+@@ -740,7 +792,7 @@
+     })
+     it('cancels drafts and cancelled pointer drags without saving, and deselects on blank canvas', async () => {
+         const { api } = setup()
+-        fireEvent.click(await screen.findByRole('button', { name: 'Add frame' }))
++        await selectAdd('Frame')
+         fireEvent.click(within(await screen.findByRole('dialog', { name: 'Frame' })).getByRole('button', { name: 'Cancel' }))
+         expect(api.editNodeAnnotation).not.toHaveBeenCalled()
+         const frame = await addDecoration('frame', 'Draft')
+@@ -772,7 +824,7 @@
+     return { clientX: x! + parseFloat(dot.style.left) * k!, clientY: y! + parseFloat(dot.style.top) * k! }
+ }
+ const addDot = async () => {
+-    fireEvent.click(await screen.findByRole('button', { name: 'Add junction' }))
++    await selectAdd('Branch junction')
+     return (await screen.findByRole('button', { name: 'Junction 1' })).getAttribute('data-junction-id')!
+ }
+ const dotTo = (id: string, child: string) => {
+@@ -862,6 +914,75 @@
+ })
+ 
+ describe('canvas Add node menu', () => {
++    it('lists common items before chats and searches both with keyboard navigation', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.keyDown(screen.getByRole('application'), { key: 'A', shiftKey: true })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        expect(within(menu).getAllByRole('button').map(button => button.textContent)).toEqual(['Frame', 'Text box', 'Branch junction', 'New chat'])
++        const search = within(menu).getByRole('searchbox')
++        fireEvent.change(search, { target: { value: 'junction' } })
++        expect(within(menu).getAllByRole('button').map(button => button.textContent)).toEqual(['Branch junction'])
++        fireEvent.keyDown(search, { key: 'ArrowDown' })
++        expect(within(menu).getByRole('button', { name: 'Branch junction' })).toHaveFocus()
++        fireEvent.keyDown(document.activeElement!, { key: 'ArrowUp' })
++        expect(within(menu).getByRole('button', { name: 'Branch junction' })).toHaveFocus()
++        fireEvent.change(search, { target: { value: 'note' } })
++        fireEvent.keyDown(search, { key: 'Enter' })
++        const editor = await screen.findByRole('dialog', { name: 'Text box' })
++        fireEvent.click(within(editor).getByRole('button', { name: 'Cancel' }))
++        expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++    })
++    it('ignores touch double-tap compatibility events and preserves mouse double-click and native context menus', async () => {
++        setup(); const node = await screen.findByRole('button', { name: 'Node Alpha' })
++        const canvas = screen.getByRole('application'), point = { clientX: 600, clientY: 450 }
++        for (let tap = 0; tap < 2; tap++) {
++            fireEvent.pointerDown(canvas, { pointerId: 10, pointerType: 'touch', button: 0, ...point })
++            fireEvent.pointerUp(canvas, { pointerId: 10, pointerType: 'touch', ...point })
++        }
++        fireEvent.doubleClick(canvas, point)
++        expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++        expect(fireEvent.contextMenu(canvas, point)).toBe(false)
++        fireEvent.pointerDown(canvas, { pointerId: 1, pointerType: 'mouse', button: 2, ...point })
++        expect(fireEvent.contextMenu(canvas, point)).toBe(true)
++        fireEvent.contextMenu(node, point)
++        expect(await screen.findByRole('dialog', { name: 'Actions for Alpha' })).toBeInTheDocument()
++        fireEvent.keyDown(screen.getByRole('dialog', { name: 'Actions for Alpha' }), { key: 'Escape' })
++        fireEvent.pointerDown(canvas, { pointerId: 1, pointerType: 'mouse', button: 0, ...point })
++        fireEvent.pointerUp(canvas, { pointerId: 1, pointerType: 'mouse', ...point })
++        fireEvent.doubleClick(canvas, point)
++        expect(await screen.findByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
++    })
++    it('opens Add on an empty-canvas touch hold and keeps it open after release', async () => {
++        const { api, onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        const canvas = screen.getByRole('application')
++        vi.useFakeTimers()
++        try {
++            expect(fireEvent.pointerDown(canvas, { pointerId: 10, pointerType: 'touch', button: 0, clientX: 600, clientY: 450 })).toBe(false)
++            act(() => vi.advanceTimersByTime(550))
++            expect(screen.getByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
++            expect(fireEvent.contextMenu(canvas, { clientX: 600, clientY: 450 })).toBe(false)
++            fireEvent.pointerUp(canvas, { pointerId: 10, pointerType: 'touch', clientX: 600, clientY: 450 })
++            expect(screen.getByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
++            expect(api.addNode).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++        } finally { vi.useRealTimers() }
++    })
++    it.each(['drag', 'pinch', 'cancel', 'release', 'capture loss'])('cancels empty-canvas touch Add hold after %s', async reason => {
++        setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        const canvas = screen.getByRole('application')
++        vi.useFakeTimers()
++        try {
++            fireEvent.pointerDown(canvas, { pointerId: 10, pointerType: 'touch', button: 0, clientX: 600, clientY: 450 })
++            if (reason === 'drag') fireEvent.pointerMove(canvas, { pointerId: 10, pointerType: 'touch', clientX: 615, clientY: 450 })
++            else if (reason === 'pinch') fireEvent.pointerDown(canvas, { pointerId: 11, pointerType: 'touch', button: 0, clientX: 650, clientY: 450 })
++            else if (reason === 'cancel') fireEvent.pointerCancel(canvas, { pointerId: 10, pointerType: 'touch' })
++            else if (reason === 'release') fireEvent.pointerUp(canvas, { pointerId: 10, pointerType: 'touch' })
++            else fireEvent.lostPointerCapture(canvas, { pointerId: 10, pointerType: 'touch' })
++            act(() => vi.advanceTimersByTime(600))
++            expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++            fireEvent.pointerCancel(canvas, { pointerId: 10, pointerType: 'touch' })
++            fireEvent.pointerCancel(canvas, { pointerId: 11, pointerType: 'touch' })
++        } finally { vi.useRealTimers() }
++    })
+     it('opens only on empty canvas and adds a searched chat at the clicked graph position, with undo', async () => {
+         const { api, onOpenChat } = setup()
+         const node = await screen.findByRole('button', { name: 'Node Alpha' })
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -3,6 +3,7 @@
+ import { useNodeGrid } from '@/hooks/useNodeGrid'
+ import { useNodeChatPin } from '@/hooks/useNodeChatPin'
+ import * as Popover from '@radix-ui/react-popover'
++import { createPortal } from 'react-dom'
+ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+ import type { ApiClient } from '@/api/client'
+@@ -58,8 +59,9 @@
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+ /** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
+-export function NodeGraphView({ api, sessions, onOpenChat, visible = true }: {
++export function NodeGraphView({ api, sessions, onOpenChat, visible = true, headerTargets }: {
+     api: ApiClient | null; sessions?: readonly SessionSummary[]; onOpenChat: (id: string) => void; visible?: boolean
++    headerTargets?: { center: HTMLElement | null; actions: HTMLElement | null }
+ }) {
+     const { data: graph, error: loadError, isLoading, enabled, mutate } = useNodeGraph(api, visible)
+     const canvas = useRef<HTMLDivElement>(null)
+@@ -94,9 +96,11 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
++    const lastPointerType = useRef('mouse')
+     const touchMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const cancelTouchMenu = () => { if (touchMenuTimer.current) clearTimeout(touchMenuTimer.current); touchMenuTimer.current = null }
+     useEffect(() => () => cancelTouchMenu(), [])
++    useEffect(() => { if (!visible) cancelTouchMenu() }, [visible])
+     const pendingSave = useRef<NodeLayoutPositions>({})
+     const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const fittedWorkspace = useRef<string | null>(null)
+@@ -245,6 +249,7 @@
+         setMenu(null); setObjectMenu({ id, x: clientX - (r?.left ?? 0), y: clientY - (r?.top ?? 0) })
+     }
+     const pinchStart = () => {
++        cancelTouchMenu()
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
+         const previous = gesture.current
+@@ -260,7 +265,9 @@
+         const target = event.target as Element
+         // React portals bubble through this component even though their DOM is
+         // outside the canvas. Capturing those pointers eats dialog clicks.
+-        if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui]')) return
++        if (!event.currentTarget.contains(target)) return
++        lastPointerType.current = event.pointerType || 'mouse'
++        if (target.closest('[data-graph-ui]')) return
+         if ((event.button !== 0 && event.button !== 1) || pending || mutationBusy.current || dropInFlight.current) return
+         if (event.button === 1) {
+             event.preventDefault(); event.currentTarget.focus({ preventScroll: true }); cancelTouchMenu()
+@@ -305,7 +312,18 @@
+                 }, 550)
+             }
+         }
+-        else gesture.current = event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
++        else {
++            gesture.current = event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
++            if (event.pointerType === 'touch') {
++                event.preventDefault()
++                const at = { x: event.clientX, y: event.clientY }, pointer = event.pointerId
++                touchMenuTimer.current = setTimeout(() => {
++                    touchMenuTimer.current = null
++                    if (gesture.current?.kind !== 'pan' || gesture.current.pointer !== pointer || pointers.current.size !== 1) return
++                    gesture.current = null; pointers.current.clear(); showAddMenu(at.x, at.y)
++                }, 550)
++            }
++        }
+         // Touch has implicit capture; touch-action:none prevents native scrolling.
+         if (event.pointerType !== 'touch') { event.preventDefault(); event.currentTarget.setPointerCapture?.(event.pointerId) }
+     }
+@@ -324,7 +342,7 @@
+             return
+         }
+         if (g.pointer !== event.pointerId) return
+-        if (g.kind === 'node' && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) cancelTouchMenu()
++        if ((g.kind === 'node' || g.kind === 'pan') && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) cancelTouchMenu()
+         if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + event.clientX - g.x, y: g.view.y + event.clientY - g.y })
+         else if (g.kind === 'link') { const to = toGraph(event.clientX, event.clientY); setLink({ fixed: g.from, direction: 'child', to, target: linkTarget(g.from, to) }) }
+         else if (g.kind === 'input') {
+@@ -683,13 +701,60 @@
+     const closeMenu = () => { setMenu(null); setError(null) }
+     const menuKeys = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu() } }
+ 
++    const workspaceControl = graph ? <WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /> : null
++    const gridControl = graph ? <div data-graph-ui className="flex shrink-0 items-center">
++        <Popover.Root><Popover.Trigger asChild><button type="button" aria-label="Grid settings" title="Grid and snapping" aria-pressed={grid.enabled} className={`${iconButton} ${grid.enabled ? 'text-[var(--app-link)]' : ''}`}>#</button></Popover.Trigger>
++            <Popover.Portal><Popover.Content data-graph-ui aria-label="Grid settings" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="end" collisionPadding={8} className="z-[110] w-60 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-sm shadow-xl">
++                <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.enabled} onChange={e => setGrid({ ...grid, enabled: e.target.checked })} />Snap to grid</label>
++                <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.visible} onChange={e => setGrid({ ...grid, visible: e.target.checked })} />Show grid</label>
++                <label className="flex min-h-9 items-center gap-2">Grid size<input aria-label="Grid size" type="number" min="4" max="200" value={gridSizeDraft} onChange={e => { const raw = e.target.value; setGridSizeDraft(raw); const size = Number(raw); if (raw && size >= 4 && size <= 200) setGrid({ ...grid, size }) }} onBlur={() => { const size = Math.max(4, Math.min(200, Number(gridSizeDraft) || 20)); setGrid({ ...grid, size }); setGridSizeDraft(String(size)) }} onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') { setGrid({ ...grid, size: Number(gridSizeDraft) }); if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } } }} className="w-20 rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1" /></label>
++            </Popover.Content></Popover.Portal>
++        </Popover.Root>
++    </div> : null
++    const addOptions = [
++        { id: 'frame', label: 'Frame', search: 'frame group', run: () => addAnnotation('frame', addMenu?.point) },
++        { id: 'text', label: 'Text box', search: 'text box note label', run: () => addAnnotation('text', addMenu?.point) },
++        { id: 'junction', label: 'Branch junction', search: 'branch junction dot reroute', run: () => addJunction(addMenu?.point) },
++        ...(sessions ?? []).filter(session => session.id !== overseer && !ids.includes(session.id)).map(session => ({
++            id: session.id, label: title(session.id), search: title(session.id), run: () => placeChat(session.id, addMenu!.point)
++        }))
++    ].filter(option => option.search.toLowerCase().includes(addQuery.trim().toLowerCase())).slice(0, 53)
++    const chooseAdd = (run: () => void) => {
++        if (!addMenu || addMenu.workspace !== graph?.activeWorkspaceId) return
++        run(); setAddMenu(null)
++    }
++    const addMenuKeys = (event: KeyboardEvent<HTMLDivElement>) => {
++        if (event.key === 'Escape') { event.stopPropagation(); return }
++        const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[data-add-option]')]
++        const index = buttons.indexOf(event.target as HTMLButtonElement)
++        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
++            event.preventDefault(); event.stopPropagation()
++            const next = index < 0 ? (event.key === 'ArrowDown' ? 0 : buttons.length - 1) : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
++            buttons[next]?.focus()
++        } else if (event.key === 'Enter' && event.target instanceof HTMLInputElement && buttons[0]) {
++            event.preventDefault(); event.stopPropagation(); buttons[0].click()
++        }
++    }
+     return <div className="relative flex h-full min-h-0 w-full flex-col">
++        {headerTargets ? <>
++            {headerTargets.center && createPortal(workspaceControl, headerTargets.center)}
++            {headerTargets.actions && createPortal(gridControl, headerTargets.actions)}
++        </> : graph && <div data-graph-ui data-graph-header className="app-section-header app-window-chrome shrink-0 justify-between gap-2">
++            <div className="min-w-0">{workspaceControl}</div>{gridControl}
++        </div>}
+         {(loadError || (error && !menu && !editingAnnotation)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+         <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+             onDoubleClick={event => {
++                // Touch uses hold-to-add; ignore compatibility double-clicks
++                // even on browsers that ignore pointerdown preventDefault.
++                if (lastPointerType.current === 'touch' || (event.nativeEvent as MouseEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } }).sourceCapabilities?.firesTouchEvents) return
+                 const target = event.target as Element
+                 if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui],[data-node-id],[data-junction-id],[data-annotation-id],button,input,[role="dialog"]')) return
+                 event.preventDefault(); showAddMenu(event.clientX, event.clientY)
++            }}
++            onContextMenu={event => {
++                const target = event.target as Element
++                if (lastPointerType.current === 'touch' && event.currentTarget.contains(target) && !target.closest('[data-graph-ui],[data-node-id],[data-junction-id],[data-annotation-id],button,input,[role="dialog"]')) event.preventDefault()
+             }}
+             onKeyDown={event => {
+                 const target = event.target instanceof Element ? event.target : null
+@@ -701,42 +766,23 @@
+             onAuxClick={event => { if (event.button === 1) event.preventDefault() }}
+             onDragEnter={dragOver} onDragOver={dragOver} onDrop={drop}
+             onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropActive(false) }}
+-            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) gesture.current = null }}
++            onLostPointerCapture={event => { const g = gesture.current; if (g?.kind === 'pan' && g.pointer === event.pointerId) { cancelTouchMenu(); gesture.current = null } }}
+             style={grid.visible ? { backgroundImage: 'radial-gradient(circle, var(--app-hint) 0.7px, transparent 0.8px)', backgroundSize: `${grid.size * view.k}px ${grid.size * view.k}px`, backgroundPosition: `${view.x}px ${view.y}px` } : undefined}
+             className="relative min-h-0 flex-1 touch-none select-none overflow-hidden bg-[var(--app-subtle-bg)] cursor-default outline-none">
+             <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
+-                <Popover.Portal><Popover.Content aria-label="Add node" side="bottom" align="start" sideOffset={0} collisionPadding={12}
++                <Popover.Portal><Popover.Content data-graph-ui aria-label="Add node" onKeyDown={addMenuKeys} side="bottom" align="start" sideOffset={0} collisionPadding={12}
+                     className="z-[110] max-h-[calc(100dvh-24px)] w-64 max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-2 shadow-xl">
+                     <div className="px-2 py-1 text-xs font-semibold text-[var(--app-hint)]">Add node</div>
+-                    <input type="search" aria-label="Search chats for node" placeholder="Search chats…" value={addQuery} onChange={event => setAddQuery(event.target.value)}
++                    <input type="search" aria-label="Search nodes" placeholder="Search…" value={addQuery} onChange={event => setAddQuery(event.target.value)}
+                         className="my-1 min-h-10 w-full rounded-lg bg-[var(--app-subtle-bg)] px-2 text-sm" />
+-                    <div className="max-h-48 overflow-y-auto overscroll-contain" aria-label="Available chats">
+-                        {(sessions ?? []).filter(session => session.id !== overseer && !ids.includes(session.id) && title(session.id).toLowerCase().includes(addQuery.toLowerCase())).slice(0, 50).map(session => <button type="button" key={session.id} data-add-session={session.id} className={menuItem}
+-                            onClick={() => { if (!addMenu || addMenu.workspace !== graph?.activeWorkspaceId) return; const point = addMenu.point; setAddMenu(null); placeChat(session.id, point) }}>{title(session.id)}</button>)}
+-                        {!(sessions ?? []).some(session => session.id !== overseer && !ids.includes(session.id) && title(session.id).toLowerCase().includes(addQuery.toLowerCase())) ? <p className="px-2 py-2 text-xs text-[var(--app-hint)]">No matching chats</p> : null}
++                    <div className="max-h-72 overflow-y-auto overscroll-contain" aria-label="Available nodes">
++                        {addOptions.map(option => <button type="button" key={option.id} data-add-option data-add-session={sessionsById.has(option.id) ? option.id : undefined} className={menuItem}
++                            onClick={() => chooseAdd(option.run)}>{option.label}</button>)}
++                        {!addOptions.length && <p className="px-2 py-2 text-xs text-[var(--app-hint)]">No matching nodes</p>}
+                     </div>
+-                    <div className="my-1 border-t border-[var(--app-border)]" />
+-                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addAnnotation('frame', point) }}>Frame</button>
+-                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addAnnotation('text', point) }}>Text box</button>
+-                    <button type="button" className={menuItem} onClick={() => { const point = addMenu?.point; setAddMenu(null); addJunction(point) }}>Branch junction</button>
+                 </Popover.Content></Popover.Portal>
+             </Popover.Root>
+-            {graph && <div data-graph-ui className="app-section-header app-window-chrome pointer-events-none absolute inset-x-0 top-0 z-30">
+-                <div className="flex w-full min-w-0 items-center gap-2"><div className="min-w-0 flex-1"><WorkspaceBar graph={graph} title={title} mutate={mutate} beforeSwitch={async () => { await dropInFlight.current; await flushSave() }} /></div>
+-                <div className="pointer-events-auto flex shrink-0 items-center gap-0.5">
+-                    <Popover.Root><Popover.Trigger asChild><button type="button" aria-label="Grid settings" title="Grid and snapping" aria-pressed={grid.enabled} className={`${iconButton} ${grid.enabled ? 'text-[var(--app-link)]' : ''}`}>#</button></Popover.Trigger>
+-                        <Popover.Portal><Popover.Content data-graph-ui aria-label="Grid settings" side="bottom" align="end" collisionPadding={8} className="z-[110] w-60 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-sm shadow-xl">
+-                            <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.enabled} onChange={e => setGrid({ ...grid, enabled: e.target.checked })} />Snap to grid</label>
+-                            <label className="flex min-h-9 items-center gap-2"><input type="checkbox" checked={grid.visible} onChange={e => setGrid({ ...grid, visible: e.target.checked })} />Show grid</label>
+-                            <label className="flex min-h-9 items-center gap-2">Grid size<input aria-label="Grid size" type="number" min="4" max="200" value={gridSizeDraft} onChange={e => { const raw = e.target.value; setGridSizeDraft(raw); const size = Number(raw); if (raw && size >= 4 && size <= 200) setGrid({ ...grid, size }) }} onBlur={() => { const size = Math.max(4, Math.min(200, Number(gridSizeDraft) || 20)); setGrid({ ...grid, size }); setGridSizeDraft(String(size)) }} onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') { setGrid({ ...grid, size: Number(gridSizeDraft) }); if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } } }} className="w-20 rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1" /></label>
+-                        </Popover.Content></Popover.Portal>
+-                    </Popover.Root>
+-                    <button type="button" aria-label="Add frame" title="Add frame" disabled={pending !== null} onClick={() => addAnnotation('frame')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="1" strokeDasharray="4 2" /></svg></button>
+-                    <button type="button" aria-label="Add junction" title="Add branch junction" disabled={pending !== null} onClick={() => addJunction()} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M10 2v6M10 10l-6 7M10 10l6 7" /><circle cx="10" cy="9" r="2" fill="currentColor" /></svg></button>
+-                    <button type="button" aria-label="Add text box" title="Add text box" disabled={pending !== null} onClick={() => addAnnotation('text')} className={iconButton}><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M4 5V3h12v2M10 3v14M7 17h6" /></svg></button>
+-                </div></div>
+-            </div>}
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+                 <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
+@@ -910,12 +956,12 @@
+         finally { setPending(false) }
+     }
+     const closeSwitch = () => { if (!pending) { setTarget(null); setResult(null); setError(null) } }
+-    return <div className="relative min-w-0">
+-        <button type="button" aria-label="Workspaces" aria-expanded={open} onClick={() => { setOpen(value => !value); setError(null) }}
+-            className="pointer-events-auto flex min-h-12 min-w-0 max-w-full items-center gap-1.5 rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] px-3 text-sm shadow hover:bg-[var(--app-subtle-bg)]">
++    return <Popover.Root open={open} onOpenChange={value => { setOpen(value); setError(null) }}>
++        <Popover.Trigger asChild><button type="button" aria-label="Workspaces" aria-expanded={open}
++            className="pointer-events-auto flex h-8 min-w-0 max-w-full items-center gap-1 rounded-md px-2 text-xs hover:bg-[var(--app-subtle-bg)]">
+             <span className="truncate font-medium">{current}</span><span aria-hidden="true" className="text-[var(--app-hint)]">▾</span>
+-        </button>
+-        {open && <div role="group" aria-label="Workspace slots" className="pointer-events-auto absolute left-0 top-full z-30 mt-1 w-[min(22rem,100%)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
++        </button></Popover.Trigger>
++        <Popover.Portal><Popover.Content data-graph-ui role="group" aria-label="Workspace slots" onEscapeKeyDown={event => event.stopPropagation()} side="bottom" align="start" collisionPadding={8} className="pointer-events-auto z-[110] w-80 max-w-[calc(100vw-16px)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-2 shadow-xl">
+             <ul className="max-h-72 overflow-y-auto overscroll-contain">
+                 {sortWorkspaces(graph.workspaces).map(workspace => {
+                     const active = workspace.id === graph.activeWorkspaceId, editable = workspace.kind === 'preset' && !active
+@@ -932,7 +978,7 @@
+                             <span className="min-w-0 flex-1 truncate px-1 text-sm">{workspace.name}
+                                 {workspace.kind === 'default' && <span className="ml-1.5 text-[11px] text-[var(--app-hint)]">default</span>}
+                                 {active && <span className="ml-1.5 rounded bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[11px] text-[var(--app-fg)]">active</span>}</span>
+-                            {!active && <button type="button" aria-label={`Switch to ${workspace.name}`} disabled={pending} onClick={() => { setTarget(workspace); setResult(null); setError(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Switch</button>}
++                            {!active && <button type="button" aria-label={`Switch to ${workspace.name}`} disabled={pending} onClick={() => { setOpen(false); setTarget(workspace); setResult(null); setError(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Switch</button>}
+                             {editable && <button type="button" aria-label={`Rename ${workspace.name}`} disabled={pending} onClick={() => { setRenaming({ id: workspace.id, name: workspace.name }); setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">Rename</button>}
+                             {editable && (deleting === workspace.id
+                                 ? <button type="button" aria-label={`Confirm delete ${workspace.name}`} disabled={pending} onClick={async () => { if (await run(() => mutate(client => client.deleteWorkspace(workspace.id)))) setDeleting(null) }} className="min-h-10 rounded-lg px-2 text-sm font-medium text-[var(--app-badge-error-text)] hover:bg-[var(--app-subtle-bg)]">Delete?</button>
+@@ -950,7 +996,7 @@
+                 <button type="submit" disabled={pending || !presetName.trim()} className="min-h-10 shrink-0 rounded-lg px-2 text-sm text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] disabled:opacity-40">Save as preset</button>
+             </form>
+             {error && !target && <p role="alert" className="px-1 pt-1 text-xs text-[var(--app-badge-error-text)]">{error}</p>}
+-        </div>}
++        </Popover.Content></Popover.Portal>
+         <Dialog open={target !== null} onOpenChange={value => { if (!value) closeSwitch() }}>
+             {/* Escape closes only this dialog, not a floating window around the graph. */}
+             <DialogContent className="max-w-sm" onKeyDown={event => { if (event.key === 'Escape') event.stopPropagation() }}>
+@@ -981,5 +1027,5 @@
+                 </div>
+             </DialogContent>
+         </Dialog>
+-    </div>
++    </Popover.Root>
+ }
+diff --git a/web/src/routes/popout.test.tsx b/web/src/routes/popout.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/routes/popout.test.tsx
+@@ -0,0 +1,69 @@
++import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
++import { createPortal } from 'react-dom'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { NodesPopout, SessionManagerPopout } from './popout'
++
++type HeaderTargets = { center: HTMLElement | null; actions: HTMLElement | null }
++const state = vi.hoisted(() => ({ sendToMain: vi.fn(), rememberBounds: vi.fn(), stopRemembering: vi.fn(), graphRender: vi.fn() }))
++vi.mock('@/lib/app-context', () => ({ useAppContext: () => ({ api: {} }) }))
++vi.mock('@/hooks/queries/useSessions', () => ({ useSessions: () => ({ sessions: [], isLoading: false }) }))
++vi.mock('@/hooks/queries/useMachines', () => ({ useMachines: () => ({ machines: [] }) }))
++vi.mock('@/hooks/useManagedSessions', () => ({ useManagedSessions: () => ({}) }))
++vi.mock('@/lib/popout', () => ({ sendToMain: state.sendToMain, rememberPopoutBounds: state.rememberBounds }))
++vi.mock('@/components/NodeGraphView', () => ({
++    NodeGraphView: (props: { headerTargets?: HeaderTargets; onOpenChat: (id: string) => void }) => {
++        state.graphRender(props)
++        const workspace = <select aria-label="Workspace"><option>Current workspace</option></select>
++        const actions = <button type="button">Graph options</button>
++        return <>
++            {props.headerTargets
++                ? <>{props.headerTargets.center && createPortal(workspace, props.headerTargets.center)}{props.headerTargets.actions && createPortal(actions, props.headerTargets.actions)}</>
++                : <header>{workspace}{actions}</header>}
++            <section aria-label="Graph canvas"><button onClick={() => props.onOpenChat('selected-chat')}>Open chat</button></section>
++        </>
++    },
++}))
++vi.mock('@/components/SessionManagerButton', () => ({
++    SessionManagerButton: (props: { onSelect: (id: string) => void }) => <section aria-label="Session manager contents"><button onClick={() => props.onSelect('manager-chat')}>Open manager chat</button></section>,
++}))
++
++beforeEach(() => {
++    vi.clearAllMocks()
++    document.title = 'Previous application title'
++    state.rememberBounds.mockReturnValue(state.stopRemembering)
++})
++afterEach(() => { cleanup() })
++
++describe('native popout headers', () => {
++    it('renders one Nodes top header with portal targets and sends chat navigation to the main window', async () => {
++        const { container, unmount } = render(<NodesPopout />)
++        expect(document.title).toBe('Nodes')
++        expect(state.rememberBounds).toHaveBeenCalledWith('nodes')
++        const header = container.querySelector('header')!
++        expect(container.querySelectorAll('header')).toHaveLength(1)
++        expect(within(header).getByText('Nodes', { exact: true })).toBeInTheDocument()
++        expect(header).not.toHaveTextContent('Nodes ·')
++        const workspace = await within(header).findByRole('combobox', { name: 'Workspace' })
++        const actions = within(header).getByRole('button', { name: 'Graph options' })
++        const targets = state.graphRender.mock.lastCall![0].headerTargets as HeaderTargets
++        expect(targets.center?.contains(workspace)).toBe(true)
++        expect(targets.actions?.contains(actions)).toBe(true)
++        expect(within(screen.getByRole('region', { name: 'Graph canvas' })).queryByRole('combobox')).toBeNull()
++        fireEvent.click(screen.getByRole('button', { name: 'Open chat' }))
++        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'selected-chat' })
++        expect(container.querySelector('header')).toBe(header)
++        expect(container.querySelectorAll('header')).toHaveLength(1)
++        unmount()
++        expect(state.stopRemembering).toHaveBeenCalledOnce()
++    })
++
++    it('uses the plain Session Manager document title and keeps its navigation contract', () => {
++        const { unmount } = render(<SessionManagerPopout />)
++        expect(document.title).toBe('Session Manager')
++        expect(state.rememberBounds).toHaveBeenCalledWith('session-manager')
++        fireEvent.click(screen.getByRole('button', { name: 'Open manager chat' }))
++        expect(state.sendToMain).toHaveBeenCalledWith({ action: 'open-session', sessionId: 'manager-chat' })
++        unmount()
++        expect(state.stopRemembering).toHaveBeenCalledOnce()
++    })
++})
+diff --git a/web/src/routes/popout.tsx b/web/src/routes/popout.tsx
+--- a/web/src/routes/popout.tsx
++++ b/web/src/routes/popout.tsx
+@@ -1,14 +1,13 @@
+-import { useEffect } from 'react'
++import { useEffect, useState } from 'react'
+ import { SessionManagerButton } from '@/components/SessionManagerButton'
+ import { NodeGraphView } from '@/components/NodeGraphView'
+ import { useSessions } from '@/hooks/queries/useSessions'
+ import { useMachines } from '@/hooks/queries/useMachines'
+ import { useManagedSessions } from '@/hooks/useManagedSessions'
+-import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { useAppContext } from '@/lib/app-context'
+ import { rememberPopoutBounds, sendToMain, type PopoutKind } from '@/lib/popout'
+ 
+-/** Popup window body: full bleed, no app chrome; titles live in the browser window bar. */
++/** Standalone popup pages retain their section header without the main app shell. */
+ function usePopoutWindow(kind: PopoutKind, title: string) {
+     useEffect(() => { document.title = title }, [title])
+     useEffect(() => rememberPopoutBounds(kind), [kind])
+@@ -19,8 +18,7 @@
+     const { sessions, isLoading } = useSessions(api)
+     const managed = useManagedSessions(api)
+     const { machines } = useMachines(api, true)
+-    const workspace = activeWorkspaceName(useNodeGraph(api).data)
+-    usePopoutWindow('session-manager', workspace ? `Session Manager · ${workspace}` : 'Session Manager')
++    usePopoutWindow('session-manager', 'Session Manager')
+     const machineLabels = Object.fromEntries(machines.map(machine => [machine.id, machine.metadata?.displayName || machine.metadata?.host || machine.id.slice(0, 8)]))
+     return <div className="h-full min-h-0 bg-[var(--app-bg)]">
+         <SessionManagerButton embedded hideTrigger api={api} sessions={isLoading ? undefined : sessions} managed={managed} machineLabels={machineLabels}
+@@ -31,10 +29,17 @@
+ export function NodesPopout() {
+     const { api } = useAppContext()
+     const { sessions, isLoading } = useSessions(api)
+-    const workspace = activeWorkspaceName(useNodeGraph(api).data)
+-    usePopoutWindow('nodes', workspace ? `Nodes · ${workspace}` : 'Nodes')
++    const [center, setCenter] = useState<HTMLDivElement | null>(null)
++    const [actions, setActions] = useState<HTMLDivElement | null>(null)
++    usePopoutWindow('nodes', 'Nodes')
+     return <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
++        <header className="app-section-header app-window-chrome" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr)' }}>
++            <span className="truncate px-2 text-sm font-semibold">Nodes</span>
++            <div ref={setCenter} className="flex min-w-0 items-center justify-center" />
++            <div ref={setActions} className="flex min-w-0 items-center justify-end" />
++        </header>
+         <NodeGraphView api={api} sessions={isLoading ? undefined : sessions}
++            headerTargets={{ center, actions }}
+             onOpenChat={sessionId => sendToMain({ action: 'open-session', sessionId })} />
+     </div>
+ }

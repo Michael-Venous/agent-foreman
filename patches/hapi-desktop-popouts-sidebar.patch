@@ -1,0 +1,557 @@
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -43,6 +43,8 @@
+ import { PwaUpdateProvider } from '@/lib/pwa-update-context'
+ import { ToastProvider, useToast } from '@/lib/toast-context'
+ import type { SyncEvent } from '@/types/api'
++import { PopoutNavigation } from '@/components/PopoutNavigation'
++import { isPopoutPath } from '@/lib/popout'
+ 
+ type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
+ 
+@@ -75,6 +77,7 @@
+     const [titleSuggestionAvailable, setTitleSuggestionAvailable] = useState(false)
+     const goBack = useAppGoBack()
+     const pathname = useLocation({ select: (location) => location.pathname })
++    const popout = isPopoutPath(pathname)
+     const matchRoute = useMatchRoute()
+     const router = useRouter()
+     const { addToast } = useToast()
+@@ -534,10 +537,12 @@
+                 <div className="h-full min-h-0 flex flex-col">
+                     <Outlet />
+                 </div>
+-                <SessionManagerHost />
+-                <NodeGraphHost />
++                {/* Popup windows render their content page only; the main window hosts the in-page windows. */}
++                {!popout && <PopoutNavigation />}
++                {!popout && <SessionManagerHost />}
++                {!popout && <NodeGraphHost />}
+                 <ToastContainer />
+-                <InstallPrompt />
++                {!popout && <InstallPrompt />}
+             </VoiceProvider>
+         </AppContextProvider>
+     )
+--- a/web/src/components/NodeGraphWindow.tsx
++++ b/web/src/components/NodeGraphWindow.tsx
+@@ -1,3 +1,4 @@
++import { canPopout, openPopout } from '@/lib/popout'
+ import { useFloatingWindow, type FloatingWindowConfig } from './FloatingWindow'
+ 
+ export function NodesIcon({ className = 'h-5 w-5' }: { className?: string }) {
+@@ -19,7 +20,11 @@
+ export function NodesButton() {
+     const { open, collapsed, setOpen, setCollapsed } = useNodeGraphWindow()
+     return <button type="button" aria-label="Nodes" aria-expanded={open && !collapsed} title={open ? (collapsed ? 'Show node graph' : 'Collapse node graph') : 'Node graph'}
+-        onClick={() => { if (!open) setOpen(true); else setCollapsed(!collapsed) }}
++        onClick={() => {
++            // Desktop: a real browser popup window; phones (or a blocked popup) use the in-page window.
++            if (!open && canPopout() && openPopout('nodes')) return
++            if (!open) setOpen(true); else setCollapsed(!collapsed)
++        }}
+         className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]">
+         <NodesIcon className="h-[22px] w-[22px]" />
+     </button>
+--- /dev/null
++++ b/web/src/components/PopoutNavigation.tsx
+@@ -0,0 +1,14 @@
++import { useEffect } from 'react'
++import { useNavigate } from '@tanstack/react-router'
++import { listenForPopouts } from '@/lib/popout'
++import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
++
++/** Main window: chats chosen in the Session Manager / node graph popups open here. */
++export function PopoutNavigation() {
++    const navigate = useNavigate()
++    useEffect(() => listenForPopouts(message => {
++        if (message.action === 'open-session') void navigate(getSessionListSelectionNavigation(message.sessionId))
++        else void navigate({ to: '/sessions' })
++    }), [navigate])
++    return null
++}
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -1,5 +1,5 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+-import { Fragment, useEffect, useMemo, useState } from 'react'
++import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+ import { SessionManagerWindow, useSessionManagerWindow, useSessionManagerMobile } from './SessionManagerWindow'
+@@ -8,6 +8,7 @@
+ import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
+ import { sessionHasWork } from '@/lib/sessionManager'
+ import { getSessionTitle } from '@/lib/sessionTitle'
++import { canPopout, openPopout } from '@/lib/popout'
+ 
+ 
+ /** Pause evidence is read only, and fetched only for visible panel rows. */
+@@ -31,6 +32,8 @@
+ export function SessionManagerButton(props: {
+     api?: ApiClient | null; sessions?: readonly SessionSummary[]; onSelect: (id: string) => void;
+     hideTrigger?: boolean;
++    /** Render the panel content directly (popup window page) instead of a floating window. */
++    embedded?: boolean;
+     managed?: Record<string, ManagedSession>; machineLabels?: Record<string, string>;
+ }) {
+     const client = useQueryClient()
+@@ -47,7 +50,7 @@
+     const [managedOnly, setManagedOnly] = useState(false)
+     const [showAdd, setShowAdd] = useState(false)
+     const [addQuery, setAddQuery] = useState('')
+-    const { entries, dismiss, add, adding, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api, open && !collapsed)
++    const { entries, dismiss, add, adding, markStopped, clearing, error: listError } = useSessionManager(props.sessions, currentManaged, props.api, props.embedded || (open && !collapsed))
+     // Session Manager lists the active workspace's nodes when the hub has a node graph.
+     const workspace = activeWorkspaceName(useNodeGraph(props.api).data)
+     const rows = Object.values(entries).filter(e => !e.dismissed).sort((a, b) =>
+@@ -63,9 +66,10 @@
+         .filter(session => `${getSessionTitle(session)} ${session.metadata?.path ?? ''} ${session.metadata?.flavor ?? 'claude'}`.toLowerCase().includes(addQuery.trim().toLowerCase()))
+         .sort((a, b) => b.updatedAt - a.updatedAt)
+     const working = rows.filter(e => sessionHasWork(e.session)).length
++    const Frame = props.embedded ? EmbeddedFrame : SessionManagerWindow
+     return <>
+         {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
+-        {open && <SessionManagerWindow count={rows.length} title={workspace ? `Session Manager · ${workspace}` : undefined}>
++        {(props.embedded || open) && <Frame count={rows.length} title={workspace ? `Session Manager · ${workspace}` : undefined}>
+             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+                 <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+                     {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+@@ -106,7 +110,7 @@
+                     {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+                     <div className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile && !props.embedded) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+                         <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+@@ -139,13 +143,19 @@
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+             </div>
+-        </SessionManagerWindow>}
++        </Frame>}
+     </>
++}
++
++/** Popup-window page body: edge to edge, no window chrome of its own. */
++function EmbeddedFrame({ children }: { children: ReactNode; count?: number; title?: ReactNode }) {
++    return <div className="flex h-full min-h-0 flex-col gap-2 overflow-auto p-3">{children}</div>
+ }
+ 
+ export function SessionManagerLauncher({ count }: { count: number }) {
+     const { open, toggleOpen } = useSessionManagerWindow()
+-    return (<button type="button" onClick={toggleOpen} aria-label="Session Manager" aria-expanded={open}
++    // Desktop: a real browser popup window; phones (or a blocked popup) keep the in-page window.
++    return (<button type="button" onClick={() => { if (open || !canPopout() || !openPopout('session-manager')) toggleOpen() }} aria-label="Session Manager" aria-expanded={open}
+             className="mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg px-5 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+             <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{count}</span>
+--- /dev/null
++++ b/web/src/hooks/useSidebarResize.test.tsx
+@@ -0,0 +1,18 @@
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, expect, it } from 'vitest'
++import { useSidebarResize } from './useSidebarResize'
++afterEach(() => { cleanup(); localStorage.clear() })
++it('keeps the resized width while collapse persists across remount and can be restored', () => {
++    localStorage.setItem('hapi-sidebar-width', '515')
++    let hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(false)
++    act(() => hook.result.current.setCollapsed(true))
++    expect(hook.result.current.width).toBe(515)
++    hook.unmount(); hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(true)
++    expect(hook.result.current.width).toBe(515)
++    act(() => hook.result.current.setCollapsed(false))
++    hook.unmount(); hook = renderHook(useSidebarResize)
++    expect(hook.result.current.collapsed).toBe(false)
++    expect(hook.result.current.width).toBe(515)
++})
+--- a/web/src/hooks/useSidebarResize.ts
++++ b/web/src/hooks/useSidebarResize.ts
+@@ -1,6 +1,7 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ 
+ const STORAGE_KEY = 'hapi-sidebar-width'
++const COLLAPSED_KEY = 'hapi-sidebar-collapsed'
+ const MIN_WIDTH = 280
+ const MAX_WIDTH = 600
+ const DEFAULT_WIDTH = 420
+@@ -21,6 +22,12 @@
+ export function useSidebarResize() {
+     const [width, setWidth] = useState(loadWidth)
+     const [isDragging, setIsDragging] = useState(false)
++    // Desktop-only: hide the chat list to give the chat the full width (persists across reloads).
++    const [collapsed, setCollapsedState] = useState(() => localStorage.getItem(COLLAPSED_KEY) === '1')
++    const setCollapsed = useCallback((value: boolean) => {
++        setCollapsedState(value)
++        localStorage.setItem(COLLAPSED_KEY, value ? '1' : '0')
++    }, [])
+     const startXRef = useRef(0)
+     const startWidthRef = useRef(0)
+     const activePointerIdRef = useRef<number | null>(null)
+@@ -89,5 +96,5 @@
+         }
+     }, [isDragging])
+ 
+-    return { width, isDragging, onPointerDown }
++    return { width, isDragging, onPointerDown, collapsed, setCollapsed }
+ }
+--- /dev/null
++++ b/web/src/lib/popout.test.ts
+@@ -0,0 +1,100 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++let popout: typeof import('./popout')
++beforeEach(async () => {
++    vi.resetModules()
++    localStorage.clear()
++    vi.stubGlobal('innerWidth', 1280)
++    vi.stubGlobal('innerHeight', 800)
++    popout = await import('./popout')
++})
++afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
++
++describe('desktop popup lifecycle', () => {
++    it('opens once per tool, focuses the existing window, and reopens after closing', () => {
++        const first = { closed: false, focus: vi.fn() }, second = { closed: false, focus: vi.fn() }
++        const open = vi.spyOn(window, 'open').mockReturnValueOnce(first as unknown as Window).mockReturnValueOnce(second as unknown as Window)
++        expect(popout.openPopout('nodes')).toBe(true)
++        expect(popout.openPopout('nodes')).toBe(true)
++        expect(open).toHaveBeenCalledTimes(1)
++        expect(first.focus).toHaveBeenCalledTimes(2)
++        expect(open.mock.calls[0].slice(0, 2)).toEqual(['/popout/nodes', 'hapi-popout-nodes'])
++        expect(open.mock.calls[0][2]).toContain('popup=yes')
++        first.closed = true
++        expect(popout.openPopout('nodes')).toBe(true)
++        expect(open).toHaveBeenCalledTimes(2)
++    })
++    it.each(['blocked', 'denied'])('allows an in-page fallback when popup is %s', mode => {
++        const open = vi.spyOn(window, 'open')
++        if (mode === 'blocked') open.mockReturnValue(null)
++        else open.mockImplementation(() => { throw new DOMException('Denied', 'SecurityError') })
++        expect(popout.openPopout('session-manager')).toBe(false)
++    })
++    it('restores valid geometry and ignores invalid stored sizes', () => {
++        localStorage.setItem('hapi-popout-bounds:nodes', JSON.stringify({ left: -600, top: 50, width: 700, height: 500 }))
++        localStorage.setItem('hapi-popout-bounds:session-manager', JSON.stringify({ left: 1, top: 2, width: -50, height: 0 }))
++        const open = vi.spyOn(window, 'open').mockReturnValue({ closed: false, focus: vi.fn() } as unknown as Window)
++        popout.openPopout('nodes'); popout.openPopout('session-manager')
++        expect(open.mock.calls[0][2]).toContain('left=-600,top=50')
++        expect(open.mock.calls[0][2]).toContain('width=700,height=500')
++        expect(open.mock.calls[1][2]).toContain('width=480,height=640')
++    })
++    it('saves geometry on close, avoids unchanged writes, and cleans up its timers', () => {
++        vi.useFakeTimers()
++        const write = vi.spyOn(localStorage, 'setItem')
++        const cleanup = popout.rememberPopoutBounds('nodes')
++        vi.advanceTimersByTime(6000)
++        expect(write).toHaveBeenCalledTimes(1)
++        vi.stubGlobal('screenX', -500)
++        window.dispatchEvent(new Event('pagehide'))
++        expect(write).toHaveBeenCalledTimes(2)
++        expect(JSON.parse(localStorage.getItem('hapi-popout-bounds:nodes')!).left).toBe(-500)
++        cleanup(); vi.advanceTimersByTime(10000)
++        expect(write).toHaveBeenCalledTimes(2)
++    })
++    it('keeps working when geometry storage is unavailable', () => {
++        vi.useFakeTimers()
++        vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('Storage unavailable') })
++        const cleanup = popout.rememberPopoutBounds('nodes')
++        expect(() => vi.advanceTimersByTime(3000)).not.toThrow()
++        expect(cleanup).not.toThrow()
++    })
++})
++
++describe('popup navigation', () => {
++    it('only accepts same-origin supported messages and removes its listener', () => {
++        const handler = vi.fn(), cleanup = popout.listenForPopouts(handler)
++        const data = { type: 'hapi-popout', action: 'open-session', sessionId: 'chat' }
++        window.dispatchEvent(new MessageEvent('message', { origin: 'https://elsewhere.test', data }))
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data: { ...data, sessionId: 123 } }))
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data: { type: 'hapi-popout', action: 'stop-session' } }))
++        expect(handler).not.toHaveBeenCalled()
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data }))
++        expect(handler).toHaveBeenCalledExactlyOnceWith(data)
++        cleanup()
++        window.dispatchEvent(new MessageEvent('message', { origin: location.origin, data }))
++        expect(handler).toHaveBeenCalledTimes(1)
++    })
++    it('selects chats in the opener without opening another tab', () => {
++        const opener = { closed: false, postMessage: vi.fn(), focus: vi.fn() }
++        vi.stubGlobal('opener', opener)
++        const open = vi.spyOn(window, 'open')
++        popout.sendToMain({ action: 'open-session', sessionId: 'chat' })
++        expect(opener.postMessage).toHaveBeenCalledWith({ type: 'hapi-popout', action: 'open-session', sessionId: 'chat' }, location.origin)
++        expect(opener.focus).toHaveBeenCalled()
++        expect(open).not.toHaveBeenCalled()
++    })
++    it('opens a main window safely when the opener has closed', () => {
++        vi.stubGlobal('opener', { closed: true })
++        const focus = vi.fn(), open = vi.spyOn(window, 'open').mockReturnValue({ focus } as unknown as Window)
++        popout.sendToMain({ action: 'open-session', sessionId: 'a/b?' })
++        expect(open).toHaveBeenCalledWith('/sessions/a%2Fb%3F', 'hapi-main')
++        expect(focus).toHaveBeenCalled()
++    })
++    it('keeps narrow screens and mobile devices on in-page windows', () => {
++        expect(popout.canPopout()).toBe(true)
++        vi.stubGlobal('innerWidth', 390); expect(popout.canPopout()).toBe(false)
++        vi.stubGlobal('innerWidth', 1280)
++        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Linux; Android 14)')
++        expect(popout.canPopout()).toBe(false)
++    })
++})
+--- /dev/null
++++ b/web/src/lib/popout.ts
+@@ -0,0 +1,109 @@
++/**
++ * Session Manager and the node graph open as real browser popup windows on desktop.
++ * Popups are same-origin and share auth (localStorage); chat navigation is sent back
++ * to the main window. Phone browsers cannot open separate windows, so they keep the
++ * in-page floating window.
++ */
++export type PopoutKind = 'session-manager' | 'nodes'
++export type PopoutRequest = { action: 'open-session'; sessionId: string } | { action: 'open-chats' }
++export type PopoutMessage = PopoutRequest & { type: 'hapi-popout' }
++
++const SIZES: Record<PopoutKind, { width: number; height: number }> = {
++    'session-manager': { width: 480, height: 640 },
++    nodes: { width: 820, height: 640 },
++}
++const MAIN_WINDOW = 'hapi-main'
++const boundsKey = (kind: PopoutKind) => 'hapi-popout-bounds:' + kind
++const opened = new Map<PopoutKind, Window>()
++
++export const popoutPath = (kind: PopoutKind) => '/popout/' + kind
++export const isPopoutPath = (pathname: string) => pathname.startsWith('/popout/')
++
++/** Desktop-class browsers: wide enough and not a touch-first phone/tablet. */
++export function canPopout(): boolean {
++    if (typeof window === 'undefined' || typeof window.open !== 'function') return false
++    const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
++    return !mobile && window.innerWidth >= 920
++}
++
++function savedBounds(kind: PopoutKind): { left?: number; top?: number; width: number; height: number } {
++    try {
++        const value = JSON.parse(localStorage.getItem(boundsKey(kind)) ?? 'null') as { left: number; top: number; width: number; height: number } | null
++        if (value && [value.left, value.top, value.width, value.height].every(Number.isFinite) && value.width >= 280 && value.height >= 260) return value
++    } catch { /* ignore */ }
++    const size = SIZES[kind]
++    return { ...size, left: Math.max(0, (window.screenX ?? 0) + (window.outerWidth ?? size.width) - size.width - 24), top: Math.max(0, (window.screenY ?? 0) + 72) }
++}
++
++/** Open (or focus) the popup. Returns false when the browser blocked it, so callers can fall back. */
++export function openPopout(kind: PopoutKind): boolean {
++    try {
++        const existing = opened.get(kind)
++        if (existing && !existing.closed) { existing.focus(); return true }
++        // Name the main window so popups can bring it back even after a reload.
++        if (!window.name) window.name = MAIN_WINDOW
++        const b = savedBounds(kind)
++        const features = ['popup=yes', `width=${Math.round(b.width)}`, `height=${Math.round(b.height)}`]
++        if (b.left !== undefined && b.top !== undefined) features.push(`left=${Math.round(b.left)}`, `top=${Math.round(b.top)}`)
++        const popup = window.open(popoutPath(kind), 'hapi-popout-' + kind, features.join(','))
++        if (!popup) return false
++        opened.set(kind, popup)
++        popup.focus()
++        return true
++    } catch {
++        opened.delete(kind)
++        return false
++    }
++}
++
++/** Inside a popup: remember its geometry for the next open. */
++export function rememberPopoutBounds(kind: PopoutKind): () => void {
++    let timer: ReturnType<typeof setTimeout> | null = null
++    let lastSaved = ''
++    const save = () => {
++        try {
++            const bounds = JSON.stringify({ left: window.screenX, top: window.screenY,
++                width: window.innerWidth, height: window.innerHeight })
++            if (bounds !== lastSaved) { localStorage.setItem(boundsKey(kind), bounds); lastSaved = bounds }
++        } catch { /* Geometry persistence is optional (private mode/storage unavailable). */ }
++    }
++    const resize = () => {
++        if (timer) clearTimeout(timer)
++        timer = setTimeout(save, 300)
++    }
++    window.addEventListener('resize', resize)
++    window.addEventListener('pagehide', save)
++    // Moving a window fires no event; sample position while the popup is open.
++    const interval = setInterval(save, 2000)
++    return () => {
++        save()
++        window.removeEventListener('resize', resize); window.removeEventListener('pagehide', save)
++        clearInterval(interval); if (timer) clearTimeout(timer)
++    }
++}
++
++/** Inside a popup: drive the main window (focus it and navigate), or open one if it is gone. */
++export function sendToMain(message: PopoutRequest): void {
++    const full = { type: 'hapi-popout', ...message } as PopoutMessage
++    const opener = window.opener as Window | null
++    if (opener && !opener.closed) {
++        opener.postMessage(full, window.location.origin)
++        opener.focus()
++        return
++    }
++    const path = full.action === 'open-session' ? '/sessions/' + encodeURIComponent(full.sessionId) : '/sessions'
++    window.open(path, MAIN_WINDOW)?.focus()
++}
++
++/** Main window: accept same-origin popup navigation requests only. */
++export function listenForPopouts(handler: (message: PopoutMessage) => void): () => void {
++    const onMessage = (event: MessageEvent) => {
++        if (event.origin !== window.location.origin) return
++        const data = event.data as Partial<PopoutMessage> | null
++        if (data?.type !== 'hapi-popout') return
++        if (data.action === 'open-session' && typeof data.sessionId === 'string') handler(data as PopoutMessage)
++        else if (data.action === 'open-chats') handler(data as PopoutMessage)
++    }
++    window.addEventListener('message', onMessage)
++    return () => window.removeEventListener('message', onMessage)
++}
+--- a/web/src/router.tsx
++++ b/web/src/router.tsx
+@@ -46,6 +46,7 @@
+ import { useToast } from '@/lib/toast-context'
+ import { useTranslation } from '@/lib/use-translation'
+ import { seedMessageWindowFromSession, syncTailMessages } from '@/lib/message-window-store'
++import { NodesPopout, SessionManagerPopout } from '@/routes/popout'
+ import { clearDraftsAfterSend } from '@/lib/clearDraftsAfterSend'
+ import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+ import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
+@@ -224,7 +225,7 @@
+         <>
+             <div className="flex h-full min-h-0">
+             <div
+-                className={`${isSessionsIndex ? 'flex' : 'hidden split:flex'} w-full shrink-0 flex-col bg-[var(--app-bg)]`}
++                className={`${isSessionsIndex ? 'flex' : 'hidden split:flex'} ${sidebar.collapsed ? 'split:hidden!' : ''} w-full shrink-0 flex-col bg-[var(--app-bg)]`}
+                 style={{ '--sidebar-w': `${sidebar.width}px` } as React.CSSProperties}
+             >
+                 <div className="flex min-h-0 flex-1 flex-col pt-[env(safe-area-inset-top)]">
+@@ -249,6 +250,15 @@
+                         renderHeader={false}
+                         headerActions={(
+                             <div className="flex items-center gap-2">
++                                <button
++                                    type="button"
++                                    onClick={() => sidebar.setCollapsed(true)}
++                                    className="hidden split:block p-1.5 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors"
++                                    title="Hide sidebar"
++                                    aria-label="Hide sidebar"
++                                >
++                                    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M16 10l-2 2 2 2" /></svg>
++                                </button>
+                                 {canBrowse && (
+                                     <button
+                                         type="button"
+@@ -289,8 +299,31 @@
+             </div>
+ 
+             {/* Resize handle - desktop only */}
++            {sidebar.collapsed && (
++                // Collapsed (desktop): a slim rail keeps the way back to the chat list.
++                <div className="hidden split:flex w-11 shrink-0 flex-col items-center gap-1 border-r border-[var(--app-divider)] bg-[var(--app-bg)] pt-[calc(0.5rem+env(safe-area-inset-top))]">
++                    <button
++                        type="button"
++                        onClick={() => sidebar.setCollapsed(false)}
++                        className="p-2 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors"
++                        title="Show sidebar"
++                        aria-label="Show sidebar"
++                    >
++                        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M14 10l2 2-2 2" /></svg>
++                    </button>
++                    <button
++                        type="button"
++                        onClick={() => navigate({ to: '/sessions/new', ...PRESERVE_SESSION_SIDEBAR_SCROLL })}
++                        className="p-2 rounded-full text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] transition-colors"
++                        title={t('sessions.new')}
++                        aria-label={t('sessions.new')}
++                    >
++                        <PlusIcon className="h-5 w-5" />
++                    </button>
++                </div>
++            )}
+             <div
+-                className="sidebar-resize-handle hidden split:block shrink-0"
++                className={`sidebar-resize-handle hidden ${sidebar.collapsed ? '' : 'split:block'} shrink-0`}
+                 data-dragging={sidebar.isDragging || undefined}
+                 onPointerDown={sidebar.onPointerDown}
+             />
+@@ -1044,6 +1077,19 @@
+     component: App,
+ })
+ 
++// Desktop popup windows (Session Manager, node graph): content only, no app layout.
++const sessionManagerPopoutRoute = createRoute({
++    getParentRoute: () => rootRoute,
++    path: '/popout/session-manager',
++    component: SessionManagerPopout,
++})
++
++const nodesPopoutRoute = createRoute({
++    getParentRoute: () => rootRoute,
++    path: '/popout/nodes',
++    component: NodesPopout,
++})
++
+ const indexRoute = createRoute({
+     getParentRoute: () => rootRoute,
+     path: '/',
+@@ -1274,6 +1320,8 @@
+ })
+ 
+ export const routeTree = rootRoute.addChildren([
++    sessionManagerPopoutRoute,
++    nodesPopoutRoute,
+     indexRoute,
+     sessionsRoute.addChildren([
+         sessionsIndexRoute,
+--- /dev/null
++++ b/web/src/routes/popout.tsx
+@@ -0,0 +1,41 @@
++import { useEffect } from 'react'
++import { SessionManagerButton } from '@/components/SessionManagerButton'
++import { NodeGraphView } from '@/components/NodeGraphView'
++import { useSessions } from '@/hooks/queries/useSessions'
++import { useMachines } from '@/hooks/queries/useMachines'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
++import { activeWorkspaceName, useNodeGraph } from '@/hooks/useNodeGraph'
++import { useAppContext } from '@/lib/app-context'
++import { rememberPopoutBounds, sendToMain, type PopoutKind } from '@/lib/popout'
++
++/** Popup window body: full bleed, no app chrome; titles live in the browser window bar. */
++function usePopoutWindow(kind: PopoutKind, title: string) {
++    useEffect(() => { document.title = title }, [title])
++    useEffect(() => rememberPopoutBounds(kind), [kind])
++}
++
++export function SessionManagerPopout() {
++    const { api } = useAppContext()
++    const { sessions, isLoading } = useSessions(api)
++    const managed = useManagedSessions(api)
++    const { machines } = useMachines(api, true)
++    const workspace = activeWorkspaceName(useNodeGraph(api).data)
++    usePopoutWindow('session-manager', workspace ? `Session Manager · ${workspace}` : 'Session Manager')
++    const machineLabels = Object.fromEntries(machines.map(machine => [machine.id, machine.metadata?.displayName || machine.metadata?.host || machine.id.slice(0, 8)]))
++    return <div className="h-full min-h-0 bg-[var(--app-bg)]">
++        <SessionManagerButton embedded hideTrigger api={api} sessions={isLoading ? undefined : sessions} managed={managed} machineLabels={machineLabels}
++            onSelect={sessionId => sendToMain({ action: 'open-session', sessionId })} />
++    </div>
++}
++
++export function NodesPopout() {
++    const { api } = useAppContext()
++    const { sessions, isLoading } = useSessions(api)
++    const workspace = activeWorkspaceName(useNodeGraph(api).data)
++    usePopoutWindow('nodes', workspace ? `Nodes · ${workspace}` : 'Nodes')
++    return <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
++        <NodeGraphView api={api} sessions={isLoading ? undefined : sessions}
++            onOpenChat={sessionId => sendToMain({ action: 'open-session', sessionId })}
++            onOpenChats={() => sendToMain({ action: 'open-chats' })} />
++    </div>
++}

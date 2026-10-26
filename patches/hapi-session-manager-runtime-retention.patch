@@ -1,0 +1,246 @@
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -1,7 +1,9 @@
+ import type { SessionSummary } from '@/types/api'
+ 
++export const SESSION_MANAGER_ACTIVITY_KEY = ['session-manager-activity'] as const
++export type SessionManagerActivity = Record<string, number>
+ export const SESSION_MANAGER_KEY = ['session-manager-retained'] as const
+-export type ManagedListEntry = { session: SessionSummary; dismissed: boolean; missing: boolean; stopped?: boolean; observedWork?: boolean }
++export type ManagedListEntry = { session: SessionSummary; dismissed: boolean; missing: boolean; stopped?: boolean; observedWork?: boolean; activityAt?: number; dismissedAt?: number }
+ export type SessionManagerState = Record<string, ManagedListEntry>
+ 
+ export function sessionHasWork(session: SessionSummary): boolean {
+@@ -11,7 +13,7 @@
+ /** UI-only retention. Undefined managedIds means this observer has no roster
+  * knowledge; only an explicit roster snapshot may remove roster-only rows.
+  * Never writes to a session, controller, goal or history. */
+-export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[], managedIds?: ReadonlySet<string>): SessionManagerState {
++export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[], managedIds?: ReadonlySet<string>, activity: SessionManagerActivity = {}): SessionManagerState {
+     let next = previous
+     const set = (id: string, entry: ManagedListEntry) => {
+         if (next === previous) next = { ...previous }
+@@ -20,8 +22,9 @@
+     const present = new Set(sessions.map(s => s.id))
+     for (const session of sessions) {
+         const old = previous[session.id]
+-        if (!old && !sessionHasWork(session) && !managedIds?.has(session.id)) continue
+-        const observedWork = old?.observedWork || sessionHasWork(old?.session ?? session) || sessionHasWork(session)
++        const activityAt = Math.max(old?.activityAt ?? 0, activity[session.id] ?? 0)
++        if (!old && !activityAt && !sessionHasWork(session) && !managedIds?.has(session.id)) continue
++        const observedWork = activityAt > 0 || old?.observedWork || sessionHasWork(old?.session ?? session) || sessionHasWork(session)
+         // A chat admitted solely by the current managed roster must leave when
+         // oversight is released. Actual observed work keeps normal retention.
+         if (old && !observedWork && managedIds !== undefined && !managedIds.has(session.id) && !old.dismissed) {
+@@ -29,11 +32,11 @@
+             delete next[session.id]
+             continue
+         }
+-        const newWork = old && sessionHasWork(session) && (!sessionHasWork(old.session) || (!old.session.thinking && session.thinking))
++        const newWork = old && ((activityAt > (old.activityAt ?? 0) && activityAt > (old.dismissedAt ?? 0)) || (sessionHasWork(session) && (!sessionHasWork(old.session) || (!old.session.thinking && session.thinking))))
+         const dismissed = old?.dismissed === true && !newWork
+         const stopped = !sessionHasWork(session) || (newWork ? false : old?.stopped)
+-        if (!old || old.session !== session || old.missing || old.dismissed !== dismissed || old.stopped !== stopped || old.observedWork !== observedWork) {
+-            set(session.id, { session, dismissed, missing: false, stopped, observedWork })
++        if (!old || old.session !== session || old.missing || old.dismissed !== dismissed || old.stopped !== stopped || old.observedWork !== observedWork || old.activityAt !== activityAt) {
++            set(session.id, { session, dismissed, missing: false, stopped, observedWork, activityAt, dismissedAt: old?.dismissedAt })
+         }
+     }
+     for (const [id, old] of Object.entries(previous)) {
+@@ -49,7 +52,7 @@
+ 
+ export function dismissSessions(previous: SessionManagerState, ids: readonly string[]): SessionManagerState {
+     const next = { ...previous }
+-    for (const id of ids) if (next[id]?.stopped) next[id] = { ...next[id], dismissed: true }
++    for (const id of ids) if (next[id]?.stopped) next[id] = { ...next[id], dismissed: true, dismissedAt: Date.now() }
+     return next
+ }
+ 
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -122,3 +122,22 @@
+     expect(observeSessions(updated, [idle], new Set())).toEqual({})
+     expect(observeSessions(missing, [], new Set())).toEqual({})
+ })
++
++it('retains a completed turn missed between runtime snapshots, including after automatic unmanage', () => {
++    const idle = session({ thinking: false })
++    const first = observeSessions({}, [idle], new Set(['s']))
++    const finished = observeSessions(first, [idle], new Set(), { s: 100 })
++    expect(finished.s?.observedWork).toBe(true)
++    expect(finished.s?.stopped).toBe(true)
++    expect(observeSessions(finished, [idle], new Set(), { s: 100 })).toBe(finished)
++    // An empty page cache after restart does not seed historical finished work.
++    expect(observeSessions({}, [idle], new Set())).toEqual({})
++})
++
++it('new terminal activity restores a dismissed row but replay/older events do not', () => {
++    const idle = session({ thinking: false })
++    const at = Date.now()
++    const hidden = dismissSessions(observeSessions({}, [idle], new Set(), { s: at - 10 }), ['s'])
++    expect(observeSessions(hidden, [idle], new Set(), { s: at - 5 }).s?.dismissed).toBe(true)
++    expect(observeSessions(hidden, [idle], new Set(), { s: at + 100 }).s?.dismissed).toBe(false)
++})
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -1,7 +1,7 @@
+ import { useEffect } from 'react'
+ import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+ import type { SessionSummary } from '@/types/api'
+-import { dismissSessions, markSessionStopped, observeSessions, SESSION_MANAGER_KEY, type SessionManagerState } from '@/lib/sessionManager'
++import { dismissSessions, markSessionStopped, observeSessions, SESSION_MANAGER_KEY, SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity, type SessionManagerState } from '@/lib/sessionManager'
+ 
+ /** Query-cache lifetime: survives navigation, cleared on reload/hub cache reset. */
+ export function useSessionManager(sessions?: readonly SessionSummary[], managed?: Readonly<Record<string, unknown>>) {
+@@ -9,10 +9,13 @@
+     const { data: entries = {} } = useQuery<SessionManagerState>({
+         queryKey: SESSION_MANAGER_KEY, queryFn: skipToken, initialData: {}, enabled: false, gcTime: Infinity,
+     })
++    const { data: activity = {} } = useQuery<SessionManagerActivity>({
++        queryKey: SESSION_MANAGER_ACTIVITY_KEY, queryFn: skipToken, initialData: {}, enabled: false, gcTime: Infinity,
++    })
+     useEffect(() => {
+         // Undefined means data not loaded; do not mistake loading for disconnect.
+-        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed))))
+-    }, [client, sessions, managed])
++        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed)), activity))
++    }, [client, sessions, managed, activity])
+     return {
+         entries,
+         markStopped: (id: string) => client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => markSessionStopped(old ?? {}, id)),
+--- a/web/src/hooks/useSSE.ts
++++ b/web/src/hooks/useSSE.ts
+@@ -23,6 +23,7 @@
+ import { queryKeys } from '@/lib/query-keys'
+ import { applyAgyCatalogAnnouncement } from '@/lib/agyCatalogAnnouncement'
+ import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, markMessagesIndeterminate, markMessagesRequeued, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
++import { observeSessionManagerEvent } from '@/lib/sessionManagerActivity'
+ import { applySessionDetailPatch } from '@/lib/sessionPatch'
+ 
+ // Pure patch-application rules live in @/lib/sessionPatch (React-free, shared
+@@ -645,6 +646,7 @@
+ 
+         const handleSyncEvent = (event: SyncEvent) => {
+             lastActivityAtRef.current = Date.now()
++            observeSessionManagerEvent(queryClient, event)
+ 
+             if (event.type === 'heartbeat') {
+                 return
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -222,3 +222,17 @@
+     expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
+     expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+ })
++
++it('shows completed work from an SSE event even when no render saw the busy state', async () => {
++    const { act } = await import('@testing-library/react')
++    const { observeSessionManagerEvent } = await import('@/lib/sessionManagerActivity')
++    const client = new QueryClient()
++    render(fixture(client, [session('SampleCourse', true, false)])); open()
++    await screen.findByText(/No sessions\./)
++    act(() => observeSessionManagerEvent(client, { type: 'message-received', sessionId: 'SampleCourse', message: { id: 'done', seq: 3, localId: null, createdAt: Date.now(), content: { role: 'agent', content: { type: 'output', data: { type: 'task_complete' } } } } }))
++    await screen.findByRole('button', { name: 'Open SampleCourse' })
++    fireEvent.click(screen.getByRole('button', { name: 'Dismiss SampleCourse from Session Manager' }))
++    await screen.findByText(/No sessions\./)
++    expect(controls.abortSession).not.toHaveBeenCalled()
++    expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
+--- /dev/null
++++ b/web/src/lib/sessionManagerActivity.ts
+@@ -0,0 +1,34 @@
++import type { QueryClient } from '@tanstack/react-query'
++import type { SyncEvent } from '@/types/api'
++import { SESSION_MANAGER_ACTIVITY_KEY, type SessionManagerActivity } from './sessionManager'
++
++const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
++
++/** Activity evidence only; no chat actions and no transcript content retained. */
++export function sessionManagerActivityTime(event: SyncEvent): number | null {
++    if (event.type === 'messages-consumed') return event.localIds.length ? event.invokedAt : null
++    if (event.type !== 'message-received') return null
++    const content = object(event.message.content)
++    if (content?.role !== 'agent') return null
++    const inner = object(content.content)
++    const data = object(inner?.data)
++    if (data?.isSidechain) return null
++    const kind = data?.type
++    const terminal = ['task_complete', 'task_failed', 'turn_aborted'].includes(String(kind))
++        || (inner?.type === 'event' && ['ready', 'error', 'abort-restore'].includes(String(kind)))
++        || (kind === 'system' && data?.subtype === 'turn_duration')
++    // Public output covers a final reply even when its busy heartbeat was missed.
++    const reply = (inner?.type === 'text' && typeof inner.text === 'string')
++        || (kind === 'assistant' && object(data?.message)?.role !== 'user')
++    return terminal || reply ? event.message.createdAt : null
++}
++
++export function observeSessionManagerEvent(client: QueryClient, event: SyncEvent): void {
++    const at = sessionManagerActivityTime(event)
++    if (at === null || !Number.isFinite(at) || at <= 0 || !('sessionId' in event)) return
++    const id = event.sessionId
++    client.setQueryData<SessionManagerActivity>(SESSION_MANAGER_ACTIVITY_KEY, previous => {
++        if ((previous?.[id] ?? 0) >= at) return previous
++        return { ...previous, [id]: at }
++    })
++}
+--- /dev/null
++++ b/web/src/lib/sessionManagerActivity.test.ts
+@@ -0,0 +1,35 @@
++import { QueryClient } from '@tanstack/react-query'
++import { describe, expect, it } from 'vitest'
++import type { SyncEvent } from '@/types/api'
++import { observeSessionManagerEvent, sessionManagerActivityTime } from './sessionManagerActivity'
++import { SESSION_MANAGER_ACTIVITY_KEY } from './sessionManager'
++const event = (data: unknown, type = 'output', at = 100): SyncEvent => ({ type: 'message-received', sessionId: 's', message: { id: 'm', seq: 1, localId: null, createdAt: at, content: { role: 'agent', content: { type, data } } } })
++describe('Session Manager runtime activity evidence', () => {
++    it('recognizes Codex/Claude terminal records and public replies', () => {
++        for (const data of [{ type: 'task_complete' }, { type: 'task_failed' }, { type: 'turn_aborted' }, { type: 'system', subtype: 'turn_duration' }, { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }]) {
++            expect(sessionManagerActivityTime(event(data))).toBe(100)
++        }
++        expect(sessionManagerActivityTime(event({ type: 'ready' }, 'event'))).toBe(100)
++        expect(sessionManagerActivityTime({ type: 'messages-consumed', sessionId: 's', localIds: ['a'], invokedAt: 200 })).toBe(200)
++    })
++    it('ignores user queue entries, metadata, sidechains and reasoning', () => {
++        expect(sessionManagerActivityTime({ type: 'session-updated', sessionId: 's', data: { updatedAt: 100 } })).toBeNull()
++        expect(sessionManagerActivityTime(event({ type: 'assistant', isSidechain: true }))).toBeNull()
++        expect(sessionManagerActivityTime(event({ type: 'reasoning', text: 'hidden' }))).toBeNull()
++        expect(sessionManagerActivityTime({ type: 'message-received', sessionId: 's', message: { id: 'u', seq: 2, localId: 'queued', createdAt: 100, content: { role: 'user', content: { text: 'queued' } } } })).toBeNull()
++        expect(sessionManagerActivityTime({ type: 'messages-consumed', sessionId: 's', localIds: [], invokedAt: 200 })).toBeNull()
++    })
++    it('deduplicates both SSE scopes and replay without storing transcript content', () => {
++        const client = new QueryClient()
++        observeSessionManagerEvent(client, event({ type: 'task_complete', last_agent_message: 'Private result' }))
++        const first = client.getQueryData(SESSION_MANAGER_ACTIVITY_KEY)
++        observeSessionManagerEvent(client, event({ type: 'task_complete' }))
++        observeSessionManagerEvent(client, event({ type: 'task_complete' }, 'output', 99))
++        expect(client.getQueryData(SESSION_MANAGER_ACTIVITY_KEY)).toBe(first)
++        expect(first).toEqual({ s: 100 })
++        observeSessionManagerEvent(client, event({ type: 'task_complete' }, 'output', 101))
++        expect(client.getQueryData(SESSION_MANAGER_ACTIVITY_KEY)).toEqual({ s: 101 })
++        expect(new QueryClient().getQueryData(SESSION_MANAGER_ACTIVITY_KEY)).toBeUndefined()
++        client.clear()
++    })
++})
+--- a/web/src/hooks/useSSE.test.ts
++++ b/web/src/hooks/useSSE.test.ts
+@@ -1,3 +1,4 @@
++import { SESSION_MANAGER_ACTIVITY_KEY } from '@/lib/sessionManager'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { act, renderHook } from '@testing-library/react'
+ import { createElement, type ReactNode } from 'react'
+@@ -69,6 +70,15 @@
+     afterEach(() => {
+         vi.unstubAllGlobals()
+         vi.useRealTimers()
++    })
++
++    it('records a global terminal event before the message-stream early return', () => {
++        const client = new QueryClient()
++        const wrapper = ({ children }: { children: ReactNode }) => createElement(QueryClientProvider, { client }, children)
++        const { unmount } = renderHook(() => useSSE({ enabled: true, token: 'test-token', baseUrl: 'http://hub.test', subscription: { all: true }, scope: 'global', onEvent: () => {} }), { wrapper })
++        act(() => FakeEventSource.instances[0]?.simulateMessage({ type: 'message-received', sessionId: 'finished', message: { id: 'done', seq: 1, localId: null, createdAt: 123, content: { role: 'agent', content: { type: 'event', data: { type: 'ready' } } } } }))
++        expect(client.getQueryData(SESSION_MANAGER_ACTIVITY_KEY)).toEqual({ finished: 123 })
++        unmount(); client.clear()
+     })
+ 
+     it('reconnects on visibility resume when a heartbeat interval was missed', () => {

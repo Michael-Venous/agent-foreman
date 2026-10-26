@@ -1,0 +1,97 @@
+--- a/hub/src/codexFolders.ts
++++ b/hub/src/codexFolders.ts
+@@ -23,6 +23,8 @@
+     try { return realpathSync(home) } catch { return home }
+ }
+ 
++class AppServerUnavailable extends Error {}
++
+ /** One short-lived app-server per operation, serialized; no daemon or shared state. */
+ export function createStdioAppServer(command = process.env.HAPI_CODEX_FOLDERS_BIN || 'codex', timeoutMs = 20_000): CodexAppServer {
+     let queue: Promise<unknown> = Promise.resolve()
+@@ -32,9 +34,15 @@
+             const pending = new Map<number, { resolve: (v: Record<string, unknown>) => void; reject: (e: Error) => void }>()
+             let buffer = ''
+             let nextId = 0
+-            const fail = (error: Error) => { for (const p of pending.values()) p.reject(error); pending.clear() }
++            let terminal: AppServerUnavailable | undefined
++            const fail = (error: Error) => {
++                terminal ??= new AppServerUnavailable(error.message)
++                for (const p of pending.values()) p.reject(terminal)
++                pending.clear()
++            }
+             child.on('error', fail)
+             child.on('exit', () => fail(new Error('Codex app-server exited')))
++            child.stdin.on('error', fail)
+             child.stdout.setEncoding('utf8')
+             child.stdout.on('data', (chunk: string) => {
+                 buffer += chunk
+@@ -52,9 +60,10 @@
+             })
+             const send = (payload: Record<string, unknown>) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...payload }) + '\n')
+             const call: Rpc = (method, params) => new Promise((resolve, reject) => {
++                if (terminal) { reject(terminal); return }
+                 const id = ++nextId
+                 pending.set(id, { resolve, reject })
+-                send({ id, method, params })
++                try { send({ id, method, params }) } catch (error) { fail(error instanceof Error ? error : new Error(String(error))) }
+             })
+             const timer = setTimeout(() => { fail(new Error('Codex app-server timed out')); child.kill() }, timeoutMs)
+             try {
+@@ -120,7 +129,8 @@
+             try {
+                 const thread = (await call('thread/read', { threadId, includeTurns: false })).thread as { projectId?: string | null } | undefined
+                 canonical = thread?.projectId ?? null
+-            } catch {
++            } catch (error) {
++                if (error instanceof AppServerUnavailable) throw error
+                 continue // Unknown/unmaterialized thread: leave unassigned.
+             }
+             // A canonical value wins; otherwise show what ChatGPT still shows from its own state.
+--- /dev/null
++++ b/hub/src/codexFolders.transport.test.ts
+@@ -0,0 +1,44 @@
++import { test, expect } from 'bun:test'
++import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { createStdioAppServer, readFolders } from './codexFolders'
++
++test('timeout during thread read rejects the operation and releases serialized queue', async () => {
++    const dir = mkdtempSync(join(tmpdir(), 'hapi-folders-'))
++    const executable = join(dir, 'app-server')
++    writeFileSync(executable, `#!/usr/bin/env python3
++import sys,json
++for line in sys.stdin:
++ m=json.loads(line)
++ if 'id' not in m: continue
++ if m['method']=='initialize': result={}
++ elif m['method']=='project/list': result={'data':[{'id':'folder','name':'Dev','position':1}]}
++ else: continue
++ print(json.dumps({'id':m['id'],'result':result}),flush=True)
++`, { mode: 0o700 })
++    const server = createStdioAppServer(executable, 150)
++    try {
++        const first = readFolders(server, ['first', 'second'], { assignments: {}, pending: new Set() })
++        const next = readFolders(server, [], { assignments: {}, pending: new Set() })
++        await expect(first).rejects.toThrow('timed out')
++        expect((await next).folders[0].name).toBe('Dev')
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++}, 3000)
++
++test('RPC after child exit rejects even when no waiter was pending at exit', async () => {
++    const dir = mkdtempSync(join(tmpdir(), 'hapi-folders-exit-'))
++    const executable = join(dir, 'app-server')
++    writeFileSync(executable, `#!/usr/bin/env python3
++import sys,json
++m=json.loads(sys.stdin.readline())
++print(json.dumps({'id':m['id'],'result':{}}),flush=True)
++`, { mode: 0o700 })
++    try {
++        const server = createStdioAppServer(executable, 200)
++        await expect(server(async call => {
++            await new Promise(resolve => setTimeout(resolve, 40))
++            return call('project/list', {})
++        })).rejects.toThrow('exited')
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++}, 3000)

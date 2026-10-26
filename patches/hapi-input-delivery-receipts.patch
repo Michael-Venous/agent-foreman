@@ -1,0 +1,1312 @@
+diff --git a/cli/src/api/apiSession.goalAck.test.ts b/cli/src/api/apiSession.goalAck.test.ts
+new file mode 100644
+--- /dev/null
++++ b/cli/src/api/apiSession.goalAck.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it, vi } from 'vitest'
++import { ApiSessionClient } from './apiSession'
++
++describe('goal metadata receipt transport', () => {
++    it('queues a stable typed receipt losslessly without marking it as turn input', () => {
++        const emit = vi.fn()
++        const emitOrQueue = vi.fn((send: () => void) => send())
++        const session = { sessionId: 'session', socket: { emit }, emitOrQueue } as unknown as ApiSessionClient
++        const receipt = { type: 'goal-command-ack' as const, localId: 'goal-local', action: 'set' as const,
++            threadId: 'thread', currentTurnId: 'busy', goalStatus: 'blocked', appliedToCurrentTurn: false as const }
++        ApiSessionClient.prototype.sendSessionEvent.call(session, receipt, 'goal-command-ack:goal-local')
++        expect(emitOrQueue).toHaveBeenCalledWith(expect.any(Function), 'lossless')
++        expect(emit).toHaveBeenCalledExactlyOnceWith('message', { sid: 'session', message: {
++            role: 'agent', content: { id: 'goal-command-ack:goal-local', type: 'event', data: receipt }
++        } })
++        expect(emit.mock.calls.some(([kind]) => kind === 'messages-consumed')).toBe(false)
++    })
++})
+diff --git a/cli/src/api/apiSession.ts b/cli/src/api/apiSession.ts
+--- a/cli/src/api/apiSession.ts
++++ b/cli/src/api/apiSession.ts
+@@ -1104,6 +1104,17 @@
+         type: 'abort-restore'
+         text: string
+     } | {
++        // Goal RPC acknowledgement changes saved goal metadata only. It is not
++        // evidence that a busy turn consumed the objective as steering input.
++        type: 'goal-command-ack'
++        localId: string
++        action: 'set' | 'show' | 'clear' | 'pause' | 'resume'
++        threadId: string
++        currentTurnId?: string
++        goalStatus?: string
++        savedStateConfirmed?: boolean
++        appliedToCurrentTurn: false
++    } | {
+         // Structured result of Pi's compact RPC: the web chat renders the
+         // summary as a dedicated block instead of a small status line.
+         type: 'compact-summary'
+@@ -1125,7 +1136,7 @@
+                 sid: this.sessionId,
+                 message: content
+             })
+-        }, event.type === 'message' || event.type === 'error' || event.type === 'compact-summary' ? 'lossless' : 'droppable')
++        }, event.type === 'message' || event.type === 'error' || event.type === 'compact-summary' || event.type === 'goal-command-ack' ? 'lossless' : 'droppable')
+     }
+ 
+     emitAgentTerminalOutput(data: string): void {
+@@ -1235,7 +1246,7 @@
+         }, 'droppable')
+     }
+ 
+-    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean }): void {
++    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean; controlOnly?: boolean }): void {
+         if (localIds.length === 0) return
+         // `clearQueuedThinkingGrace` is an opt-in signal for the hub to drop
+         // the 15s queued-thinking grace immediately. Only synchronous handlers
+@@ -1248,6 +1259,7 @@
+             localIds: string[]
+             clearQueuedThinkingGrace?: boolean
+             steered?: boolean
++            controlOnly?: boolean
+         } = {
+             sid: this.sessionId,
+             localIds
+@@ -1258,6 +1270,7 @@
+         if (options?.steered) {
+             payload.steered = true
+         }
++        if (options?.controlOnly) payload.controlOnly = true
+         this.emitOrQueue(() => this.socket.emit('messages-consumed', payload))
+     }
+ 
+diff --git a/cli/src/codex/shared/queue.test.ts b/cli/src/codex/shared/queue.test.ts
+--- a/cli/src/codex/shared/queue.test.ts
++++ b/cli/src/codex/shared/queue.test.ts
+@@ -128,3 +128,31 @@
+         expect(queue.state('local')).toBe('queued');
+     });
+ });
++
++
++it('persists control-only command classification on the first ACK and after ledger reload', async () => {
++    const { queue, client, dir, consumed, uncertain } = await fixture();
++    const changeGoal = vi.fn(async () => null);
++    await queue.command('goal', changeGoal, { controlOnly: true });
++    expect(consumed).toHaveBeenCalledExactlyOnceWith(['goal'], undefined, true);
++    consumed.mockClear();
++    const restarted = new SharedCodexQueue(client, 'thread', join(dir, 'ledger.json'), consumed, uncertain);
++    await restarted.load();
++    await restarted.command('goal', changeGoal, { controlOnly: true });
++    expect(changeGoal).toHaveBeenCalledOnce();
++    expect(consumed).toHaveBeenCalledExactlyOnceWith(['goal'], undefined, true);
++});
++
++it('does not carry slash-control classification into an expanded prompt sent to the native queue', async () => {
++    const { queue, rpc, consumed } = await fixture();
++    expect(await queue.command('custom', async () => 'Expanded prompt', { controlOnly: true })).toBe('Expanded prompt');
++    rpc.mockResolvedValueOnce({ queuedSubmission: { id: 'native-custom', input, clientUserMessageId: 'custom' } });
++    await queue.enqueue('custom', input); await queue.committed('custom');
++    expect(consumed).toHaveBeenCalledExactlyOnceWith(['custom']);
++    consumed.mockClear();
++    const expand = vi.fn(async () => 'Expanded prompt');
++    await queue.command('custom', expand, { controlOnly: true });
++    expect(expand).not.toHaveBeenCalled();
++    expect(queue.isControlOnly('custom')).toBe(false);
++    expect(consumed).toHaveBeenCalledExactlyOnceWith(['custom']);
++});
+diff --git a/cli/src/codex/shared/queue.ts b/cli/src/codex/shared/queue.ts
+--- a/cli/src/codex/shared/queue.ts
++++ b/cli/src/codex/shared/queue.ts
+@@ -8,7 +8,7 @@
+ const InputSchema = z.array(z.object({ type: z.string() }).passthrough());
+ export const SubmissionSchema = z.object({ id: z.string(), input: InputSchema, clientUserMessageId: z.string() });
+ const LedgerSchema = z.record(z.string(), z.object({
+-    input: InputSchema, state: z.enum(['unknown', 'queued', 'consumed', 'canceled', 'rejected', 'released']), nativeId: z.string().optional()
++    input: InputSchema, state: z.enum(['unknown', 'queued', 'consumed', 'canceled', 'rejected', 'released']), nativeId: z.string().optional(), controlOnly: z.boolean().optional()
+ }));
+ export type QueueInput = z.infer<typeof InputSchema>;
+ type Entry = z.infer<typeof LedgerSchema>[string];
+@@ -19,7 +19,7 @@
+     private operations: Promise<unknown> = Promise.resolve();
+     private writes = Promise.resolve();
+     constructor(private readonly client: Pick<CodexAppServerClient, 'request'>, readonly threadId: string,
+-        private readonly file: string, private readonly consumed: (ids: string[], steered?: boolean) => void,
++        private readonly file: string, private readonly consumed: (ids: string[], steered?: boolean, controlOnly?: boolean) => void,
+         private readonly uncertain: (ids: string[]) => void,
+         private readonly mirror?: (id: string, input: QueueInput | null) => void,
+         private readonly requeued?: (ids: string[]) => Promise<unknown>) {}
+@@ -44,16 +44,19 @@
+     }
+     owns(id: string): boolean { return id in this.entries; }
+     state(id: string): Entry['state'] | undefined { return this.entries[id]?.state; }
++    isControlOnly(id: string): boolean { return this.entries[id]?.controlOnly === true; }
+     /** Slash commands can mutate native state too. Crash/redelivery must not
+      * repeat /new, /compact, or a settings change whose outcome was lost. */
+-    command(id: string, work: () => Promise<string | null>): Promise<string | null> {
++    command(id: string, work: () => Promise<string | null>, options?: { controlOnly?: boolean }): Promise<string | null> {
+         return this.serial(async () => {
+             const existing = this.entries[id];
+-            if (existing?.state === 'consumed') { this.consumed([id]); return null; }
++            if (existing?.state === 'consumed') {
++                this.acknowledge(id); return null;
++            }
+             if (existing && !['rejected', 'canceled'].includes(existing.state)) {
+                 this.uncertain([id]); throw new Error('Previous command outcome is unknown; not replaying');
+             }
+-            this.entries[id] = { input: [], state: 'unknown' }; await this.save();
++            this.entries[id] = { input: [], state: 'unknown', ...(options?.controlOnly ? { controlOnly: true } : {}) }; await this.save();
+             try {
+                 const result = await work();
+                 if (result === null) await this.committed(id);
+@@ -67,7 +70,13 @@
+         // redelivery. Remember it even when this generation did not enqueue it.
+         const entry = this.entries[id] ??= { state: 'consumed', input: [] };
+         entry.state = 'consumed';
+-        await this.save(); this.consumed([id]);
++        await this.save(); this.acknowledge(id);
++    }
++
++    private acknowledge(id: string, steered?: boolean): void {
++        if (this.entries[id]?.controlOnly) this.consumed([id], steered, true);
++        else if (steered !== undefined) this.consumed([id], steered);
++        else this.consumed([id]);
+     }
+ 
+     async list(): Promise<Array<z.infer<typeof SubmissionSchema>>> {
+@@ -166,7 +175,7 @@
+         return this.serial(async () => {
+             const existing = this.entries[id];
+             if (existing && !['rejected', 'canceled', 'released'].includes(existing.state)) {
+-                if (existing.state === 'consumed') this.consumed([id]);
++                if (existing.state === 'consumed') this.acknowledge(id);
+                 else await this.reconcileNow();
+                 return;
+             }
+@@ -240,7 +249,7 @@
+             } else return { steered: false, error: 'Message not queued' };
+             try {
+                 await this.client.request('turn/steer', { threadId: this.threadId, expectedTurnId, input: entry.input, clientUserMessageId: id });
+-                entry.state = 'consumed'; await this.save(); this.consumed([id], true); return { steered: true };
++                entry.state = 'consumed'; await this.save(); this.acknowledge(id, true); return { steered: true };
+             } catch (error) {
+                 if (this.state(id) === 'consumed') return { steered: true };
+                 if (isIndeterminateError(error)) { this.uncertain([id]); return { steered: false, indeterminate: true }; }
+diff --git a/cli/src/codex/shared/root.test.ts b/cli/src/codex/shared/root.test.ts
+--- a/cli/src/codex/shared/root.test.ts
++++ b/cli/src/codex/shared/root.test.ts
+@@ -14,6 +14,7 @@
+         initialized = false;
+         thread = { id: 'thread', turns: [] as NativeTurn[] };
+         settings: Record<string, unknown> = { model: 'mock', collaborationMode: { mode: 'default' } };
++        goal: Record<string, unknown> | null = { objective: 'Original objective', status: 'blocked' };
+         queue: Array<{ id: string; clientUserMessageId: unknown; input: unknown }> = [];
+         notify?: (method: string, params: unknown) => void;
+         abandoned?: () => void;
+@@ -28,6 +29,9 @@
+             if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
+             if (method === 'thread/list') return { data: [] };
+             if (method === 'thread/queue/list') return { data: this.queue };
++            if (method === 'thread/goal/get') return { goal: this.goal };
++            if (method === 'thread/goal/set') { this.goal = { ...this.goal, ...params }; return { goal: this.goal }; }
++            if (method === 'thread/goal/clear') { this.goal = null; return { cleared: true }; }
+             if (method === 'thread/settings/update') {
+                 this.settings = { ...this.settings, ...params };
+                 this.notify?.('thread/settings/updated', { threadId: 'thread', threadSettings: this.settings });
+@@ -61,15 +65,17 @@
+     const updateState = vi.fn((fn: (value: AgentState) => AgentState) => { state = fn(state); });
+     const rpc = new Map<string, (raw: unknown) => Promise<unknown>>();
+     const send = vi.fn();
++    const events = vi.fn(), consumed = vi.fn();
++    let receive: Parameters<ApiSessionClient['onUserMessage']>[0] | undefined;
+     const session = {
+         sessionId: 'sid', getMetadata: () => metadata,
+         updateMetadata: (fn: (value: Metadata) => Metadata) => { metadata = fn(metadata); },
+         updateAgentState: updateState, keepAlive() {},
+-        onUserMessage() {}, onCancelQueuedMessage() {}, onRetryQueuedMessage() {},
++        onUserMessage: (callback: Parameters<ApiSessionClient['onUserMessage']>[0]) => { receive = callback; }, onCancelQueuedMessage() {}, onRetryQueuedMessage() {},
+         onReconnect: (fn: (() => void) | null) => { reconnect = fn; },
+         rpcHandlerManager: { registerHandler: (name: string, handler: (raw: unknown) => Promise<unknown>) => rpc.set(name, handler) },
+-        sendSessionEvent() {}, sendAgentMessage: send, emitSessionReady() {},
+-        sendUserMessage() {}, emitMessagesConsumed() {}, emitSteerIndeterminate() {}, syncNativeQueuedMessage() {},
++        sendSessionEvent: events, sendAgentMessage: send, emitSessionReady() {},
++        sendUserMessage() {}, emitMessagesConsumed: consumed, emitSteerIndeterminate() {}, syncNativeQueuedMessage() {},
+         sendSessionDeath() {}, async flush() {}, close() {}
+     } as unknown as ApiSessionClient;
+     const root = new SharedCodexRoot({ session, workingDirectory: directory } as SessionBootstrapResult, {
+@@ -86,8 +92,11 @@
+         queue: Array<{ id: string; clientUserMessageId: string; input: unknown }>;
+         notify(method: string, params: unknown): void;
+         abandoned(): void;
++        goal: Record<string, unknown> | null;
++        request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+     };
+-    return { root, native, rpc, send, metadata: () => metadata, state: () => state, updateState, reconnect: () => reconnect?.() };
++    const deliver = (text: string, localId: string) => receive!({ role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'webapp', deliveryMode: 'queue' } }, localId);
++    return { root, native, rpc, send, events, consumed, deliver, metadata: () => metadata, state: () => state, updateState, reconnect: () => reconnect?.() };
+ }
+ 
+ async function completePlan(f: Awaited<ReturnType<typeof fixture>>, status = 'completed') {
+@@ -300,3 +309,81 @@
+     expect(result.applied.model).toBe('mock');
+     expect(request).not.toHaveBeenCalledWith('thread/settings/update', expect.anything());
+  });
++
++
++describe('shared goal metadata acknowledgements', () => {
++    it('acknowledges a busy blocked goal update without steering, interrupting, resuming or duplicating a turn', async () => {
++        const f = await fixture(), request = vi.spyOn(f.native, 'request');
++        await f.root.activate();
++        f.native.thread.turns.push({ id: 'busy-turn', status: 'inProgress', items: [] });
++        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'busy-turn' } });
++        await vi.waitFor(() => expect(f.state().steeringActive).toBe(true));
++        f.deliver('/goal Finish the current iteration then stop', 'goal-update');
++        await vi.waitFor(() => expect(f.events).toHaveBeenCalledWith({ type: 'goal-command-ack', localId: 'goal-update', action: 'set', threadId: 'thread', currentTurnId: 'busy-turn', goalStatus: 'blocked', savedStateConfirmed: true, appliedToCurrentTurn: false }, 'goal-command-ack:goal-update'));
++        expect(request).toHaveBeenCalledWith('thread/goal/set', { threadId: 'thread', objective: 'Finish the current iteration then stop' });
++        expect(f.events).toHaveBeenCalledWith({ type: 'message', message: 'Saved goal updated (blocked); current turn unchanged.' });
++        expect(request.mock.calls.some(([method]) => ['turn/start', 'turn/steer', 'turn/interrupt', 'thread/queue/add', 'thread/queue/start'].includes(method))).toBe(false);
++        expect(f.native.goal?.status).toBe('blocked'); expect(f.state().steeringActive).toBe(true);
++        await vi.waitFor(() => expect(f.consumed).toHaveBeenCalledWith(['goal-update'], { clearQueuedThinkingGrace: true, controlOnly: true }));
++        expect(f.consumed.mock.calls.filter(([ids]) => ids.includes('goal-update')).every(([, options]) => options?.controlOnly === true)).toBe(true);
++        f.deliver('Ordinary correction awaiting native acceptance', 'ordinary-correction');
++        await vi.waitFor(() => expect(f.native.queue).toHaveLength(1));
++        expect(f.native.queue[0]?.clientUserMessageId).toBe('ordinary-correction');
++        expect(f.consumed.mock.calls.some(([ids]) => ids.includes('ordinary-correction'))).toBe(false);
++    });
++    it('never repeats a saved mutation or invents another native acknowledgement on redelivery', async () => {
++        const f = await fixture(), request = vi.spyOn(f.native, 'request');
++        await f.root.activate();
++        f.deliver('/goal Saved objective', 'same-goal');
++        await vi.waitFor(() => expect(f.consumed).toHaveBeenCalledWith(['same-goal'], { clearQueuedThinkingGrace: true, controlOnly: true }));
++        const count = f.consumed.mock.calls.length;
++        f.deliver('/goal Saved objective', 'same-goal');
++        await vi.waitFor(() => expect(f.consumed.mock.calls.length).toBeGreaterThan(count));
++        expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toHaveLength(1);
++        expect(f.events.mock.calls.filter(([event]) => event.type === 'goal-command-ack')).toHaveLength(1);
++    });
++    it('does not acknowledge an unconfirmed goal RPC or replay its uncertain mutation', async () => {
++        const f = await fixture(), original = f.native.request.bind(f.native);
++        await f.root.activate();
++        const request = vi.spyOn(f.native, 'request').mockImplementation(async (method, params) => {
++            if (method === 'thread/goal/set') throw new Error('Lost goal RPC result');
++            return original(method, params);
++        });
++        f.deliver('/goal Uncertain objective', 'uncertain-goal');
++        await vi.waitFor(() => expect(f.events).toHaveBeenCalledWith({ type: 'message', message: expect.stringContaining('Lost goal RPC result') }));
++        f.deliver('/goal Uncertain objective', 'uncertain-goal');
++        await vi.waitFor(() => expect(f.events).toHaveBeenCalledWith({ type: 'message', message: expect.stringContaining('not replaying') }));
++        expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toHaveLength(1);
++        expect(f.events.mock.calls.some(([event]) => event.type === 'goal-command-ack')).toBe(false);
++        expect(f.consumed.mock.calls.some(([ids]) => ids.includes('uncertain-goal'))).toBe(false);
++    });
++    it.each([
++        {},
++        { goal: { objective: 'Different objective', status: 'blocked' } },
++        { goal: { objective: 'Requested objective', status: 'blocked', threadId: 'other-thread' } },
++        { goal: { objective: 'Requested objective' } }
++    ])('does not claim saved metadata from an empty or mismatched RPC result: %j', async response => {
++        const f = await fixture(), original = f.native.request.bind(f.native);
++        await f.root.activate();
++        vi.spyOn(f.native, 'request').mockImplementation(async (method, params) =>
++            method === 'thread/goal/set' ? response : original(method, params));
++        f.deliver('/goal Requested objective', 'unconfirmed-response');
++        await vi.waitFor(() => expect(f.events).toHaveBeenCalledWith(expect.objectContaining({
++            type: 'goal-command-ack', localId: 'unconfirmed-response',
++            savedStateConfirmed: false, appliedToCurrentTurn: false
++        }), 'goal-command-ack:unconfirmed-response'));
++        expect(f.events).toHaveBeenCalledWith({ type: 'message', message: 'Goal command handled; saved state unconfirmed; current turn unchanged.' });
++        expect(f.events.mock.calls.some(([event]) => event.message?.startsWith('Saved goal'))).toBe(false);
++    });
++    it('distinguishes show, explicit pause/resume and clear without manufacturing a turn', async () => {
++        const f = await fixture(), request = vi.spyOn(f.native, 'request');
++        await f.root.activate();
++        for (const [command, action, status] of [['/goal', 'show', 'blocked'], ['/goal pause', 'pause', 'paused'], ['/goal resume', 'resume', 'active'], ['/goal clear', 'clear', undefined]] as const) {
++            f.deliver(command, action);
++            await vi.waitFor(() => expect(f.events).toHaveBeenCalledWith({ type: 'goal-command-ack', localId: action, action, threadId: 'thread', ...(status ? { goalStatus: status } : {}), savedStateConfirmed: true, appliedToCurrentTurn: false }, 'goal-command-ack:' + action));
++        }
++        expect(request).toHaveBeenCalledWith('thread/goal/set', { threadId: 'thread', status: 'paused' });
++        expect(request).toHaveBeenCalledWith('thread/goal/set', { threadId: 'thread', status: 'active' });
++        expect(request.mock.calls.some(([method]) => ['turn/start', 'turn/interrupt', 'turn/steer', 'thread/queue/add'].includes(method))).toBe(false);
++    });
++});
+diff --git a/cli/src/codex/shared/root.ts b/cli/src/codex/shared/root.ts
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -117,8 +117,11 @@
+                 if (this.closed || this.stopping) return;
+                 const id = localId ?? randomUUID();
+                 const text = formatMessageWithAttachments(message.content.text, message.content.attachments);
+-                const resolved = text.trim().startsWith('/') ? await this.queue.command(id, () => this.command(text)) : text;
+-                if (resolved === null) { this.session.emitMessagesConsumed([id], { clearQueuedThinkingGrace: true }); return; }
++                const resolved = text.trim().startsWith('/') ? await this.queue.command(id, () => this.command(text, id), { controlOnly: true }) : text;
++                if (resolved === null) {
++                    if (this.queue.isControlOnly(id)) this.session.emitMessagesConsumed([id], { clearQueuedThinkingGrace: true, controlOnly: true });
++                    return;
++                }
+                 await this.queue.enqueue(id, buildUserInputFromMessage(resolved), this.interrupted);
+             }).catch(error => this.notice(`Message not confirmed: ${error instanceof Error ? error.message : error}. Inspect the queue before retrying.`));
+         });
+@@ -186,7 +189,7 @@
+         if (this.threadId && this.threadId !== threadId) throw new Error('Cannot retarget a shared HAPI session');
+         this.threadId = threadId;
+         this.queue = new SharedCodexQueue(this.client, threadId, join(this.host.directory, `${this.session.sessionId}.queue.json`),
+-            (ids, steered) => this.session.emitMessagesConsumed(ids, { steered }), ids => this.session.emitSteerIndeterminate(ids),
++            (ids, steered, controlOnly) => this.session.emitMessagesConsumed(ids, { steered, ...(controlOnly ? { controlOnly: true } : {}) }), ids => this.session.emitSteerIndeterminate(ids),
+             (id, input) => this.session.syncNativeQueuedMessage(id, input === null ? null : inputText(input)),
+             ids => this.session.setSteerDeliveryState(ids, 'queued'));
+         await this.queue.load();
+@@ -529,7 +532,7 @@
+         const child = await this.host.create('thread/start', this.freshParams());
+         await child.initialSettings({ collaborationMode: this.settings.collaborationMode }); return child;
+     }
+-    private async command(text: string): Promise<string | null> {
++    private async command(text: string, localId: string): Promise<string | null> {
+         const command = text.trim();
+         if (command === '/clear' || command === '/new') {
+             const child = await this.newConversation(); this.notice(`New conversation: /sessions/${child.session.sessionId}`); return null;
+@@ -543,11 +546,31 @@
+             modelReasoningEffort: parseReasoningEffortValue(this.settings.modelReasoningEffort), serviceTier: this.settings.serviceTier });
+         if (slash.kind === 'passthrough') return text;
+         if (slash.kind === 'goal') {
++            const currentTurnId = this.currentTurn ?? undefined;
+             const params = { threadId: this.threadId };
+             const response = slash.action === 'show' ? await this.client.request('thread/goal/get', params)
+                 : slash.action === 'clear' ? await this.client.request('thread/goal/clear', params)
+                 : await this.client.request('thread/goal/set', { ...params, ...(slash.action === 'set' ? { objective: slash.objective } : { status: slash.action === 'pause' ? 'paused' : 'active' }) });
+-            this.notice(JSON.stringify(response)); return null;
++            const result = record(response), goal = record(result.goal);
++            const goalStatus = string(goal.status) ?? undefined;
++            // An RPC return is not necessarily a confirmed saved goal: tolerate
++            // older servers while refusing to claim a mismatched/empty response
++            // persisted the requested metadata. This never proves turn steering.
++            const matchingThread = goal.threadId === undefined || goal.threadId === this.threadId;
++            const hasGoal = matchingThread && typeof goal.objective === 'string' && !!goalStatus;
++            const savedStateConfirmed = slash.action === 'clear' ? result.cleared === true
++                : slash.action === 'show' ? result.goal === null || hasGoal
++                : slash.action === 'set' ? hasGoal && goal.objective === slash.objective
++                : hasGoal && goalStatus === (slash.action === 'pause' ? 'paused' : 'active');
++            this.session.sendSessionEvent({ type: 'goal-command-ack', localId, action: slash.action,
++                threadId: this.threadId, ...(currentTurnId ? { currentTurnId } : {}),
++                ...(goalStatus ? { goalStatus } : {}), savedStateConfirmed,
++                appliedToCurrentTurn: false }, `goal-command-ack:${localId}`);
++            const label = slash.action === 'show' ? 'status' : slash.action === 'clear' ? 'cleared' : 'updated';
++            this.notice(savedStateConfirmed
++                ? `Saved goal ${label}${goalStatus ? ` (${goalStatus})` : ''}; current turn unchanged.`
++                : 'Goal command handled; saved state unconfirmed; current turn unchanged.');
++            return null;
+         }
+         if (slash.updates?.proactiveMultiAgent !== undefined) throw new Error('This Codex version uses Ultra reasoning effort instead of a multi-agent toggle');
+         if (slash.updates?.model === null) throw new Error('Choose an explicit model in a shared thread');
+diff --git a/hub/src/socket/handlers/cli/sessionHandlers.test.ts b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+--- a/hub/src/socket/handlers/cli/sessionHandlers.test.ts
++++ b/hub/src/socket/handlers/cli/sessionHandlers.test.ts
+@@ -510,3 +510,65 @@
+         })
+     })
+ })
++
++describe('consumption receipt publication', () => {
++    it('commits steering proof before SSE and keeps it after a reconnect ACK/native echo', () => {
++        const store = new Store(':memory:')
++        try {
++            const session = store.sessions.getOrCreateSession('receipt-order', {}, null, 'default')
++            const record = { role: 'user', content: { type: 'text', text: 'correct course now' }, meta: { source: 'peer', sourceSessionId: 'original-peer' } }
++            store.messages.addMessage(session.id, record, 'exact')
++            const socket = new FakeSocket(), events: SyncEvent[] = []
++            registerSessionHandlers(socket as unknown as CliSocketWithData, {
++                store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {},
++                onWebappEvent: event => {
++                    if (event.type === 'messages-consumed') {
++                        expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ steered: true, content: { meta: { source: 'peer', deliveryReceipt: { steered: true } } } })
++                    }
++                    events.push(event)
++                }
++            })
++            socket.trigger('messages-consumed', { sid: session.id, localIds: ['exact', 'unknown'], steered: true })
++            socket.trigger('messages-consumed', { sid: session.id, localIds: ['exact'], steered: false })
++            socket.trigger('native-queue-message', { sid: session.id, localId: 'exact', text: 'later echo' })
++            expect(events.filter(e => e.type === 'messages-consumed')).toHaveLength(2)
++            expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ localId: 'exact', steered: true, content: { content: record.content, meta: record.meta } })
++        } finally { store.close() }
++    })
++    it('emits no consumption success if persistence fails', () => {
++        const store = new Store(':memory:')
++        try {
++            const session = store.sessions.getOrCreateSession('receipt-rejected', {}, null, 'default')
++            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'pending' } }, 'pending')
++            const socket = new FakeSocket(), events: SyncEvent[] = []
++            registerSessionHandlers(socket as unknown as CliSocketWithData, {
++                store, resolveSessionAccess: () => ({ ok: true, value: { ...session, namespace: 'wrong' } }), emitAccessError() {},
++                onWebappEvent: event => events.push(event)
++            })
++            socket.trigger('messages-consumed', { sid: session.id, localIds: ['pending'], steered: true })
++            expect(events).toEqual([])
++            expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ invokedAt: null })
++            expect(store.messages.getAllMessages(session.id)[0].steered).toBeUndefined()
++        } finally { store.close() }
++    })
++})
++
++describe('command ACK delivery classification', () => {
++    it.each(['explicit', 'grace', 'goal'] as const)('persists %s control consumption without a steering event', kind => {
++        const store = new Store(':memory:')
++        try {
++            const session = store.sessions.getOrCreateSession('command-control', {}, null, 'default')
++            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: kind === 'goal' ? '/goal revised objective' : '/status' } }, 'command')
++            const socket = new FakeSocket(), events: SyncEvent[] = []
++            registerSessionHandlers(socket as unknown as CliSocketWithData, {
++                store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {}, onWebappEvent: event => events.push(event)
++            })
++            socket.trigger('messages-consumed', { sid: session.id, localIds: ['command'], steered: true,
++                ...(kind === 'explicit' ? { controlOnly: true } : kind === 'grace' ? { clearQueuedThinkingGrace: true } : {}) })
++            expect(events[0]).toMatchObject({ type: 'messages-consumed', localIds: ['command'] })
++            expect((events[0] as { steered?: boolean }).steered).toBeUndefined()
++            expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ content: { meta: { deliveryReceipt: { controlOnly: true } } } })
++            expect(store.messages.getAllMessages(session.id)[0].steered).toBeUndefined()
++        } finally { store.close() }
++    })
++})
+diff --git a/hub/src/socket/handlers/cli/sessionHandlers.ts b/hub/src/socket/handlers/cli/sessionHandlers.ts
+--- a/hub/src/socket/handlers/cli/sessionHandlers.ts
++++ b/hub/src/socket/handlers/cli/sessionHandlers.ts
+@@ -3,7 +3,7 @@
+ import { randomUUID } from 'node:crypto'
+ import type { CopilotAgentMode } from '@hapi/protocol'
+ import type { AgentState, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
+-import { getReasoningStreamId, isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
++import { getReasoningStreamId, getMessageDeliveryReceipt, isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
+ import type { Store, StoredSession } from '../../../store'
+ import type { SyncEvent } from '../../../sync/syncEngine'
+ import { extractTodoWriteTodosFromMessageContent } from '../../../sync/todos'
+@@ -396,7 +396,7 @@
+         onSessionReady?.(data)
+     })
+ 
+-    socket.on('messages-consumed', (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => {
++    socket.on('messages-consumed', (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean; controlOnly?: boolean }) => {
+         if (!data || typeof data.sid !== 'string' || !Array.isArray(data.localIds)) {
+             return
+         }
+@@ -416,7 +416,8 @@
+                 data.sid,
+                 localIds,
+                 invokedAt,
+-                sessionAccess.value.namespace
++                sessionAccess.value.namespace,
++                { steered: data.steered === true, controlOnly: data.controlOnly === true || data.clearQueuedThinkingGrace === true }
+             )
+         } catch (err) {
+             console.error('recordMessagesConsumed failed', err)
+@@ -439,9 +440,16 @@
+         }
+         // Emit only after the DB transaction succeeds. This is an ACK-level
+         // batch contract, so preserve its original timestamp even when IDs are
+-        // heterogeneous, replayed, or unknown. `steered` is a live-only signal
+-        // (never persisted) that marks mid-turn delivery for the web badge.
+-        onWebappEvent?.({ type: 'messages-consumed', sessionId: data.sid, localIds, invokedAt, ...(data.steered === true ? { steered: true } : {}) })
++        // heterogeneous, replayed, or unknown. Steer evidence has already been
++        // persisted, so REST reloads retain the same active-turn delivery proof.
++        const controlOnly = data.controlOnly === true || data.clearQueuedThinkingGrace === true
++        const hasControlReceipt = localIds.some(id => {
++            const result = store.messages.lookupQueuedMessage(data.sid, id)
++            return result.status === 'invoked' && getMessageDeliveryReceipt(result.message.content)?.controlOnly === true
++        })
++        onWebappEvent?.({ type: 'messages-consumed', sessionId: data.sid, localIds, invokedAt,
++            ...(data.steered === true && !controlOnly && !hasControlReceipt ? { steered: true } : {}),
++            ...(controlOnly ? { controlOnly: true } : {}) })
+     })
+ 
+     socket.on('messages-indeterminate', (data: { sid: string; localIds: string[] }) => {
+diff --git a/hub/src/store/index.ts b/hub/src/store/index.ts
+--- a/hub/src/store/index.ts
++++ b/hub/src/store/index.ts
+@@ -166,10 +166,12 @@
+         sessionId: string,
+         localIds: string[],
+         invokedAt: number,
+-        namespace: string
++        namespace: string,
++        options: { steered?: boolean; controlOnly?: boolean } = {}
+     ): number {
+         return this.db.transaction(() => {
+             const changes = this.messages.markMessagesInvoked(sessionId, localIds, invokedAt)
++            this.messages.recordMessageDeliveryReceipts(sessionId, localIds, invokedAt, options)
+             if (changes > 0) {
+                 this.sessions.touchSessionUpdatedAt(sessionId, invokedAt, namespace)
+             }
+diff --git a/hub/src/store/messageStore.ts b/hub/src/store/messageStore.ts
+--- a/hub/src/store/messageStore.ts
++++ b/hub/src/store/messageStore.ts
+@@ -30,6 +30,7 @@
+     minFutureScheduledAtBySessionIds,
+     countMessages,
+     markMessagesInvoked,
++    recordMessageDeliveryReceipts,
+     markMessagesIndeterminate,
+     setMessagesDeliveryState,
+     markUninvokedImmediateMessages,
+@@ -202,6 +203,10 @@
+         return markMessagesInvoked(this.db, sessionId, localIds, invokedAt)
+     }
+ 
++    recordMessageDeliveryReceipts(sessionId: string, localIds: string[], consumedAt: number, options: { steered?: boolean; controlOnly?: boolean }): void {
++        recordMessageDeliveryReceipts(this.db, sessionId, localIds, consumedAt, options)
++    }
++
+     markMessagesIndeterminate(sessionId: string, localIds: string[]): number {
+         return markMessagesIndeterminate(this.db, sessionId, localIds)
+     }
+diff --git a/hub/src/store/messages.test.ts b/hub/src/store/messages.test.ts
+--- a/hub/src/store/messages.test.ts
++++ b/hub/src/store/messages.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from 'bun:test'
+ import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+-import { getReasoningStreamId } from '@hapi/protocol/messages'
++import { getReasoningStreamId, getMessageDeliveryReceipt, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+ import { Store } from './index'
+ 
+ function makeStore(): Store {
+@@ -724,3 +724,76 @@
+         expect(reasoningTexts(store, session.id)).toEqual([])
+     })
+ })
++
++describe('durable CLI delivery receipts', () => {
++    const wrappers = [
++        (message: unknown) => message,
++        (message: unknown) => ({ message, extra: 'preserve' }),
++        (message: unknown) => ({ data: { message }, extra: 'preserve' }),
++        (message: unknown) => ({ payload: { message }, extra: 'preserve' })
++    ]
++    it.each(wrappers)('preserves wrapped text, origin and steering proof across generic replay', wrap => {
++        const store = makeStore()
++        try {
++            const session = makeSession(store, 'durable-receipt')
++            const sibling = makeSession(store, 'sibling-receipt')
++            const record = { role: 'user', content: { type: 'text', text: 'original instruction' }, meta: { source: 'peer', sourceSessionId: 'origin', custom: 1 } }
++            const original = store.messages.addMessage(session.id, wrap(record), 'exact-id')
++            store.messages.addMessage(sibling.id, wrap(record), 'exact-id')
++            store.messages.addMessage(session.id, wrap({ role: 'agent', content: 'agent' }), 'agent-id')
++            store.recordMessagesConsumed(session.id, ['exact-id', 'agent-id', 'unknown'], 2_000, 'default')
++            store.recordMessagesConsumed(session.id, ['exact-id'], 3_000, 'default', { steered: true })
++            store.recordMessagesConsumed(session.id, ['exact-id'], 4_000, 'default', { steered: false })
++            const message = store.messages.getAllMessages(session.id).find(m => m.id === original.id)!
++            expect(message).toMatchObject({ localId: 'exact-id', invokedAt: 2_000, steered: true })
++            expect(getMessageDeliveryReceipt(message.content)).toEqual({ consumedAt: 2_000, steered: true })
++            expect(unwrapRoleWrappedRecordEnvelope(message.content)).toEqual({ ...record, meta: { ...record.meta, deliveryReceipt: { consumedAt: 2_000, steered: true } } })
++            expect(getMessageDeliveryReceipt(store.messages.getAllMessages(sibling.id)[0].content)).toBeNull()
++            expect(store.messages.getAllMessages(sibling.id)[0].invokedAt).toBeNull()
++            expect(getMessageDeliveryReceipt(store.messages.getAllMessages(session.id).find(m => m.localId === 'agent-id')!.content)).toBeNull()
++            // Native echoes under the same ID may not replace history or proof.
++            store.messages.syncNativeQueuedMessage(session.id, 'exact-id', 'stale echo')
++            expect(store.messages.getAllMessages(session.id).find(m => m.id === original.id)).toEqual(message)
++        } finally { store.close() }
++    })
++    it('rolls receipt metadata back with invocation when namespace validation fails', () => {
++        const store = makeStore()
++        try {
++            const session = makeSession(store, 'receipt-rollback')
++            const original = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'keep me' } }, 'rollback')
++            expect(() => store.recordMessagesConsumed(session.id, ['rollback'], 2_000, 'wrong', { steered: true })).toThrow()
++            expect(store.messages.getAllMessages(session.id)[0]).toEqual(original)
++        } finally { store.close() }
++    })
++})
++
++describe('control-only delivery receipts', () => {
++    it('distinguishes goal command handling from proof of current-turn steering', () => {
++        const store = makeStore()
++        try {
++            const session = makeSession(store, 'command-receipt')
++            const inputs = [['goal', '/goal new objective'], ['goal-pause', '/goal pause'], ['ordinary', 'please update /goal later'], ['lookalike', '/goals are different']]
++            for (const [id, text] of inputs) store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text } }, id)
++            store.recordMessagesConsumed(session.id, ['goal', 'goal-pause'], 10, 'default', { steered: true })
++            store.recordMessagesConsumed(session.id, ['ordinary', 'lookalike'], 11, 'default', { steered: true })
++            for (const message of store.messages.getAllMessages(session.id)) {
++                if (message.localId?.startsWith('goal')) {
++                    expect(message.steered).toBeUndefined()
++                    expect(getMessageDeliveryReceipt(message.content)).toEqual({ consumedAt: 10, controlOnly: true })
++                } else expect(message.steered).toBe(true)
++            }
++            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: '/status' } }, 'control')
++            store.recordMessagesConsumed(session.id, ['control'], 12, 'default', { controlOnly: true, steered: true })
++            expect(getMessageDeliveryReceipt(store.messages.getAllMessages(session.id).find(m => m.localId === 'control')!.content)).toEqual({ consumedAt: 12, controlOnly: true })
++        } finally { store.close() }
++    })
++    it('preserves wrapped peer provenance when native pending text is edited', () => {
++        const store = makeStore()
++        try {
++            const session = makeSession(store, 'wrapped-native-edit')
++            store.messages.addMessage(session.id, { payload: { message: { role: 'user', content: { type: 'text', text: 'before', attachments: ['keep'] }, meta: { source: 'peer', sourceSessionId: 'origin' } } }, retained: true }, 'wrapped')
++            const edited = store.messages.syncNativeQueuedMessage(session.id, 'wrapped', 'after')
++            expect(edited.content).toEqual({ payload: { message: { role: 'user', content: { type: 'text', text: 'after', attachments: ['keep'] }, meta: { source: 'peer', sourceSessionId: 'origin' } } }, retained: true })
++        } finally { store.close() }
++    })
++})
+diff --git a/hub/src/store/messages.ts b/hub/src/store/messages.ts
+--- a/hub/src/store/messages.ts
++++ b/hub/src/store/messages.ts
+@@ -1,9 +1,15 @@
+ import type { Database } from 'bun:sqlite'
+ import { randomUUID } from 'node:crypto'
+ import { isDeepStrictEqual } from 'node:util'
+-import { z } from 'zod'
+-
+-import { getLiveReasoningStreamId } from '@hapi/protocol/messages'
++
++import {
++    getLiveReasoningStreamId,
++    getMessageDeliveryReceipt,
++    isGoalCommandMessage,
++    unwrapRoleWrappedRecordEnvelope,
++    type MessageDeliveryReceipt
++} from '@hapi/protocol/messages'
++import { isObject } from '@hapi/protocol'
+ 
+ import type { StoredMessage } from './types'
+ import { decodeMessageContent, encodeMessageContent, truncateOversizedMessageContent } from './contentCodec'
+@@ -83,10 +89,12 @@
+ }
+ 
+ function toStoredMessage(row: DbMessageRow): StoredMessage {
++    const content = decodeMessageContent(row.content)
+     return {
+         id: row.id,
+         sessionId: row.session_id,
+-        content: decodeMessageContent(row.content),
++        content,
++        ...(getMessageDeliveryReceipt(content)?.steered ? { steered: true } : {}),
+         createdAt: row.created_at,
+         seq: row.seq,
+         localId: row.local_id,
+@@ -185,8 +193,10 @@
+         const message = addMessage(db, sessionId, initial, localId)
+         if (message.invokedAt !== null) return message
+         // Native text edits must not erase Web attachments or origin metadata.
+-        const prior = z.object({ role: z.literal('user'), content: z.object({ type: z.literal('text') }).passthrough() }).passthrough().safeParse(message.content)
+-        const content = prior.success ? { ...prior.data, content: { ...prior.data.content, text } } : initial
++        const prior = unwrapRoleWrappedRecordEnvelope(message.content)
++        const preserved = prior?.role === 'user' && isObject(prior.content) && prior.content.type === 'text'
++        if (preserved) prior.content = { ...prior.content as Record<string, unknown>, text }
++        const content = preserved ? message.content : initial
+         const encoded = encodeMessageContent(truncateOversizedMessageContent(content))
+         db.prepare('UPDATE messages SET content = ? WHERE session_id = ? AND local_id = ? AND invoked_at IS NULL')
+             .run(encoded, sessionId, localId)
+@@ -896,6 +906,40 @@
+            AND local_id IN (${placeholders})
+            AND invoked_at IS NULL`
+     ).run(invokedAt, sessionId, ...localIds).changes
++}
++
++/** Persist exact-row ACK evidence without replacing history text or origin metadata.
++ * Called inside Store.recordMessagesConsumed's transaction, including replays of
++ * already invoked rows so a late steer proof can upgrade an earlier generic ACK.
++ */
++export function recordMessageDeliveryReceipts(
++    db: Database,
++    sessionId: string,
++    localIds: string[],
++    consumedAt: number,
++    options: { steered?: boolean; controlOnly?: boolean }
++): void {
++    const update = db.prepare('UPDATE messages SET content = ? WHERE session_id = ? AND id = ?')
++    const select = db.prepare('SELECT * FROM messages WHERE session_id = ? AND local_id = ?')
++    for (const localId of new Set(localIds)) {
++        const rows = select.all(sessionId, localId) as DbMessageRow[]
++        for (const row of rows) {
++            const content = decodeMessageContent(row.content)
++            const record = unwrapRoleWrappedRecordEnvelope(content)
++            if (record?.role !== 'user') continue
++            const prior = getMessageDeliveryReceipt(content)
++            const controlOnly = prior?.controlOnly || options.controlOnly === true || isGoalCommandMessage(content)
++            const receipt: MessageDeliveryReceipt = {
++                consumedAt: prior?.consumedAt ?? row.invoked_at ?? consumedAt,
++                // Evidence only accumulates; generic reconnect ACKs cannot erase it.
++                ...(prior?.steered || (!controlOnly && options.steered === true) ? { steered: true } : {}),
++                ...(controlOnly && !prior?.steered ? { controlOnly: true } : {})
++            }
++            if (isDeepStrictEqual(prior, receipt)) continue
++            record.meta = { ...(isObject(record.meta) ? record.meta : {}), deliveryReceipt: receipt }
++            update.run(encodeMessageContent(content), sessionId, row.id)
++        }
++    }
+ }
+ 
+ /** Move an uninvoked steer through its durable delivery states. */
+diff --git a/hub/src/store/types.ts b/hub/src/store/types.ts
+--- a/hub/src/store/types.ts
++++ b/hub/src/store/types.ts
+@@ -51,6 +51,8 @@
+     scheduledAt: number | null
+     /** Omitted for ordinary queued/delivered rows; set when steer outcome is unknown. */
+     deliveryState?: MessageDeliveryState
++    /** Derived from the persisted user message delivery receipt. */
++    steered?: boolean
+ }
+ 
+ export type StoredUser = {
+diff --git a/hub/src/sync/messageService.ts b/hub/src/sync/messageService.ts
+--- a/hub/src/sync/messageService.ts
++++ b/hub/src/sync/messageService.ts
+@@ -45,7 +45,8 @@
+         createdAt: message.createdAt,
+         invokedAt: message.invokedAt,
+         scheduledAt: message.scheduledAt,
+-        ...(message.deliveryState ? { deliveryState: message.deliveryState } : {})
++        ...(message.deliveryState ? { deliveryState: message.deliveryState } : {}),
++        ...(message.steered ? { steered: true } : {})
+     }
+ }
+ 
+@@ -470,7 +471,8 @@
+             createdAt: message.createdAt,
+             invokedAt: message.invokedAt,
+             scheduledAt: message.scheduledAt,
+-            ...(message.deliveryState ? { deliveryState: message.deliveryState } : {})
++            ...(message.deliveryState ? { deliveryState: message.deliveryState } : {}),
++            ...(message.steered ? { steered: true } : {})
+         }))
+     }
+ 
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -21,7 +21,7 @@
+ import type { SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
+ import type { ImplementCodexPlanResult } from '@hapi/protocol/apiTypes'
+ import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+-import { hasConversationMessageContent, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
++import { hasConversationMessageContent, getMessageDeliveryReceipt, isGoalCommandMessage, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+ import type { Server } from 'socket.io'
+ import { randomUUID } from 'node:crypto'
+ import type { Store, CancelQueuedMessageResult } from '../store'
+@@ -227,9 +227,14 @@
+                 if (session) {
+                     // CLI reconnect replays ACKs with a fresh receipt timestamp.
+                     // Only persisted first-invocation times identify new work.
+-                    const invokedAt = event.type === 'messages-consumed' ? event.localIds.reduce((latest, id) => {
++                    const invokedAt = event.type === 'messages-consumed' && event.controlOnly !== true ? event.localIds.reduce((latest, id) => {
+                         const result = this.store.messages.lookupQueuedMessage(event.sessionId, id)
+-                        return result.status === 'invoked' ? Math.max(latest, result.message.invokedAt ?? 0) : latest
++                        if (result.status !== 'invoked') return latest
++                        // Consuming a synchronous command changes metadata, not
++                        // the model turn. Older controllers omit the explicit
++                        // control marker, so exact /goal syntax is conservative.
++                        if (getMessageDeliveryReceipt(result.message.content)?.controlOnly || isGoalCommandMessage(result.message.content)) return latest
++                        return Math.max(latest, result.message.invokedAt ?? 0)
+                     }, 0) : 0
+                     if (invokedAt) this.sessionCache.clearTurnFailure(session.id, invokedAt)
+                     if (this.store.sessionManager.observe(toSessionSummary(session), session.namespace, invokedAt, false, 0, event.type !== 'session-added')) this.enrolNode(session.id, session.namespace)
+@@ -1237,7 +1242,8 @@
+                     content: message.content,
+                     createdAt: message.createdAt,
+                     invokedAt: message.invokedAt,
+-                    scheduledAt: message.scheduledAt
++                    scheduledAt: message.scheduledAt,
++                    ...(message.steered ? { steered: true } : {})
+                 }
+             }
+         }
+diff --git a/hub/src/sync/turnFailure.test.ts b/hub/src/sync/turnFailure.test.ts
+--- a/hub/src/sync/turnFailure.test.ts
++++ b/hub/src/sync/turnFailure.test.ts
+@@ -9,18 +9,17 @@
+ 
+ const event = (message: string, type = 'message') => ({ role: 'agent', content: { type: 'event', data: { type, message } } })
+ const output = (data: unknown) => ({ role: 'agent', content: { type: 'output', data } })
+-function fixture(path = ':memory:') {
++function fixture(path = ':memory:', clock = { now: Date.now() }) {
+     const store = new Store(path)
+     const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+     const session = engine.getOrCreateSession('failure-test', { host: 'test', path: '/tmp/work', flavor: 'codex' }, {}, 'default')
+-    let time = Date.now()
+     const send = (content: unknown) => {
+         const msg = store.messages.addMessage(session.id, content)
+-        const message = { ...msg, createdAt: ++time }
++        const message = { ...msg, createdAt: ++clock.now }
+         engine.handleRealtimeEvent({ type: 'message-received', sessionId: session.id, message })
+         return message
+     }
+-    const alive = (thinking: boolean) => engine.handleSessionAlive({ sid: session.id, time: ++time, thinking })
++    const alive = (thinking: boolean) => engine.handleSessionAlive({ sid: session.id, time: ++clock.now, thinking })
+     return { store, engine, session, send, alive, close: () => { engine.stop(); store.close() } }
+ }
+ describe('trusted turn outcome classification', () => {
+@@ -49,7 +48,12 @@
+ describe('durable terminal failure projection', () => {
+     it('retains failure across ready, heartbeat, disconnect and hub recreation; actual new turn clears it', () => {
+         const dir = mkdtempSync(join(tmpdir(), 'hapi-turn-failure-')), path = join(dir, 'state.db')
+-        let f = fixture(path)
++        // Model events use a synthetic monotonic clock. Recreating the hub
++        // must not reset it behind the persisted failure. Anchor the short
++        // event sequence in the past so keepalive's future-time clamp cannot
++        // turn a later synthetic event into an older wall-clock timestamp.
++        const clock = { now: Date.now() - 1_000 }
++        let f = fixture(path, clock)
+         try {
+             f.alive(true)
+             f.send(event('Task failed: Selected model is at capacity'))
+@@ -58,7 +62,7 @@
+             f.engine.handleSessionEnd({ sid: f.session.id, time: Date.now() })
+             expect(f.engine.getSession(f.session.id)?.lastFailure?.kind).toBe('capacity')
+             const version = f.engine.getSession(f.session.id)?.lastFailureAt
+-            f.close(); f = fixture(path)
++            f.close(); f = fixture(path, clock)
+             expect(f.engine.getSession(f.session.id)?.lastFailure?.kind).toBe('capacity')
+             expect(f.engine.getSession(f.session.id)?.lastFailureAt).toBe(version)
+             f.alive(true)
+@@ -94,3 +98,25 @@
+         } finally { f.close() }
+     })
+ })
++
++describe('control ACKs do not imply new inference', () => {
++    it('retains failure for synchronous commands and goal syntax until real work starts', () => {
++        const f = fixture()
++        try {
++            f.alive(true)
++            f.send(event('Task failed: capacity'))
++            f.alive(false)
++            const now = Date.now() + 60_000
++            for (const [localId, text, controlOnly] of [['goal', '/goal revise objective', false], ['control', '/status', true]] as const) {
++                f.store.messages.addMessage(f.session.id, { role: 'user', content: { type: 'text', text } }, localId)
++                f.store.recordMessagesConsumed(f.session.id, [localId], now, 'default', { controlOnly })
++                f.engine.handleRealtimeEvent({ type: 'messages-consumed', sessionId: f.session.id, localIds: [localId], invokedAt: now })
++                expect(f.engine.getSession(f.session.id)?.lastFailure?.kind).toBe('capacity')
++            }
++            f.store.messages.addMessage(f.session.id, { role: 'user', content: { type: 'text', text: 'actual new prompt' } }, 'new-prompt')
++            f.store.recordMessagesConsumed(f.session.id, ['new-prompt'], now + 1, 'default')
++            f.engine.handleRealtimeEvent({ type: 'messages-consumed', sessionId: f.session.id, localIds: ['new-prompt'], invokedAt: now + 1 })
++            expect(f.engine.getSession(f.session.id)?.lastFailure).toBeNull()
++        } finally { f.close() }
++    })
++})
+diff --git a/hub/src/web/routes/messages.test.ts b/hub/src/web/routes/messages.test.ts
+--- a/hub/src/web/routes/messages.test.ts
++++ b/hub/src/web/routes/messages.test.ts
+@@ -8,6 +8,11 @@
+ import { describe, expect, it } from 'bun:test'
+ import { Hono } from 'hono'
+ import type { SyncEngine } from '../../sync/syncEngine'
++import { Store } from '../../store'
++import { MessageService } from '../../sync/messageService'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { join } from 'node:path'
++import { tmpdir } from 'node:os'
+ import type { WebAppEnv } from '../middleware/auth'
+ import { createMessagesRoutes } from './messages'
+ 
+@@ -527,7 +532,6 @@
+     })
+ })
+ 
+-
+ describe('POST messages peer provenance', () => {
+     const request = (app: ReturnType<typeof createApp>['app'], body: unknown) => app.request('/api/sessions/session-1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+     it('validates a peer source in the authenticated namespace and forwards its ID', async () => {
+@@ -556,3 +560,29 @@
+         }
+     })
+ })
++
++describe('GET message receipt roundtrip', () => {
++    it('returns durable steering after the SQLite store is closed and reopened', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-receipt-roundtrip-'))
++        const path = join(dir, 'state.db')
++        let store = new Store(path)
++        try {
++            const session = store.sessions.getOrCreateSession('receipt-api', {}, null, 'default')
++            const content = { role: 'user', content: { type: 'text', text: 'steering text remains intact' }, meta: { source: 'peer', sourceSessionId: 'peer-origin' } }
++            store.messages.addMessage(session.id, content, 'api-exact-id')
++            store.recordMessagesConsumed(session.id, ['api-exact-id'], 10_000, 'default', { steered: true })
++            store.recordMessagesConsumed(session.id, ['api-exact-id'], 20_000, 'default')
++            store.close()
++            store = new Store(path)
++            const service = new MessageService(store, {} as never, {} as never)
++            const { app } = createApp({ getMessagesPage: (_id, options) => service.getMessagesPage(session.id, options) })
++            const response = await app.request('/api/sessions/session-1/messages')
++            expect(response.status).toBe(200)
++            const body = await response.json() as { messages: unknown[] }
++            expect(body.messages).toEqual([expect.objectContaining({
++                localId: 'api-exact-id', invokedAt: 10_000, steered: true,
++                content: { ...content, meta: { ...content.meta, deliveryReceipt: { consumedAt: 10_000, steered: true } } }
++            })])
++        } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
++    })
++})
+diff --git a/shared/src/messages.ts b/shared/src/messages.ts
+--- a/shared/src/messages.ts
++++ b/shared/src/messages.ts
+@@ -39,6 +39,36 @@
+     if (isObject(payload) && isRoleWrappedRecord(payload.message)) return payload.message as RoleWrappedRecord
+ 
+     return null
++}
++
++/** An ACK proves consumption, not successful completion of the user's instruction. */
++export type MessageDeliveryReceipt = {
++    consumedAt: number
++    steered?: true
++    /** Synchronous command handling did not apply input to the current model turn. */
++    controlOnly?: true
++}
++
++export function getMessageDeliveryReceipt(value: unknown): MessageDeliveryReceipt | null {
++    const record = unwrapRoleWrappedRecordEnvelope(value)
++    if (record?.role !== 'user' || !isObject(record.meta)) return null
++    const receipt = record.meta.deliveryReceipt
++    if (!isObject(receipt) || typeof receipt.consumedAt !== 'number' || !Number.isFinite(receipt.consumedAt)) return null
++    return {
++        consumedAt: receipt.consumedAt,
++        ...(receipt.steered === true ? { steered: true as const } : {}),
++        ...(receipt.controlOnly === true ? { controlOnly: true as const } : {})
++    }
++}
++
++/** Goal syntax is a command acknowledgement, never proof of current-turn input. */
++export function isGoalCommandMessage(value: unknown): boolean {
++    const record = unwrapRoleWrappedRecordEnvelope(value)
++    if (record?.role !== 'user') return false
++    const content = record.content
++    const text = typeof content === 'string' ? content
++        : isObject(content) && content.type === 'text' && typeof content.text === 'string' ? content.text : null
++    return text !== null && /^\/goal(?:\s|$)/i.test(text.trim())
+ }
+ 
+ export function isClaudeChatVisibleSystemSubtype(subtype: unknown): subtype is string {
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -316,7 +316,7 @@
+     // The agent was sent the steer but its final outcome could not be proven.
+     // The row stays uninvoked and requires an explicit user resolution.
+     deliveryState: z.literal('indeterminate').optional(),
+-    // Live signal via messages-consumed (steered:true); not persisted by the hub.
++    // Derived from the durable user-message receipt; true proves active-turn steering.
+     steered: z.boolean().optional()
+ })
+ 
+@@ -634,7 +634,9 @@
+         localIds: z.array(z.string()),
+         invokedAt: z.number(),
+         // True when messages were steered into an active turn (not a normal queue drain).
+-        steered: z.boolean().optional()
++        steered: z.boolean().optional(),
++        // Synchronous command consumption alone proves no new model inference.
++        controlOnly: z.boolean().optional()
+     }),
+     SessionChangedSchema.extend({
+         type: z.literal('messages-indeterminate'),
+diff --git a/shared/src/socket.ts b/shared/src/socket.ts
+--- a/shared/src/socket.ts
++++ b/shared/src/socket.ts
+@@ -273,7 +273,7 @@
+   /** CLI agent finished session/load (or equivalent) and can accept prompts. */
+     'session-ready': (data: { sid: string; time: number }) => void
+     'session-end': (data: { sid: string; time: number; reason?: SessionEndReason }) => void
+-    'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => void
++    'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean; controlOnly?: boolean }) => void
+     'messages-indeterminate': (data: { sid: string; localIds: string[] }) => void
+     /** Native shared-engine queue projection. null = positively acknowledged removal. */
+     'native-queue-message': (data: { sid: string; localId: string; text: string | null }) => void
+diff --git a/web/src/chat/normalize.test.ts b/web/src/chat/normalize.test.ts
+--- a/web/src/chat/normalize.test.ts
++++ b/web/src/chat/normalize.test.ts
+@@ -1362,3 +1362,23 @@
+     })
+ 
+ })
++
++
++describe('durable steering receipt normalization', () => {
++    it.each([
++        (message: unknown) => message,
++        (message: unknown) => ({ message }),
++        (message: unknown) => ({ data: { message } }),
++        (message: unknown) => ({ payload: { message } })
++    ])('retains REST steering proof and peer metadata through user normalization', wrap => {
++        const record = { role: 'user', content: { type: 'text', text: 'correct current work' }, meta: {
++            source: 'peer', sourceSessionId: 'origin', deliveryReceipt: { consumedAt: 2_000, steered: true }
++        } }
++        const message = { ...makeMessage(wrap(record)), localId: 'exact-local-id', invokedAt: 2_000, steered: true }
++        const reloaded = JSON.parse(JSON.stringify(message)) as DecryptedMessage
++        expect(normalizeDecryptedMessage(reloaded)).toMatchObject({
++            role: 'user', localId: 'exact-local-id', invokedAt: 2_000, steered: true,
++            content: { type: 'text', text: 'correct current work' }, meta: record.meta
++        })
++    })
++})
+diff --git a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.test.tsx
+@@ -1,3 +1,4 @@
++import { GoalBanner } from '@/components/GoalBanner'
+ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+@@ -805,7 +806,9 @@
+         renderQueuedMessage(null, null, 0, true, { steerMessage: mocks.steerMessage } as unknown as ApiClient, true)
+         const button = screen.getByRole('button', { name: 'Stop & send now' })
+         expect(button.textContent).toContain('Stop & send now')
+-        expect(button.previousElementSibling?.className).toContain('line-clamp-3')
++        const preview = button.parentElement?.querySelector('.line-clamp-3')
++        expect(preview).toBeTruthy()
++        expect(preview!.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+         fireEvent.click(button)
+         await waitFor(() => expect(mocks.steerMessage).toHaveBeenCalledTimes(1))
+         await waitFor(() => expect(screen.getByRole('button', { name: 'Cancel queued message' })).not.toBeDisabled())
+@@ -895,3 +898,56 @@
+     expect(onEdit).toHaveBeenCalledWith({ text: 'Newer draft\nRecovered native prompt', pendingSchedule: schedule })
+     expect(getQueuedEditRecovery('session-1')).toBeNull()
+ })
++
++
++it('keeps a correction queued when an already-handled goal updates saved metadata', async () => {
++    const now = Date.now()
++    const correction = makeQueuedMessage(null, 'correction-id', { createdAt: now - 30 * 60_000, content: { role: 'user', content: { type: 'text', text: 'Use the corrected scope' }, meta: { deliveryMode: 'queue' } } })
++    const handledGoal = makeQueuedMessage(null, 'goal-id', { invokedAt: now - 1000, content: { role: 'user', content: { type: 'text', text: '/goal New objective' } } })
++    mocks.messageWindowState = { messages: [handledGoal, correction] }
++    const client = new QueryClient()
++    client.setQueryData(['session-goal', 'session-1'], { objective: 'Earlier objective', status: 'active', source: 'codex', updatedAt: now - 1000 })
++    render(<QueryClientProvider client={client}><GoalBanner api={null} sessionId="session-1" running /><QueuedMessagesBar sessionId="session-1" api={null} pendingSchedule={null} pendingScheduleRevision={0} canSteer onEdit={vi.fn()} /></QueryClientProvider>)
++    await act(async () => { client.setQueryData(['session-goal', 'session-1'], { objective: 'New objective', status: 'active', source: 'codex', updatedAt: now }) })
++    expect(await screen.findByText('New objective')).toBeTruthy()
++    expect(screen.getByText('Use the corrected scope')).toBeTruthy()
++    expect(screen.getByText('After current turn · waiting 30m')).toBeTruthy()
++    expect(screen.getByRole('status', { name: '1 queued message pending invocation' })).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'Edit queued message' })).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'Cancel queued message' })).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'Send now' })).toBeTruthy()
++    expect(screen.queryByText(/applied/i)).toBeNull()
++    expect(mocks.markMessagesConsumed).not.toHaveBeenCalled()
++    expect(mocks.steerMessage).not.toHaveBeenCalled()
++    expect(mocks.mutateAsync).not.toHaveBeenCalled()
++    expect(mocks.messageWindowState.messages).toContain(correction)
++})
++
++it('shows priority-specific unconfirmed delivery while keeping the waiting message actionable', () => {
++    const now = Date.now()
++    mocks.messageWindowState = { messages: [makeQueuedMessage(null, 'uncertain-id', { createdAt: now - 120_000, deliveryState: 'indeterminate', content: { role: 'user', content: { type: 'text', text: 'Scope correction' }, meta: { deliveryMode: 'steer' } } })] }
++    render(<QueryClientProvider client={new QueryClient()}><QueuedMessagesBar sessionId="session-1" api={null} pendingSchedule={null} pendingScheduleRevision={0} canSteer onEdit={vi.fn()} /></QueryClientProvider>)
++    expect(screen.getByText('Send now · delivery unconfirmed 2m')).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'Edit queued message' })).toBeTruthy()
++    expect(screen.getByRole('button', { name: 'Cancel queued message' })).toBeTruthy()
++    expect(screen.queryByRole('button', { name: 'Send now' })).toBeNull()
++    expect(screen.queryByText(/applied/i)).toBeNull()
++})
++
++it('refreshes elapsed waiting time without changing queue identity or delivery', () => {
++    vi.useFakeTimers()
++    vi.setSystemTime(2_000_000)
++    const correction = makeQueuedMessage(null, 'stable-correction', { createdAt: Date.now() - 30_000, content: { role: 'user', content: { type: 'text', text: 'Keep this correction queued' }, meta: { deliveryMode: 'queue' } } })
++    mocks.messageWindowState = { messages: [correction] }
++    const view = render(<QueryClientProvider client={new QueryClient()}><QueuedMessagesBar sessionId="session-1" api={null} pendingSchedule={null} pendingScheduleRevision={0} /></QueryClientProvider>)
++    try {
++        const row = screen.getByRole('listitem')
++        expect(screen.getByText('After current turn · waiting <1m')).toBeTruthy()
++        act(() => { vi.advanceTimersByTime(60_000) })
++        expect(screen.getByText('After current turn · waiting 1m')).toBeTruthy()
++        expect(screen.getByRole('listitem')).toBe(row)
++        expect(mocks.markMessagesConsumed).not.toHaveBeenCalled()
++        expect(mocks.steerMessage).not.toHaveBeenCalled()
++        expect(mocks.mutateAsync).not.toHaveBeenCalled()
++    } finally { view.unmount(); vi.useRealTimers() }
++})
+diff --git a/web/src/components/AssistantChat/QueuedMessagesBar.tsx b/web/src/components/AssistantChat/QueuedMessagesBar.tsx
+--- a/web/src/components/AssistantChat/QueuedMessagesBar.tsx
++++ b/web/src/components/AssistantChat/QueuedMessagesBar.tsx
+@@ -1,7 +1,8 @@
+ import { useAui, useAuiState } from '@assistant-ui/react'
+-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
++import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+ import type { ApiClient } from '@/api/client'
+ import { getMessageWindowState, subscribeMessageWindow } from '@/lib/message-window-store'
++import { queuedDeliveryStatus } from '@/lib/queuedDeliveryStatus'
+ import { isQueuedForInvocation } from '@/lib/messages'
+ import { EMPTY_STATE } from '@/hooks/queries/useMessages'
+ import { normalizeDecryptedMessage } from '@/chat/normalize'
+@@ -223,6 +224,13 @@
+     sendNowStopsTurn?: boolean
+ }) {
+     const queued = useQueuedMessages(sessionId)
++    const [now, setNow] = useState(Date.now)
++    useEffect(() => {
++        if (!queued.length) return
++        setNow(Date.now())
++        const timer = setInterval(() => setNow(Date.now()), 60_000)
++        return () => clearInterval(timer)
++    }, [queued.length])
+     const assistantApi = useAui()
+     const composerText = useAuiState((state) => state.composer.text)
+     const cancelMutation = useCancelQueuedMessage(api)
+@@ -529,6 +537,7 @@
+                                             {text}
+                                         </span>
+                                     ) : null}
++                                    <div className="mt-1 text-[11px] text-[var(--app-hint)]" data-queued-delivery-state>{queuedDeliveryStatus(msg, now)}</div>
+                                     {msg.deliveryState === 'indeterminate' ? (
+                                         <div className="mt-1 text-xs text-[var(--app-warning-text)]">
+                                             {t('queuedMessages.steerOutcomeUnknown')}
+diff --git a/web/src/components/GoalBanner.test.tsx b/web/src/components/GoalBanner.test.tsx
+--- a/web/src/components/GoalBanner.test.tsx
++++ b/web/src/components/GoalBanner.test.tsx
+@@ -16,7 +16,7 @@
+         const api = renderBanner({ objective: 'Finish the SampleSpace outreach deck and draft follow-ups', status: 'active', source: 'codex', updatedAt: 1, tokensUsed: 7009, timeUsedSeconds: 125 })
+         expect(await screen.findByText('Active')).toBeInTheDocument()
+         expect(api.getSessionGoal).toHaveBeenCalledWith('s1')
+-        const toggle = screen.getByRole('button', { name: /Goal/ })
++        const toggle = screen.getByRole('button', { name: /Saved goal/ })
+         expect(toggle).toHaveAttribute('aria-expanded', 'false')
+         fireEvent.click(toggle)
+         expect(toggle).toHaveAttribute('aria-expanded', 'true')
+@@ -32,3 +32,15 @@
+         expect(screen.queryByTestId('goal-banner')).toBeNull()
+     })
+ })
++
++
++it('labels a busy goal as saved metadata without claiming current-turn steering', async () => {
++    const client = new QueryClient()
++    client.setQueryData(['session-goal', 's1'], { objective: 'New objective', status: 'active', source: 'codex', updatedAt: 10 })
++    render(<QueryClientProvider client={client}><GoalBanner api={null} sessionId="s1" running /></QueryClientProvider>)
++    const toggle = screen.getByRole('button', { name: /Saved goal/ })
++    expect(toggle).toHaveAttribute('title', 'Saved goal metadata does not confirm that the current turn received this change. Check message delivery.')
++    fireEvent.click(toggle)
++    expect(screen.getByText(/Saved goal metadata does not confirm/)).toBeInTheDocument()
++    expect(screen.queryByText(/applied|steered/i)).toBeNull()
++})
+diff --git a/web/src/components/GoalBanner.tsx b/web/src/components/GoalBanner.tsx
+--- a/web/src/components/GoalBanner.tsx
++++ b/web/src/components/GoalBanner.tsx
+@@ -17,7 +17,7 @@
+     return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+ }
+ 
+-/** Current native /goal of the chat, so a goal running in the background is visible. */
++/** Saved native goal metadata; its status is not proof of delivery to a busy turn. */
+ export function GoalBanner(props: { api: ApiClient | null; sessionId: string; running: boolean }) {
+     const [open, setOpen] = useState(false)
+     const query = useQuery<SessionGoal | null>({
+@@ -30,6 +30,9 @@
+     const goal = query.data
+     if (!goal) return null
+     const status = STATUS[goal.status] ?? { label: goal.status, className: 'bg-[var(--app-subtle-bg)] text-[var(--app-fg)]' }
++    const deliveryNote = props.running
++        ? 'Saved goal metadata does not confirm that the current turn received this change. Check message delivery.'
++        : 'Saved goal metadata is separate from message delivery.'
+     const usage = [
+         goal.timeUsedSeconds ? duration(goal.timeUsedSeconds) : null,
+         goal.tokensUsed ? `${goal.tokensUsed.toLocaleString()} tokens` : null,
+@@ -39,19 +42,21 @@
+             <button
+                 type="button"
+                 aria-expanded={open}
++                title={deliveryNote}
+                 onClick={() => setOpen(value => !value)}
+                 className="flex w-full min-w-0 items-center gap-2 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] rounded"
+             >
+                 <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0 text-[var(--app-hint)]" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                     <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.5" fill="currentColor" />
+                 </svg>
+-                <span className="shrink-0 font-semibold">Goal</span>
++                <span className="shrink-0 font-semibold">Saved goal</span>
+                 <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${status.className}`}>{status.label}</span>
+                 <span className={`min-w-0 flex-1 text-[var(--app-hint)] ${open ? '' : 'truncate'}`}>{open ? null : goal.objective}</span>
+             </button>
+             {open ? (
+                 <div className="mt-1.5 max-h-48 overflow-y-auto whitespace-pre-wrap break-words pl-6 text-xs text-[var(--app-fg)]">
+                     {goal.objective}
++                    <p className="mt-1 text-[var(--app-hint)]">{deliveryNote}</p>
+                     {usage ? <div className="mt-1 text-[11px] text-[var(--app-hint)]">{usage}</div> : null}
+                 </div>
+             ) : null}
+diff --git a/web/src/lib/message-window-store.test.ts b/web/src/lib/message-window-store.test.ts
+--- a/web/src/lib/message-window-store.test.ts
++++ b/web/src/lib/message-window-store.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest'
++import { normalizeDecryptedMessage } from '@/chat/normalize'
+ import type { ApiClient } from '@/api/client'
+ import type { DecryptedMessage, MessagesResponse } from '@/types/api'
+ import {
+@@ -1572,3 +1573,32 @@
+         expect(state.newestSeq).toBe(3)
+     })
+ })
++
++
++describe('durable steering in message windows', () => {
++    it('retains REST proof through cold load, generic ACK, stale echo and JSON storage hydration', async () => {
++        const id = sessionId('durable-steering-cold')
++        const record = { role: 'user', content: { type: 'text', text: 'correct course' }, meta: {
++            source: 'peer', sourceSessionId: 'original-peer', deliveryReceipt: { consumedAt: 2_000, steered: true }
++        } }
++        const server = { ...makeUserMessage({ id: 'stored-steering', seq: 1, localId: 'exact-id', invokedAt: 2_000 }), content: record, steered: true }
++        await syncTailMessages(createApi(vi.fn(async () => latestResponse([server], { epoch: 1 }))), id)
++        expect(getMessageWindowState(id).messages[0]).toMatchObject({ steered: true, localId: 'exact-id', content: record })
++        markMessagesConsumed(id, ['exact-id'], 4_000)
++        markMessagesConsumed(id, ['exact-id'], 5_000, false)
++        ingestIncomingMessages(id, [{ ...server, steered: undefined }])
++        const stored = getMessageWindowState(id).messages[0]
++        expect(stored).toMatchObject({ steered: true, invokedAt: 2_000, content: record })
++        const hydratedId = sessionId('durable-steering-hydrated')
++        sessionStorage.setItem(`hapi:message-window:v2:${hydratedId}`, JSON.stringify({
++            messages: [stored], hasMore: false, oldestPositionAt: 2_000, oldestPositionSeq: 1,
++            newestPositionAt: 2_000, newestPositionSeq: 1, epoch: 1
++        }))
++        activateMessageWindow(hydratedId)
++        const hydrated = getMessageWindowState(hydratedId).messages[0]
++        expect(normalizeDecryptedMessage(hydrated)).toMatchObject({
++            role: 'user', steered: true, localId: 'exact-id', invokedAt: 2_000,
++            content: { type: 'text', text: 'correct course' }, meta: record.meta
++        })
++    })
++})
+diff --git a/web/src/lib/queuedDeliveryStatus.test.ts b/web/src/lib/queuedDeliveryStatus.test.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/queuedDeliveryStatus.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from 'vitest'
++import type { DecryptedMessage } from '@/types/api'
++import { queuedDeliveryStatus } from './queuedDeliveryStatus'
++const now = 2_000_000
++const message = (mode?: string): DecryptedMessage => ({ createdAt: now - 30 * 60_000, scheduledAt: null, invokedAt: null, content: { role: 'user', content: { text: 'Correct the current task' }, meta: mode ? { deliveryMode: mode } : {} } } as DecryptedMessage)
++
++describe('queued delivery status', () => {
++    it('shows the stored priorities and elapsed waiting time without claiming application', () => {
++        expect(queuedDeliveryStatus(message('queue'), now)).toBe('After current turn · waiting 30m')
++        expect(queuedDeliveryStatus(message('next'), now)).toBe('When ready · awaiting boundary 30m')
++        expect(queuedDeliveryStatus(message('steer'), now)).toBe('Send now · awaiting confirmation 30m')
++        expect(queuedDeliveryStatus(message(), now)).toBe('Queued · waiting 30m')
++    })
++    it('keeps uncertain, scheduled and wrapped legacy messages distinct', () => {
++        expect(queuedDeliveryStatus({ ...message('steer'), deliveryState: 'indeterminate' }, now)).toBe('Send now · delivery unconfirmed 30m')
++        expect(queuedDeliveryStatus({ ...message('queue'), scheduledAt: now + 1000 }, now)).toBe('Scheduled')
++        const wrapped = message('queue'); wrapped.content = { type: 'plaintext', data: wrapped.content }
++        expect(queuedDeliveryStatus(wrapped, now)).toBe('After current turn · waiting 30m')
++    })
++    it('measures overdue scheduled input from its due time and bounds clock skew', () => {
++        expect(queuedDeliveryStatus({ ...message('queue'), scheduledAt: now - 1000 }, now)).toBe('After current turn · waiting <1m')
++        expect(queuedDeliveryStatus({ ...message('queue'), createdAt: now + 1000 }, now)).toBe('After current turn · waiting <1m')
++    })
++})
+diff --git a/web/src/lib/queuedDeliveryStatus.ts b/web/src/lib/queuedDeliveryStatus.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/lib/queuedDeliveryStatus.ts
+@@ -0,0 +1,17 @@
++import type { DecryptedMessage } from '@/types/api'
++
++const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
++
++/** Stored transport intent, not an acknowledgement that an agent changed scope. */
++export function queuedDeliveryStatus(message: DecryptedMessage, now: number): string {
++    if (message.scheduledAt != null && message.scheduledAt > now) return 'Scheduled'
++    const outer = object(message.content)
++    const content = outer?.type === 'plaintext' ? object(outer.data) : outer
++    const mode = object(content?.meta)?.deliveryMode
++    const priority = mode === 'queue' ? 'After current turn' : mode === 'next' ? 'When ready' : mode === 'steer' ? 'Send now' : 'Queued'
++    const waited = Math.max(0, now - Math.max(message.createdAt, message.scheduledAt ?? 0))
++    const minutes = Math.floor(waited / 60_000)
++    const duration = minutes < 1 ? '<1m' : minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`
++    const state = message.deliveryState === 'indeterminate' ? 'delivery unconfirmed' : mode === 'steer' ? 'awaiting confirmation' : mode === 'next' ? 'awaiting boundary' : 'waiting'
++    return `${priority} · ${state} ${duration}`
++}

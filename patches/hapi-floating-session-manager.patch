@@ -1,0 +1,346 @@
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -2,7 +2,7 @@
+ import { useEffect, useMemo, useState } from 'react'
+ import type { SessionSummary } from '@/types/api'
+ import type { ApiClient, ManagedSession } from '@/api/client'
+-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { SessionManagerWindow, useSessionManagerWindow } from './SessionManagerWindow'
+ import { SessionRowSummary } from '@/components/SessionRowSummary'
+ import { useSessionManager } from '@/hooks/useSessionManager'
+ import { sessionHasWork } from '@/lib/sessionManager'
+@@ -29,6 +29,7 @@
+ 
+ export function SessionManagerButton(props: {
+     api?: ApiClient | null; sessions?: readonly SessionSummary[]; onSelect: (id: string) => void;
++    hideTrigger?: boolean;
+     managed?: Record<string, ManagedSession>; machineLabels?: Record<string, string>;
+ }) {
+     const client = useQueryClient()
+@@ -38,7 +39,7 @@
+     useEffect(() => { setLocallyUnmanaged(old => Object.fromEntries(Object.entries(old).filter(([id]) => props.managed?.[id]))) }, [props.managed])
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+-    const [open, setOpen] = useState(false)
++    const { open } = useSessionManagerWindow()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+     const { entries, dismiss, markStopped } = useSessionManager(props.sessions, currentManaged)
+@@ -51,13 +52,8 @@
+         && (!e.observedWork || currentManaged[e.session.id]?.projectStatus === 'paused' || currentManaged[e.session.id]?.manualHold)))
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+-        <button type="button" onClick={() => setOpen(true)} aria-label="Session Manager"
+-            className="mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg px-5 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
+-            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
+-            <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{rows.length}</span>
+-        </button>
+-        <Dialog open={open} onOpenChange={setOpen}><DialogContent aria-describedby={undefined} className="flex max-h-[85dvh] max-w-2xl flex-col">
+-            <DialogHeader><DialogTitle>Session Manager</DialogTitle></DialogHeader>
++        {!props.hideTrigger && <SessionManagerLauncher count={rows.length} />}
++        {open && <SessionManagerWindow>
+             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Session filters">
+                 <div className="inline-flex rounded-lg bg-[var(--app-subtle-bg)] p-0.5" role="group" aria-label="Activity filter">
+                     {(['all', 'active', 'inactive'] as const).map(value => <button key={value} type="button" aria-pressed={activityFilter === value}
+@@ -75,7 +71,7 @@
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+                 {visibleRows.map(({ session, missing, stopped }) => <div key={session.id} className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+-                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); setOpen(false) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
++                        <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+                             <SessionRowSummary session={session} showPath managed={isManaged(session.id)} machineLabel={props.machineLabels?.[session.metadata?.machineId ?? '']} />
+                         </button>
+                         <SessionManagerStateLabel session={session} missing={missing} managed={isManaged(session.id) ? props.managed?.[session.id] : undefined} api={props.api} />
+@@ -108,6 +104,15 @@
+                 {rows.length > 0 && !visibleRows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No matching sessions.</p>}
+                 {!rows.length && <p className="py-6 text-center text-sm text-[var(--app-hint)]">No sessions.</p>}
+             </div>
+-        </DialogContent></Dialog>
++        </SessionManagerWindow>}
+     </>
+ }
++
++export function SessionManagerLauncher({ count }: { count: number }) {
++    const { setOpen } = useSessionManagerWindow()
++    return (<button type="button" onClick={() => setOpen(true)} aria-label="Session Manager"
++            className="mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg px-5 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h10M8 12h10M8 16h10M5 8h.1M5 12h.1M5 16h.1"/></svg>
++            <span>Session Manager</span><span className="ml-auto text-xs text-[var(--app-hint)]">{count}</span>
++        </button>)
++}
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -50,6 +50,8 @@
+         const row = await screen.findByRole('button', { name: 'Open Codex' })
+         rerender(fixture(client, undefined, select)); expect(screen.queryByText(/^Inactive$/, { selector: 'p' })).toBeNull()
+         fireEvent.click(row); expect(select).toHaveBeenCalledWith('Codex')
++        expect(screen.getByRole('dialog')).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' }))
+         await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+     })
+ })
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1,4 +1,5 @@
+-import { SessionManagerButton } from '@/components/SessionManagerButton'
++import { useSessionManager } from '@/hooks/useSessionManager'
++import { SessionManagerLauncher } from '@/components/SessionManagerButton'
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import { SessionListScrollAnchor } from './SessionListScrollAnchor'
+ import type { SessionSummary } from '@/types/api'
+@@ -1455,6 +1456,7 @@
+     )
+     const codexFolders = useCodexFolders(api, activeTab === 'claude' ? [] : codexThreadIds, activeTab === 'claude' ? 'claude' : 'codex')
+     const managedSessions = useManagedSessions(api)
++    const sessionManagerEntries = useSessionManager(props.sessions, managedSessions).entries
+     const folderOf = (session: SessionSummary): string | null => {
+         const threadId = getChatTab(session) === 'claude' ? session.id : session.metadata?.agentSessionId
+         return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
+@@ -1928,7 +1930,7 @@
+                 </div>
+             ) : null}
+ 
+-            <SessionManagerButton api={api} sessions={props.isLoading ? undefined : props.sessions} onSelect={props.onSelect} managed={managedSessions} machineLabels={machineLabelsById} />
++            <SessionManagerLauncher count={Object.values(sessionManagerEntries).filter(entry => !entry.dismissed).length} />
+             {showMachineFilterBar ? (
+                 <MachineFilterBar
+                     machines={machineFilterItems}
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -28,6 +28,7 @@
+ import { canUseAppBadging, useAppBadge } from '@/hooks/useAppBadge'
+ import { useAppBadgePreference } from '@/hooks/useAppBadgePreference'
+ import { reconcileQueuedStateAfterConnect } from '@/lib/queued-state-reconciliation'
++import { SessionManagerHost } from '@/components/SessionManagerHost'
+ import { LoginPrompt } from '@/components/LoginPrompt'
+ import { InstallPrompt } from '@/components/InstallPrompt'
+ import { OfflineBanner } from '@/components/OfflineBanner'
+@@ -532,6 +533,7 @@
+                 <div className="h-full min-h-0 flex flex-col">
+                     <Outlet />
+                 </div>
++                <SessionManagerHost />
+                 <ToastContainer />
+                 <InstallPrompt />
+             </VoiceProvider>
+--- /dev/null
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -0,0 +1,110 @@
++import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
++import { useEffect, useId, useRef, type PointerEvent, type ReactNode } from 'react'
++import { createPortal } from 'react-dom'
++
++export type WindowBounds = { x: number; y: number; width: number; height: number }
++type WindowState = { open: boolean; bounds?: WindowBounds }
++const WINDOW_KEY = ['session-manager-window'] as const
++const viewport = () => ({
++    x: window.visualViewport?.offsetLeft ?? 0, y: window.visualViewport?.offsetTop ?? 0,
++    width: window.visualViewport?.width ?? window.innerWidth, height: window.visualViewport?.height ?? window.innerHeight,
++})
++export function fitSessionWindow(bounds: WindowBounds, view = viewport()): WindowBounds {
++    const availableWidth = Math.max(1, view.width - 16), availableHeight = Math.max(1, view.height - 16)
++    const width = Math.min(availableWidth, Math.max(Math.min(280, availableWidth), bounds.width))
++    const height = Math.min(availableHeight, Math.max(Math.min(260, availableHeight), bounds.height))
++    return { width, height, x: Math.max(view.x + 8, Math.min(bounds.x, view.x + view.width - width - 8)), y: Math.max(view.y + 8, Math.min(bounds.y, view.y + view.height - height - 8)) }
++}
++function initialBounds(): WindowBounds {
++    const view = viewport(), width = Math.min(480, view.width - 24), height = Math.min(560, view.height * .72)
++    return fitSessionWindow({ width, height, x: view.x + view.width - width - 16, y: view.y + 64 }, view)
++}
++export function useSessionManagerWindow() {
++    const client = useQueryClient()
++    const { data = { open: false } } = useQuery<WindowState>({ queryKey: WINDOW_KEY, queryFn: skipToken, initialData: { open: false }, enabled: false, gcTime: Infinity })
++    return {
++        ...data,
++        setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open })),
++        setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ open: old?.open ?? false, bounds })),
++    }
++}
++
++/** A non-modal page window: no backdrop, focus trap, or outside-click dismissal. */
++export function SessionManagerWindow({ children }: { children: ReactNode }) {
++    const { open, bounds, setBounds, setOpen } = useSessionManagerWindow()
++    const titleId = useId()
++    const moveButton = useRef<HTMLButtonElement>(null)
++    const gesture = useRef<{ pointer: number; kind: 'move' | 'resize'; x: number; y: number; bounds: WindowBounds } | null>(null)
++    const current = useRef(bounds)
++    current.current = bounds
++    useEffect(() => {
++        if (!open) return
++        const fit = () => setBounds(fitSessionWindow(current.current ?? initialBounds()))
++        fit(); moveButton.current?.focus({ preventScroll: true })
++        window.addEventListener('resize', fit)
++        window.visualViewport?.addEventListener('resize', fit)
++        window.visualViewport?.addEventListener('scroll', fit)
++        return () => {
++            gesture.current = null
++            window.removeEventListener('resize', fit)
++            window.visualViewport?.removeEventListener('resize', fit)
++            window.visualViewport?.removeEventListener('scroll', fit)
++        }
++        // Setters operate on the shared page cache, not captured bounds.
++        // eslint-disable-next-line react-hooks/exhaustive-deps
++    }, [open])
++    const start = (event: PointerEvent<HTMLButtonElement>, kind: 'move' | 'resize') => {
++        if (event.button !== 0 || gesture.current) return
++        event.preventDefault()
++        event.currentTarget.focus({ preventScroll: true })
++        event.currentTarget.setPointerCapture(event.pointerId)
++        gesture.current = { pointer: event.pointerId, kind, x: event.clientX, y: event.clientY, bounds: fitSessionWindow(current.current ?? initialBounds()) }
++    }
++    const move = (event: PointerEvent<HTMLButtonElement>) => {
++        const start = gesture.current
++        if (!start || start.pointer !== event.pointerId) return
++        const dx = event.clientX - start.x, dy = event.clientY - start.y
++        const next = start.kind === 'move'
++            ? { ...start.bounds, x: start.bounds.x + dx, y: start.bounds.y + dy }
++            : { ...start.bounds, width: start.bounds.width + dx, height: start.bounds.height + dy }
++        // Resizing stays anchored at the window's top-left corner.
++        const view = viewport()
++        if (start.kind === 'resize') { next.width = Math.min(next.width, view.x + view.width - next.x - 8); next.height = Math.min(next.height, view.y + view.height - next.y - 8) }
++        setBounds(fitSessionWindow(next))
++    }
++    const end = (event: PointerEvent<HTMLButtonElement>) => {
++        if (gesture.current?.pointer !== event.pointerId) return
++        gesture.current = null
++        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
++    }
++    const keyboard = (event: React.KeyboardEvent, kind: 'move' | 'resize') => {
++        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
++        event.preventDefault()
++        const step = event.shiftKey ? 40 : 10, next = { ...(current.current ?? initialBounds()) }
++        const horizontal = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
++        const change = (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1) * step
++        if (kind === 'move') next[horizontal ? 'x' : 'y'] += change
++        else next[horizontal ? 'width' : 'height'] += change
++        setBounds(fitSessionWindow(next))
++    }
++    if (!open) return null
++    const rect = fitSessionWindow(bounds ?? initialBounds())
++    const pointerEvents = { onPointerMove: move, onPointerUp: end, onPointerCancel: end, onLostPointerCapture: () => { gesture.current = null } }
++    return createPortal(<section role="dialog" aria-modal="false" aria-labelledby={titleId}
++        onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented) { event.stopPropagation(); setOpen(false) } }}
++        className="fixed z-[45] flex min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] text-[var(--app-fg)] shadow-2xl"
++        style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}>
++        <header className="flex shrink-0 items-center border-b border-[var(--app-divider)] px-2">
++            <button ref={moveButton} type="button" aria-label="Move Session Manager" title="Drag to move · arrow keys to move" onPointerDown={event => start(event, 'move')} {...pointerEvents}
++                onKeyDown={event => keyboard(event, 'move')} className="flex min-h-11 min-w-0 flex-1 touch-none select-none items-center gap-2 rounded-lg px-2 text-left cursor-move focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++                <span aria-hidden="true" className="text-[var(--app-hint)]">⠿</span><span id={titleId} className="truncate text-sm font-semibold">Session Manager</span>
++            </button>
++            <button type="button" aria-label="Close Session Manager" onClick={() => setOpen(false)} className="h-11 w-11 shrink-0 rounded-lg text-xl text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">×</button>
++        </header>
++        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3 pb-7">{children}</div>
++        <button type="button" aria-label="Resize Session Manager" title="Drag to resize · arrow keys to resize" onPointerDown={event => start(event, 'resize')} {...pointerEvents}
++            onKeyDown={event => keyboard(event, 'resize')} className="absolute bottom-0 right-0 flex h-7 w-7 touch-none select-none items-center justify-center rounded-tl-lg bg-[var(--app-dialog-bg)] text-[var(--app-hint)] cursor-nwse-resize focus-visible:outline-2 focus-visible:outline-[var(--app-link)]">
++            <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor"><path d="m4 13 9-9M9 13l4-4"/></svg>
++        </button>
++    </section>, document.body)
++}
+--- /dev/null
++++ b/web/src/components/SessionManagerWindow.test.tsx
+@@ -0,0 +1,69 @@
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { SessionManagerWindow, fitSessionWindow, useSessionManagerWindow } from './SessionManagerWindow'
++
++beforeEach(() => {
++    vi.stubGlobal('innerWidth', 1200); vi.stubGlobal('innerHeight', 900)
++    vi.stubGlobal('PointerEvent', class extends MouseEvent {
++        pointerId: number
++        constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1 }
++    })
++    HTMLElement.prototype.setPointerCapture = vi.fn()
++    HTMLElement.prototype.hasPointerCapture = vi.fn(() => false)
++    HTMLElement.prototype.releasePointerCapture = vi.fn()
++})
++afterEach(() => { cleanup(); vi.unstubAllGlobals() })
++function Fixture() {
++    const { setOpen } = useSessionManagerWindow()
++    return <><button onClick={() => setOpen(true)}>Open window</button><input aria-label="Page composer"/><SessionManagerWindow><p>Sessions</p></SessionManagerWindow></>
++}
++const setup = (client = new QueryClient()) => render(<QueryClientProvider client={client}><Fixture/></QueryClientProvider>)
++const open = async () => { fireEvent.click(screen.getByRole('button', { name: 'Open window' })); await screen.findByRole('dialog') }
++const geometry = () => {
++    const panel = screen.getByRole('dialog')
++    return { x: parseFloat(panel.style.left), y: parseFloat(panel.style.top), width: parseFloat(panel.style.width), height: parseFloat(panel.style.height) }
++}
++it('floats outside the page, allows background interaction, and only closes explicitly', async () => {
++    const { container } = setup(); await open()
++    expect(container.querySelector('[role=dialog]')).toBeNull()
++    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'false')
++    fireEvent.click(screen.getByLabelText('Page composer')); fireEvent.change(screen.getByLabelText('Page composer'), { target: { value: 'Still usable' } })
++    expect(screen.getByLabelText('Page composer')).toHaveValue('Still usable'); expect(screen.getByRole('dialog')).toBeInTheDocument()
++    fireEvent.keyDown(screen.getByLabelText('Page composer'), { key: 'Escape' }); expect(screen.getByRole('dialog')).toBeInTheDocument()
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Move Session Manager' }), { key: 'Escape' }); await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
++})
++it('supports pointer dragging, touch resizing and cancelling a gesture', async () => {
++    setup(); await open(); const first = geometry(), title = screen.getByRole('button', { name: 'Move Session Manager' })
++    fireEvent.pointerDown(title, { pointerId: 1, button: 0, clientX: 800, clientY: 80 })
++    fireEvent.pointerMove(title, { pointerId: 1, clientX: 600, clientY: 140 })
++    await waitFor(() => expect(geometry().x).toBe(first.x - 200)); expect(geometry().y).toBe(first.y + 60)
++    fireEvent.pointerUp(title, { pointerId: 1 })
++    const before = geometry(), handle = screen.getByRole('button', { name: 'Resize Session Manager' })
++    fireEvent.pointerDown(handle, { pointerId: 2, pointerType: 'touch', button: 0, clientX: 900, clientY: 600 })
++    fireEvent.pointerMove(handle, { pointerId: 2, pointerType: 'touch', clientX: 1000, clientY: 650 })
++    await waitFor(() => expect(geometry().width).toBe(before.width + 100)); expect(geometry().height).toBe(before.height + 50)
++    fireEvent.pointerCancel(handle, { pointerId: 2 }); const cancelled = geometry()
++    fireEvent.pointerMove(handle, { pointerId: 2, clientX: 1200, clientY: 800 }); expect(geometry()).toEqual(cancelled)
++})
++it('keeps position and size after close/reopen or remount, and fits a smaller viewport', async () => {
++    const client = new QueryClient(); const first = setup(client); await open()
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Move Session Manager' }), { key: 'ArrowLeft', shiftKey: true })
++    await waitFor(() => expect(geometry().x).toBe(664))
++    fireEvent.keyDown(screen.getByRole('button', { name: 'Resize Session Manager' }), { key: 'ArrowUp' })
++    await waitFor(() => expect(geometry().height).toBe(550))
++    const before = geometry(); fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); await open(); expect(geometry()).toEqual(before)
++    first.unmount(); setup(client); expect(geometry()).toEqual(before)
++    vi.stubGlobal('innerWidth', 390); vi.stubGlobal('innerHeight', 400); fireEvent(window, new Event('resize'))
++    await waitFor(() => expect(geometry().width).toBeLessThanOrEqual(374))
++    const after = geometry(); expect(after.x).toBeGreaterThanOrEqual(8); expect(after.y).toBeGreaterThanOrEqual(8)
++    expect(after.x + after.width).toBeLessThanOrEqual(382); expect(after.y + after.height).toBeLessThanOrEqual(392)
++})
++it('clamps geometry to narrow phones and keyboard-sized viewports', () => {
++    for (const view of [{ x: 0, y: 0, width: 390, height: 844 }, { x: 5, y: 100, width: 230, height: 180 }]) {
++        const fitted = fitSessionWindow({ x: -999, y: 9999, width: 2000, height: 1500 }, view)
++        expect(fitted.x).toBeGreaterThanOrEqual(view.x + 8); expect(fitted.y).toBeGreaterThanOrEqual(view.y + 8)
++        expect(fitted.x + fitted.width).toBeLessThanOrEqual(view.x + view.width - 8)
++        expect(fitted.y + fitted.height).toBeLessThanOrEqual(view.y + view.height - 8)
++    }
++})
+--- /dev/null
++++ b/web/src/components/SessionManagerHost.tsx
+@@ -0,0 +1,21 @@
++import { getSessionListSelectionNavigation } from '@/lib/sessionNavigation'
++import { useNavigate } from '@tanstack/react-router'
++import { useAppContext } from '@/lib/app-context'
++import { useSessionManagerWindow } from './SessionManagerWindow'
++import { useMachines } from '@/hooks/queries/useMachines'
++import { useSessions } from '@/hooks/queries/useSessions'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
++import { SessionManagerButton } from './SessionManagerButton'
++
++/** Lives above routing so selecting chats or hiding the mobile sidebar keeps it open. */
++export function SessionManagerHost() {
++    const { api } = useAppContext()
++    const navigate = useNavigate()
++    const { sessions, isLoading } = useSessions(api)
++    const managed = useManagedSessions(api)
++    const { open } = useSessionManagerWindow()
++    const { machines } = useMachines(api, open)
++    const machineLabels = Object.fromEntries(machines.map(machine => [machine.id, machine.metadata?.displayName || machine.metadata?.host || machine.id.slice(0, 8)]))
++    return <SessionManagerButton hideTrigger api={api} sessions={isLoading ? undefined : sessions} managed={managed} machineLabels={machineLabels}
++        onSelect={id => { void navigate(getSessionListSelectionNavigation(id)) }} />
++}
+--- a/hub/src/managerControl.test.ts
++++ b/hub/src/managerControl.test.ts
+@@ -9,6 +9,9 @@
+     const responder = setInterval(() => {
+         for (const file of readdirSync(directory).filter(f => f.endsWith('.req'))) {
+             command = JSON.parse(readFileSync(join(directory, file), 'utf8'))
++            // The real supervisor consumes each request once; do not recreate
++            // the response after the client has already removed it.
++            rmSync(join(directory, file))
+             writeFileSync(join(directory, file.replace('.req', '.out')), JSON.stringify({ ok: true }))
+         }
+     }, 10)

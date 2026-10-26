@@ -1,0 +1,271 @@
+diff --git a/cli/src/commands/registry.ts b/cli/src/commands/registry.ts
+--- a/cli/src/commands/registry.ts
++++ b/cli/src/commands/registry.ts
+@@ -21,6 +21,7 @@
+ import { hubCommand } from './hub'
+ import { pingPeerCommand } from './pingPeer'
+ import { inspectPeerCommand } from './inspectPeer'
++import { refreshToolsCommand } from './refreshTools'
+ import type { CommandContext, CommandDefinition } from './types'
+ 
+ // Gemini CLI was sunset (Google stopped serving the consumer Gemini CLI on
+@@ -62,7 +63,8 @@
+     runnerCommand,
+     notifyCommand,
+     pingPeerCommand,
+-    inspectPeerCommand
++    inspectPeerCommand,
++    refreshToolsCommand
+ ]
+ 
+ const commandMap = new Map<string, CommandDefinition>()
+diff --git a/cli/src/commands/help.ts b/cli/src/commands/help.ts
+--- a/cli/src/commands/help.ts
++++ b/cli/src/commands/help.ts
+@@ -24,6 +24,7 @@
+   hapi doctor                Run diagnostics and troubleshooting
+   hapi ping-peer             List peers or message another session
+   hapi inspect-peer <id>     Read another session's metadata and messages
++  hapi refresh-tools <id>    Inspect/queue a live Codex tool catalog refresh
+   hapi mcp                   Start the MCP stdio bridge
+ 
+ Options:
+diff --git a/cli/src/commands/refreshTools.ts b/cli/src/commands/refreshTools.ts
+new file mode 100644
+--- /dev/null
++++ b/cli/src/commands/refreshTools.ts
+@@ -0,0 +1,44 @@
++import { initializeToken } from '@/ui/tokenInit';
++import { refreshSessionTools, type ToolRefreshOptions } from '@/codex/shared/refreshTools';
++import type { CommandDefinition } from './types';
++
++const HELP = `Usage: hapi refresh-tools <full-session-id> [--status] [--server codex_apps] [--tool gmail.search_emails]
++Refresh the hosted app snapshot, then queue native MCP reload for a live Codex engine.
++Codex applies it at the next native turn. This command does not send input, resume,
++restart, or unpause a chat. --status only reads its current cached inventory.
++--tool may be repeated to show input field names without exposing account IDs.
++Reload is refused when the engine has multiple active HAPI roots.`;
++
++export function parseRefreshToolsArgs(args: string[]): ToolRefreshOptions & { sessionId?: string; help?: boolean } {
++    if (args.length === 1 && ['--help', '-h'].includes(args[0])) return { help: true };
++    const result: ToolRefreshOptions & { sessionId?: string } = {};
++    for (let i = 0; i < args.length; i++) {
++        const arg = args[i];
++        if (arg === '--status') result.statusOnly = true;
++        else if (arg === '--server' || arg === '--tool') {
++            const value = args[++i];
++            if (!value?.trim() || value.startsWith('-')) throw new Error(`${arg} requires a name`);
++            if (arg === '--server') result.serverName = value;
++            else (result.toolNames ??= []).push(value);
++        } else if (arg.startsWith('-') || result.sessionId) throw new Error(`Unexpected argument: ${arg}`);
++        else result.sessionId = arg;
++    }
++    if (!result.sessionId || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(result.sessionId)) throw new Error('A full HAPI session UUID is required.');
++    return result;
++}
++
++export const refreshToolsCommand: CommandDefinition = {
++    name: 'refresh-tools', requiresRuntimeAssets: false,
++    run: async ({ commandArgs }) => {
++        try {
++            const options = parseRefreshToolsArgs(commandArgs);
++            if (options.help) { console.log(HELP); return; }
++            await initializeToken();
++            console.log(JSON.stringify(await refreshSessionTools(options.sessionId!, options), null, 2));
++        } catch (error) {
++            // Do not dump HTTP client errors and their credential-bearing config.
++            console.error(error instanceof Error ? error.message : 'Tool refresh failed.');
++            process.exitCode = 1;
++        }
++    }
++};
+diff --git a/cli/src/commands/refreshTools.test.ts b/cli/src/commands/refreshTools.test.ts
+new file mode 100644
+--- /dev/null
++++ b/cli/src/commands/refreshTools.test.ts
+@@ -0,0 +1,10 @@
++import { describe, expect, it } from 'vitest';
++import { parseRefreshToolsArgs } from './refreshTools';
++const sid = '1db2880d-aad0-5eca-a47c-ae128e14eafc';
++describe('refresh-tools arguments', () => {
++    it('accepts a full session and selective schema diagnostics', () => {
++        expect(parseRefreshToolsArgs([sid, '--status', '--server', 'codex_apps', '--tool', 'gmail.search_emails', '--tool', 'gmail.get_profile'])).toEqual({ sessionId: sid, statusOnly: true, serverName: 'codex_apps', toolNames: ['gmail.search_emails', 'gmail.get_profile'] });
++    });
++    it('supports help without loading a runtime', () => expect(parseRefreshToolsArgs(['--help'])).toEqual({ help: true }));
++    it.each([[], ['451fffe1'], [sid, '--resume'], [sid, '--tool'], [sid, '--server', '--status'], [sid, 'another']].map(args => ({ args })))('rejects ambiguous or mutating arguments $args', ({ args }) => expect(() => parseRefreshToolsArgs(args)).toThrow());
++});
+diff --git a/cli/src/codex/shared/refreshTools.ts b/cli/src/codex/shared/refreshTools.ts
+new file mode 100644
+--- /dev/null
++++ b/cli/src/codex/shared/refreshTools.ts
+@@ -0,0 +1,83 @@
++import { createHash } from 'node:crypto';
++import { ApiClient } from '@/api/api';
++import { CodexAppServerClient, isIndeterminateError } from '../codexAppServerClient';
++import { findRuntime, runtimeAlive } from './registry';
++import { initializeSharedClient } from './launch';
++import { record } from './gateway';
++
++export type ToolRefreshOptions = { statusOnly?: boolean; serverName?: string; toolNames?: string[] };
++
++function canonical(value: unknown): unknown {
++    if (Array.isArray(value)) return value.map(canonical);
++    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]));
++    return value;
++}
++
++/** Attach only to a verified live engine. Never load a thread, send input or clear a pause. */
++export async function refreshSessionTools(sessionId: string, options: ToolRefreshOptions = {}) {
++    const runtime = await findRuntime(sessionId);
++    if (!runtime) throw new Error('No live local Codex runtime for this session. Nothing was resumed or started.');
++    const binding = runtime.sessions[sessionId];
++    if (!binding?.active) throw new Error('Session is not bound to this live runtime.');
++    const session = await (await ApiClient.create()).getSession(sessionId);
++    if (binding.namespace !== session.namespace || session.metadata?.flavor !== 'codex'
++        || session.metadata.codexSessionId !== binding.threadId) throw new Error('Codex runtime/session binding mismatch.');
++    // Native reload is engine-wide. Do not silently change another root's tools.
++    if (!options.statusOnly && Object.values(runtime.sessions).filter(value => value.active).length !== 1) {
++        throw new Error('MCP reload affects every loaded thread in this engine. Multiple HAPI roots are active; use --status to inspect only.');
++    }
++    const serverName = options.serverName ?? 'codex_apps';
++    const client = new CodexAppServerClient({ endpoint: runtime.endpoint, token: runtime.token });
++    const inventory = async () => {
++        const result = record(await client.request('mcpServerStatus/list', {
++            threadId: binding.threadId, serverName, detail: 'toolsAndAuthOnly', limit: 100
++        }));
++        if (!Array.isArray(result.data) || result.nextCursor) throw new Error('Incomplete MCP inventory; refresh outcome is not verified.');
++        const server = result.data.map(record).find(value => value.name === serverName);
++        if (!server) throw new Error(`MCP server ${serverName} is not available in this thread.`);
++        const tools = record(server.tools);
++        const schemas = Object.fromEntries(Object.entries(tools).map(([name, tool]) => [name, {
++            inputSchema: record(tool).inputSchema, outputSchema: record(tool).outputSchema
++        }]));
++        return {
++            serverName, toolCount: Object.keys(tools).length,
++            schemaHash: createHash('sha256').update(JSON.stringify(canonical(schemas))).digest('hex'),
++            // Names only: do not print connection IDs, account emails or full schemas.
++            tools: (options.toolNames ?? []).map(name => {
++                const tool = tools[name];
++                const schema = record(record(tool).inputSchema);
++                return { name, available: Boolean(tool), inputProperties: Object.keys(record(schema.properties)), required: Array.isArray(schema.required) ? schema.required : [] };
++            })
++        };
++    };
++    try {
++        await initializeSharedClient(client);
++        const before = await inventory();
++        if (options.statusOnly) return { sessionId, threadId: binding.threadId, refreshRequested: false, inventory: before };
++        const current = await findRuntime(sessionId);
++        if (!current || !runtimeAlive(runtime) || current.id !== runtime.id || current.marker !== runtime.marker
++            || current.sessions[sessionId]?.threadId !== binding.threadId
++            || Object.values(current.sessions).filter(value => value.active).length !== 1) throw new Error('Runtime binding changed; no refresh requested.');
++        try {
++            // Config reload alone retains the hosted connector snapshot, even
++            // across subsequent turns. Publish fresh app schemas before reload.
++            if (serverName === 'codex_apps') await client.request('app/installed', { threadId: binding.threadId, forceRefresh: true });
++            await client.request('config/mcpServer/reload');
++        }
++        catch (error) {
++            if (isIndeterminateError(error)) throw new Error('Tool refresh outcome is unknown after transport loss. Inspect with --status; do not retry blindly.', { cause: error });
++            throw error;
++        }
++        let after;
++        try { after = await inventory(); }
++        catch {
++            return { sessionId, threadId: binding.threadId, refreshRequested: true, appliesAt: 'next-native-turn',
++                inventoryVerification: 'unavailable', note: 'Reload acknowledged, but the follow-up inventory could not be read. Inspect with --status; no prompt was sent.' };
++        }
++        return { sessionId, threadId: binding.threadId, refreshRequested: true, appliesAt: 'next-native-turn',
++            inventoryChanged: before.schemaHash !== after.schemaHash, inventory: after,
++            note: 'Codex acknowledged the refresh. The inventory reflects observed native schemas; it does not prove an already-running model turn received them. No prompt was sent and no thread was resumed.' };
++    } finally {
++        await client.disconnect();
++    }
++}
+diff --git a/cli/src/codex/shared/refreshTools.test.ts b/cli/src/codex/shared/refreshTools.test.ts
+new file mode 100644
+--- /dev/null
++++ b/cli/src/codex/shared/refreshTools.test.ts
+@@ -0,0 +1,82 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({ findRuntime: vi.fn(), runtimeAlive: vi.fn(), getSession: vi.fn(), initialize: vi.fn(), request: vi.fn(), disconnect: vi.fn(), constructed: vi.fn() }));
++vi.mock('@/api/api', () => ({ ApiClient: { create: async () => ({ getSession: mocks.getSession }) } }));
++vi.mock('./registry', () => ({ findRuntime: mocks.findRuntime, runtimeAlive: mocks.runtimeAlive }));
++vi.mock('./launch', () => ({ initializeSharedClient: mocks.initialize }));
++vi.mock('../codexAppServerClient', () => ({
++    isIndeterminateError: (error: any) => error?.indeterminate === true,
++    CodexAppServerClient: class { request = mocks.request; disconnect = mocks.disconnect; constructor(options: unknown) { mocks.constructed(options); } }
++}));
++import { refreshSessionTools } from './refreshTools';
++
++const sid = '1db2880d-aad0-5eca-a47c-ae128e14eafc';
++const runtime = () => ({ id: 'runtime', pid: 12, marker: 'start', endpoint: 'unix://test', token: 'private', sessions: { [sid]: { active: true, namespace: 'n', threadId: 'native' } } });
++const catalog = (linked = false) => ({ data: [{ name: 'codex_apps', tools: {
++    'gmail.search_emails': { inputSchema: { properties: { query: {}, ...(linked ? { link_id: { enum: ['private-account-id'] } } : {}) }, required: linked ? ['link_id'] : [] } }
++} }], nextCursor: null });
++beforeEach(() => {
++    vi.resetAllMocks();
++    mocks.findRuntime.mockImplementation(async () => runtime()); mocks.runtimeAlive.mockReturnValue(true);
++    mocks.getSession.mockResolvedValue({ namespace: 'n', active: false, metadata: { flavor: 'codex', codexSessionId: 'native' } });
++    mocks.request.mockImplementation(async (method: string) => method === 'mcpServerStatus/list' ? catalog() : {});
++});
++
++describe('existing-session tool refresh', () => {
++    it('uses only native inventory/reload and detaches; reports queued even when the old schema remains', async () => {
++        const result = await refreshSessionTools(sid, { toolNames: ['gmail.search_emails'] });
++        expect(result).toMatchObject({ refreshRequested: true, appliesAt: 'next-native-turn', inventoryChanged: false });
++        expect(mocks.request.mock.calls).toEqual([
++            ['mcpServerStatus/list', { threadId: 'native', serverName: 'codex_apps', detail: 'toolsAndAuthOnly', limit: 100 }],
++            ['app/installed', { threadId: 'native', forceRefresh: true }],
++            ['config/mcpServer/reload'],
++            ['mcpServerStatus/list', { threadId: 'native', serverName: 'codex_apps', detail: 'toolsAndAuthOnly', limit: 100 }]
++        ]);
++        expect(mocks.disconnect).toHaveBeenCalledOnce();
++    });
++    it('reports changed signatures without exposing account IDs or claiming a turn consumed them', async () => {
++        mocks.request.mockResolvedValueOnce(catalog()).mockResolvedValueOnce({ apps: [] }).mockResolvedValueOnce({}).mockResolvedValueOnce(catalog(true));
++        const result = await refreshSessionTools(sid, { toolNames: ['gmail.search_emails'] });
++        expect(result).toMatchObject({ refreshRequested: true, inventoryChanged: true, inventory: { tools: [{ inputProperties: ['query', 'link_id'], required: ['link_id'] }] } });
++        expect(JSON.stringify(result)).not.toContain('private-account-id');
++        expect(JSON.stringify(result)).not.toContain('private');
++    });
++    it('allows read-only status for a paused/inactive chat in a multi-root engine', async () => {
++        mocks.findRuntime.mockResolvedValue({ ...runtime(), sessions: { ...runtime().sessions, other: { active: true } } });
++        const result = await refreshSessionTools(sid, { statusOnly: true });
++        expect(result.refreshRequested).toBe(false);
++        expect(mocks.request.mock.calls.map(([method]) => method)).toEqual(['mcpServerStatus/list']);
++    });
++    it('never cold-resumes a missing runtime', async () => {
++        mocks.findRuntime.mockResolvedValue(undefined);
++        await expect(refreshSessionTools(sid)).rejects.toThrow('Nothing was resumed or started');
++        expect(mocks.constructed).not.toHaveBeenCalled();
++    });
++    it.each(['namespace', 'thread', 'provider'])('refuses a mismatched %s before connecting', async kind => {
++        mocks.getSession.mockResolvedValue({ namespace: kind === 'namespace' ? 'other' : 'n', metadata: { flavor: kind === 'provider' ? 'claude' : 'codex', codexSessionId: kind === 'thread' ? 'other' : 'native' } });
++        await expect(refreshSessionTools(sid)).rejects.toThrow('binding mismatch');
++        expect(mocks.constructed).not.toHaveBeenCalled();
++    });
++    it('refuses an engine-wide reload with multiple active roots', async () => {
++        mocks.findRuntime.mockResolvedValue({ ...runtime(), sessions: { ...runtime().sessions, other: { active: true } } });
++        await expect(refreshSessionTools(sid)).rejects.toThrow('Multiple HAPI roots');
++        expect(mocks.request).not.toHaveBeenCalled();
++    });
++    it('rechecks the owner generation before mutation', async () => {
++        mocks.findRuntime.mockResolvedValueOnce(runtime()).mockResolvedValueOnce({ ...runtime(), marker: 'replacement' });
++        await expect(refreshSessionTools(sid)).rejects.toThrow('binding changed');
++        expect(mocks.request.mock.calls.map(([method]) => method)).toEqual(['mcpServerStatus/list']);
++        expect(mocks.disconnect).toHaveBeenCalledOnce();
++    });
++    it('does not retry an unknown reload outcome', async () => {
++        mocks.request.mockResolvedValueOnce(catalog()).mockRejectedValueOnce(Object.assign(new Error('Lost reply'), { indeterminate: true }));
++        await expect(refreshSessionTools(sid)).rejects.toThrow('do not retry blindly');
++        expect(mocks.request).toHaveBeenCalledTimes(2);
++        expect(mocks.disconnect).toHaveBeenCalledOnce();
++    });
++    it('retains acknowledgement when later inventory verification fails', async () => {
++        mocks.request.mockResolvedValueOnce(catalog()).mockResolvedValueOnce({ apps: [] }).mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('read failed'));
++        expect(await refreshSessionTools(sid)).toMatchObject({ refreshRequested: true, inventoryVerification: 'unavailable' });
++        expect(mocks.request).toHaveBeenCalledTimes(4);
++    });
++});

@@ -1,0 +1,657 @@
+--- a/hub/src/chatFolderState.ts
++++ b/hub/src/chatFolderState.ts
+@@ -0,0 +1,17 @@
++import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
++import { dirname } from 'node:path'
++
++/** Hub-owned metadata only. No project directories or native transcripts are moved. */
++export class ChatFolderState {
++    constructor(readonly path: string) {}
++    read(): Record<string, string | null> {
++        if (!existsSync(this.path)) return {}
++        return JSON.parse(readFileSync(this.path, 'utf8'))
++    }
++    assign(sessionId: string, folderId: string | null): void {
++        const next = { ...this.read(), [sessionId]: folderId }
++        mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
++        writeFileSync(this.path + '.tmp', JSON.stringify(next), { mode: 0o600 })
++        renameSync(this.path + '.tmp', this.path)
++    }
++}
+--- a/hub/src/web/routes/codexFolders.ts
++++ b/hub/src/web/routes/codexFolders.ts
+@@ -1,3 +1,5 @@
++import type { SyncEngine } from '../../sync/syncEngine'
++import { ChatFolderState } from '../../chatFolderState'
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ import {
+@@ -6,7 +8,7 @@
+ } from '../../codexFolders'
+ 
+ /** ChatGPT/Codex folders on this machine, shared two-way with the ChatGPT desktop app. */
+-export function createCodexFoldersRoutes(server: CodexAppServer = createStdioAppServer(), legacy = readLegacyState): Hono<WebAppEnv> {
++export function createCodexFoldersRoutes(server: CodexAppServer = createStdioAppServer(), legacy = readLegacyState, getEngine?: () => SyncEngine | null, local?: ChatFolderState): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+     // The local Codex store belongs to the hub owner, never to other namespaces.
+     app.use('/codex-folders/*', async (c, next) => c.get('namespace') === 'default' ? next() : c.json({ error: 'Codex folders are only available to the hub owner' }, 403))
+@@ -20,14 +22,33 @@
+     app.get('/codex-folders', async (c) => {
+         try {
+             c.header('Cache-Control', 'no-store')
+-            return c.json(await readFolders(server, validThreadIds(c.req.query('threads')), legacy()))
++            const provider = c.req.query('provider') ?? 'codex'
++            if (!['codex', 'claude'].includes(provider)) return c.json({ error: 'Invalid provider' }, 400)
++            if (provider === 'codex') return c.json(await readFolders(server, validThreadIds(c.req.query('threads')), legacy()))
++            if (!local || !getEngine?.()) return c.json({ error: 'Not connected' }, 502)
++            const catalog = await readFolders(server, [], legacy())
++            const assignments = local.read()
++            const sessions = getEngine()!.getSessionsByNamespace(c.get('namespace'))
++            return c.json({ folders: catalog.folders, assignments: Object.fromEntries(sessions
++                .filter(s => s.metadata?.flavor === 'claude')
++                .map(s => [s.id, { folderId: assignments[s.id] ?? null, source: 'hapi' }])) })
+         } catch (error) { return failure(c, error) }
+     })
+     app.post('/codex-folders/assign', async (c) => {
+-        const body = await c.req.json().catch(() => null) as { threadId?: unknown; folderId?: unknown } | null
++        const body = await c.req.json().catch(() => null) as { threadId?: unknown; folderId?: unknown; provider?: unknown } | null
+         if (!body || typeof body.threadId !== 'string' || (body.folderId !== null && typeof body.folderId !== 'string')) return c.json({ error: 'Invalid body' }, 400)
+         try {
+-            await assignFolder(server, body.threadId, body.folderId as string | null)
++            if (body.provider === 'claude') {
++                const session = getEngine?.()?.getSessionByNamespace(body.threadId, c.get('namespace'))
++                if (!session || session.metadata?.flavor !== 'claude') return c.json({ error: 'Claude session not found' }, 404)
++                if (!local) return c.json({ error: 'Not connected' }, 502)
++                const catalog = await readFolders(server, [], legacy())
++                if (body.folderId !== null && !catalog.folders.some(f => f.id === body.folderId)) return c.json({ error: 'Folder not found' }, 400)
++                local.assign(session.id, body.folderId as string | null)
++            } else {
++                if (body.provider !== undefined && body.provider !== 'codex') return c.json({ error: 'Invalid provider' }, 400)
++                await assignFolder(server, body.threadId, body.folderId as string | null)
++            }
+             return c.json({ ok: true })
+         } catch (error) { return failure(c, error) }
+     })
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -21,6 +21,8 @@
+ import { createMessagesRoutes } from './routes/messages'
+ import { createPermissionsRoutes } from './routes/permissions'
+ import { createMachinesRoutes } from './routes/machines'
++import { createProviderHandoffRoutes } from './routes/providerHandoff'
++import { ChatFolderState } from '../chatFolderState'
+ import { createCodexFoldersRoutes } from './routes/codexFolders'
+ import { createSessionGoalRoutes } from './routes/sessionGoals'
+ import { createCodexContextRoutes } from './routes/codexContext'
+@@ -297,7 +299,8 @@
+     app.route('/api', createMessagesRoutes(options.getSyncEngine))
+     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
+     app.route('/api', createMachinesRoutes(options.getSyncEngine))
+-    app.route('/api', createCodexFoldersRoutes())
++    app.route('/api', createCodexFoldersRoutes(undefined, undefined, options.getSyncEngine, new ChatFolderState(configuration.dbPath + '.folders.json')))
++    app.route('/api', createProviderHandoffRoutes(options.getSyncEngine, configuration.dbPath + '.handoffs.json'))
+     app.route('/api', createSessionGoalRoutes(options.getSyncEngine))
+     app.route('/api', createManagedSessionsRoutes())
+     app.route('/api', createCodexContextRoutes(options.getSyncEngine))
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -78,10 +78,12 @@
+ }
+ 
+ /** ChatGPT desktop folders (Codex app-server projects), shared two-way with that app. */
++export type ProviderHandoffDraft = { sessionId: string; sourceId: string; destination: 'codex' | 'claude'; context: string; capturedAt: number; title: string }
++
+ export type CodexFolder = { id: string; name: string; position: number }
+ export type CodexFoldersResponse = {
+     folders: CodexFolder[]
+-    assignments: Record<string, { folderId: string | null; source: 'app-server' | 'chatgpt-pending' }>
++    assignments: Record<string, { folderId: string | null; source: 'app-server' | 'chatgpt-pending' | 'hapi' }>
+ }
+ 
+ export type RetryIndeterminateMessageResponse =
+@@ -839,13 +841,19 @@
+         return (await this.request<{ goal: SessionGoal | null }>(`/api/sessions/${encodeURIComponent(sessionId)}/goal`)).goal
+     }
+ 
+-    async getCodexFolders(threadIds: string[]): Promise<CodexFoldersResponse> {
++    async createProviderHandoff(sessionId: string, destination: 'codex' | 'claude', key: string): Promise<ProviderHandoffDraft> {
++        return (await this.request<{ draft: ProviderHandoffDraft }>(`/api/sessions/${encodeURIComponent(sessionId)}/provider-handoff`, { method: 'POST', body: JSON.stringify({ destination, key }) })).draft
++    }
++    async getHandoffDraft(sessionId: string): Promise<ProviderHandoffDraft | null> {
++        return (await this.request<{ draft: ProviderHandoffDraft | null }>(`/api/sessions/${encodeURIComponent(sessionId)}/handoff-draft`)).draft
++    }
++    async getCodexFolders(threadIds: string[], provider: 'codex' | 'claude' = 'codex'): Promise<CodexFoldersResponse> {
+         const params = new URLSearchParams({ threads: threadIds.join(',') })
+-        return await this.request<CodexFoldersResponse>(`/api/codex-folders?${params.toString()}`)
++        return await this.request<CodexFoldersResponse>(`/api/codex-folders?${params.toString()}&provider=${provider}`)
+     }
+ 
+-    async assignCodexFolder(threadId: string, folderId: string | null): Promise<void> {
+-        await this.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId, folderId }) })
++    async assignCodexFolder(threadId: string, folderId: string | null, provider: 'codex' | 'claude' = 'codex'): Promise<void> {
++        await this.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ threadId, folderId, provider }) })
+     }
+ 
+     async createCodexFolder(name: string, idempotencyKey: string): Promise<CodexFolder> {
+--- a/web/src/components/CodexFolders.tsx
++++ b/web/src/components/CodexFolders.tsx
+@@ -7,11 +7,11 @@
+ const FOLDERS_KEY = 'codex-folders'
+ 
+ /** ChatGPT folders and the folder of each listed Codex thread. Errors leave the list unfoldered. */
+-export function useCodexFolders(api: ApiClient | null, threadIds: string[]) {
++export function useCodexFolders(api: ApiClient | null, threadIds: string[], provider: 'codex' | 'claude' = 'codex') {
+     const ids = [...new Set(threadIds)].sort()
+     return useQuery<CodexFoldersResponse>({
+-        queryKey: [FOLDERS_KEY, ids.join(',')],
+-        queryFn: () => api!.getCodexFolders(ids),
++        queryKey: [FOLDERS_KEY, provider, ids.join(',')],
++        queryFn: () => api!.getCodexFolders(ids, provider),
+         enabled: Boolean(api),
+         staleTime: 30_000,
+         refetchOnWindowFocus: true,
+@@ -104,6 +104,7 @@
+     isOpen: boolean
+     onClose: () => void
+     threadId: string
++    provider?: 'codex' | 'claude'
+     chatTitle: string
+     folders: CodexFolder[]
+     currentFolderId: string | null
+@@ -117,7 +118,7 @@
+     const move = async (folderId: string | null) => {
+         setBusy(true); setError(null)
+         try {
+-            await props.api.assignCodexFolder(props.threadId, folderId)
++            await props.api.assignCodexFolder(props.threadId, folderId, props.provider)
+             await invalidate()
+             props.onClose()
+         } catch {
+@@ -169,7 +170,7 @@
+                     </div>
+                 )}
+                 {error ? <div className="mt-2 text-sm text-red-600" role="alert">{error}</div> : null}
+-                <p className="mt-3 text-center text-[11px] text-[var(--app-hint)]">{t('folders.syncNote')}</p>
++                <p className="mt-3 text-center text-[11px] text-[var(--app-hint)]">{props.provider === 'claude' ? 'Claude membership is stored in HAPI. Folder names are shared with Codex; project files stay in place.' : t('folders.syncNote')}</p>
+             </DialogContent>
+         </Dialog>
+     )
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1439,18 +1439,27 @@
+             .map(session => session.metadata!.agentSessionId!),
+         [props.sessions]
+     )
+-    const codexFolders = useCodexFolders(api, codexThreadIds)
++    const codexFolders = useCodexFolders(api, activeTab === 'claude' ? [] : codexThreadIds, activeTab === 'claude' ? 'claude' : 'codex')
+     const managedSessions = useManagedSessions(api)
+     const folderOf = (session: SessionSummary): string | null => {
+-        const threadId = session.metadata?.agentSessionId
++        const threadId = getChatTab(session) === 'claude' ? session.id : session.metadata?.agentSessionId
+         return threadId ? codexFolders.data?.assignments[threadId]?.folderId ?? null : null
+     }
+     const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null)
+     const [folderDialog, setFolderDialog] = useState<{ folder: CodexFolder | null } | null>(null)
+     const canMoveToFolder = Boolean(api && codexFolders.data)
+     const handleMoveToFolder = (session: SessionSummary) => {
+-        if (session.metadata?.flavor === 'codex' && session.metadata?.agentSessionId) setMoveTarget(session)
++        if (getChatTab(session) === 'claude' || (session.metadata?.flavor === 'codex' && session.metadata?.agentSessionId)) setMoveTarget(session)
+     }
++    const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>(() => {
++        try { return JSON.parse(localStorage.getItem('hapi:collapsed-chat-folders') ?? '{}') } catch { return {} }
++    })
++    const folderKey = (id: string | null) => `${activeTab}:${id ?? 'none'}`
++    const toggleFolder = (id: string | null) => setCollapsedFolders(previous => {
++        const next = { ...previous, [folderKey(id)]: !previous[folderKey(id)] }
++        try { localStorage.setItem('hapi:collapsed-chat-folders', JSON.stringify(next)) } catch { /* private mode */ }
++        return next
++    })
+     const [runningSectionCollapsed, setRunningSectionCollapsed] = useState(false)
+     const [activeSectionCollapsed, setActiveSectionCollapsed] = useState(false)
+     const [pinnedSectionCollapsed, setPinnedSectionCollapsed] = useState(false)
+@@ -1566,7 +1575,7 @@
+                 machineLabel={showChatMachineLabel ? resolveMachineLabel(s.metadata?.machineId ?? null) : undefined}
+                 lastSeenVersion={lastSeenVersion}
+                 managed={Boolean(managedSessions[s.id])}
+-                onMoveToFolder={canMoveToFolder && getChatTab(s) === 'codex' ? handleMoveToFolder : undefined}
++                onMoveToFolder={canMoveToFolder && ['codex', 'claude'].includes(getChatTab(s)) ? handleMoveToFolder : undefined}
+             />
+         </div>
+     )
+@@ -1576,7 +1585,7 @@
+             return null
+         }
+         const tabSessions = chatSessions.filter(session => getChatTab(session) === activeTab)
+-        const sections = activeTab === 'codex' && codexFolders.data
++        const sections = ['codex', 'claude'].includes(activeTab) && codexFolders.data
+             ? groupChatsByFolder(tabSessions, codexFolders.data.folders, folderOf)
+             : [{ folder: undefined, sessions: tabSessions }]
+         return (
+@@ -1612,7 +1621,7 @@
+                     ))}
+                 </div>
+                 <div id="chat-tab-panel" role="tabpanel" aria-labelledby={`chat-tab-${activeTab}`} className="flex flex-col gap-0.5 py-1">
+-                    {activeTab === 'codex' && api ? (
++                    {['codex', 'claude'].includes(activeTab) && api ? (
+                         <div className="flex items-center justify-between px-2 pb-1 text-[11px] text-[var(--app-hint)]">
+                             <span>{codexFolders.isError ? t('folders.unavailable') : null}</span>
+                             {codexFolders.data ? (
+@@ -1626,10 +1635,15 @@
+                         <div key={folder === undefined ? 'all' : folder?.id ?? 'no-folder'} data-testid={folder === undefined ? undefined : 'chat-folder'} className="flex flex-col gap-0.5">
+                             {folder !== undefined ? (
+                                 <div className="group/folder flex min-w-0 items-center gap-2 px-2 pb-0.5 pt-2">
++                                    <button type="button" aria-expanded={!collapsedFolders[folderKey(folder?.id ?? null)] || isFiltering}
++                                        onClick={() => toggleFolder(folder?.id ?? null)} className="flex min-w-0 flex-1 items-center gap-2 text-left"
++                                        aria-label={`${folder?.name ?? t('folders.none')} folder`}>
++                                    <ChevronIcon className="h-3 w-3" collapsed={Boolean(collapsedFolders[folderKey(folder?.id ?? null)]) && !isFiltering} />
+                                     <FolderGlyph className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]" />
+                                     <span className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
+                                         {folder ? folder.name : t('folders.none')}
+                                     </span>
++                                    </button>
+                                     {folder ? (
+                                         <button
+                                             type="button"
+@@ -1644,16 +1658,17 @@
+                                     <span className="shrink-0 text-[11px] tabular-nums text-[var(--app-hint)]">({sessions.length})</span>
+                                 </div>
+                             ) : null}
+-                            {sessions.map((s, index) => renderChatRow(s, index, sessions))}
++                            {(folder === undefined || isFiltering || !collapsedFolders[folderKey(folder?.id ?? null)]) && sessions.map((s, index) => renderChatRow(s, index, sessions))}
+                         </div>
+                     ))}
+                 </div>
+-                {api && moveTarget?.metadata?.agentSessionId && codexFolders.data ? (
++                {api && moveTarget && codexFolders.data ? (
+                     <MoveToFolderDialog
+                         api={api}
+                         isOpen
+                         onClose={() => setMoveTarget(null)}
+-                        threadId={moveTarget.metadata.agentSessionId}
++                        threadId={getChatTab(moveTarget) === 'claude' ? moveTarget.id : moveTarget.metadata!.agentSessionId!}
++                        provider={getChatTab(moveTarget) === 'claude' ? 'claude' : 'codex'}
+                         chatTitle={getSessionTitle(moveTarget)}
+                         folders={codexFolders.data.folders}
+                         currentFolderId={folderOf(moveTarget)}
+--- a/hub/src/web/routes/providerHandoff.ts
++++ b/hub/src/web/routes/providerHandoff.ts
+@@ -0,0 +1,82 @@
++import { Hono } from 'hono'
++import { randomUUID } from 'node:crypto'
++import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
++import { dirname } from 'node:path'
++import { readClaudeGoal, readCodexGoal } from '../../sessionGoals'
++import type { SyncEngine } from '../../sync/syncEngine'
++import type { WebAppEnv } from '../middleware/auth'
++import { requireSessionFromParam, requireSyncEngine } from './guards'
++
++const object = (v: unknown): Record<string, any> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, any> : {}
++/** Public text only; attachments, reasoning and executable tool state cannot be transplanted. */
++export function handoffText(messages: unknown[]): { text: string; omitted: number } {
++    const entries = messages.map(raw => {
++        const m = object(raw); let c = object(m.content)
++        if (c.type === 'plaintext') c = object(c.data)
++        const inner = object(c.content); const data = object(inner.data); const msg = object(data.message)
++        if (c.role !== 'user' && c.role !== 'agent') return ''
++        if (['reasoning', 'thinking', 'agent_reasoning', 'reasoning_delta', 'user'].includes(data.type)) return ''
++        const parts = Array.isArray(msg.content) ? msg.content : []
++        const text = inner.text || data.last_agent_message || parts.filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n') || (typeof data.message === 'string' && ['message', 'agent_message'].includes(data.type) ? data.message : '')
++        if (typeof text !== 'string' || !text.trim() || text.startsWith('Claude AI usage limit ')) return ''
++        const pending = c.role === 'user' && m.localId && !m.invokedAt ? ' (delivery unconfirmed; do not replay)' : ''
++        return `[${c.role}${pending}; message ${m.id}]\n${text}`
++    }).filter(Boolean)
++    const selected: string[] = []; let size = 0; let omitted = 0
++    for (const entry of entries.reverse()) {
++        const clipped = entry.length > 8000 ? entry.slice(0, 8000) + '\n[message clipped]' : entry
++        if (entry.length > 8000) omitted++
++        if (size + clipped.length > 32000) { omitted++; continue }
++        selected.unshift(clipped); size += clipped.length
++    }
++    return { text: selected.join('\n\n'), omitted }
++}
++
++type Draft = { sessionId: string; sourceId: string; namespace: string; destination: 'codex' | 'claude'; context: string; capturedAt: number; title: string }
++export function createProviderHandoffRoutes(getEngine: () => SyncEngine | null, path: string): Hono<WebAppEnv> {
++    const app = new Hono<WebAppEnv>()
++    const read = (): Record<string, Draft> => existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
++    const write = (value: Record<string, Draft>) => {
++        mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
++        writeFileSync(path + '.tmp', JSON.stringify(value), { mode: 0o600 }); renameSync(path + '.tmp', path)
++    }
++    app.get('/sessions/:id/handoff-draft', c => {
++        const engine = requireSyncEngine(c, getEngine); if (engine instanceof Response) return engine
++        const access = requireSessionFromParam(c, engine); if (access instanceof Response) return access
++        const draft = Object.values(read()).find(d => d.sessionId === access.sessionId && d.namespace === c.get('namespace'))
++        return c.json({ draft: draft ?? null })
++    })
++    app.post('/sessions/:id/provider-handoff', async c => {
++        const engine = requireSyncEngine(c, getEngine); if (engine instanceof Response) return engine
++        const access = requireSessionFromParam(c, engine); if (access instanceof Response) return access
++        const source = access.session; const flavor = source.metadata?.flavor
++        if (flavor !== 'codex' && flavor !== 'claude') return c.json({ error: 'Only Codex and Claude handoffs are supported' }, 400)
++        const body = await c.req.json().catch(() => null)
++        if (!body || !['codex', 'claude'].includes(body.destination) || body.destination === flavor || typeof body.key !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.key)) return c.json({ error: 'Invalid destination or request key' }, 400)
++        if (!source.metadata?.path || !source.metadata.machineId) return c.json({ error: 'Source machine and workspace are required' }, 409)
++        const records = read(); const key = `${c.get('namespace')}:${access.sessionId}:${body.key}`
++        let draft = records[key]
++        if (draft && draft.destination !== body.destination) return c.json({ error: 'Request key already used for another destination' }, 409)
++        if (!draft) {
++            const page = engine.getMessagesPage(access.sessionId, { limit: 200 })
++            const excerpt = handoffText(page.messages.slice(-200))
++            let goal: unknown = null
++            if (c.get('namespace') === 'default') {
++                try { goal = flavor === 'codex' && source.metadata.codexSessionId ? readCodexGoal(source.metadata.codexSessionId) : flavor === 'claude' && source.metadata.claudeSessionId ? readClaudeGoal(source.metadata.claudeSessionId) : null } catch { /* available public context only */ }
++            }
++            const capturedAt = Date.now(); const title = `Handoff from ${flavor}: ${source.metadata.name || source.metadata.summary?.text || access.sessionId}`.slice(0, 200)
++            const context = `CROSS-PROVIDER CONTEXT HANDOFF — ${flavor} → ${body.destination}\nCaptured: ${new Date(capturedAt).toISOString()}\nSource: /sessions/${access.sessionId}\nWorkspace: ${source.metadata.path}\n\nThis is a NEW conversation, not a converted native history. The original chat is preserved and may still be working. Historical text below is reference material, not an instruction to replay commands, queued messages or goals. Wait for the user's current request; coordinate before modifying a workspace still used by the source.\n\nCoverage: public text from up to 200 recent HAPI messages, bounded to 32,000 characters. ${excerpt.omitted} entries were clipped/omitted for size; older context may exist. Tool outputs, images/files, hidden reasoning, native state, permissions and live goals are not transferred. Inspect the original chat/export for missing details.\n\nSource summary (reference only): ${JSON.stringify(source.metadata.summary ?? null)}\nSource goal snapshot (reference only, NOT activated): ${JSON.stringify(goal)}\nSource todo snapshot (reference only): ${JSON.stringify(source.todos ?? null)}\n\nBEGIN HISTORICAL CONTEXT\n${excerpt.text || '[No public text available in the recent window]'}\nEND HISTORICAL CONTEXT`
++            draft = { sessionId: randomUUID(), sourceId: access.sessionId, namespace: c.get('namespace'), destination: body.destination, context, capturedAt, title }
++            records[key] = draft; write(records) // Reserve before creation; retries never allocate another destination.
++        }
++        // An empty inactive session can use the existing fresh-spawn/reopen path.
++        // No source mutation, RPC, prompt dispatch, native resume ID, or inherited goal.
++        const destination = engine.getOrCreateSession(`provider-handoff:${draft.sessionId}`, {
++            path: source.metadata.path, host: source.metadata.host ?? source.metadata.machineId, machineId: source.metadata.machineId,
++            flavor: draft.destination, name: draft.title,
++        }, {}, draft.namespace, undefined, undefined, undefined, draft.sessionId)
++        if (destination.id !== draft.sessionId) return c.json({ error: 'Destination identity mismatch' }, 409)
++        return c.json({ draft })
++    })
++    return app
++}
+--- a/web/src/components/ProviderHandoff.tsx
++++ b/web/src/components/ProviderHandoff.tsx
+@@ -0,0 +1,41 @@
++import { useRef, useState } from 'react'
++import { useQuery } from '@tanstack/react-query'
++import type { ApiClient, ProviderHandoffDraft } from '@/api/client'
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
++import { getDraft, saveDraft } from '@/lib/composer-drafts'
++
++export function ProviderHandoffDialog(props: { api: ApiClient; sessionId: string; provider: 'codex' | 'claude'; onClose: () => void }) {
++    const key = useRef(crypto.randomUUID())
++    const [draft, setDraft] = useState<ProviderHandoffDraft | null>(null)
++    const [busy, setBusy] = useState(false)
++    const [error, setError] = useState('')
++    const destination = props.provider === 'codex' ? 'claude' : 'codex'
++    return <Dialog open onOpenChange={open => !open && !busy && props.onClose()}><DialogContent>
++        <DialogHeader><DialogTitle>Transfer context to {destination === 'claude' ? 'Claude' : 'Codex'}</DialogTitle></DialogHeader>
++        <p className="text-sm">Creates a separate, labelled chat and a reviewable draft. Your original history and running work stay in place. Native histories, goals, permissions and attachments are not converted.</p>
++        <p className="text-sm">The draft captures recent public text (up to 200 messages / 32,000 characters) and links to the source. Resume the new chat, review the draft and send it when ready. Nothing is sent automatically.</p>
++        {error && <p role="alert">{error}</p>}
++        {draft ? <><textarea aria-label="Handoff context" readOnly value={draft.context} className="h-48 w-full rounded border bg-[var(--app-bg)] p-2 text-xs" />
++            <a className="text-[var(--app-link)]" href={`/sessions/${draft.sessionId}`} onClick={() => { if (!getDraft(draft.sessionId)) saveDraft(draft.sessionId, draft.context) }}>Open new {destination} chat</a></> :
++            <button type="button" disabled={busy} className="rounded bg-[var(--app-button)] p-2 text-[var(--app-button-text)]" onClick={async () => {
++                setBusy(true); setError('')
++                try { setDraft(await props.api.createProviderHandoff(props.sessionId, destination, key.current)) }
++                catch (e) { setError(e instanceof Error ? e.message : 'Could not create handoff. Retry uses the same request.') }
++                finally { setBusy(false) }
++            }}>{busy ? 'Creating…' : `Create ${destination} handoff draft`}</button>}
++    </DialogContent></Dialog>
++}
++
++export function HandoffDraftBanner(props: { api: ApiClient | null; sessionId: string }) {
++    const [error, setError] = useState('')
++    const { data: draft } = useQuery({ queryKey: ['handoff-draft', props.sessionId], queryFn: () => props.api!.getHandoffDraft(props.sessionId), enabled: Boolean(props.api?.getHandoffDraft), staleTime: Infinity, retry: false })
++    if (!draft) return null
++    return <div className="border-b px-3 py-2 text-xs text-[var(--app-hint)]">
++        Context handoff from <a href={`/sessions/${draft.sourceId}`} className="text-[var(--app-link)]">original chat</a>. This is a new conversation; resume and review before sending.
++        <button className="ml-2 text-[var(--app-link)]" onClick={() => {
++            if (getDraft(props.sessionId)) { setError('A composer draft already exists; it was preserved.'); return }
++            saveDraft(props.sessionId, draft.context); window.location.reload()
++        }}>Restore handoff draft</button>
++        {error && <span role="alert" className="ml-2">{error}</span>}
++    </div>
++}
+--- a/web/src/components/SessionActionMenu.tsx
++++ b/web/src/components/SessionActionMenu.tsx
+@@ -18,6 +18,7 @@
+     sessionGlobalPinned?: boolean
+     onSetPinMode?: (mode: 'none' | 'project' | 'global') => void
+     onExport?: () => void
++    onProviderHandoff?: () => void
+     /** Codex chats only: choose a ChatGPT folder. */
+     onMoveToFolder?: () => void
+     onMarkUnread?: () => void
+@@ -209,6 +210,7 @@
+         sessionGlobalPinned = false,
+         onSetPinMode,
+         onExport,
++        onProviderHandoff,
+         onMoveToFolder,
+         onMarkUnread,
+         onSyncCodex,
+@@ -378,6 +380,7 @@
+                     </button>
+                 ) : null}
+ 
++                {onProviderHandoff ? <button type="button" role="menuitem" className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`} onClick={() => { onClose(); onProviderHandoff() }}>Transfer to another provider…</button> : null}
+                 {onExport ? (
+                     <button
+                         type="button"
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -1,3 +1,4 @@
++import { ProviderHandoffDialog, HandoffDraftBanner } from '@/components/ProviderHandoff'
+ import { useEffect, useId, useMemo, useRef, useState } from 'react'
+ import { useIsMutating, useQueryClient } from '@tanstack/react-query'
+ import type { Session } from '@/types/api'
+@@ -211,6 +212,7 @@
+     const menuAnchorRef = useRef<HTMLButtonElement | null>(null)
+     const [renameOpen, setRenameOpen] = useState(false)
+     const [exportOpen, setExportOpen] = useState(false)
++    const [handoffOpen, setHandoffOpen] = useState(false)
+     const [archiveOpen, setArchiveOpen] = useState(false)
+     const [deleteOpen, setDeleteOpen] = useState(false)
+     const [isSyncingCodex, setIsSyncingCodex] = useState(false)
+@@ -493,6 +495,8 @@
+                 </div>
+             </div>
+ 
++            <HandoffDraftBanner api={api} sessionId={session.id} />
++            {handoffOpen && api && (agentFlavor === 'codex' || agentFlavor === 'claude') ? <ProviderHandoffDialog api={api} sessionId={session.id} provider={agentFlavor} onClose={() => setHandoffOpen(false)} /> : null}
+             <SessionActionMenu
+                 isOpen={menuOpen}
+                 onClose={() => setMenuOpen(false)}
+@@ -505,6 +509,7 @@
+                 onMarkUnread={() => markSessionUnread(session.id, session.updatedAt)}
+                 onSetPinMode={api ? (mode) => void handleSetPinMode(mode) : undefined}
+                 onExport={() => setExportOpen(true)}
++                onProviderHandoff={api && (agentFlavor === 'codex' || agentFlavor === 'claude') ? () => setHandoffOpen(true) : undefined}
+                 onSyncCodex={api && codexSessionId ? handleSyncCodex : undefined}
+                 onSyncPi={api && piSessionId && !session.active ? handleSyncPi : undefined}
+                 onArchive={() => setArchiveOpen(true)}
+--- a/hub/src/web/routes/providerHandoff.test.ts
++++ b/hub/src/web/routes/providerHandoff.test.ts
+@@ -0,0 +1,75 @@
++import { describe, it, expect } from 'bun:test'
++import { Hono } from 'hono'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { SyncEngine } from '../../sync/syncEngine'
++import { Store } from '../../store'
++import { RpcRegistry } from '../../socket/rpcRegistry'
++import type { WebAppEnv } from '../middleware/auth'
++import { createProviderHandoffRoutes, handoffText } from './providerHandoff'
++
++const key = '11111111-1111-4111-8111-111111111111'
++describe('provider handoff', () => {
++    for (const flavor of ['codex', 'claude']) it(`creates a distinct inactive ${flavor} handoff without mutating or dispatching to the source`, async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'hapi-handoff-'))
++        try {
++            const source = { id: 'source', active: true, thinking: true, metadata: { flavor, path: '/project', machineId: 'machine', host: 'pc', name: 'Working chat', codexSessionId: 'original-native', claudeSessionId: 'original-native' } }
++            const original = JSON.stringify(source); const sessions = new Map<string, any>([['source', source]])
++            let created = 0
++            const engine = {
++                resolveSessionAccess: (id: string, ns: string) => ns !== 'default' ? { ok: false, reason: 'access-denied' } : sessions.has(id) ? { ok: true, sessionId: id, session: sessions.get(id) } : { ok: false, reason: 'not-found' },
++                getMessagesPage: () => ({ messages: [{ id: 'm', content: { role: 'user', content: { text: 'Preserve my current task scope' } } }] }),
++                getOrCreateSession: (_tag: string, metadata: unknown, _state: unknown, _namespace: string, _model: unknown, _effort: unknown, _reasoning: unknown, id: string) => {
++                    if (!sessions.has(id)) { sessions.set(id, { id, metadata, active: false }); created++ }
++                    return sessions.get(id)
++                },
++                sendMessage: () => { throw new Error('must not send') }, resumeSession: () => { throw new Error('must not resume') },
++            } as unknown as SyncEngine
++            const mount = (ns = 'default') => { const app = new Hono<WebAppEnv>(); app.use('*', async (c, next) => { c.set('namespace', ns); await next() }); app.route('/', createProviderHandoffRoutes(() => engine, join(dir, 'state.json'))); return app }
++            const destination = flavor === 'codex' ? 'claude' : 'codex'
++            const post = () => mount().request('/sessions/source/provider-handoff', { method: 'POST', body: JSON.stringify({ destination, key }) })
++            const first = await post(); expect(first.status).toBe(200); const { draft } = await first.json() as any
++            const retry = await post(); expect(((await retry.json()) as any).draft.sessionId).toBe(draft.sessionId); expect(created).toBe(1)
++            expect(JSON.stringify(source)).toBe(original); expect(draft.sessionId).not.toBe('source')
++            expect(draft.context).toContain('Preserve my current task scope'); expect(draft.context).toContain('not a converted native history')
++            expect(sessions.get(draft.sessionId).metadata.codexSessionId).toBeUndefined(); expect(sessions.get(draft.sessionId).metadata.claudeSessionId).toBeUndefined(); expect(sessions.get(draft.sessionId).active).toBe(false)
++            expect(((await (await mount().request(`/sessions/${draft.sessionId}/handoff-draft`)).json()) as any).draft.context).toBe(draft.context)
++            expect((await mount('other').request('/sessions/source/provider-handoff', { method: 'POST', body: JSON.stringify({ destination, key }) })).status).toBe(403)
++            expect((await mount().request('/sessions/source/provider-handoff', { method: 'POST', body: JSON.stringify({ destination: flavor, key }) })).status).toBe(400)
++        } finally { rmSync(dir, { recursive: true, force: true }) }
++    })
++    it('labels unconfirmed input, omits reasoning/tool output and bounds large context', () => {
++        const result = handoffText([
++            { id: 'queued', localId: 'local', content: { role: 'user', content: { text: 'Pending instruction' } } },
++            { id: 'r', content: { role: 'agent', content: { data: { type: 'reasoning', message: 'secret thought' } } } },
++            { id: 't', content: { role: 'agent', content: { data: { type: 'user', message: { content: [{ type: 'text', text: 'raw tool output' }] } } } } },
++            { id: 'large', content: { role: 'user', content: { text: 'x'.repeat(9000) } } },
++        ])
++        expect(result.text).toContain('delivery unconfirmed'); expect(result.text).not.toContain('secret thought'); expect(result.text).not.toContain('raw tool output'); expect(result.omitted).toBe(1); expect(result.text.length).toBeLessThan(33000)
++    })
++})
++
++describe('handoff fresh-start integration', () => {
++    for (const destination of ['codex', 'claude'] as const) it(`reopens an empty ${destination} reservation without resuming the source native ID`, async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'handoff-resume-'))
++        const store = new Store(':memory:')
++        const engine = new SyncEngine(store, { of: () => ({ to: () => ({ emit() {} }) }) } as never, new RpcRegistry(), { broadcast() {} } as never)
++        try {
++            engine.getOrCreateMachine('machine', { host: 'pc', platform: 'linux', happyCliVersion: 'test' }, {}, 'default')
++            engine.handleMachineAlive({ machineId: 'machine', time: Date.now() })
++            const source = engine.getOrCreateSession('source', { path: '/project', host: 'pc', machineId: 'machine', flavor: destination === 'codex' ? 'claude' : 'codex', claudeSessionId: 'original-native', codexSessionId: 'original-native' }, {}, 'default')
++            const app = new Hono<WebAppEnv>(); app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() }); app.route('/', createProviderHandoffRoutes(() => engine, join(dir, 'drafts.json')))
++            const response = await app.request(`/sessions/${source.id}/provider-handoff`, { method: 'POST', body: JSON.stringify({ destination, key }) })
++            expect(response.status).toBe(200); const { draft } = await response.json() as any
++            expect(engine.getSession(draft.sessionId)?.active).toBe(false)
++            const calls: unknown[][] = []
++            ;(engine as any).rpcGateway.spawnSession = async (...args: unknown[]) => { calls.push(args); engine.handleSessionAlive({ sid: draft.sessionId, time: Date.now(), thinking: false }); return { type: 'success', sessionId: draft.sessionId } }
++            const result = await engine.resumeSession(draft.sessionId, 'default')
++            expect(result.type).toBe('success'); expect(calls).toHaveLength(1)
++            expect(calls[0]![2]).toBe(destination); expect(calls[0]![8]).toBeUndefined(); expect(calls[0]![12]).toBe(draft.sessionId)
++            expect(engine.getSession(source.id)?.metadata?.codexSessionId).toBe('original-native')
++            expect(store.messages.getMessages(draft.sessionId, 10)).toHaveLength(0)
++        } finally { engine.stop(); rmSync(dir, { recursive: true, force: true }) }
++    })
++})
+--- a/hub/src/web/routes/codexFolders.test.ts
++++ b/hub/src/web/routes/codexFolders.test.ts
+@@ -1,3 +1,5 @@
++import { ChatFolderState } from '../../chatFolderState'
++import type { SyncEngine } from '../../sync/syncEngine'
+ import { afterAll, describe, expect, it } from 'bun:test'
+ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+@@ -140,3 +142,22 @@
+         await expect(server(call => call('boom', {}))).rejects.toThrow('boom')
+     })
+ })
++
++describe('Claude folders reuse the existing catalog', () => {
++    it('persists HAPI membership without touching a native transcript, and rejects cross-provider IDs', async () => {
++        const dir = mkdtempSync(join(tmpdir(), 'claude-folders-')); const fake = fakeServer()
++        const session = { id: 'claude-id', metadata: { flavor: 'claude' } }
++        const engine = { getSessionsByNamespace: () => [session], getSessionByNamespace: (id: string) => id === session.id ? session : undefined } as unknown as SyncEngine
++        const local = new ChatFolderState(join(dir, 'folders.json'))
++        const root = new Hono<WebAppEnv>(); root.use('*', async (c, next) => { c.set('namespace', 'default'); await next() }); root.route('/api', createCodexFoldersRoutes(fake.server, () => ({ assignments: {}, pending: new Set() }), () => engine, local))
++        try {
++            const result = await root.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ provider: 'claude', threadId: 'claude-id', folderId: 'p-blender' }) })
++            expect(result.status).toBe(200)
++            const folders = await (await root.request('/api/codex-folders?provider=claude')).json() as any
++            expect(folders.folders[0].name).toBe('Blender'); expect(folders.assignments['claude-id']).toEqual({ folderId: 'p-blender', source: 'hapi' })
++            expect(new ChatFolderState(local.path).read()['claude-id']).toBe('p-blender')
++            expect(fake.calls).not.toContain('thread/metadata/update')
++            expect((await root.request('/api/codex-folders/assign', { method: 'POST', body: JSON.stringify({ provider: 'claude', threadId: 'codex-id', folderId: 'p-blender' }) })).status).toBe(404)
++        } finally { rmSync(dir, { recursive: true, force: true }) }
++    })
++})
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -115,7 +115,7 @@
+         const api = folderApi()
+         renderList({ api })
+         await waitFor(() => expect(screen.getAllByTestId('chat-folder')).toHaveLength(3))
+-        expect(api.getCodexFolders).toHaveBeenCalledWith(['thread-blender', 'thread-loose', 'thread-school'])
++        expect(api.getCodexFolders).toHaveBeenCalledWith(['thread-blender', 'thread-loose', 'thread-school'], 'codex')
+         const [blender, school, none] = screen.getAllByTestId('chat-folder')
+         expect(within(blender!).getByText('Blender')).toBeInTheDocument()
+         expect(within(blender!).getByRole('button', { name: /Liquid sim/ })).toBeInTheDocument()
+@@ -137,7 +137,7 @@
+         const dialog = await screen.findByRole('dialog')
+         expect(within(dialog).getByRole('menuitemradio', { name: /No folder/ })).toHaveAttribute('aria-checked', 'true')
+         fireEvent.click(within(dialog).getByRole('menuitemradio', { name: /Blender/ }))
+-        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-loose', 'f-blender'))
++        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-loose', 'f-blender', 'codex'))
+         await waitFor(() => expect(api.getCodexFolders).toHaveBeenCalledTimes(2))
+         await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+     })
+@@ -151,7 +151,7 @@
+         fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /New folder/ }))
+         fireEvent.change(screen.getByLabelText('Folder name'), { target: { value: 'Outreach' } })
+         fireEvent.click(screen.getByRole('button', { name: 'Create and move' }))
+-        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-blender', 'f-new'))
++        await waitFor(() => expect(api.assignCodexFolder).toHaveBeenCalledWith('thread-blender', 'f-new', 'codex'))
+         expect(api.createCodexFolder).toHaveBeenCalledWith('Outreach', expect.stringMatching(/^[0-9a-f-]{36}$/))
+         await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+ 
+@@ -190,3 +190,26 @@
+         expect(groups.map(g => [g.folder?.name ?? null, g.sessions.map(s => s.id)])).toEqual([['Two', ['a']], [null, ['b']]])
+     })
+ })
++
++describe('folder collapsing and Claude membership', () => {
++    it('persists collapsed sections independently for Codex and Claude', async () => {
++        renderList({ api: folderApi() })
++        const toggle = await screen.findByRole('button', { name: 'Blender folder' })
++        expect(toggle).toHaveAttribute('aria-expanded', 'true')
++        fireEvent.click(toggle)
++        expect(screen.queryByRole('button', { name: /Liquid sim/ })).toBeNull()
++        expect(toggle).toHaveAttribute('aria-expanded', 'false')
++        cleanup(); renderList({ api: folderApi() })
++        expect(await screen.findByRole('button', { name: 'Blender folder' })).toHaveAttribute('aria-expanded', 'false')
++        fireEvent.click(screen.getByRole('button', { name: 'Blender folder' }))
++        expect(screen.getByRole('button', { name: /Liquid sim/ })).toBeInTheDocument()
++    })
++    it('uses HAPI IDs for Claude folders and offers folder creation on the Claude tab', async () => {
++        const api = folderApi({ getCodexFolders: vi.fn(async (_ids, provider) => provider === 'claude' ? { folders: folders.folders, assignments: { 'cl-a': { folderId: 'f-blender', source: 'hapi' as const } } } : folders) })
++        renderList({ api }); fireEvent.click(screen.getByRole('tab', { name: /Claude/ }))
++        expect(await screen.findByRole('button', { name: 'Blender folder' })).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: /Claude planning/ })).toBeInTheDocument()
++        expect(api.getCodexFolders).toHaveBeenCalledWith([], 'claude')
++        expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument()
++    })
++})
+--- a/web/src/components/ProviderHandoff.test.tsx
++++ b/web/src/components/ProviderHandoff.test.tsx
+@@ -0,0 +1,27 @@
++import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
++import { afterEach, describe, it, expect, vi } from 'vitest'
++import { I18nProvider } from '@/lib/i18n-context'
++import { ProviderHandoffDialog } from './ProviderHandoff'
++import type { ApiClient } from '@/api/client'
++
++afterEach(cleanup)
++describe('provider handoff review', () => {
++    for (const provider of ['codex', 'claude'] as const) it(`offers ${provider} transfer without sending a prompt`, async () => {
++        const destination = provider === 'codex' ? 'claude' : 'codex'
++        const createProviderHandoff = vi.fn(async () => ({ sessionId: 'new', sourceId: 'old', destination, context: 'Historical draft', title: 'New handoff', capturedAt: 1 }))
++        const api = { createProviderHandoff, sendMessage: vi.fn() } as unknown as ApiClient
++        render(<I18nProvider><ProviderHandoffDialog api={api} sessionId="old" provider={provider} onClose={() => {}} /></I18nProvider>)
++        expect(screen.getByText(/Nothing is sent automatically/)).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: `Create ${destination} handoff draft` }))
++        expect(await screen.findByRole('textbox', { name: 'Handoff context' })).toHaveValue('Historical draft')
++        expect(screen.getByRole('link', { name: `Open new ${destination} chat` })).toHaveAttribute('href', '/sessions/new')
++        expect(api.sendMessage).not.toHaveBeenCalled(); expect(createProviderHandoff).toHaveBeenCalledWith('old', destination, expect.any(String))
++    })
++    it('retries with the same idempotency key after uncertain delivery', async () => {
++        const fn = vi.fn().mockRejectedValue(new Error('Network unavailable'))
++        render(<I18nProvider><ProviderHandoffDialog api={{ createProviderHandoff: fn } as unknown as ApiClient} sessionId="source" provider="codex" onClose={() => {}} /></I18nProvider>)
++        fireEvent.click(screen.getByRole('button', { name: /Create claude/ })); await screen.findByRole('alert')
++        fireEvent.click(screen.getByRole('button', { name: /Create claude/ })); await waitFor(() => expect(fn).toHaveBeenCalledTimes(2))
++        expect(fn.mock.calls[0][2]).toBe(fn.mock.calls[1][2])
++    })
++})

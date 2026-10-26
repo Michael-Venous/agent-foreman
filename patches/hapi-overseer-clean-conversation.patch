@@ -1,0 +1,654 @@
+diff --git a/hub/src/sync/messageService.ts b/hub/src/sync/messageService.ts
+--- a/hub/src/sync/messageService.ts
++++ b/hub/src/sync/messageService.ts
+@@ -1,3 +1,4 @@
++import { supervisorOrigin } from '../coordinationOrigins'
+ import {
+     HAPI_SESSION_EXPORT_SCHEMA_VERSION,
+     SESSION_EXPORT_MAX_BYTES,
+@@ -881,6 +882,8 @@
+             payload.scheduledAt
+         )
+ 
++        const localId = payload.localId ?? randomUUID()
++        const coordination = supervisorOrigin(sessionId, localId, payload.text, this.store.sessions.getSession(sessionId)?.namespace ?? '')
+         const content = {
+             role: 'user',
+             content: {
+@@ -891,6 +894,7 @@
+             meta: {
+                 sentFrom,
+                 deliveryMode,
++                ...(coordination ? { coordination } : {}),
+                 ...(payload.source === 'peer' ? { source: 'peer' as const, ...(payload.sourceSessionId ? { sourceSessionId: payload.sourceSessionId } : {}) } : {})
+             }
+         }
+@@ -898,7 +902,9 @@
+         const inserted = this.store.addMessageForCurrentSession(
+             sessionId,
+             content,
+-            payload.localId ?? undefined,
++            // Legacy peer clients omit localId. Assign one before delivery so
++            // the native echo/receipt resolves to this same history row.
++            localId,
+             payload.scheduledAt ?? null
+         )
+         const actualSessionId = inserted.sessionId
+diff --git a/hub/src/sync/messageService.test.ts b/hub/src/sync/messageService.test.ts
+--- a/hub/src/sync/messageService.test.ts
++++ b/hub/src/sync/messageService.test.ts
+@@ -1838,3 +1838,18 @@
+         expect(stillQueued.find((m) => m.localId === 'local-future')?.invokedAt).toBeNull()
+     })
+ })
++
++describe('legacy sender canonical input identity', () => {
++    it('assigns an input ID before delivery so native echo/receipt reuse one row, without deduping separate identical messages', async () => {
++        const store = makeStore(), session = makeSession(store, 'legacy-peer'), publisher = makePublisher()
++        const service = new MessageService(store, makeIo(() => {}), publisher as any)
++        const result = await service.sendMessage(session.id, { text: 'Same public report' })
++        const stored = store.messages.getMessages(session.id, 100).find(m => m.id === result.messageId)!
++        expect(stored.localId).toBeTruthy(); expect(stored.invokedAt).toBeNull()
++        const echo = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'Same public report' }, meta: { sentFrom: 'cli' } }, stored.localId!)
++        store.messages.markMessagesInvoked(session.id, [stored.localId!], Date.now())
++        expect(echo.id).toBe(stored.id); expect(store.messages.getMessages(session.id, 100)).toHaveLength(1)
++        await service.sendMessage(session.id, { text: 'Same public report' })
++        expect(store.messages.getMessages(session.id, 100)).toHaveLength(2)
++    })
++})
+diff --git a/hub/src/web/routes/messages.ts b/hub/src/web/routes/messages.ts
+--- a/hub/src/web/routes/messages.ts
++++ b/hub/src/web/routes/messages.ts
+@@ -1,4 +1,5 @@
+ import { Hono } from 'hono'
++import { annotateReviewedOrigins, annotateSupervisorOrigins } from '../../coordinationOrigins'
+ import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema } from '@hapi/protocol'
+ import type { SyncEngine } from '../../sync/syncEngine'
+ import type { WebAppEnv } from '../middleware/auth'
+@@ -34,13 +35,14 @@
+         const until = parsed.data.untilAt !== undefined && parsed.data.untilSeq !== undefined
+             ? { at: parsed.data.untilAt, seq: parsed.data.untilSeq }
+             : null
+-        return c.json(engine.getMessagesPage(sessionId, {
++        const result = engine.getMessagesPage(sessionId, {
+             limit,
+             before,
+             after,
+             until,
+             epoch: parsed.data.epoch ?? null
+-        }))
++        })
++        return c.json({ ...result, messages: annotateReviewedOrigins(sessionId, annotateSupervisorOrigins(sessionId, result.messages, c.get('namespace')), c.get('namespace')) })
+     })
+ 
+     app.delete('/sessions/:id/messages/:messageId', async (c) => {
+diff --git a/hub/src/coordinationOrigins.ts b/hub/src/coordinationOrigins.ts
+new file mode 100644
+--- /dev/null
++++ b/hub/src/coordinationOrigins.ts
+@@ -0,0 +1,95 @@
++/** Read-only provenance overlay. Text/prefix similarity never identifies a sender. */
++import { Database } from 'bun:sqlite'
++import { readFileSync } from 'node:fs'
++import { createHash } from 'node:crypto'
++import { dirname, join } from 'node:path'
++import { isObject } from '@hapi/protocol'
++import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
++import type { DecryptedMessage } from '@hapi/protocol/types'
++
++export function supervisorOrigin(sessionId: string, localId: string, text: string, namespace: string,
++    databasePath = process.env.HAPI_MANAGED_SESSIONS_FILE
++        ? join(dirname(process.env.HAPI_MANAGED_SESSIONS_FILE), 'manager.sqlite') : undefined) {
++    if (namespace !== 'default' || !databasePath) return undefined
++    let db: Database | undefined
++    try {
++        db = new Database(databasePath, { readonly: true, create: false })
++        const row = db.query('SELECT id,text FROM outbox WHERE session=? AND id=?').get(sessionId, localId) as { id: string; text: string } | null
++        if (!row || row.text !== text) return undefined
++        let needsHumanInput = false
++        try {
++            const events = db.query('SELECT kind,detail FROM events WHERE wake_id=?').all(localId) as { kind: string; detail: string }[]
++            needsHumanInput = events.some(event => {
++                if (event.kind === 'input-required') return true
++                try { const detail = JSON.parse(event.detail); return Array.isArray(detail.pending_requests) && detail.pending_requests.length > 0 } catch { return false }
++            })
++        } catch { /* Older producer ledgers still prove origin. */ }
++        return { kind: 'supervisor' as const, deliveryId: localId, evidence: 'manager-outbox' as const, needsHumanInput }
++    } catch { return undefined }
++    finally { db?.close() }
++}
++
++export function annotateSupervisorOrigins(sessionId: string, messages: DecryptedMessage[], namespace: string,
++    databasePath = process.env.HAPI_MANAGED_SESSIONS_FILE
++        ? join(dirname(process.env.HAPI_MANAGED_SESSIONS_FILE), 'manager.sqlite') : undefined): DecryptedMessage[] {
++    if (namespace !== 'default' || !databasePath) return messages
++    const candidates = messages.filter(m => m.localId && unwrapRoleWrappedRecordEnvelope(m.content)?.role === 'user')
++    if (!candidates.length) return messages
++    let db: Database | undefined
++    try {
++        db = new Database(databasePath, { readonly: true, create: false })
++        const origins = new Set<string>()
++        for (let offset = 0; offset < candidates.length; offset += 200) {
++            const batch = candidates.slice(offset, offset + 200)
++            const rows = db.query(`SELECT id,text FROM outbox WHERE session=? AND id IN (${batch.map(() => '?').join(',')})`)
++                .all(sessionId, ...batch.map(m => m.localId!)) as { id: string; text: string }[]
++            for (const row of rows) {
++                const original = batch.find(m => m.localId === row.id)
++                const record = original && unwrapRoleWrappedRecordEnvelope(original.content)
++                // Exact durable delivery ID AND producer payload must agree.
++                if (record && isObject(record.content) && record.content.text === row.text) origins.add(row.id)
++            }
++        }
++        if (!origins.size) return messages
++        return messages.map(message => {
++            if (!message.localId || !origins.has(message.localId)) return message
++            const clone = structuredClone(message)
++            const record = unwrapRoleWrappedRecordEnvelope(clone.content)!
++            const origin = supervisorOrigin(sessionId, message.localId, isObject(record.content) ? String(record.content.text ?? '') : '', namespace, databasePath)
++            if (!origin) return message
++            record.meta = { ...(isObject(record.meta) ? record.meta : {}), coordination: origin }
++            return clone
++        })
++    } catch { return messages } // Missing provenance stays visible; never infer from text.
++    finally { db?.close() }
++}
++
++/** Explicit user-reviewed legacy display aliases, never inferred peer identity. */
++export function annotateReviewedOrigins(sessionId: string, messages: DecryptedMessage[], namespace: string,
++    reviewPath = process.env.HAPI_MANAGED_SESSIONS_FILE
++        ? join(dirname(process.env.HAPI_MANAGED_SESSIONS_FILE), 'coordination-display-review.json') : undefined): DecryptedMessage[] {
++    if (namespace !== 'default' || !reviewPath) return messages
++    try {
++        const review = JSON.parse(readFileSync(reviewPath, 'utf8'))
++        if (review.version !== 1 || review.session !== sessionId || review.evidence !== 'user-screenshot-review'
++            || typeof review.reviewId !== 'string' || !Array.isArray(review.groups) || review.groups.length > 100) return messages
++        return messages.map(message => {
++            const record = unwrapRoleWrappedRecordEnvelope(message.content)
++            if (record?.role !== 'user' || !isObject(record.content) || record.content.type !== 'text'
++                || typeof record.content.text !== 'string' || (Array.isArray(record.content.attachments) && record.content.attachments.length)) return message
++            const hash = createHash('sha256').update(record.content.text).digest('hex')
++            const group = review.groups.find((g: any) => typeof g.deliveryId === 'string' && typeof g.canonicalMessageId === 'string'
++                && Array.isArray(g.records) && g.records.length <= 10 && g.records.some((r: any) => r.id === g.canonicalMessageId)
++                && g.textHash === hash && g.records.some((r: any) => r.id === message.id && r.localId === message.localId
++                    && r.createdAt === message.createdAt && r.seq === message.seq))
++            if (!group) return message
++            const clone = structuredClone(message), output = unwrapRoleWrappedRecordEnvelope(clone.content)!
++            output.meta = { ...(isObject(output.meta) ? output.meta : {}), coordination: {
++                kind: 'reviewed', evidence: 'user-screenshot-review', reviewId: review.reviewId,
++                deliveryId: group.deliveryId, canonicalMessageId: group.canonicalMessageId,
++                recordIds: group.records.map((r: any) => r.id)
++            } }
++            return clone
++        })
++    } catch { return messages }
++}
+diff --git a/hub/src/coordinationOrigins.test.ts b/hub/src/coordinationOrigins.test.ts
+new file mode 100644
+--- /dev/null
++++ b/hub/src/coordinationOrigins.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'bun:test'
++import { Database } from 'bun:sqlite'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { annotateSupervisorOrigins, supervisorOrigin } from './coordinationOrigins'
++import type { DecryptedMessage } from '@hapi/protocol/types'
++
++describe('exact supervisor origin', () => {
++    it('requires exact durable session, delivery ID and payload; preserves original history', () => {
++        const folder = mkdtempSync(join(tmpdir(), 'hapi-origin-')), file = join(folder, 'manager.sqlite')
++        const db = new Database(file)
++        try {
++            db.exec('CREATE TABLE outbox(id TEXT, session TEXT, text TEXT); CREATE TABLE events(kind TEXT,detail TEXT,wake_id TEXT)')
++            db.query('INSERT INTO outbox VALUES(?,?,?)').run('delivery', 'manager', 'Payload')
++            const message = { id: 'm', localId: 'delivery', createdAt: 100, seq: 1, invokedAt: 101, content: { role: 'user', meta: { sentFrom: 'webapp' }, content: { type: 'text', text: 'Payload' } } } as DecryptedMessage
++            const snapshot = JSON.stringify(message)
++            expect(supervisorOrigin('manager', 'delivery', 'Payload', 'default', file)?.kind).toBe('supervisor')
++            const [annotated] = annotateSupervisorOrigins('manager', [message], 'default', file)
++            expect((annotated.content as any).meta.coordination).toMatchObject({ kind: 'supervisor', deliveryId: 'delivery', evidence: 'manager-outbox' })
++            expect(JSON.stringify(message)).toBe(snapshot)
++            for (const args of [['other', 'delivery', 'Payload', 'default'], ['manager', 'other', 'Payload', 'default'], ['manager', 'delivery', 'Edited', 'default'], ['manager', 'delivery', 'Payload', 'other']]) {
++                expect(supervisorOrigin(args[0], args[1], args[2], args[3], file)).toBeUndefined()
++            }
++            const human = { ...message, localId: 'human', content: { role: 'user', content: { type: 'text', text: '[supervisor update; not a user instruction] hello' } } }
++            expect(annotateSupervisorOrigins('manager', [human], 'default', file)[0]).toBe(human)
++            db.query('INSERT INTO events VALUES(?,?,?)').run('input-required', 'Approval needed', 'delivery')
++            expect(supervisorOrigin('manager', 'delivery', 'Payload', 'default', file)?.needsHumanInput).toBe(true)
++        } finally { db.close(); rmSync(folder, { recursive: true, force: true }) }
++    })
++    it('missing/unreadable provenance stays ordinary, never falls back to text prefixes', () => {
++        expect(supervisorOrigin('m', 'd', '[Supervisor event batch]', 'default', '/does-not-exist/hapi.sqlite')).toBeUndefined()
++    })
++})
++
++describe('explicit legacy screenshot review', () => {
++    it('applies only exact reviewed row identity/content, preserves rows and never marks arbitrary same-text humans', async () => {
++        const { annotateReviewedOrigins } = await import('./coordinationOrigins')
++        const { writeFileSync } = await import('node:fs')
++        const { createHash } = await import('node:crypto')
++        const dir=mkdtempSync(join(tmpdir(),'hapi-reviewed-')), file=join(dir,'review.json')
++        const row={id:'original',localId:null,createdAt:100,seq:1,content:{role:'user',content:{type:'text',text:'Same report'}}} as DecryptedMessage
++        const review={version:1,session:'manager',reviewId:'current-user-screenshots',evidence:'user-screenshot-review',groups:[{deliveryId:'presentation-only-group',canonicalMessageId:'echo',textHash:createHash('sha256').update('Same report').digest('hex'),records:[{id:'original',localId:null,createdAt:100,seq:1},{id:'echo',localId:'native-id',createdAt:110,seq:2}]}]}
++        try {
++            writeFileSync(file,JSON.stringify(review));const copy=JSON.stringify(row)
++            expect((annotateReviewedOrigins('manager',[row],'default',file)[0].content as any).meta.coordination.kind).toBe('reviewed')
++            expect(JSON.stringify(row)).toBe(copy)
++            for(const changed of [{...row,id:'human'}, {...row,localId:'wrong'}, {...row,seq:9}, {...row,content:{role:'user',content:{type:'text',text:'Edited'}}}]) {
++                expect(annotateReviewedOrigins('manager',[changed],'default',file)[0]).toBe(changed)
++            }
++            expect(annotateReviewedOrigins('other',[row],'default',file)[0]).toBe(row)
++            expect(annotateReviewedOrigins('manager',[row],'foreign',file)[0]).toBe(row)
++        } finally { rmSync(dir,{recursive:true,force:true}) }
++    })
++})
+diff --git a/web/src/chat/coordination.ts b/web/src/chat/coordination.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/chat/coordination.ts
+@@ -0,0 +1,57 @@
++import { isObject } from '@hapi/protocol'
++import type { ChatBlock, ToolCallBlock, UserTextBlock } from './types'
++import { isAskUserQuestionToolName } from '@/components/ToolCard/askUserQuestion'
++import { isRequestUserInputToolName } from '@/components/ToolCard/requestUserInput'
++
++export type CoordinationOrigin = { kind: 'peer' | 'supervisor' | 'reviewed'; deliveryId: string; sourceSessionId?: string; needsHumanInput?: boolean; recordIds?: string[]; canonicalMessageId?: string }
++
++export function coordinationOrigin(block: Pick<UserTextBlock, 'meta' | 'localId' | 'id'>): CoordinationOrigin | null {
++    const meta = isObject(block.meta) ? block.meta : {}
++    const review = isObject(meta.coordination) ? meta.coordination : {}
++    if (review.kind === 'reviewed' && review.evidence === 'user-screenshot-review' && typeof review.reviewId === 'string'
++        && typeof review.deliveryId === 'string' && typeof review.canonicalMessageId === 'string'
++        && Array.isArray(review.recordIds) && review.recordIds.every(id => typeof id === 'string') && review.recordIds.includes(block.id)) {
++        return { kind: 'reviewed', deliveryId: review.deliveryId, recordIds: review.recordIds as string[], canonicalMessageId: review.canonicalMessageId }
++    }
++    if (!block.localId?.trim()) return null
++    if (meta.source === 'peer' && typeof meta.sourceSessionId === 'string' && meta.sourceSessionId.trim()) {
++        return { kind: 'peer', sourceSessionId: meta.sourceSessionId, deliveryId: block.localId }
++    }
++    const proof = isObject(meta.coordination) ? meta.coordination : {}
++    if (proof.kind === 'supervisor' && proof.evidence === 'manager-outbox' && proof.deliveryId === block.localId) {
++        return { kind: 'supervisor', deliveryId: block.localId, needsHumanInput: proof.needsHumanInput === true }
++    }
++    return null
++}
++
++function needsHumanAttention(block: ToolCallBlock): boolean {
++    return block.tool.permission?.status === 'pending' || block.tool.state === 'error'
++        || isAskUserQuestionToolName(block.tool.name) || isRequestUserInputToolName(block.tool.name)
++        || block.children.some(child => (child.kind === 'tool-call' && needsHumanAttention(child)) || (child.kind === 'user-text' && !coordinationOrigin(child)))
++}
++
++/** A presentation projection only. Original blocks/history/input delivery stay untouched. */
++export function partitionOverseerConversation(blocks: readonly ChatBlock[], enabled: boolean, showAll = false) {
++    const background: ChatBlock[] = [], conversation: ChatBlock[] = [], runtime: ChatBlock[] = []
++    const delivered = new Map<string, UserTextBlock>()
++    for (const block of blocks) {
++        const origin = block.kind === 'user-text' ? coordinationOrigin(block) : null
++        if (enabled && origin && block.kind === 'user-text') {
++            if (origin.kind === 'reviewed' && block.id !== origin.canonicalMessageId
++                && blocks.some(b => b.id === origin.canonicalMessageId && b.kind === 'user-text' && coordinationOrigin(b)?.deliveryId === origin.deliveryId)) continue
++            const key = JSON.stringify([origin.kind, origin.sourceSessionId, origin.deliveryId])
++            const prior = delivered.get(key)
++            // Same authenticated delivery identity, never merely identical text.
++            // Attachments/edits with conflicting content remain inspectable.
++            if (prior && prior.text === block.text && JSON.stringify(prior.attachments) === JSON.stringify(block.attachments)) continue
++            delivered.set(key, block)
++        }
++        const technical = Boolean(origin && !origin.needsHumanInput && (block.kind !== 'user-text' || block.status !== 'failed')) || (block.kind === 'tool-call' && !needsHumanAttention(block))
++        if (enabled && technical) background.push(block)
++        if (!enabled || !technical || showAll) conversation.push(block)
++        // Keep all input boundaries in assistant-ui even when their DOM is hidden.
++        // Otherwise separate native turns join and Fork can target the wrong input.
++        if (!enabled || !technical || showAll || block.kind === 'user-text') runtime.push(block)
++    }
++    return { conversation, background, runtime }
++}
+diff --git a/web/src/chat/coordination.test.ts b/web/src/chat/coordination.test.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/chat/coordination.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from 'vitest'
++import type { ChatBlock, ToolCallBlock, UserTextBlock } from './types'
++import { coordinationOrigin, partitionOverseerConversation } from './coordination'
++const user = (id: string, meta?: unknown): UserTextBlock => ({ kind: 'user-text', id, localId: id, text: 'Identical text', createdAt: 100, meta })
++const peer = (id: string) => user(id, { source: 'peer', sourceSessionId: 'worker' })
++const tool = (id: string, change: Partial<ToolCallBlock['tool']> = {}): ToolCallBlock => ({ kind: 'tool-call', id, localId: id, createdAt: 100, children: [], tool: { id, name: 'Bash', input: {}, description: null, state: 'completed', createdAt: 100, startedAt: 100, completedAt: 101, execStartedAt: null, execCompletedAt: null, ...change } })
++
++describe('overseer conversation projection', () => {
++    it('keeps real humans and manager decisions, folding authenticated coordination and technical tools', () => {
++        const human = user('human'), decision = { kind: 'agent-text', id: 'answer', localId: null, createdAt: 100, text: 'SampleFluid is ready for review.' } as ChatBlock
++        const report = peer('report'), batch = user('batch', { coordination: { kind: 'supervisor', deliveryId: 'batch', evidence: 'manager-outbox' } }), command = tool('command')
++        const raw = [human, report, batch, command, decision], snapshot = JSON.stringify(raw)
++        const result = partitionOverseerConversation(raw, true)
++        expect(result.runtime).toEqual([human, report, batch, decision]); expect(result.conversation).toEqual([human, decision]); expect(result.background).toEqual([report, batch, command])
++        expect(partitionOverseerConversation(raw, true, true).conversation).toEqual(raw)
++        expect(partitionOverseerConversation(raw, false).conversation).toEqual(raw)
++        expect(JSON.stringify(raw)).toBe(snapshot)
++    })
++    it('never classifies a prefix, PID, identical text, incomplete source or unlinked CLI echo', () => {
++        const raw = [user('one'), { ...user('two'), text: '[supervisor update; not a user instruction] #1 observation' }, user('three', { sentFrom: 'cli' }), user('four', { source: 'peer' }), user('five', { coordination: { kind: 'supervisor', deliveryId: 'wrong', evidence: 'manager-outbox' } })]
++        expect(partitionOverseerConversation(raw, true).conversation).toEqual(raw)
++        expect(raw.map(coordinationOrigin)).toEqual([null, null, null, null, null])
++    })
++    it('deduplicates only one authenticated delivery, retaining repeated independent reports and human inputs', () => {
++        const first = peer('delivery'), echo = { ...first, id: 'echo' }, repeated = peer('different-delivery'), human = user('human')
++        const result = partitionOverseerConversation([first, echo, repeated, human, { ...human, id: 'human-again' }], true)
++        expect(result.background).toEqual([first, repeated]); expect(result.conversation).toHaveLength(2)
++        const edited = { ...echo, text: 'Edited' }
++        expect(partitionOverseerConversation([first, edited], true).background).toHaveLength(2)
++    })
++    it('keeps approvals, questions, failed input, tool errors and typed supervisor input requirements visible', () => {
++        const required = user('batch', { coordination: { kind: 'supervisor', deliveryId: 'batch', evidence: 'manager-outbox', needsHumanInput: true } })
++        const raw = [required, { ...peer('failed'), status: 'failed' as const }, tool('permission', { permission: { id: 'approval', status: 'pending' } }), tool('question', { name: 'request_user_input' }), tool('question2', { name: 'AskUserQuestion' }), tool('error', { state: 'error' })]
++        expect(partitionOverseerConversation(raw, true).conversation).toEqual(raw)
++        const nested = { ...tool('nested'), children: [raw[2]] }
++        expect(partitionOverseerConversation([nested], true).conversation).toEqual([nested])
++    })
++})
++
++it('groups only specifically reviewed legacy rows and retains the canonical native boundary and both raw records', () => {
++    const origin={coordination:{kind:'reviewed',evidence:'user-screenshot-review',reviewId:'user-screenshots',deliveryId:'review-group',canonicalMessageId:'echo',recordIds:['original','echo']}}
++    const original={...user('original',origin),localId:null},echo={...user('echo',origin),localId:'native-input'},human=user('human')
++    const raw=[original,echo,human],snapshot=JSON.stringify(raw)
++    const result=partitionOverseerConversation(raw,true)
++    expect(result.background).toEqual([echo]);expect(result.runtime).toEqual([echo,human]);expect(result.conversation).toEqual([human])
++    expect(partitionOverseerConversation([original,human],true).background).toEqual([original])
++    expect(JSON.stringify(raw)).toBe(snapshot)
++})
+diff --git a/web/src/components/OverseerActivity.tsx b/web/src/components/OverseerActivity.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/OverseerActivity.tsx
+@@ -0,0 +1,36 @@
++import { useState } from 'react'
++import type { ChatBlock } from '@/chat/types'
++import { coordinationOrigin } from '@/chat/coordination'
++import { ToolCard } from '@/components/ToolCard/ToolCard'
++import { useHappyChatContext } from '@/components/AssistantChat/context'
++import { MarkdownRenderer } from '@/components/MarkdownRenderer'
++
++export function OverseerActivity(props: { blocks: readonly ChatBlock[]; showAll: boolean; onToggleAll: () => void }) {
++    const [open, setOpen] = useState(false)
++    const ctx = useHappyChatContext()
++    const running = props.blocks.filter(b => b.kind === 'tool-call' && (b.tool.state === 'running' || b.tool.state === 'pending')).length
++    return <section aria-label="Background coordination" data-hapi-share-exclude="true" className="mx-auto w-full max-w-content shrink-0 min-w-0 border-b border-[var(--app-border)] px-3 text-xs text-[var(--app-hint)]">
++        <div className="flex min-h-8 items-center gap-2">
++            <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="flex min-w-0 flex-1 items-center gap-1.5 py-1.5 text-left hover:text-[var(--app-fg)]">
++                <span aria-hidden="true">{open ? '⌄' : '›'}</span><span className="truncate">Background activity · {props.blocks.length}{running ? ` · ${running} running` : ''}</span>
++            </button>
++            <button type="button" onClick={props.onToggleAll} className="shrink-0 rounded px-1.5 py-1.5 hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]">{props.showAll ? 'Clean view' : 'Show in chat'}</button>
++        </div>
++        {open ? <div className="max-h-[45dvh] overflow-auto overscroll-contain space-y-2 pb-2" data-hapi-nested-scroll="true">
++            {props.blocks.map(block => {
++                if (block.kind === 'tool-call') return <ToolCard key={block.id} api={ctx.api} sessionId={ctx.sessionId} metadata={ctx.metadata} disabled={ctx.disabled}
++                    terminalToolDisplayMode={ctx.terminalToolDisplayMode} onDone={ctx.onRefresh} block={block} />
++                if (block.kind !== 'user-text') return null
++                const origin = coordinationOrigin(block)
++                return <details key={block.id} className="rounded border border-[var(--app-border)] px-2 py-1.5">
++                    <summary className="cursor-pointer text-[var(--app-hint)]">{origin?.kind === 'supervisor' ? 'Supervisor events' : origin?.kind === 'reviewed' ? 'Reviewed report' : 'Worker report'}
++                        <time className="ml-2 tabular-nums" dateTime={new Date(block.createdAt).toISOString()}>{new Date(block.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
++                    </summary>
++                    {origin?.kind === 'reviewed' ? <div className="mt-1 text-[11px]">Reviewed from your screenshots · {origin.recordIds?.length} stored records</div> : null}
++                    {origin?.sourceSessionId ? <a className="mt-1 inline-block text-[var(--app-link)]" href={`/sessions/${encodeURIComponent(origin.sourceSessionId)}`}>Open source chat</a> : null}
++                    <div className="mt-1 break-words text-[var(--app-fg)]"><MarkdownRenderer content={block.text} /></div>
++                </details>
++            })}
++        </div> : null}
++    </section>
++}
+diff --git a/web/src/components/OverseerActivity.test.tsx b/web/src/components/OverseerActivity.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/OverseerActivity.test.tsx
+@@ -0,0 +1,23 @@
++import { describe, expect, it, vi } from 'vitest'
++import { fireEvent, render, screen } from '@testing-library/react'
++import type { UserTextBlock } from '@/chat/types'
++vi.mock('@/components/AssistantChat/context', () => ({ useHappyChatContext: () => ({ sessionId: 'manager', metadata: null, api: {}, disabled: false, onRefresh: vi.fn() }) }))
++vi.mock('@/components/ToolCard/ToolCard', () => ({ ToolCard: () => <div>Tool details</div> }))
++vi.mock('@/components/MarkdownRenderer', () => ({ MarkdownRenderer: ({ content }: { content: string }) => <div>{content}</div> }))
++import { OverseerActivity } from './OverseerActivity'
++const peer: UserTextBlock = { kind: 'user-text', id: 'report', localId: 'delivery', createdAt: 100, text: 'Detailed PID/cache report', meta: { source: 'peer', sourceSessionId: 'source-session' } }
++it('starts compact, exposes raw report/source only on demand and keeps user expansion through updates', () => {
++    const toggle = vi.fn()
++    const { rerender } = render(<OverseerActivity blocks={[peer]} showAll={false} onToggleAll={toggle} />)
++    expect(screen.queryByText(peer.text)).not.toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: /Background activity/ }))
++    expect(screen.getByText(peer.text)).not.toBeVisible()
++    fireEvent.click(screen.getByText('Worker report'))
++    expect(screen.getByText(peer.text)).toBeInTheDocument()
++    expect(screen.getByRole('link', { name: 'Open source chat' })).toHaveAttribute('href', '/sessions/source-session')
++    rerender(<OverseerActivity blocks={[{ ...peer, invokedAt: 110 }]} showAll={false} onToggleAll={toggle} />)
++    expect(screen.getByText(peer.text)).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Show in chat' })); expect(toggle).toHaveBeenCalledOnce()
++    rerender(<OverseerActivity blocks={[peer]} showAll onToggleAll={toggle} />)
++    expect(screen.getByRole('button', { name: 'Clean view' })).toBeInTheDocument()
++})
+diff --git a/web/src/components/AssistantChat/HappyThread.tsx b/web/src/components/AssistantChat/HappyThread.tsx
+--- a/web/src/components/AssistantChat/HappyThread.tsx
++++ b/web/src/components/AssistantChat/HappyThread.tsx
+@@ -1,3 +1,5 @@
++import { OverseerActivity } from '@/components/OverseerActivity'
++import type { ChatBlock } from '@/chat/types'
+ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+ import { ThreadPrimitive, unstable_useThreadMessageIds, useAuiState } from '@assistant-ui/react'
+ import type { ComponentProps } from 'react'
+@@ -530,6 +532,10 @@
+ }
+ 
+ export function HappyThread(props: {
++    hideCoordination?: boolean
++    overseerActivity?: readonly ChatBlock[]
++    showAllActivity?: boolean
++    onToggleAllActivity?: () => void
+     api: ApiClient
+     session: Session
+     serviceTier?: string | null
+@@ -1703,6 +1709,7 @@
+ 
+     return (
+         <HappyChatProvider value={{
++            hideCoordination: props.hideCoordination,
+             api: props.api,
+             sessionId: props.sessionId,
+             metadata: props.metadata,
+@@ -1728,6 +1735,7 @@
+             loadOlderMessagesPreservingScroll: loadOlderFromConsumer
+         }}>
+             <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col relative">
++                {props.overseerActivity && props.onToggleAllActivity ? <OverseerActivity blocks={props.overseerActivity} showAll={Boolean(props.showAllActivity)} onToggleAll={props.onToggleAllActivity} /> : null}
+                 {!props.isSyncingTail && (
+                     props.isLoadingMoreMessages || pullToLoadState !== 'idle'
+                 ) ? (
+diff --git a/web/src/components/AssistantChat/messages/UserMessage.tsx b/web/src/components/AssistantChat/messages/UserMessage.tsx
+--- a/web/src/components/AssistantChat/messages/UserMessage.tsx
++++ b/web/src/components/AssistantChat/messages/UserMessage.tsx
+@@ -11,10 +11,10 @@
+ import { useState } from 'react'
+ import { parseSupervisorBatch, type SupervisorBatch } from '@/components/AssistantChat/messages/supervisorBatch'
+ 
+-function SupervisorBatchMessage(props: { batch: SupervisorBatch; text: string; elementId: string }) {
+-    const [open, setOpen] = useState(false)
++function SupervisorBatchMessage(props: { batch: SupervisorBatch; text: string; elementId: string; label?: string; initiallyOpen?: boolean }) {
++    const [open, setOpen] = useState(Boolean(props.initiallyOpen))
+     const { count, kinds } = props.batch
+-    const summary = `Supervisor update${count === null ? '' : ` · ${count} event${count === 1 ? '' : 's'}`}${kinds.length ? ` · ${kinds.slice(0, 3).join(', ')}${kinds.length > 3 ? '…' : ''}` : ''}`
++    const summary = props.label ?? `Supervisor update${count === null ? '' : ` · ${count} event${count === 1 ? '' : 's'}`}${kinds.length ? ` · ${kinds.slice(0, 3).join(', ')}${kinds.length > 3 ? '…' : ''}` : ''}`
+     return (
+         <MessagePrimitive.Root id={props.elementId} data-hapi-message-role="user" data-supervisor-batch className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full">
+             <button
+@@ -67,6 +67,7 @@
+     const steered = useAuiState(({ message }) => (
+         message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+     )?.steered === true)
++    const coordination = useAuiState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.coordination)
+     const cliText = useAuiState((s) => {
+         const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+         if (custom?.kind !== 'cli-output') return ''
+@@ -99,8 +100,14 @@
+         )
+     }
+ 
+-    const supervisorBatch = parseSupervisorBatch(text)
++    if (ctx.hideCoordination && coordination && !coordination.needsHumanInput && status !== 'failed') return null
++
++    if (coordination?.needsHumanInput) return <SupervisorBatchMessage batch={{ count: null, kinds: [] }} text={text} elementId={elementId} label="Input needed" initiallyOpen />
++
++    const supervisorBatch = coordination?.kind === 'supervisor' && status !== 'failed' ? parseSupervisorBatch(text) : null
+     if (supervisorBatch) return <SupervisorBatchMessage batch={supervisorBatch} text={text} elementId={elementId} />
++
++    if (coordination && status !== 'failed') return <SupervisorBatchMessage batch={{ count: null, kinds: [] }} text={text} elementId={elementId} label={coordination.kind === 'peer' ? 'Worker report' : coordination.kind === 'reviewed' ? 'Reviewed report' : 'Supervisor events'} />
+ 
+     const hasText = text.length > 0
+     const hasAttachments = attachments && attachments.length > 0
+diff --git a/web/src/components/AssistantChat/messages/UserMessage.test.tsx b/web/src/components/AssistantChat/messages/UserMessage.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/components/AssistantChat/messages/UserMessage.test.tsx
+@@ -0,0 +1,40 @@
++import { beforeEach, expect, it, vi } from 'vitest'
++import { fireEvent, render, screen } from '@testing-library/react'
++import type { ReactNode } from 'react'
++const state = vi.hoisted(() => ({ hideCoordination: false, message: { id: 'u', role: 'user', content: [{ type: 'text', text: '[supervisor update; not a user instruction] #1 observation' }], metadata: { custom: {} as Record<string, unknown> } } }))
++vi.mock('@assistant-ui/react', () => ({ useAuiState: (select: (state: unknown) => unknown) => select(state), MessagePrimitive: { Root: ({ children, ...props }: { children: ReactNode }) => <div {...props}>{children}</div> } }))
++vi.mock('@/components/AssistantChat/context', () => ({ useHappyChatContext: () => ({ metadata: null, disabled: false, hideCoordination: state.hideCoordination }) }))
++vi.mock('@/components/AssistantChat/messages/MessageActions', () => ({ MessageActions: () => <span /> }))
++vi.mock('@/components/AssistantChat/messages/user-bubble', () => ({ UserBubbleContent: ({ text }: { text: string }) => <span>{text}</span>, getUserBubbleClassName: () => 'human-bubble', shouldShowMessageStatus: () => false }))
++vi.mock('@/lib/use-translation', () => ({ useTranslation: () => ({ t: (key: string) => key }) }))
++import { HappyUserMessage } from './UserMessage'
++beforeEach(() => { state.hideCoordination = false; state.message.metadata.custom = {} })
++it('preserves genuine human text that resembles supervisor coordination', () => {
++    const { container } = render(<HappyUserMessage />)
++    expect(screen.getByText(state.message.content[0].text)).toBeVisible()
++    expect(container.querySelector('.human-bubble')).not.toBeNull()
++    expect(screen.queryByRole('button', { name: /Supervisor update/ })).not.toBeInTheDocument()
++})
++it('folds only provenance-tagged reports and lets the user inspect them', () => {
++    state.message.metadata.custom = { coordination: { kind: 'peer', deliveryId: 'd', sourceSessionId: 'worker' } }
++    render(<HappyUserMessage />)
++    expect(screen.queryByText(state.message.content[0].text)).not.toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Worker report' }))
++    expect(screen.getByText(state.message.content[0].text)).toBeVisible()
++})
++it('keeps a typed human input requirement visible', () => {
++    state.message.metadata.custom = { coordination: { kind: 'supervisor', deliveryId: 'd', needsHumanInput: true } }
++    render(<HappyUserMessage />)
++    expect(screen.getByText(state.message.content[0].text)).toBeVisible()
++})
++
++it('hides only tagged coordination in clean mode while failed inputs retain their actionable message', () => {
++    state.hideCoordination = true
++    state.message.metadata.custom = { coordination: { kind: 'peer', deliveryId: 'd', sourceSessionId: 'worker' } }
++    const { container, rerender } = render(<HappyUserMessage />)
++    expect(container).toBeEmptyDOMElement()
++    state.message.metadata.custom.status = 'failed'
++    rerender(<HappyUserMessage />)
++    expect(screen.getByText(state.message.content[0].text)).toBeVisible()
++    expect(container.querySelector('.human-bubble')).not.toBeNull()
++})
+diff --git a/web/src/lib/assistant-runtime.ts b/web/src/lib/assistant-runtime.ts
+--- a/web/src/lib/assistant-runtime.ts
++++ b/web/src/lib/assistant-runtime.ts
+@@ -1,3 +1,4 @@
++import { coordinationOrigin, type CoordinationOrigin } from '@/chat/coordination'
+ import { useCallback, useMemo, useRef } from 'react'
+ import type React from 'react'
+ import type { AppendMessage, AttachmentAdapter, ThreadMessageLike } from '@assistant-ui/react'
+@@ -33,6 +34,7 @@
+ 
+ export type HappyChatMessageMetadata = {
+     kind: 'user' | 'assistant' | 'tool' | 'event' | 'cli-output' | 'codex-review' | 'compact-summary'
++    coordination?: CoordinationOrigin
+     status?: HappyMessageStatus
+     localId?: string | null
+     originalText?: string
+@@ -530,6 +532,7 @@
+             metadata: {
+                 custom: {
+                     kind: 'user',
++                    coordination: coordinationOrigin(block) ?? undefined,
+                     status: block.status,
+                     localId: block.localId,
+                     originalText: block.originalText,
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1,3 +1,4 @@
++import { coordinationOrigin, partitionOverseerConversation } from '@/chat/coordination'
+ import { SessionFailureBanner } from '@/components/SessionFailureBanner'
+ import { openUtilityPanel } from '@/lib/utilityPanels'
+ import { editHistoryPrompt } from '@/lib/history-prompt'
+@@ -1478,13 +1479,18 @@
+         blocksByIdRef.current = reconciled.byId
+     }, [reconciled.byId])
+ 
++    const managedSessions = useManagedSessions(props.api)
++    const [showAllActivity, setShowAllActivity] = useState(false)
++    const cleanOverseer = managedSessions[props.session.id]?.role === 'manager'
++    const overseerView = useMemo(() => partitionOverseerConversation(reconciled.blocks, cleanOverseer, showAllActivity), [reconciled.blocks, cleanOverseer, showAllActivity])
++
+     const visibleBlocks = useMemo(
+-        () => buildVisibleChatBlocks(reconciled.blocks, {
++        () => buildVisibleChatBlocks(overseerView.runtime, {
+             hasMoreMessages: props.hasMoreMessages,
+             previousGroups: visibleGroupsRef.current,
+             codexExplorationCollapsed
+         }),
+-        [reconciled.blocks, props.hasMoreMessages, codexExplorationCollapsed]
++        [overseerView.runtime, props.hasMoreMessages, codexExplorationCollapsed]
+     )
+ 
+     // Fork-current must compare against assistant-ui message ids (`kind:id`),
+@@ -1536,11 +1542,16 @@
+     // "N new messages" counts rendered blocks, not raw messages: a subagent run
+     // is dozens of sidechain messages but a single Task card, and a tool_use +
+     // tool_result pair is one card.
+-    const unseenCount = useUnseenBlockCount(props.viewMode, visibleBlocks)
++    const readableBlocks = useMemo(() => cleanOverseer && !showAllActivity ? visibleBlocks.filter(block => {
++        if (block.kind !== 'user-text' || block.status === 'failed') return true
++        const origin = coordinationOrigin(block)
++        return !origin || origin.needsHumanInput
++    }) : visibleBlocks, [visibleBlocks, cleanOverseer, showAllActivity])
++    const unseenCount = useUnseenBlockCount(props.viewMode, readableBlocks)
+ 
+     const outlineItems = useMemo(
+-        () => buildConversationOutline(reconciled.blocks),
+-        [reconciled.blocks]
++        () => buildConversationOutline(overseerView.conversation),
++        [overseerView.conversation]
+     )
+ 
+     // Permission mode change handler
+@@ -1927,7 +1938,7 @@
+         } finally { setHistoryActionPending(false) }
+     }, [historyActionPending, props.api, props.session, props.onRefresh, hasRunningChildAgent, runtime, navigate])
+ 
+-    const managedSessions = useManagedSessions(props.api)
++
+     return (
+         <div className="flex h-full min-h-0 flex-col">
+             <div className="shrink-0">
+@@ -2040,6 +2051,10 @@
+                         messagesVersion={props.messagesVersion}
+                         historyVersion={props.historyVersion}
+                         forceScrollToken={forceScrollToken}
++                        hideCoordination={cleanOverseer && !showAllActivity}
++                        overseerActivity={cleanOverseer ? overseerView.background : undefined}
++                        showAllActivity={showAllActivity}
++                        onToggleAllActivity={() => setShowAllActivity(value => !value)}
+                         outlineOpen={outlineOpen}
+                         outlineItems={outlineItems}
+                         onOutlineOpenChange={setOutlineOpen}
+diff --git a/web/src/components/AssistantChat/context.tsx b/web/src/components/AssistantChat/context.tsx
+--- a/web/src/components/AssistantChat/context.tsx
++++ b/web/src/components/AssistantChat/context.tsx
+@@ -7,6 +7,7 @@
+ export type OlderHistoryLoadResult = 'loaded' | 'transient-stop' | 'terminal-stop'
+ 
+ export type HappyChatContextValue = {
++    hideCoordination?: boolean
+     api: ApiClient
+     sessionId: string
+     metadata: SessionMetadataSummary | null

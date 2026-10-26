@@ -1,0 +1,77 @@
+--- a/web/src/components/NewSession/index.tsx
++++ b/web/src/components/NewSession/index.tsx
+@@ -101,10 +101,10 @@
+     const { getRecentPaths, addRecentPath, getLastUsedMachineId, setLastUsedMachineId } = useRecentPaths()
+ 
+     const [machineId, setMachineId] = useState<string | null>(props.initialMachineId ?? null)
+-    const [directory, setDirectory] = useState(props.initialDirectory ?? '')
++    const [directory, setDirectory] = useState(props.initialDirectory ?? '/home/user')
+     const [suppressSuggestions, setSuppressSuggestions] = useState(false)
+     const [isDirectoryFocused, setIsDirectoryFocused] = useState(false)
+-    const [agent, setAgent] = useState<AgentType>(loadPreferredAgent)
++    const [agent, setAgent] = useState<AgentType>(() => props.initialDirectory === undefined ? 'claude' : loadPreferredAgent())
+     // Snapshot taken once at mount, before any savePreferredAgent() call this
+     // component makes can overwrite the stored agent. savePreferredAgent()
+     // runs on every agent change (below), so reading loadPreferredAgent()
+@@ -271,15 +271,13 @@
+         if (props.machines.length === 0) return
+         if (machineId && props.machines.find((m) => m.id === machineId)) return
+ 
+-        const lastUsed = getLastUsedMachineId()
++        const preferredMachine = props.machines.find((m) => m.metadata?.host === 'example-host')
++        const lastUsed = preferredMachine?.id ?? getLastUsedMachineId()
+         const foundLast = lastUsed ? props.machines.find((m) => m.id === lastUsed) : null
+ 
+         if (foundLast) {
+             setMachineId(foundLast.id)
+-            if (!props.initialDirectory) {
+-                const paths = getRecentPaths(foundLast.id)
+-                if (paths[0]) setDirectory(paths[0])
+-            }
++            // Keep the requested home directory unless explicitly choosing a folder.
+         } else if (props.machines[0]) {
+             setMachineId(props.machines[0].id)
+         }
+@@ -867,11 +865,13 @@
+ 
+         const preferred = resolvePreferredLaunchSettings(
+             agent,
+-            loadPreferredLaunchSettings(machineId, agent),
++            agent === 'claude' && props.initialDirectory === undefined
++                ? { model: 'claude-opus-5-5', cursorSelectedBase: 'auto', effort: 'low', modelReasoningEffort: 'default', permissionMode: 'bypassPermissions' }
++                : loadPreferredLaunchSettings(machineId, agent),
+             legacyYoloAgent === agent
+         )
+ 
+-        setModel(agent === 'opencode' ? 'auto' : preferred.model)
++        setModel(agent === 'claude' && props.initialDirectory === undefined ? 'claude-opus-5-5' : agent === 'opencode' ? 'auto' : preferred.model)
+         setCursorSelectedBase(preferred.cursorSelectedBase)
+         setEffort(preferred.effort)
+         setModelReasoningEffort(preferred.modelReasoningEffort)
+@@ -885,7 +885,7 @@
+         setAgySelectedModel(
+             agent === 'agy' && preferred.model !== 'auto' ? preferred.model : null
+         )
+-    }, [agent, legacyYoloAgent, machineId, usesSharedPermissionMode])
++    }, [agent, legacyYoloAgent, machineId, usesSharedPermissionMode, props.initialDirectory])
+ 
+     useEffect(() => {
+         if (
+--- a/web/src/components/NewSession/index.test.tsx
++++ b/web/src/components/NewSession/index.test.tsx
+@@ -319,6 +319,15 @@
+         savePreferredAgent('codex')
+     })
+ 
++    it('uses the requested defaults for a fresh New Session despite previous preferences', async () => {
++        savePreferredAgent('codex')
++        render(<NewSession api={api} machines={[machine]} onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions'))
++        expect(screen.getByDisplayValue('claude')).toBeChecked()
++        expect(screen.getByTestId('model')).toHaveTextContent('claude-opus-5-5')
++        expect(screen.getByTestId('launch-effort')).toHaveTextContent('low')
++    })
++
+     it('hides unavailable Agents and falls back to the first available Agent', async () => {
+         savePreferredAgent('claude')
+         mocks.availableAgents.splice(

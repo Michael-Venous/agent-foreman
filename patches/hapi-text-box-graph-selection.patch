@@ -1,0 +1,254 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -46,7 +46,7 @@
+ 
+ type SelectionRect = { x: number; y: number; width: number; height: number }
+ type Gesture =
+-    | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; beforeDots: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
++    | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; beforeDots: string[]; beforeTexts: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
+     | { kind: 'junction-move'; editLabel?: boolean; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'annotation'; editLabel?: boolean; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'pan'; previewNode?: string; tapStartedAt?: number; moved?: boolean; pointer: number; x: number; y: number; view: View }
+@@ -107,6 +107,7 @@
+     const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null
+     const setSelectedNode = (id: string | null) => setSelectedNodes(id ? [id] : [])
+     const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null)
++    const [selectedTexts, setSelectedTexts] = useState<string[]>([])
+     const [selectedJunctions, setSelectedJunctions] = useState<string[]>([])
+     const setSelectedJunction = (id: string | null) => setSelectedJunctions(id ? [id] : [])
+     const boxSelection = useRef(false)
+@@ -145,7 +146,7 @@
+     const cancelSelectionGesture = () => {
+         lastCanvasTap.current = null
+         const current = gesture.current
+-        if (current?.kind === 'box') { setSelectedNodes(current.before); setSelectedJunctions(current.beforeDots); setSelectionRect(null); setAddMenu(null) }
++        if (current?.kind === 'box') { setSelectedNodes(current.before); setSelectedJunctions(current.beforeDots); setSelectedTexts(current.beforeTexts); setSelectionRect(null); setAddMenu(null) }
+         else if (current?.kind === 'node') {
+             setAnnotationDrafts({}); setJunctionDrafts({})
+             setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in current.origins))))
+@@ -226,7 +227,7 @@
+     useLayoutEffect(() => {
+         if (!graph || !layout || !visible || fittedWorkspace.current === graph.graph.workspaceId) return
+         fittedWorkspace.current = graph.graph.workspaceId; skipViewWrite.current = true
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; lastCanvasTap.current = null; setLink(null)
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setSelectedTexts([]); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; lastCanvasTap.current = null; setLink(null)
+         let saved: View | null = null
+         try { const value = JSON.parse(readChatWindowPreference('node-view:' + graph.graph.workspaceId) ?? 'null'); if (value && [value.x, value.y, value.k].every(Number.isFinite) && value.k > 0 && value.k <= 2.5) saved = value } catch { /* First view fits. */ }
+         if (saved) setView(saved); else fit()
+@@ -340,13 +341,14 @@
+     }
+     const armTouchSelection = (pointer: number, at: GraphPoint, before: string[]) => {
+         gesture.current = { kind: 'box', pointer, x: at.x, y: at.y,
+-            origin: toGraph(at.x, at.y), before, beforeDots: selectedJunctions, mode: 'replace', moved: false }
++            origin: toGraph(at.x, at.y), before, beforeDots: selectedJunctions, beforeTexts: selectedTexts, mode: 'replace', moved: false }
+         showAddMenu(at.x, at.y)
+     }
+     const movedSelection = (g: Extract<Gesture, { kind: 'node' }>, moved: NodeLayoutPositions): NodeVisualState => {
+-        const real = Object.fromEntries(Object.entries(moved).filter(([id]) => !id.startsWith('junction:')))
++        const real = Object.fromEntries(Object.entries(moved).filter(([id]) => !id.startsWith('junction:') && !id.startsWith('text:')))
++        const frames = g.frames.map(a => a.kind === 'text' && moved['text:' + a.id] ? { ...a, ...moved['text:' + a.id] } : a)
+         const routing = g.routing ? { ...g.routing, junctions: g.routing.junctions.map(j => ({ ...j, ...moved['junction:' + j.id] })) } : undefined
+-        return { positions: real, annotations: placeSelectionInFrames(g.frames, Object.keys(moved), framePoints({ ...g.positions, ...real }, g.frames, routing?.junctions ?? junctionsRef.current)), ...(routing ? { routing } : {}) }
++        return { positions: real, annotations: placeSelectionInFrames(frames, Object.keys(moved), framePoints({ ...g.positions, ...real }, frames, routing?.junctions ?? junctionsRef.current)), ...(routing ? { routing } : {}) }
+     }
+     const pinchStart = () => {
+         cancelTouchMenu()
+@@ -354,7 +356,7 @@
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
+         const previous = gesture.current
+-        if (previous?.kind === 'box') { setSelectedNodes(previous.before); setSelectedJunctions(previous.beforeDots); setSelectionRect(null); setAddMenu(null) }
++        if (previous?.kind === 'box') { setSelectedNodes(previous.before); setSelectedJunctions(previous.beforeDots); setSelectedTexts(previous.beforeTexts); setSelectionRect(null); setAddMenu(null) }
+         if (previous?.kind === 'node') {
+             setAnnotationDrafts({}); setJunctionDrafts({})
+             setOverrides(old => Object.fromEntries(Object.entries(old).filter(([id]) => !(id in previous.origins))))
+@@ -400,19 +402,23 @@
+         const annotation = annotationsRef.current.find(a => a.id === (annotationId?.getAttribute('data-annotation-move') ?? annotationId?.getAttribute('data-annotation-resize')))
+         if (!annotation) setSelectedAnnotation(target.closest('[data-annotation-select]')?.getAttribute('data-annotation-select') ?? null)
+         const dotId = target.closest('[data-junction-id]')?.getAttribute('data-junction-id')
+-        if (!dotId && !(boxSelection.current && selectedNodes.includes(target.closest('[data-node-id]')?.getAttribute('data-node-id') ?? ''))) { setSelectedJunction(null); setMovingJunction(null) }
++        if (!dotId && !(boxSelection.current && annotation?.kind === 'text' && selectedTexts.includes(annotation.id)) && !(boxSelection.current && selectedNodes.includes(target.closest('[data-node-id]')?.getAttribute('data-node-id') ?? ''))) { setSelectedJunction(null); setMovingJunction(null) }
+         const handle = target.closest('[data-link-handle]')?.getAttribute('data-link-handle')
+         const input = target.closest('[data-input-handle]')?.getAttribute('data-input-handle')
+         const node = target.closest('[data-node-id]')?.getAttribute('data-node-id')
+         const dotGroup = Boolean(dotId && boxSelection.current && selectedJunctions.includes(dotId))
+-        if (annotation || handle || input || (!dotGroup && (!node || !selectedNodes.includes(node)))) boxSelection.current = false
++        const textGroup = Boolean(annotation?.kind === 'text' && !annotationId?.hasAttribute('data-annotation-resize') && boxSelection.current && selectedTexts.includes(annotation.id))
++        if ((annotation && !textGroup) || handle || input || (!dotGroup && !textGroup && (!node || !selectedNodes.includes(node)))) boxSelection.current = false
++        if (!boxSelection.current && (annotation || node || dotId)) setSelectedTexts(annotation?.kind === 'text' ? [annotation.id] : [])
++        if (!annotation && !node && !dotId && !(event.shiftKey || event.ctrlKey || event.metaKey)) setSelectedTexts([])
+         const groupDots = boxSelection.current ? selectedJunctions : []
++        const textOrigins = Object.fromEntries(annotationsRef.current.filter(a => boxSelection.current && a.kind === 'text' && selectedTexts.includes(a.id)).map(a => ['text:' + a.id, { x: a.x, y: a.y }]))
+         const dotOrigins = Object.fromEntries(junctionsRef.current.filter(j => groupDots.includes(j.id)).map(j => ['junction:' + j.id, { x: j.x, y: j.y }]))
+-        if (!node && !dotGroup && (annotation || dotId || handle || input || event.pointerType === 'touch' || !(event.shiftKey || event.ctrlKey || event.metaKey))) setSelectedNode(null)
++        if (!node && !dotGroup && !textGroup && (annotation || dotId || handle || input || event.pointerType === 'touch' || !(event.shiftKey || event.ctrlKey || event.metaKey))) setSelectedNode(null)
+         if (dotId) {
+             setMenu(null); if (!dotGroup) setSelectedJunction(dotId)
+             const dot = junctionsRef.current.find(j => j.id === dotId)!
+-            if (dotGroup) gesture.current = { kind: 'node', pointer: event.pointerId, id: 'junction:' + dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false, frames: graph!.graph.annotations ?? [], positions: { ...positionsRef.current }, origins: { ...Object.fromEntries(selectedNodes.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), ...dotOrigins }, routing: nodeRouting(graph!.graph), junctionIds: groupDots }
++            if (dotGroup) gesture.current = { kind: 'node', pointer: event.pointerId, id: 'junction:' + dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false, frames: graph!.graph.annotations ?? [], positions: { ...positionsRef.current }, origins: { ...Object.fromEntries(selectedNodes.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), ...dotOrigins, ...textOrigins }, routing: nodeRouting(graph!.graph), junctionIds: groupDots }
+             else if (movingJunction === dotId || target.closest('[data-junction-label]')) gesture.current = { kind: 'junction-move', editLabel: Boolean(target.closest('[data-junction-label]')), pointer: event.pointerId, id: dotId, x: event.clientX, y: event.clientY, origin: dot, last: dot, moved: false, frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) }
+             else { gesture.current = { kind: 'link', pointer: event.pointerId, from: dotId, holdOrigin: { x: event.clientX, y: event.clientY } }; setLink({ fixed: dotId, direction: 'child', to: dot, target: null }) }
+             if (event.pointerType === 'touch') {
+@@ -427,6 +433,10 @@
+                 }, 550)
+             }
+         }
++        else if (annotation && textGroup) {
++            setMenu(null); gesture.current = { kind: 'node', pointer: event.pointerId, id: 'text:' + annotation.id, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, frames: graph!.graph.annotations ?? [], positions: { ...positionsRef.current },
++                origins: { ...Object.fromEntries(selectedNodes.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), ...dotOrigins, ...textOrigins }, routing: nodeRouting(graph!.graph), junctionIds: groupDots }
++        }
+         else if (annotation) { setMenu(null); setSelectedAnnotation(annotation.id); gesture.current = { kind: 'annotation', editLabel: Boolean(target.closest('[data-annotation-label]')), pointer: event.pointerId, x: event.clientX, y: event.clientY, origin: annotation, last: annotation, moved: false, resize: annotationId!.hasAttribute('data-annotation-resize'), members: Object.fromEntries(frameMemberIds(annotation, annotationsRef.current).flatMap(id => { const point = framePoints(positionsRef.current, annotationsRef.current, junctionsRef.current)[id]; return point ? [[id, point]] : [] })), frames: graph!.graph.annotations ?? [], routing: nodeRouting(graph!.graph) } }
+         else if (input) {
+             const routing = nodeRouting(graph!.graph), pendingDot = routing.junctions.find(j => j.targets?.includes(input))
+@@ -437,7 +447,7 @@
+             const moving = selectedNodes.includes(node) ? selectedNodes : [node]
+             if (!selectedNodes.includes(node)) setSelectedNode(node)
+             gesture.current = { kind: 'node', pointer: event.pointerId, id: node, x: event.clientX, y: event.clientY, origin: positionsRef.current[node]!, moved: false, last: positionsRef.current[node]!, frames: graph!.graph.annotations ?? [],
+-                origins: { ...Object.fromEntries(moving.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), ...dotOrigins }, positions: { ...positionsRef.current }, ...(groupDots.length ? { routing: nodeRouting(graph!.graph), junctionIds: groupDots } : {}) }
++                origins: { ...Object.fromEntries(moving.filter(id => positionsRef.current[id]).map(id => [id, positionsRef.current[id]!])), ...dotOrigins, ...textOrigins }, positions: { ...positionsRef.current }, ...(groupDots.length ? { routing: nodeRouting(graph!.graph), junctionIds: groupDots } : {}) }
+             if (event.pointerType === 'touch') {
+                 // Navigation is handled on pointerup. Suppress the compatibility click/focus
+                 // that would dismiss a hold-opened popover as soon as the finger lifts.
+@@ -454,7 +464,7 @@
+             setMenu(null); setObjectMenu(null)
+             const mouse = !event.pointerType || event.pointerType === 'mouse'
+             gesture.current = mouse ? { kind: 'box', pointer: event.pointerId, x: event.clientX, y: event.clientY,
+-                origin: toGraph(event.clientX, event.clientY), before: selectedNodes, beforeDots: selectedJunctions,
++                origin: toGraph(event.clientX, event.clientY), before: selectedNodes, beforeDots: selectedJunctions, beforeTexts: selectedTexts,
+                 mode: event.ctrlKey || event.metaKey ? 'subtract' : event.shiftKey ? 'add' : 'replace', moved: false }
+                 : event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current, tapStartedAt: performance.now(), moved: false } : null
+             if (event.pointerType === 'touch') {
+@@ -507,6 +517,8 @@
+                 return point.x <= rect.x + rect.width && point.x + NODE_SIZE.width >= rect.x && point.y <= rect.y + rect.height && point.y + NODE_SIZE.height >= rect.y
+             })
+             setSelectionRect(rect)
++            const texts = annotationsRef.current.filter(a => a.kind === 'text' && a.x <= rect.x + rect.width && a.x + a.width >= rect.x && a.y <= rect.y + rect.height && a.y + a.height >= rect.y).map(a => a.id)
++            setSelectedTexts(g.mode === 'replace' ? texts : g.mode === 'add' ? [...new Set([...g.beforeTexts, ...texts])] : g.beforeTexts.filter(id => !texts.includes(id)))
+             const dots = junctionsRef.current.filter(j => j.x + 8 >= rect.x && j.x - 8 <= rect.x + rect.width && j.y + 8 >= rect.y && j.y - 8 <= rect.y + rect.height).map(j => j.id)
+             setSelectedJunctions(g.mode === 'replace' ? dots : g.mode === 'add' ? [...new Set([...g.beforeDots, ...dots])] : g.beforeDots.filter(id => !dots.includes(id)))
+             boxSelection.current = true
+@@ -555,10 +567,10 @@
+             const k = viewRef.current.k, last = snap({ x: g.origin.x + dx / k, y: g.origin.y + dy / k })
+             g.last = last
+             const moved = Object.fromEntries(Object.entries(g.origins).map(([id, p]) => [id, { x: p.x + last.x - g.origin.x, y: p.y + last.y - g.origin.y }]))
+-            setOverrides(old => ({ ...old, ...Object.fromEntries(Object.entries(moved).filter(([id]) => !id.startsWith('junction:'))) }))
++            setOverrides(old => ({ ...old, ...Object.fromEntries(Object.entries(moved).filter(([id]) => !id.startsWith('junction:') && !id.startsWith('text:'))) }))
+             {
+                 try {
+-                    const visual = g.routing ? movedSelection(g, moved) : undefined
++                    const visual = g.routing || Object.keys(g.origins).some(id => id.startsWith('text:')) ? movedSelection(g, moved) : undefined
+                     if (visual?.routing) setJunctionDrafts(Object.fromEntries(visual.routing.junctions.filter(j => g.junctionIds?.includes(j.id)).map(j => [j.id, { x: j.x, y: j.y }])))
+                     const points = framePoints({ ...g.positions, ...moved }, g.frames, junctionsRef.current)
+                     const frames = visual?.annotations ?? (Object.keys(g.origins).length > 1 ? placeSelectionInFrames(g.frames, Object.keys(g.origins), points) : placeInFrame(g.frames, g.id, points))
+@@ -573,7 +585,7 @@
+         const g = gesture.current
+         if (g?.kind === 'box' && g.pointer === event.pointerId) {
+             gesture.current = null; setSelectionRect(null)
+-            if (event.type === 'pointercancel') { setSelectedNodes(g.before); setSelectedJunctions(g.beforeDots); setAddMenu(null) }
++            if (event.type === 'pointercancel') { setSelectedNodes(g.before); setSelectedJunctions(g.beforeDots); setSelectedTexts(g.beforeTexts); setAddMenu(null) }
+             if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+             return
+         }
+@@ -615,7 +627,7 @@
+                 if (g.last.x === g.origin.x && g.last.y === g.origin.y) { clear(); return }
+                 const moved = Object.fromEntries(Object.entries(g.origins).map(([id, p]) => [id, { x: p.x + g.last.x - g.origin.x, y: p.y + g.last.y - g.origin.y }]))
+                 try {
+-                    const before = { positions: Object.fromEntries(Object.entries(g.origins).filter(([id]) => !id.startsWith('junction:'))), annotations: g.frames, ...(g.routing ? { routing: g.routing } : {}) }
++                    const before = { positions: Object.fromEntries(Object.entries(g.origins).filter(([id]) => !id.startsWith('junction:') && !id.startsWith('text:'))), annotations: g.frames, ...(g.routing ? { routing: g.routing } : {}) }
+                     void changeVisual(before, movedSelection(g, moved)).finally(clear)
+                 } catch (cause) { setError(errorText(cause, 'Could not move selection')); clear() }
+                 return
+@@ -634,6 +646,7 @@
+                     if (g.id !== overseer || graph?.graph.nodes.some(n => n.sessionId === g.id)) queueSave(g.id, g.last)
+                 }
+             }
++            else if (!cancelled && g.id.startsWith('text:')) setSelectedAnnotation(g.id.slice(5))
+             else if (!cancelled && !g.id.startsWith('junction:')) selectNode(g.id)
+         } else if (g.kind === 'link') {
+             setLink(null)
+@@ -1023,7 +1036,7 @@
+             </Popover.Root>
+             {!graph && <p className="p-4 text-sm text-[var(--app-hint)]">{isLoading ? 'Loading graph…' : 'No graph.'}</p>}
+             {graph && layout && <div className="absolute left-0 top-0 h-0 w-0" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`, transformOrigin: '0 0' }}>
+-                <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} zoom={view.k} onSelect={id => { setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
++                <GraphAnnotationLayer annotations={annotations} selected={selectedAnnotation} selectedTexts={selectedTexts} zoom={view.k} onSelect={id => { setSelectedTexts(annotations.find(a => a.id === id)?.kind === 'text' ? [id] : []); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(id); setMenu(null) }} onEdit={editAnnotation}
+                     onAdjust={adjustAnnotation} onContextMenu={(id, x, y) => { if (previewing) return; const a = annotations.find(a => a.id === id); if (a) openObjectMenu(a.kind + ':' + id, x, y) }} />
+                 <svg className="pointer-events-none absolute left-0 top-0 overflow-visible z-[1]" width="1" height="1" aria-hidden="true">
+                     <defs>
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -6,8 +6,8 @@
+ const label = (a: NodeAnnotation) => a.kind === 'frame' ? a.text || 'Untitled frame' : a.text.split('\n')[0] || 'Text box'
+ 
+ /** Frame interiors capture selection; margins capture movement; nested frames and cards remain above them. */
+-export function GraphAnnotationLayer({ annotations, selected, zoom, onSelect, onEdit, onAdjust, onContextMenu }: {
+-    annotations: readonly NodeAnnotation[]; selected: string | null; zoom: number;
++export function GraphAnnotationLayer({ annotations, selected, selectedTexts = [], zoom, onSelect, onEdit, onAdjust, onContextMenu }: {
++    annotations: readonly NodeAnnotation[]; selected: string | null; selectedTexts?: readonly string[]; zoom: number;
+     onSelect: (id: string) => void; onEdit: (annotation: NodeAnnotation) => void;
+     onAdjust: (annotation: NodeAnnotation) => void; onContextMenu?: (id: string, x: number, y: number) => void
+ }) {
+@@ -24,7 +24,7 @@
+     return <>{ordered.map(a => <section key={a.id} data-annotation-id={a.id} data-annotation-kind={a.kind} aria-label={`${a.kind === 'frame' ? 'Frame' : 'Text box'}: ${label(a)}`}
+         className="pointer-events-none absolute rounded-xl border text-[var(--app-fg)]"
+         style={{ left: a.x, top: a.y, width: a.width, height: a.height, zIndex: a.kind === 'frame' ? 'auto' : 3,
+-            borderColor: COLORS[a.color], borderWidth: selected === a.id ? 2 : 1,
++            borderColor: COLORS[a.color], borderWidth: selected === a.id || selectedTexts.includes(a.id) ? 2 : 1,
+             background: `color-mix(in srgb, ${COLORS[a.color]} ${a.kind === 'frame' ? 7 : 12}%, var(--app-bg))` }}>
+         {a.kind === 'frame' && <button type="button" data-annotation-select={a.id} style={{ cursor: 'default' }} aria-label={`Select frame: ${label(a)}`} onClick={event => { if (event.detail === 0) onSelect(a.id) }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
+@@ -37,7 +37,7 @@
+         ].map(([side, style]) => <div key={side as string} data-frame-margin={side} data-annotation-move={a.id}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }}
+             className="pointer-events-auto absolute cursor-move" style={style as React.CSSProperties} />)}</>}
+-        <button type="button" data-annotation-move={a.id} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
++        <button type="button" data-annotation-move={a.id} aria-pressed={a.kind === 'text' ? selected === a.id || selectedTexts.includes(a.id) : undefined} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+             style={{ zIndex: a.kind === 'frame' && selected === a.id ? 4 : undefined }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }} onClick={event => { if (event.detail === 0) onSelect(a.id) }} onKeyDown={event => keys(event, a)}
+             className={`pointer-events-auto absolute inset-x-0 top-0 min-w-0 cursor-move rounded-t-xl px-2 text-left focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'min-h-6 py-0.5 text-xs font-semibold' : 'min-h-10 py-1 text-sm h-full overflow-hidden rounded-b-xl'}`}>
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -2057,3 +2057,42 @@
+     expect(api.editNodeVisual).not.toHaveBeenCalled(); expect(api.editNodeAnnotation).not.toHaveBeenCalled()
+     expect(api.saveNodeLayout).not.toHaveBeenCalled(); expect(api.abortSession).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
+ })
++
++
++it.each(['mouse', 'touch'])('box-selects text boxes with cards and junctions, drags from text, and undoes with %s', async pointerType => {
++    const graph = initial()
++    graph.graph.nodes = [{ sessionId: 'A', x: 100, y: 100, addedAt: 1 }, { sessionId: 'B', x: 1000, y: 100, addedAt: 1 }]
++    graph.graph.edges = [{ owner: 'O', child: 'A', via: 'j', createdAt: 1, createdBy: 'user' }]
++    graph.graph.junctions = [{ id: 'j', owner: 'O', x: 700, y: 350 }]
++    graph.graph.annotations = [
++        { id: 'n', kind: 'text', text: 'First note', color: 'blue', x: 350, y: 100, width: 180, height: 100 },
++        { id: 'm', kind: 'text', text: 'Second note', color: 'blue', x: 500, y: 200, width: 180, height: 100 },
++    ]
++    const { api, onOpenChat } = setup(makeApi({ graph }))
++    const note = await screen.findByRole('button', { name: 'Move text box: First note' })
++    const canvas = screen.getByRole('application'), bounds = boxBounds('A'), end = dotPoint('j')
++    vi.useFakeTimers()
++    try {
++        fireEvent.pointerDown(canvas, { pointerId: 93, pointerType, button: 0, clientX: bounds.left, clientY: bounds.top })
++        if (pointerType === 'touch') act(() => vi.advanceTimersByTime(550))
++        fireEvent.pointerMove(canvas, { pointerId: 93, pointerType, clientX: end.clientX + 20, clientY: end.clientY + 20 })
++        fireEvent.pointerUp(canvas, { pointerId: 93, pointerType, clientX: end.clientX + 20, clientY: end.clientY + 20 })
++    } finally { vi.useRealTimers() }
++    for (const name of ['Move text box: First note', 'Move text box: Second note', 'Node Alpha', 'Junction 1']) expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'true')
++    expect(screen.getByRole('button', { name: 'Node Bravo' })).toHaveAttribute('aria-pressed', 'false')
++    const before = (await api.getNodeGraph()).graph
++    fireEvent.pointerDown(note, { pointerId: 94, pointerType, button: 0, clientX: 400, clientY: 200 })
++    fireEvent.pointerMove(canvas, { pointerId: 94, pointerType, clientX: 450, clientY: 230 })
++    fireEvent.pointerUp(canvas, { pointerId: 94, pointerType, clientX: 450, clientY: 230 })
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
++    const after = (await api.getNodeGraph()).graph, dx = after.nodes[0]!.x! - before.nodes[0]!.x!, dy = after.nodes[0]!.y! - before.nodes[0]!.y!
++    expect(screen.queryByRole('alert')?.textContent ?? '').toBe('')
++    expect(dx).not.toBe(0)
++    for (let i = 0; i < 2; i++) expect(after.annotations![i]).toMatchObject({ x: before.annotations![i].x + dx, y: before.annotations![i].y + dy })
++    expect(after.junctions![0]).toMatchObject({ x: 700 + dx, y: 350 + dy })
++    expect(after.nodes[1]).toEqual(before.nodes[1])
++    fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(2))
++    expect((await api.getNodeGraph()).graph).toEqual(before)
++    expect(api.abortSession).not.toHaveBeenCalled(); expect(api.setNodeOwner).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++})

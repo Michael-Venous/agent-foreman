@@ -1,0 +1,113 @@
+--- a/web/src/lib/nodeGraphJunctions.ts
++++ b/web/src/lib/nodeGraphJunctions.ts
+@@ -41,6 +41,8 @@
+     const vectors = [[0, 1], [-1, 0], [0, -1], [1, 0]] as const
+     const output = vectors[(source?.rotation ?? 0) / 90] ?? vectors[0]
+     const input = vectors[(target?.rotation ?? 0) / 90] ?? vectors[0]
+-    const bend = Math.max(30, (source || target ? Math.hypot(to.x - from.x, to.y - from.y) : Math.abs(to.y - from.y)) / 2)
++    // Keep long and sideways cables compact rather than scaling their bulge
++    // with the full endpoint distance. Short links shrink down with their gap.
++    const bend = Math.min(64, Math.max(8, Math.hypot(to.x - from.x, to.y - from.y) / 2))
+     return `M${from.x} ${from.y} C${from.x + output[0] * bend} ${from.y + output[1] * bend} ${to.x - input[0] * bend} ${to.y - input[1] * bend} ${to.x} ${to.y}`
+ }
+--- a/web/src/lib/nodeGraphJunctions.test.ts
++++ b/web/src/lib/nodeGraphJunctions.test.ts
+@@ -69,3 +69,20 @@
+         expect(junctionBranch(routing, 'j', 'A').edges).toEqual([{ owner: 'O', child: 'A', via: 'j' }])
+     })
+ })
++
++
++it('bounds cable bulges for long, sideways and backwards links in every junction rotation', () => {
++    for (const rotation of [0, 90, 180, 270]) {
++        const dot = { id: 'j', owner: null, x: 0, y: 0, rotation }
++        for (const to of [{ x: 1000, y: 0 }, { x: 0, y: -1000 }, { x: 900, y: 700 }]) {
++            for (const [source, target] of [[dot, undefined], [undefined, dot], [dot, dot], [undefined, undefined]]) {
++                const numbers = junctionCurve({ x: 0, y: 0 }, to, source, target).match(/-?[\d.]+/g)!.map(Number)
++                expect(numbers.slice(0, 2)).toEqual([0, 0])
++                expect(numbers.slice(-2)).toEqual([to.x, to.y])
++                expect(Math.hypot(numbers[2], numbers[3])).toBeLessThanOrEqual(64)
++                expect(Math.hypot(numbers[4] - to.x, numbers[5] - to.y)).toBeLessThanOrEqual(64)
++            }
++        }
++    }
++    expect(junctionCurve({ x: 0, y: 0 }, { x: 0, y: 20 })).toBe('M0 0 C0 10 0 10 0 20')
++})
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -3,13 +3,13 @@
+ export type FramePoint = GraphPoint & { width?: number; height?: number }
+ export type NodeVisualState = { positions: Record<string, FramePoint>; annotations: NodeAnnotation[]; routing?: NodeRouting }
+ export function framePoints(positions: Record<string, FramePoint>, annotations: readonly NodeAnnotation[], junctions: NodeRouting['junctions']): Record<string, FramePoint> {
+-    return { ...positions, ...Object.fromEntries(annotations.map(a => [a.kind + ':' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - (j.label ? 90 : 8), y: j.y - (j.label ? 48 : 8), width: j.label ? 180 : 16, height: j.label ? 64 : 16 }])) }
++    return { ...positions, ...Object.fromEntries(annotations.map(a => [a.kind + ':' + a.id, { x: a.x, y: a.y, width: a.width, height: a.height }])), ...Object.fromEntries(junctions.map(j => ['junction:' + j.id, { x: j.x - (j.label ? 90 : 8), y: j.y - (j.label ? 36 : 8), width: j.label ? 180 : 16, height: j.label ? 52 : 16 }])) }
+ }
+ /** Tight bounds around members, reserving space for the frame title and ports. */
+ export function fitNodeFrame(frame: NodeAnnotation, positions: Record<string, FramePoint>): NodeAnnotation {
+     const points = (frame.members ?? []).flatMap(id => positions[id] ? [positions[id]] : [])
+     if (frame.kind !== 'frame' || !points.length) return frame
+-    const x = Math.min(...points.map(p => p.x)) - 24, y = Math.min(...points.map(p => p.y)) - 52
++    const x = Math.min(...points.map(p => p.x)) - 24, y = Math.min(...points.map(p => p.y)) - 36
+     const width = Math.max(180, Math.max(...points.map(p => p.x + (p.width ?? NODE_SIZE.width))) + 24 - x)
+     const height = Math.max(100, Math.max(...points.map(p => p.y + (p.height ?? NODE_SIZE.height))) + 24 - y)
+     if (width > 8000 || height > 8000) throw new Error('Frame contents are too far apart. Keep them within 8000 canvas units.')
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -6,7 +6,7 @@
+     const initial = { A:{x:100,y:120}, B:{x:300,y:300} }
+     const first = placeInFrame([frame], 'A', initial)[0]
+     expect(first.members).toEqual(['A'])
+-    expect(first).toMatchObject({x:76,y:68,width:248,height:156})
++    expect(first).toMatchObject({x:76,y:84,width:248,height:140})
+     const expanded = fitNodeFrame({...first,members:['A','B']},initial)
+     const moved = placeInFrame([expanded], 'A', {...initial,A:{x:-200,y:-100}})[0]
+     expect(moved.members).toEqual(['B','A'])
+@@ -81,3 +81,15 @@
+     const result = placeInFrame([outer, inner], 'frame:outer', framePoints({}, [outer, inner], []))
+     expect(result.find(a => a.id === 'inner')?.members ?? []).not.toContain('frame:outer')
+ })
++
++// Header clearance includes the card's top input port, without the old tall gutter.
++it('keeps compact frame clearance for cards and labelled/unlabelled junctions', () => {
++    const junctions = [{ id: 'plain', owner: null, x: 100, y: 120 }, { id: 'labelled', owner: null, x: 300, y: 180, label: 'Branch' }]
++    const points = framePoints({ A: { x: 100, y: 120 } }, [], junctions)
++    for (const id of ['A', 'junction:plain', 'junction:labelled']) {
++        const fitted = fitNodeFrame({ ...frame, members: [id] }, points)
++        expect(points[id].y - fitted.y).toBe(36)
++        expect(fitted.y).toBeLessThan(points[id].y - 14)
++        expect(fitted.y + fitted.height).toBeGreaterThanOrEqual(points[id].y + (points[id].height ?? 80))
++    }
++})
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1360,7 +1360,7 @@
+         fireEvent.pointerUp(canvas, { pointerId: 4, clientX: 500 - 900 * k, clientY: 500 - 850 * k })
+         await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
+         const enrolled = (await api.getNodeGraph()).graph.annotations!.find(a => a.id === 'group')!
+-        expect(enrolled).toMatchObject({ x: 76, y: 98, width: 328, height: 256, members: ['text:note'] })
++        expect(enrolled).toMatchObject({ x: 76, y: 114, width: 328, height: 240, members: ['text:note'] })
+         fireEvent.click(screen.getByRole('button', { name: 'Junction 1' }))
+         openDotMenu('dot'); fireEvent.click(screen.getByRole('button', { name: 'Move junction' }))
+         const start = dotPoint('dot'), dot = screen.getByRole('button', { name: 'Junction 1' })
+--- a/web/src/components/GraphAnnotations.tsx
++++ b/web/src/components/GraphAnnotations.tsx
+@@ -32,7 +32,7 @@
+         <button type="button" data-annotation-move={a.id} aria-label={`Move ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+             style={{ zIndex: a.kind === 'frame' && selected === a.id ? 4 : undefined }}
+             onContextMenu={event => { event.preventDefault(); onSelect(a.id); onContextMenu?.(a.id, event.clientX, event.clientY) }} onClick={event => { if (event.detail === 0) onSelect(a.id) }} onKeyDown={event => keys(event, a)}
+-            className={`pointer-events-auto absolute inset-x-0 top-0 min-h-10 min-w-0 cursor-move rounded-t-xl px-3 py-2 text-left text-sm focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'font-semibold' : 'h-full overflow-hidden rounded-b-xl'}`}>
++            className={`pointer-events-auto absolute inset-x-0 top-0 min-w-0 cursor-move rounded-t-xl px-3 text-left focus-visible:outline-2 focus-visible:outline-[var(--app-link)] ${a.kind === 'frame' ? 'min-h-6 py-1 text-xs font-semibold' : 'min-h-10 py-2 text-sm h-full overflow-hidden rounded-b-xl'}`}>
+             {a.kind === 'frame' ? <span data-annotation-label={a.id} className="inline-block max-w-full truncate align-middle">{label(a)}</span> : <span data-annotation-label={a.id} className="block h-full whitespace-pre-wrap break-words leading-relaxed">{a.text || 'Text box'}</span>}
+         </button>
+         {selected === a.id && !(a.kind === 'frame' && a.members?.length) && <button type="button" data-annotation-resize={a.id} aria-label={`Resize ${a.kind === 'frame' ? 'frame' : 'text box'}: ${label(a)}`}
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -218,7 +218,7 @@
+     const fit = () => {
+         if (!layout) return
+         const element = canvas.current
+-        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 48 : 16), width: j.label ? 180 : 32, height: j.label ? 64 : 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
++        const rectangles = [layout.bounds, ...junctions.map(j => ({ x: j.x - (j.label ? 90 : 16), y: j.y - (j.label ? 36 : 16), width: j.label ? 180 : 32, height: j.label ? 52 : 32 })), ...annotations.map(a => ({ x: a.x, y: a.y, width: a.width, height: a.height }))]
+         const x = Math.min(...rectangles.map(r => r.x)), y = Math.min(...rectangles.map(r => r.y))
+         const bounds = { x, y, width: Math.max(...rectangles.map(r => r.x + r.width)) - x, height: Math.max(...rectangles.map(r => r.y + r.height)) - y }
+         setView(fitTransform(bounds, { width: element?.clientWidth || 800, height: element?.clientHeight || 600 }))

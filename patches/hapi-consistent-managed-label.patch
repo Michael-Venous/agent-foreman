@@ -1,0 +1,46 @@
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -169,6 +169,8 @@
+                             className={`shrink-0 text-[11px] font-medium ${managed ? 'text-violet-500' : s.thinking ? 'text-green-500' : 'text-[var(--app-hint)]'}`}>
+                             {s.thinking ? 'Running' : 'Background'}
+                         </span>
++                    ) : managed ? (
++                        <span aria-label="Managed session" className="shrink-0 text-[11px] font-medium text-violet-500">Managed</span>
+                     ) : null}
+                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
+                         <SessionAttentionIndicator
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -169,3 +169,22 @@
+         expect(screen.queryByTestId('activity-progress')).not.toBeInTheDocument()
+     })
+ })
++
++
++describe('idle management membership', () => {
++    it('keeps a Managed label for idle and disconnected managed chats', () => {
++        const session = makeSummary({ backgroundTaskCount: 0, thinking: false })
++        const view = render(<I18nProvider><SessionRowSummary session={session} managed /></I18nProvider>)
++        expect(screen.getByLabelText('Managed session')).toHaveTextContent('Managed')
++        expect(screen.queryByText('Running')).toBeNull()
++        view.rerender(<I18nProvider><SessionRowSummary session={{ ...session, active: false }} managed /></I18nProvider>)
++        expect(screen.getByLabelText('Managed session')).toBeInTheDocument()
++    })
++    it('removes the idle Managed label when supervision ends', () => {
++        const session = makeSummary({ backgroundTaskCount: 0, thinking: false })
++        const view = render(<I18nProvider><SessionRowSummary session={session} managed /></I18nProvider>)
++        view.rerender(<I18nProvider><SessionRowSummary session={session} managed={false} /></I18nProvider>)
++        expect(screen.queryByLabelText('Managed session')).toBeNull()
++        expect(screen.queryByText('Running')).toBeNull()
++    })
++})
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -23,7 +23,6 @@
+         : managementPaused ? (hasWork ? 'Management paused' : 'Paused')
+         : hasWork ? null : session.active ? 'Idle' : 'Inactive'
+     return label ? <div className="flex flex-wrap items-center gap-x-2 px-2 pb-1 text-xs text-[var(--app-hint)]">
+-        {managed && !hasWork && <span aria-label="Managed session" className="font-medium text-violet-500">Managed</span>}
+         <p>{label}</p>
+     </div> : null
+ }

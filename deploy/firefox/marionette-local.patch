@@ -1,0 +1,93 @@
+diff --git a/src/server.mjs b/src/server.mjs
+index 0cff8bf..244d247 100755
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -653,6 +653,16 @@ function fmtField(f) {
+ const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
+ 
+ const TOOLS = [
++  T('fx_disconnect', 'Release this controller without closing Firefox, so another authorized chat can attach. Call when finished with browser work.', {}, async () => {
++    try { if (M.sessionId && M.sock && !M.sock.destroyed) await M.send('WebDriver:DeleteSession', {}); }
++    finally {
++      if (M.sock && !M.sock.destroyed) M.sock.destroy();
++      M.sessionId = null;
++      attachApproved = null;
++      snapshotRefs = [];
++    }
++    return { ok: true, browserClosed: false };
++  }),
+   T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag. Never opens a session on its own: with no committed endpoint it probes non-invasively (TCP connect, expect the Marionette hello, close) and reports connected:false with the probe result and decision options; with a committed endpoint it attaches/re-attaches and reports live state. Reports launched/launchedCurrent when this server started the instance. When the result contains a `bootstrap` decision, present its question/options to the user and act only on THEIR choice.', {}, async () => {
+     const launched = launchedInfo();
+     if (isApproved()) {
+@@ -1219,8 +1229,9 @@ const TOOLS = [
+   }),
+   T('fx_windows', 'List windows (focused marked)', {}, async () => {
+     const r = await M.cmd('WebDriver:GetWindowHandles');
+-    const cur = await M.cmd('WebDriver:GetWindowHandle');
+-    return { windows: (r.value || []).map((h) => ({ handle: h, focused: h === cur.value })), current: cur.value };
++    let cur = {};
++    try { cur = await M.cmd('WebDriver:GetWindowHandle'); } catch { /* a sign-in popup may have closed */ }
++    return { windows: (Array.isArray(r) ? r : (r.value || [])).map((h) => ({ handle: h, focused: h === cur.value })), current: cur.value };
+   }),
+   T('fx_window', 'Switch active window by handle', { handle: { type: 'string' } }, async (a) => {
+     await M.cmd('WebDriver:SwitchToWindow', { handle: a.handle, focus: true });
+@@ -1284,7 +1295,7 @@ function toolResult(payload, opts) {
+ // auto-launch via attachApproved), later reconnects in the session are silent.
+ // fx_status is exempt and never attaches on its own; fx_launch/fx_shutdown/
+ // fx_connect act on the decisions.
+-const BOOTSTRAP_EXEMPT = new Set(['fx_status', 'fx_connect', 'fx_launch', 'fx_shutdown']);
++const BOOTSTRAP_EXEMPT = new Set(['fx_status', 'fx_connect', 'fx_launch', 'fx_shutdown', 'fx_disconnect']);
+ 
+ function classifyConnError(e) {
+   const m = String((e && e.message) || e);
+diff --git a/test/helpers/fake_marionette.mjs b/test/helpers/fake_marionette.mjs
+index 91ff282..857adc0 100644
+--- a/test/helpers/fake_marionette.mjs
++++ b/test/helpers/fake_marionette.mjs
+@@ -89,8 +89,9 @@ function respond(id, name, params, state) {
+     case 'WebDriver:ElementSendKeys':
+     case 'WebDriver:SwitchToWindow': return [1, id, null, {}];
+     case 'WebDriver:TakeScreenshot': return [1, id, null, { value: Buffer.from('FAKEPNG').toString('base64') }];
+-    case 'WebDriver:GetWindowHandles': return [1, id, null, { value: ['w1'] }];
+-    case 'WebDriver:GetWindowHandle': return [1, id, null, { value: 'w1' }];
++    case 'WebDriver:DeleteSession': return [1, id, null, {}];
++    case 'WebDriver:GetWindowHandles': return [1, id, null, state.rawWindowHandles ? ['w1'] : { value: ['w1'] }];
++    case 'WebDriver:GetWindowHandle': return state.closedWindow ? [1, id, {error: 'no such window', message: 'Browsing context has been discarded'}, null] : [1, id, null, { value: 'w1' }];
+     case 'WebDriver:GetCookies': return [1, id, null, { value: [] }];
+     case 'WebDriver:GetAlertText': return [1, id, null, { value: 'dialog?' }];
+     case 'WebDriver:AcceptAlert':
+diff --git a/test/server.test.mjs b/test/server.test.mjs
+index 96faecf..b80ece4 100644
+--- a/test/server.test.mjs
++++ b/test/server.test.mjs
+@@ -81,7 +81,7 @@ test('initialize returns server identity and echoes protocol version', async ()
+ test('tools/list exposes the full tool table', async () => {
+   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+   const names = r.result.tools.map((t) => t.name);
+-  assert.equal(names.length, 29, names.join(','));
++  assert.equal(names.length, 30, names.join(','));
+   for (const n of ['fx_status', 'fx_launch', 'fx_shutdown', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+     assert.ok(names.includes(n), 'missing tool ' + n);
+   }
+@@ -418,6 +418,21 @@ test('fx_connect re-points the MCP at a different endpoint at runtime', async ()
+   }
+ });
+ 
++test('window handles support the live Firefox array response and closed popups', async () => {
++  fake.state.rawWindowHandles = true;
++  fake.state.closedWindow = true;
++  const r = await rpc({ jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name: 'fx_windows', arguments: {} } });
++  assert.deepEqual(JSON.parse(toolText(r)).windows, [{handle: 'w1', focused: false}]);
++  fake.state.closedWindow = false;
++});
++
++test('disconnect releases the controller and permits reconnect', async () => {
++  const released = await rpc({ jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'fx_disconnect', arguments: {} } });
++  assert.deepEqual(JSON.parse(toolText(released)), {ok: true, browserClosed: false});
++  const connected = await rpc({ jsonrpc: '2.0', id: 92, method: 'tools/call', params: { name: 'fx_connect', arguments: {port: fake.port} } });
++  assert.equal(JSON.parse(toolText(connected)).ok, true);
++});
++
+ test('stdin EOF terminates the server cleanly', () =>
+   new Promise((resolve, reject) => {
+     const t0 = Date.now();

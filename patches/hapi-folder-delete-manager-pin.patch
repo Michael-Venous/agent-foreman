@@ -1,0 +1,208 @@
+--- a/hub/src/codexFolders.ts
++++ b/hub/src/codexFolders.ts
+@@ -161,3 +161,12 @@
+         return { id: project.id, name: project.name, position: project.position }
+     })
+ }
++
++/** Delete only the shared folder metadata; native threads and project directories survive. */
++export async function deleteFolder(server: CodexAppServer, folderId: string): Promise<void> {
++    if (!folderId || folderId.length > 256) throw new Error('Invalid folder ID')
++    await server(async call => {
++        // Idempotent retry also repairs local memberships after an earlier partial response.
++        if ((await listFolders(call)).some(folder => folder.id === folderId)) await call('project/delete', { projectId: folderId })
++    })
++}
+--- a/hub/src/chatFolderState.ts
++++ b/hub/src/chatFolderState.ts
+@@ -8,6 +8,14 @@
+         if (!existsSync(this.path)) return {}
+         return JSON.parse(readFileSync(this.path, 'utf8'))
+     }
++    removeFolder(folderId: string): void {
++        const next = this.read()
++        if (!Object.values(next).includes(folderId)) return
++        for (const sessionId of Object.keys(next)) if (next[sessionId] === folderId) next[sessionId] = null
++        mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
++        writeFileSync(this.path + '.tmp', JSON.stringify(next), { mode: 0o600 })
++        renameSync(this.path + '.tmp', this.path)
++    }
+     assign(sessionId: string, folderId: string | null): void {
+         const next = { ...this.read(), [sessionId]: folderId }
+         mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
+--- a/hub/src/web/routes/codexFolders.ts
++++ b/hub/src/web/routes/codexFolders.ts
+@@ -3,7 +3,7 @@
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ import {
+-    assignFolder, createFolder, createStdioAppServer, folderName, readFolders, readLegacyState, renameFolder, validThreadIds,
++    assignFolder, createFolder, deleteFolder, createStdioAppServer, folderName, readFolders, readLegacyState, renameFolder, validThreadIds,
+     type CodexAppServer
+ } from '../../codexFolders'
+ 
+@@ -64,5 +64,13 @@
+             return c.json({ folder: await renameFolder(server, c.req.param('id'), folderName(body?.name)) })
+         } catch (error) { return failure(c, error) }
+     })
++    app.delete('/codex-folders/:id', async c => {
++        try {
++            const folderId = c.req.param('id')
++            await deleteFolder(server, folderId)
++            local?.removeFolder(folderId)
++            return c.json({ ok: true })
++        } catch (error) { return failure(c, error) }
++    })
+     return app
+ }
+--- a/hub/src/web/routes/codexFolders.test.ts
++++ b/hub/src/web/routes/codexFolders.test.ts
+@@ -30,6 +30,12 @@
+         }
+         if (method === 'thread/metadata/update') { threads[params.threadId] = params.projectId || null; return { thread: {} } }
+         if (method === 'project/create') { const p = { id: 'p-new', name: params.name, position: 7 }; projects.push(p); return { project: p } }
++        if (method === 'project/delete') {
++            const index = projects.findIndex(p => p.id === params.projectId)
++            if (index >= 0) projects.splice(index, 1)
++            for (const id of Object.keys(threads)) if (threads[id] === params.projectId) threads[id] = null
++            return {}
++        }
+         if (method === 'project/update') { const p = projects.find(x => x.id === params.projectId)!; p.name = params.name; return { project: p } }
+         throw new Error('unexpected ' + method)
+     }
+@@ -161,3 +167,32 @@
+         } finally { rmSync(dir, { recursive: true, force: true }) }
+     })
+ })
++
++
++describe('folder deletion', () => {
++    it('deletes shared folder metadata and unfiles Codex/Claude chats without deleting histories or controlling sessions', async () => {
++        const fake = fakeServer(), local = new ChatFolderState(join(dir, 'delete-folders.json'))
++        local.assign('claude-id', 'p-school'); local.assign('other-id', 'p-blender')
++        const root = new Hono<WebAppEnv>(); root.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++        root.route('/api', createCodexFoldersRoutes(fake.server, () => ({ assignments: {}, pending: new Set() }), undefined, local))
++        const ids = Object.keys(fake.threads)
++        expect((await root.request('/api/codex-folders/p-school', { method: 'DELETE' })).status).toBe(200)
++        expect(fake.projects.map(p => p.id)).toEqual(['p-blender'])
++        expect(Object.keys(fake.threads)).toEqual(ids); expect(fake.threads[T1]).toBeNull()
++        expect(local.read()).toEqual({ 'claude-id': null, 'other-id': 'p-blender' })
++        expect((await root.request('/api/codex-folders/p-school', { method: 'DELETE' })).status).toBe(200)
++        expect(fake.calls.filter(c => c === 'project/delete')).toHaveLength(1)
++        expect(fake.calls.every(c => ['project/list', 'project/delete'].includes(c))).toBe(true)
++    })
++    it('blocks other namespaces and preserves local memberships when native deletion fails', async () => {
++        const { root, fake } = app('tenant')
++        expect((await root.request('/api/codex-folders/p-school', { method: 'DELETE' })).status).toBe(403)
++        expect(fake.calls).toEqual([])
++        const local = new ChatFolderState(join(dir, 'failed-delete.json')); local.assign('claude-id', 'p-school')
++        const server: CodexAppServer = work => work(async method => { if (method === 'project/list') return { data: [{ id: 'p-school' }] }; throw new Error('native unavailable') })
++        const owner = new Hono<WebAppEnv>(); owner.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++        owner.route('/api', createCodexFoldersRoutes(server, undefined, undefined, local))
++        expect((await owner.request('/api/codex-folders/p-school', { method: 'DELETE' })).status).toBe(502)
++        expect(local.read()['claude-id']).toBe('p-school')
++    })
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -995,6 +995,10 @@
+         return (await this.request<{ folder: CodexFolder }>(`/api/codex-folders/${encodeURIComponent(folderId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })).folder
+     }
+ 
++    async deleteCodexFolder(folderId: string): Promise<void> {
++        await this.request(`/api/codex-folders/${encodeURIComponent(folderId)}`, { method: 'DELETE' })
++    }
++
+     async getChatStatistics(sessionId: string): Promise<{
+         totals: { total: number; input: number; output: number; cachedInput: number } | null
+         source: 'native' | 'recorded'
+--- a/web/src/components/CodexFolders.tsx
++++ b/web/src/components/CodexFolders.tsx
+@@ -68,15 +68,31 @@
+ export function CodexFolderNameDialog(props: { api: ApiClient; folder: CodexFolder | null; isOpen: boolean; onClose: () => void; onSaved?: (folder: CodexFolder) => void }) {
+     const { t } = useTranslation()
+     const invalidate = useInvalidateCodexFolders()
++    const [confirmDelete, setConfirmDelete] = useState(false)
++    const [deleting, setDeleting] = useState(false)
++    const [deleteError, setDeleteError] = useState(false)
++    useEffect(() => { setConfirmDelete(false); setDeleteError(false) }, [props.folder?.id, props.isOpen])
+     return (
+         <Dialog open={props.isOpen} onOpenChange={(open) => !open && props.onClose()}>
+             <DialogContent className="max-w-sm">
+                 <DialogHeader className="pr-0">
+                     <DialogTitle className="min-h-6 px-10 text-center leading-6">
+-                        {t(props.folder ? 'folders.rename' : 'folders.new')}
++                        {t(confirmDelete ? 'folders.delete' : props.folder ? 'folders.rename' : 'folders.new')}
+                     </DialogTitle>
+                 </DialogHeader>
+-                {props.isOpen ? (
++                {confirmDelete ? <div className="mt-4 space-y-4">
++                    <p className="text-sm text-[var(--app-hint)]">{t('folders.deleteConfirm')}</p>
++                    {deleteError && <p role="alert" className="text-sm text-red-600">{t('folders.error')}</p>}
++                    <div className="flex justify-end gap-2">
++                        <button type="button" disabled={deleting} onClick={() => setConfirmDelete(false)} className="rounded-lg px-3 py-2 text-sm">{t('button.cancel')}</button>
++                        <button type="button" disabled={deleting} className="rounded-lg bg-red-600 px-3 py-2 text-sm text-white disabled:opacity-50" onClick={async () => {
++                            if (!props.folder) return
++                            setDeleting(true); setDeleteError(false)
++                            try { await props.api.deleteCodexFolder(props.folder.id); await invalidate(); props.onClose() }
++                            catch { setDeleteError(true) } finally { setDeleting(false) }
++                        }}>{t('folders.delete')}</button>
++                    </div>
++                </div> : props.isOpen ? (
+                     <div className="mt-4">
+                         <FolderNameForm
+                             initial={props.folder?.name ?? ''}
+@@ -93,6 +109,7 @@
+                         />
+                     </div>
+                 ) : null}
++                {props.folder && !confirmDelete && <button type="button" className="mt-2 rounded-lg px-3 py-2 text-sm text-red-600 hover:bg-[var(--app-subtle-bg)]" onClick={() => setConfirmDelete(true)}>{t('folders.delete')}</button>}
+             </DialogContent>
+         </Dialog>
+     )
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -102,6 +102,8 @@
+   'sessions.chatsSection': 'Chats',
+   'folders.error': 'Could not update ChatGPT folders. Try again.',
+   'folders.name': 'Folder name',
++  'folders.delete': 'Delete folder',
++  'folders.deleteConfirm': 'Delete this shared folder? Chats will move to No folder. Their histories are kept.',
+   'folders.rename': 'Rename folder',
+   'folders.renameButton': 'Rename folder {name}',
+   'folders.new': 'New folder',
+--- a/web/src/components/SessionList.chat-tabs.test.tsx
++++ b/web/src/components/SessionList.chat-tabs.test.tsx
+@@ -357,3 +357,32 @@
+         await waitFor(() => expect(nodes).toHaveAttribute('aria-expanded', 'false'))
+     })
+ })
++
++
++it.each(['codex', 'claude'] as const)('deletes a folder from its edit dialog for %s while keeping chats', async provider => {
++    let deleted = false
++    const api = folderApi({
++        getCodexFolders: vi.fn(async () => ({ folders: deleted ? folders.folders.filter(f => f.id !== 'f-blender') : folders.folders, assignments: provider === 'claude' ? { 'cl-a': { folderId: deleted ? null : 'f-blender', source: 'hapi' as const } } : folders.assignments })),
++        deleteCodexFolder: vi.fn(async () => { deleted = true }),
++    })
++    renderList({ api })
++    if (provider === 'claude') fireEvent.click(screen.getByRole('tab', { name: /Claude/ }))
++    fireEvent.click(await screen.findByRole('button', { name: 'Rename folder Blender' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Delete folder' }))
++    expect(api.deleteCodexFolder).not.toHaveBeenCalled()
++    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Delete folder' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Delete folder' }))
++    await waitFor(() => expect(api.deleteCodexFolder).toHaveBeenCalledWith('f-blender'))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Blender folder' })).toBeNull())
++    expect(screen.getByRole('button', { name: provider === 'claude' ? /Claude planning/ : /Liquid sim/ })).toBeInTheDocument()
++})
++
++it('keeps a folder and offers retry when deletion fails', async () => {
++    const api = folderApi({ deleteCodexFolder: vi.fn().mockRejectedValue(new Error('offline')) })
++    renderList({ api }); fireEvent.click(await screen.findByRole('button', { name: 'Rename folder Blender' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Delete folder' })); fireEvent.click(screen.getByRole('button', { name: 'Delete folder' }))
++    expect(await screen.findByRole('alert')).toHaveTextContent('Could not update')
++    expect(screen.getByRole('button', { name: 'Blender folder', hidden: true })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Delete folder' })).toBeEnabled()
++})

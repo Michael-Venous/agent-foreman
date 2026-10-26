@@ -1,0 +1,110 @@
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -40,7 +40,7 @@
+     const currentManaged = useMemo(() => Object.fromEntries(Object.entries(props.managed ?? {}).filter(([id]) => !locallyUnmanaged[id])), [props.managed, locallyUnmanaged])
+     const isManaged = (id: string) => Boolean(currentManaged[id])
+     const isPinned = (session: SessionSummary) => Boolean(session.pinned || session.globalPinned || currentManaged[session.id]?.role === 'manager' || session.id === import.meta.env.VITE_MANAGER_SESSION_ID)
+-    const { open, setCollapsed } = useSessionManagerWindow()
++    const { open, setCollapsed, pinnedCollapsed = false, setPinnedCollapsed } = useSessionManagerWindow()
+     const mobile = useSessionManagerMobile()
+     const [activityFilter, setActivityFilter] = useState<'all' | 'active' | 'inactive'>('all')
+     const [managedOnly, setManagedOnly] = useState(false)
+@@ -49,8 +49,10 @@
+         Number(isPinned(b.session)) - Number(isPinned(a.session)) || Number(sessionHasWork(b.session)) - Number(sessionHasWork(a.session)) || Number(b.session.active) - Number(a.session.active) || b.session.updatedAt - a.session.updatedAt)
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+         && (activityFilter === 'all' || (activityFilter === 'active' ? sessionHasWork(e.session) : !sessionHasWork(e.session))))
++    const pinnedCount = visibleRows.filter(e => isPinned(e.session)).length
++    const displayedRows = pinnedCollapsed ? visibleRows.filter(e => !isPinned(e.session)) : visibleRows
+     const filtered = managedOnly || activityFilter !== 'all'
+-    const clearable = visibleRows.filter(e => e.stopped && !(isManaged(e.session.id)
++    const clearable = displayedRows.filter(e => e.stopped && !(isManaged(e.session.id)
+         && (!e.observedWork || currentManaged[e.session.id]?.projectStatus === 'paused' || currentManaged[e.session.id]?.manualHold)))
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+@@ -72,8 +74,13 @@
+             </div>
+             {listError && <p role="alert" className="text-xs text-[var(--app-badge-error-text)]">{listError}</p>}
+             <div className="min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain" aria-label="Session Manager sessions">
+-                {visibleRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
+-                    {index > 0 && isPinned(visibleRows[index - 1]!.session) && !isPinned(session) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
++                {pinnedCount > 0 && <button type="button" aria-label="Pinned sessions" aria-expanded={!pinnedCollapsed}
++                    onClick={() => setPinnedCollapsed(!pinnedCollapsed)} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-2 text-left text-xs font-medium text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)]">
++                    <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={`h-3.5 w-3.5 shrink-0 transition-transform ${pinnedCollapsed ? '-rotate-90' : ''}`}><path d="m4 6 4 4 4-4" /></svg>
++                    <span>Pinned</span><span className="ml-auto tabular-nums">{pinnedCount}</span>
++                </button>}
++                {displayedRows.map(({ session, missing, stopped }, index) => <Fragment key={session.id}>
++                    {((pinnedCollapsed && pinnedCount > 0 && index === 0) || (index > 0 && isPinned(displayedRows[index - 1]!.session) && !isPinned(session))) && <div role="separator" aria-label="Pinned sessions" className="my-2 h-px bg-[var(--app-divider)] opacity-60" />}
+                     <div className="flex min-w-0 flex-wrap items-center gap-1 border-b border-[var(--app-divider)] py-1">
+                     <div className="min-w-0 flex-1 max-sm:basis-full">
+                         <button type="button" disabled={missing} aria-label={`Open ${getSessionTitle(session)}`} onClick={() => { props.onSelect(session.id); if (mobile) setCollapsed(true) }} className="flex w-full min-w-0 flex-col gap-1 rounded-lg p-2 text-left hover:bg-[var(--app-subtle-bg)] disabled:opacity-60">
+--- a/web/src/components/SessionManagerWindow.tsx
++++ b/web/src/components/SessionManagerWindow.tsx
+@@ -5,7 +5,7 @@
+ 
+ export type WindowBounds = { x: number; y: number; width: number; height: number }
+ type Position = Pick<WindowBounds, 'x' | 'y'>
+-type WindowState = { open: boolean; collapsed?: boolean; bounds?: WindowBounds; bubble?: Position }
++type WindowState = { open: boolean; collapsed?: boolean; pinnedCollapsed?: boolean; bounds?: WindowBounds; bubble?: Position }
+ const WINDOW_KEY = ['session-manager-window'] as const
+ const BUBBLE = { width: 116, height: 48 }
+ const viewport = () => ({
+@@ -45,6 +45,7 @@
+         ...data,
+         setOpen: (open: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open, ...(open ? { collapsed: false } : {}) })),
+         setCollapsed: (collapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: true, collapsed })),
++        setPinnedCollapsed: (pinnedCollapsed: boolean) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, pinnedCollapsed })),
+         setBounds: (bounds: WindowBounds) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bounds })),
+         setBubble: (bubble: Position) => client.setQueryData<WindowState>(WINDOW_KEY, old => ({ ...old, open: old?.open ?? false, bubble })),
+     }
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -282,3 +282,49 @@
+         expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
+     } finally { window.matchMedia = original }
+ })
++
++
++it('collapses pins without changing membership or controls, and preserves it through reopening', async () => {
++    const client = new QueryClient(), select = vi.fn()
++    const pinned = { ...session('Pinned task'), pinned: true }
++    const view = (pin = true) => fixture(client, [{ ...pinned, pinned: pin }, session('Other task')], select)
++    const { rerender } = render(view()); open()
++    const toggle = await screen.findByRole('button', { name: 'Pinned sessions' })
++    expect(toggle).toHaveAttribute('aria-expanded', 'true')
++    fireEvent.click(toggle)
++    await waitFor(() => expect(toggle).toHaveAttribute('aria-expanded', 'false'))
++    expect(screen.queryByRole('button', { name: 'Open Pinned task' })).toBeNull()
++    expect(screen.getByRole('button', { name: 'Open Other task' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('2')
++    expect(screen.getByRole('separator', { name: 'Pinned sessions' })).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Close Session Manager' })); open()
++    expect(screen.getByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
++    fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
++    expect(await screen.findByRole('button', { name: 'Open Pinned task' })).toBeInTheDocument()
++    fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Pinned task' })).toBeNull())
++    rerender(view(false))
++    await screen.findByRole('button', { name: 'Open Pinned task' })
++    expect(screen.queryByRole('button', { name: 'Pinned sessions' })).toBeNull()
++    expect(select).not.toHaveBeenCalled(); expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
++
++it('keeps collapsed pinned sessions out of Clear finished and preserves collapse across filters', async () => {
++    const client = new QueryClient()
++    const view = (thinking: boolean) => fixture(client, [{ ...session('Pinned task', true, thinking), globalPinned: true }, session('Other task', true, thinking)])
++    const { rerender } = render(view(true)); open()
++    fireEvent.click(await screen.findByRole('button', { name: 'Pinned sessions' }))
++    rerender(view(false))
++    await screen.findByRole('button', { name: 'Dismiss Other task from Session Manager' })
++    fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Other task' })).toBeNull())
++    expect(screen.getByRole('button', { name: 'Session Manager' })).toHaveTextContent('1')
++    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
++    expect(screen.queryByRole('button', { name: 'Pinned sessions' })).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: 'All' }))
++    expect(screen.getByRole('button', { name: 'Pinned sessions' })).toHaveAttribute('aria-expanded', 'false')
++    expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
++    fireEvent.click(screen.getByRole('button', { name: 'Pinned sessions' }))
++    expect(await screen.findByRole('button', { name: 'Open Pinned task' })).toBeInTheDocument()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})

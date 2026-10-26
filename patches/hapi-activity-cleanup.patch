@@ -1,0 +1,604 @@
+diff --git a/web/src/chat/backgroundTaskViews.test.ts b/web/src/chat/backgroundTaskViews.test.ts
+index d52972f..f975ebe 100644
+--- a/web/src/chat/backgroundTaskViews.test.ts
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -11,11 +11,11 @@ function notification(id: string, status: string): NormalizedMessage {
+ describe('background task views', () => {
+     it('finds native Claude tasks without treating the finished spawn tool as the task completion', () => {
+         const task = collectBackgroundTasks([block('spawn', { command: 'render scene', cwd: '/project' }, start)], [], true, 1)[0]
+-        expect(task).toMatchObject({ id: 'job', command: 'render scene', cwd: '/project', state: 'running', liveOutput: true })
++        expect(task).toMatchObject({ id: 'job', command: 'render scene', cwd: '/project', state: 'unknown', liveOutput: true })
+     })
+-    it.each(['completed', 'failed', 'stopped', 'cancelled'])('uses exact task %s notifications', status => {
++    it.each(['completed', 'failed', 'stopped', 'cancelled', 'killed'])('uses exact task %s notifications', status => {
+         const blocks = [block('spawn', { command: 'render' }, start)]
+-        expect(collectBackgroundTasks(blocks, [notification('job', status)], true, 0)[0].state).toBe(status === 'cancelled' ? 'stopped' : status)
++        expect(collectBackgroundTasks(blocks, [notification('job', status)], true, 0)[0].state).toBe(status === 'cancelled' || status === 'killed' ? 'stopped' : status)
+         expect(collectBackgroundTasks(blocks, [notification('other', status)], false, 0)[0].state).toBe('unknown')
+     })
+     it('groups Codex process polls into one task and captures its final exit output', () => {
+@@ -37,3 +37,8 @@ it('uses recorded TaskOutput completion and bounds captured logs', () => {
+     const task = collectBackgroundTasks([start, completed], [], true, 0)[0]
+     expect(task.state).toBe('failed'); expect(task.captured.length).toBe(65536); expect(task.capturedTruncated).toBe(true)
+ })
++
++it('does not assign an aggregate count to individual Claude tasks', () => {
++    const tasks = collectBackgroundTasks([block('one', { command: 'old' }, start), block('two', { command: 'new' }, start.replace('job.', 'other.'))], [], true, 1)
++    expect(tasks.map(task => task.state)).toEqual(['unknown', 'unknown'])
++})
+diff --git a/web/src/chat/backgroundTaskViews.ts b/web/src/chat/backgroundTaskViews.ts
+index 447e203..d82087e 100644
+--- a/web/src/chat/backgroundTaskViews.ts
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -17,6 +17,13 @@ function text(value: unknown): string {
+     }
+     return ''
+ }
++export function backgroundTaskReceipt(result: unknown): { id: string; provider: 'claude' | 'codex' } | null {
++    const output = text(result)
++    const claude = output.match(/Command running in background with ID:\s*([\w-]+)/)?.[1]
++    if (claude) return { id: claude, provider: 'claude' }
++    const codex = output.match(/Process running with session ID\s+(\d+)/i)?.[1]
++    return codex ? { id: `codex:${codex}`, provider: 'codex' } : null
++}
+ function tools(blocks: readonly ChatBlock[]): ToolCallBlock[] {
+     return blocks.flatMap(block => block.kind === 'tool-call' ? [block, ...tools(block.children)] : [])
+ }
+@@ -26,22 +33,21 @@ function command(block: ToolCallBlock): string {
+     if (isObject(block.tool.input) && Array.isArray(block.tool.input.command)) return block.tool.input.command.join(' ')
+     return block.tool.description ?? block.tool.name
+ }
+-export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, count?: number): BackgroundTaskView[] {
++export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, _count?: number): BackgroundTaskView[] {
+     const found = new Map<string, BackgroundTaskView>()
+     const all = tools(blocks)
+     for (const block of all) {
+         const output = text(block.tool.result)
+-        const claude = output.match(/Command running in background with ID:\s*([\w-]+)/)?.[1]
+-        const codex = output.match(/Process running with session ID\s+(\d+)/i)?.[1]
+-        if (!claude && !codex) continue
+-        const id = claude ?? `codex:${codex}`
++        const receipt = backgroundTaskReceipt(block.tool.result)
++        if (!receipt) continue
++        const { id, provider } = receipt
+         // A repeated poll of the same process is additional output, not a new task.
+         const existing = found.get(id)
+         if (existing) continue
+-        found.set(id, { id, provider: claude ? 'claude' : 'codex', block, command: command(block),
++        found.set(id, { id, provider, block, command: command(block),
+             cwd: getInputStringAny(block.tool.input, ['cwd', 'workdir']),
+-            state: active && (codex || count !== 0) ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
+-            liveOutput: Boolean(claude && /Output is being written to:/.test(output)) })
++            state: active && provider === 'codex' ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
++            liveOutput: Boolean(provider === 'claude' && /Output is being written to:/.test(output)) })
+     }
+     for (const block of all) {
+         if (!isObject(block.tool.input)) continue
+@@ -63,7 +69,7 @@ export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: r
+             const code = output.match(/<exit_code>\s*(-?\d+)\s*<\/exit_code>/)?.[1]
+             task.state = code && code !== '0' ? 'failed' : 'completed'
+         } else if (status === 'failed') task.state = 'failed'
+-        else if (status === 'stopped' || status === 'cancelled' || (block.tool.name === 'TaskStop' && /Successfully stopped task/i.test(output))) task.state = 'stopped'
++        else if (status === 'stopped' || status === 'cancelled' || status === 'killed' || (block.tool.name === 'TaskStop' && /Successfully stopped task/i.test(output))) task.state = 'stopped'
+     }
+     for (const message of messages) {
+         if (message.role !== 'agent') continue
+@@ -77,7 +83,7 @@ export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: r
+             const status = value.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
+             if (!status || status === 'completed') task.state = 'completed'
+             else if (status === 'failed') task.state = 'failed'
+-            else if (status === 'stopped' || status === 'cancelled') task.state = 'stopped'
++            else if (status === 'stopped' || status === 'cancelled' || status === 'killed') task.state = 'stopped'
+         }
+     }
+     return [...found.values()].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running') || b.block.createdAt - a.block.createdAt)
+diff --git a/web/src/components/AssistantChat/ComposerButtons.test.tsx b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+index d6ac051..c9be96e 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.test.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.test.tsx
+@@ -209,7 +209,7 @@ describe('ComposerExpandButton', () => {
+ describe('ComposerButtons responsive toolbar', () => {
+     afterEach(cleanup)
+ 
+-    it('keeps toolbar actions non-shrinking inside a horizontal scroll area', () => {
++    it('wraps mobile actions without shrinking controls and retains desktop overflow', () => {
+         const noop = () => {}
+         render(
+             <RuntimeProviders>
+@@ -247,8 +247,10 @@ describe('ComposerButtons responsive toolbar', () => {
+ 
+         const toolbar = screen.getByTestId('composer-toolbar-items')
+         expect(toolbar.className).toContain('overflow-x-auto')
++        expect(toolbar.className).toContain('max-sm:flex-wrap')
++        expect(toolbar.className).toContain('max-sm:overflow-visible')
+         const toolbarButtons = within(toolbar).getAllByRole('button')
+-        expect(toolbarButtons.length).toBeGreaterThanOrEqual(8)
++        expect(toolbarButtons.length).toBeGreaterThanOrEqual(6)
+         for (const button of toolbarButtons) {
+             expect(button.closest('.shrink-0')).not.toBeNull()
+         }
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index c25111e..1b6ea48 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -679,10 +679,10 @@ export function ComposerButtons(props: {
+     const toolbarJustifyContent = getComposerToolbarJustifyContent(layout.mode)
+ 
+     return (
+-        <div className="flex shrink-0 items-center gap-1 px-2 pb-2">
++        <div className="flex shrink-0 flex-wrap items-center gap-1 px-2 pb-2 sm:flex-nowrap">
+             <div
+                 data-testid="composer-toolbar-items"
+-                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
++                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto max-sm:basis-full max-sm:flex-wrap max-sm:overflow-visible [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                 style={{ justifyContent: toolbarJustifyContent }}
+             >
+                 <OrderedToolbarItems layout={effectiveLayout}>
+@@ -872,7 +872,7 @@ export function ComposerButtons(props: {
+                 onVoiceToggle={props.onVoiceToggle}
+             />
+ 
+-            {props.modelMenu}
++            {props.modelMenu ? <div className="ml-auto flex min-w-0 items-center gap-1">{props.modelMenu}</div> : null}
+ 
+             {props.nativePriorityFlavor && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
+                 <Popover.Root>
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index f5ca853..565a082 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -2175,6 +2175,7 @@ export function HappyComposer(props: {
+                     {overlays}
+ 
+                     <StatusBar
++                        compact={Boolean(props.compactModelControls && (agentFlavor === 'claude' || agentFlavor === 'codex'))}
+                         active={active}
+                         thinking={thinking}
+                         agentState={agentState}
+diff --git a/web/src/components/AssistantChat/StatusBar.popover.test.tsx b/web/src/components/AssistantChat/StatusBar.popover.test.tsx
+index 4e0acea..c4b8ef3 100644
+--- a/web/src/components/AssistantChat/StatusBar.popover.test.tsx
++++ b/web/src/components/AssistantChat/StatusBar.popover.test.tsx
+@@ -213,7 +213,8 @@ describe('StatusBar context details popover', () => {
+ 
+         const cacheLine = await screen.findByText('缓存：86k')
+         const details = cacheLine.parentElement
+-        expect(details?.textContent).toBe('缓存：86k使用：90k（35%）剩余：168k（65%）')
++        expect(details?.textContent).toContain('缓存：86k使用：90k（35%）剩余：168k（65%）')
++        expect(details?.textContent).toContain('Active runtime context: 258,000 tokens.')
+         expect(screen.queryByText('上下文详情')).toBeNull()
+     })
+ 
+@@ -238,6 +239,15 @@ describe('StatusBar context details popover', () => {
+         fireEvent.click(trigger)
+ 
+         const cacheLine = await screen.findByText('Cache: 86k')
+-        expect(cacheLine.parentElement?.textContent).toBe('Cache: 86kUsed: 90k (35%)Remaining: 168k (65%)')
++        expect(cacheLine.parentElement?.textContent).toContain('Cache: 86kUsed: 90k (35%)Remaining: 168k (65%)')
+     })
+ })
++
++it('keeps one permissions and usage entry point when compact composer controls are present', () => {
++    render(<I18nProvider><StatusBar compact active thinking={false} agentState={null} agentFlavor="claude"
++        permissionMode="bypassPermissions" effort="medium" backgroundTaskCount={2} contextSize={900000} contextWindow={1000000} /></I18nProvider>)
++    expect(screen.queryByRole('link', { name: 'Check usage' })).not.toBeInTheDocument()
++    expect(screen.queryByText('Yolo')).not.toBeInTheDocument()
++    expect(screen.getByText('Background work')).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: /Context details/i })).toBeInTheDocument()
++})
+diff --git a/web/src/components/AssistantChat/StatusBar.tsx b/web/src/components/AssistantChat/StatusBar.tsx
+index df20def..44d37b6 100644
+--- a/web/src/components/AssistantChat/StatusBar.tsx
++++ b/web/src/components/AssistantChat/StatusBar.tsx
+@@ -8,7 +8,6 @@ import {
+ import type { PermissionModeTone } from '@hapi/protocol'
+ import * as Popover from '@radix-ui/react-popover'
+ import { useMemo } from 'react'
+-import { Link } from '@tanstack/react-router'
+ import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+ import type { ConversationStatus } from '@/realtime/types'
+ import { getContextBudgetTokens } from '@/chat/modelConfig'
+@@ -101,7 +100,7 @@ function getConnectionStatus(
+ 
+     if (backgroundTaskCount > 0) {
+         return {
+-            text: `${backgroundTaskCount} background task${backgroundTaskCount > 1 ? 's' : ''} running`,
++            text: 'Background work',
+             color: 'text-[#007AFF]',
+             dotColor: 'bg-[#007AFF]',
+             isPulsing: true
+@@ -193,6 +192,7 @@ export function shouldShowCodexFastBadge(
+ }
+ 
+ export function StatusBar(props: {
++    compact?: boolean
+     active: boolean
+     thinking: boolean
+     agentState: AgentState | null | undefined
+@@ -293,7 +293,7 @@ export function StatusBar(props: {
+     const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
+ 
+     return (
+-        <div className="flex min-w-0 items-baseline justify-between gap-2 px-2 pb-1">
++        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1 px-2 pb-1">
+             <div className="flex min-w-0 items-baseline gap-2">
+                 <div className="relative top-px sm:top-0.5 flex shrink-0 items-center gap-1.5">
+                     <span
+@@ -303,14 +303,6 @@ export function StatusBar(props: {
+                         {connectionStatus.text}
+                     </span>
+                 </div>
+-                <Link
+-                    to="/settings/usage"
+-                    aria-label="Check usage"
+-                    title="Check token usage and subscription limits"
+-                    className="shrink-0 rounded px-1 text-xs text-[var(--app-link)] hover:bg-[var(--app-subtle-bg)] focus-visible:outline focus-visible:outline-2"
+-                >
+-                    Usage
+-                </Link>
+                 {contextUsageLabel ? (
+                     <Popover.Root>
+                         <Popover.Trigger asChild>
+@@ -380,13 +372,13 @@ export function StatusBar(props: {
+             </div>
+ 
+             <div className="flex min-w-0 shrink-0 items-baseline gap-2">
+-                {reasoningLabel ? (
++                {reasoningLabel && !props.compact ? (
+                     <span className="whitespace-nowrap text-xs text-[var(--app-hint)]">
+                         <span className="sm:hidden">{compactReasoningLabel}</span>
+                         <span className="hidden sm:inline">{reasoningLabel}</span>
+                     </span>
+                 ) : null}
+-                {codexFastMode ? (
++                {codexFastMode && !props.compact ? (
+                     <span className="whitespace-nowrap text-xs text-[#34C759]">
+                         fast
+                     </span>
+@@ -401,7 +393,7 @@ export function StatusBar(props: {
+                         {copilotAgentModeLabel}
+                     </span>
+                 ) : null}
+-                {displayPermissionMode ? (
++                {displayPermissionMode && !props.compact ? (
+                     <span className={`whitespace-nowrap text-xs ${permissionModeColor}`}>
+                         {permissionModeLabel}
+                     </span>
+diff --git a/web/src/components/BackgroundTasksPanel.tsx b/web/src/components/BackgroundTasksPanel.tsx
+index 6aaf35b..709844c 100644
+--- a/web/src/components/BackgroundTasksPanel.tsx
++++ b/web/src/components/BackgroundTasksPanel.tsx
+@@ -7,6 +7,7 @@ import { CodeBlock } from '@/components/CodeBlock'
+ const label = (state: BackgroundTaskView['state']) => state === 'unknown' ? 'Status unconfirmed' : state[0].toUpperCase() + state.slice(1)
+ type Output = Awaited<ReturnType<ApiClient['getBackgroundTaskOutput']>> & { id: string }
+ export function BackgroundTasksPanel(props: {
++    embedded?: boolean;
+     api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
+     active: boolean; count?: number; viewedId: string | null; onView: (id: string | null) => void;
+     hasMore: boolean; loadingMore: boolean; onLoadEarlier: () => void
+@@ -18,7 +19,7 @@ export function BackgroundTasksPanel(props: {
+     const [refresh, setRefresh] = useState(0)
+     const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, props.count), [props.blocks, props.messages, props.active, props.count])
+     const selected = tasks.find(task => task.id === props.viewedId)
+-    const running = Math.max(props.active ? props.count ?? 0 : 0, tasks.filter(t => t.state === 'running').length)
++    const running = props.active ? (props.count ?? 0) + tasks.filter(t => t.provider === 'codex' && t.state === 'running').length : 0
+     useEffect(() => {
+         setError(null)
+         if (!selected?.liveOutput) { setLoading(false); return }
+@@ -28,29 +29,29 @@ export function BackgroundTasksPanel(props: {
+                 const next = await props.api.getBackgroundTaskOutput(props.sessionId, selected.id)
+                 if (!live) return
+                 setOutput({ ...next, id: selected.id }); setError(null)
+-                if (selected.state === 'running') timer = setTimeout(load, 2000)
++                if (selected.state === 'running' || (selected.state === 'unknown' && props.active && (props.count ?? 0) > 0)) timer = setTimeout(load, 2000)
+             } catch (err) { if (live) setError(err instanceof Error ? err.message : 'Live output unavailable. Recorded output remains below.') }
+             finally { if (live) setLoading(false) }
+         }
+         setLoading(true); void load()
+         return () => { live = false; clearTimeout(timer) }
+-    }, [props.api, props.sessionId, selected?.id, selected?.state, selected?.liveOutput, refresh])
++    }, [props.api, props.sessionId, selected?.id, selected?.state, selected?.liveOutput, props.active, props.count, refresh])
+     const liveOutput = selected && output?.id === selected.id ? output : null
+-    return <div className="shrink-0 border-b border-[var(--app-border)] px-3 py-1">
+-        <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
++    return <div className={props.embedded ? "min-w-0" : "shrink-0 border-b border-[var(--app-border)] px-3 py-1"}>
++        {props.embedded ? <h3 className="mb-2 text-xs font-medium text-[var(--app-hint)]">Background tasks · {tasks.length} recorded</h3> : <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
+             className="flex min-h-8 w-full items-center gap-2 text-left text-sm text-[var(--app-hint)]">
+             <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>Background tasks ({tasks.length})</span>
+             {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">{running} running</span> : null}
+-        </button>
+-        {expanded ? <div className="max-h-52 space-y-1 overflow-y-auto pb-2">
++        </button>}
++        {props.embedded || expanded ? <div className={props.embedded ? "space-y-1" : "max-h-52 space-y-1 overflow-y-auto pb-2"}>
+             {!tasks.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
+-            {props.active && (props.count ?? 0) > tasks.filter(t => t.state === 'running').length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
++            {props.active && (props.count ?? 0) > tasks.length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
+             {tasks.map(task => <button type="button" key={task.id} onClick={() => props.onView(task.id)} aria-label={`View background task: ${task.id}`}
+                 className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
+                 <span className="min-w-0 flex-1"><code className="block truncate">{task.command}</code><span className="block text-xs text-[var(--app-hint)]">{task.id}</span></span>
+                 <span className="shrink-0 text-xs text-[var(--app-hint)]">{label(task.state)}</span><span aria-hidden="true">›</span>
+             </button>)}
+-            {props.hasMore ? <button type="button" onClick={props.onLoadEarlier} disabled={props.loadingMore}
++            {props.hasMore && !props.embedded ? <button type="button" onClick={props.onLoadEarlier} disabled={props.loadingMore}
+                 className="min-h-9 px-2 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
+         </div> : null}
+         <Dialog open={Boolean(selected)} onOpenChange={open => { if (!open) props.onView(null) }}>
+diff --git a/web/src/components/RunningBar.test.tsx b/web/src/components/RunningBar.test.tsx
+index c29edb6..e19906c 100644
+--- a/web/src/components/RunningBar.test.tsx
++++ b/web/src/components/RunningBar.test.tsx
+@@ -14,7 +14,7 @@ describe('running indicators', () => {
+     it('shows a violet labelled bar for manager-run chats and a plain bar for your own', () => {
+         render(<RunningBar running managed />)
+         expect(screen.getByTestId('running-bar')).toHaveAttribute('data-managed', 'true')
+-        expect(screen.getByText('Managed by Manager')).toBeInTheDocument()
++        expect(screen.getByText('Managed by Manager')).toHaveClass('sr-only')
+         cleanup()
+         render(<RunningBar running managed={false} />)
+         expect(screen.getByTestId('running-bar')).not.toHaveAttribute('data-managed')
+diff --git a/web/src/components/RunningBar.tsx b/web/src/components/RunningBar.tsx
+index f026223..65042c4 100644
+--- a/web/src/components/RunningBar.tsx
++++ b/web/src/components/RunningBar.tsx
+@@ -13,7 +13,7 @@ export function RunningBar(props: { running: boolean; managed: boolean }) {
+                 <div className={props.managed ? 'running-bar-managed h-full w-full' : 'running-bar-own h-full w-1/3 bg-[var(--app-badge-success-text)]'} />
+             </div>
+             {props.managed ? (
+-                <span className="absolute right-2 top-1.5 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-600 dark:text-violet-300">
++                <span className="sr-only">
+                     Managed by Manager
+                 </span>
+             ) : <span className="sr-only">Running</span>}
+diff --git a/web/src/components/SessionActivityPanel.test.tsx b/web/src/components/SessionActivityPanel.test.tsx
+new file mode 100644
+index 0000000..69be4e6
+--- /dev/null
++++ b/web/src/components/SessionActivityPanel.test.tsx
+@@ -0,0 +1,54 @@
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { useState } from 'react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { ApiClient } from '@/api/client'
++import type { ToolCallBlock } from '@/chat/types'
++import { I18nProvider } from '@/lib/i18n-context'
++import { SessionActivityPanel } from './SessionActivityPanel'
++vi.mock('@/components/CodeBlock', () => ({ CodeBlock: ({ code }: { code: string }) => <pre>{code}</pre> }))
++vi.mock('@/components/ToolCard/ToolCard', () => ({ getSubagentModel: () => null, ToolDetailDialogContent: () => <p>Agent trace</p> }))
++afterEach(cleanup)
++const block: ToolCallBlock = { kind: 'tool-call', id: 'start', localId: null, createdAt: 100, children: [], tool: {
++    id: 'start', name: 'Bash', state: 'completed', input: { command: 'render scene' },
++    result: 'Command running in background with ID: task. Output is being written to: /tmp/task.output.',
++    createdAt: 100, startedAt: 100, completedAt: 110, execStartedAt: null, execCompletedAt: null, description: null } }
++function Harness({ count = 1, empty = false, load = vi.fn(), api = {} as ApiClient }: { count?: number; empty?: boolean; load?: () => void; api?: ApiClient }) {
++    const [agent, setAgent] = useState<string | null>(null)
++    const [task, setTask] = useState<string | null>(null)
++    return <I18nProvider><SessionActivityPanel api={api} sessionId="parent" blocks={empty ? [] : [block]} messages={[]} metadata={null}
++        active managed thinking={false} count={count} status={null} viewedSubagentId={agent} onViewSubagent={setAgent}
++        viewedBackgroundId={task} onViewBackground={setTask} hasMore loadingMore={false} onLoadEarlier={load} /></I18nProvider>
++}
++describe('unified activity panel', () => {
++    it('shows one collapsed entry point and opens background details without repeating status sections', async () => {
++        const getBackgroundTaskOutput = vi.fn().mockResolvedValue({ text: 'Frame 42', truncated: false, size: 8, modifiedAt: 100 })
++        render(<Harness api={{ getBackgroundTaskOutput } as unknown as ApiClient} />)
++        expect(screen.getAllByRole('button')).toHaveLength(1)
++        expect(screen.getByText('Managed')).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: /Activity.*1 background running/ })).toHaveAttribute('aria-expanded', 'false')
++        expect(getBackgroundTaskOutput).not.toHaveBeenCalled()
++        fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++        expect(screen.queryByText(/Subagents/)).not.toBeInTheDocument()
++        expect(screen.queryByText('Session status')).not.toBeInTheDocument()
++        expect(screen.getAllByRole('button', { name: 'Load earlier activity' })).toHaveLength(1)
++        fireEvent.click(screen.getByRole('button', { name: 'View background task: task' }))
++        expect(await screen.findByText('Frame 42')).toBeInTheDocument()
++        expect(screen.getByRole('dialog')).toHaveTextContent('render scene')
++    })
++    it('trusts zero live tasks rather than promoting old receipts back to running', () => {
++        render(<Harness count={0} />)
++        expect(screen.getByRole('button', { name: /Activity.*Idle/ })).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++        expect(screen.getByText('Status unconfirmed')).toBeInTheDocument()
++        expect(screen.queryByText(/running/)).not.toBeInTheDocument()
++    })
++    it('keeps empty activity compact and provides one explicit history loader', () => {
++        const load = vi.fn()
++        render(<Harness empty count={0} load={load} />)
++        expect(screen.getAllByRole('button')).toHaveLength(1)
++        fireEvent.click(screen.getByRole('button', { name: /Activity/ }))
++        expect(screen.getByText('No activity in the loaded chat history.')).toBeInTheDocument()
++        fireEvent.click(screen.getByRole('button', { name: 'Load earlier activity' }))
++        expect(load).toHaveBeenCalledTimes(1)
++    })
++})
+diff --git a/web/src/components/SessionActivityPanel.tsx b/web/src/components/SessionActivityPanel.tsx
+new file mode 100644
+index 0000000..3201d3c
+--- /dev/null
++++ b/web/src/components/SessionActivityPanel.tsx
+@@ -0,0 +1,50 @@
++import { useMemo, useState } from 'react'
++import type { ApiClient } from '@/api/client'
++import type { ChatBlock, NormalizedMessage } from '@/chat/types'
++import type { SessionMetadataSummary } from '@/types/api'
++import type { SessionStatusData } from '@/chat/sessionStatus'
++import { collectBackgroundTasks } from '@/chat/backgroundTaskViews'
++import { BackgroundTasksPanel } from './BackgroundTasksPanel'
++import { SubagentsPanel, collectSubagents } from './SubagentsPanel'
++import { ChecklistList } from './ToolCard/checklist'
++
++/** One activity entry point; live counts and loaded history have distinct labels. */
++export function SessionActivityPanel(props: {
++    api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
++    managed?: boolean;
++    metadata: SessionMetadataSummary | null; active: boolean; thinking: boolean; count?: number; status: SessionStatusData | null;
++    viewedSubagentId: string | null; onViewSubagent: (id: string | null) => void;
++    viewedBackgroundId: string | null; onViewBackground: (id: string | null) => void;
++    hasMore: boolean; loadingMore: boolean; onLoadEarlier: () => void
++}) {
++    const [expanded, setExpanded] = useState(false)
++    const agents = useMemo(() => collectSubagents(props.blocks), [props.blocks])
++    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, props.count), [props.blocks, props.messages, props.active, props.count])
++    const runningAgents = props.active ? agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length : 0
++    const runningTasks = props.active ? (props.count ?? 0) + tasks.filter(task => task.provider === 'codex' && task.state === 'running').length : 0
++    const summary = [runningTasks ? `${runningTasks} background` : null, runningAgents ? `${runningAgents} agent${runningAgents === 1 ? '' : 's'}` : null].filter(Boolean)
++    const state = !props.active ? 'Offline' : summary.length ? `${summary.join(' · ')} running` : props.thinking ? 'Working' : 'Idle'
++    const todos = props.status?.tasks ?? []
++    const hasHistory = agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
++    return <section aria-label="Chat activity" className="shrink-0 border-b border-[var(--app-border)]">
++        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}
++            className="flex min-h-10 w-full min-w-0 items-center gap-2 px-3 text-left text-xs text-[var(--app-hint)]">
++            <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span className="font-medium text-[var(--app-fg)]">Activity</span>
++            {props.managed ? <span title="Managed by Manager" className="shrink-0 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">Managed</span> : null}
++            <span className={`ml-auto truncate ${props.active && (props.thinking || runningTasks || runningAgents) ? 'text-[var(--app-badge-success-text)]' : ''}`}>{state}</span>
++        </button>
++        <div hidden={!expanded} className="max-h-[min(50dvh,24rem)] space-y-4 overflow-y-auto px-3 pb-3">
++            {props.status?.goal ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Goal · {props.status.goal.status}</h3><p className="break-words text-sm">{props.status.goal.objective}</p></div> : null}
++            {todos.length ? <div><h3 className="mb-1 text-xs font-medium text-[var(--app-hint)]">Checklist · {todos.filter(task => task.status === 'completed').length}/{todos.length}</h3>
++                <ChecklistList items={todos.map(task => ({ id: task.id || undefined, text: task.content, status: task.status }))} /></div> : null}
++            {agents.length ? <SubagentsPanel embedded blocks={props.blocks} metadata={props.metadata} viewedId={props.viewedSubagentId} onView={props.onViewSubagent}
++                hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
++            {tasks.length || runningTasks ? <BackgroundTasksPanel embedded api={props.api} sessionId={props.sessionId} blocks={props.blocks} messages={props.messages}
++                active={props.active} count={props.count} viewedId={props.viewedBackgroundId} onView={props.onViewBackground}
++                hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
++            {!hasHistory && !runningTasks ? <p className="text-sm text-[var(--app-hint)]">No activity in the loaded chat history.</p> : null}
++            {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
++                className="min-h-9 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
++        </div>
++    </section>
++}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index 7b5578c..74da0a4 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -87,11 +87,9 @@ import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutat
+ import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+ import { ChatStatisticsButton } from '@/components/AssistantChat/ChatStatisticsButton'
+ import { SessionHeader } from '@/components/SessionHeader'
+-import { SubagentsPanel } from '@/components/SubagentsPanel'
+-import { BackgroundTasksPanel } from '@/components/BackgroundTasksPanel'
++import { SessionActivityPanel } from '@/components/SessionActivityPanel'
+ import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
+ import { TeamPanel } from '@/components/TeamPanel'
+-import { SessionStatusPanel } from '@/components/SessionStatusPanel'
+ import { buildSessionStatusData } from '@/chat/sessionStatus'
+ import { usePlatform } from '@/hooks/usePlatform'
+ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
+@@ -1904,16 +1902,14 @@ function SessionChatInner(props: SessionChatProps) {
+ 
+             <CursorMigrationBanner metadata={props.session.metadata} />
+ 
+-            {agentFlavor === 'claude' || agentFlavor === 'codex' ? <SubagentsPanel
+-                blocks={reconciled.blocks} metadata={props.session.metadata} viewedId={viewedSubagentId} onView={setViewedSubagentId}
+-                hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+-            /> : null}
+-            {agentFlavor === 'claude' || agentFlavor === 'codex' ? <BackgroundTasksPanel
++            <SessionActivityPanel
+                 api={props.api} sessionId={props.session.id} blocks={reconciled.blocks} messages={normalizedMessages}
+-                active={props.session.active} count={props.session.backgroundTaskCount} viewedId={viewedBackgroundId} onView={setViewedBackgroundId}
++                metadata={props.session.metadata} active={props.session.active} thinking={Boolean(props.session.thinking)} managed={Boolean(managedSessions[props.session.id])}
++                count={props.session.backgroundTaskCount} status={sessionStatus}
++                viewedSubagentId={viewedSubagentId} onViewSubagent={setViewedSubagentId}
++                viewedBackgroundId={viewedBackgroundId} onViewBackground={setViewedBackgroundId}
+                 hasMore={props.hasMoreMessages} loadingMore={props.isLoadingMoreMessages} onLoadEarlier={() => { void props.onLoadMore() }}
+-            /> : null}
+-            {sessionStatus ? <SessionStatusPanel data={sessionStatus} onViewSubagent={setViewedSubagentId} onViewBackground={setViewedBackgroundId} /> : null}
++            />
+ 
+             <div className="flex flex-col min-h-0 flex-1">
+             {props.session.teamState && (
+diff --git a/web/src/components/SubagentsPanel.tsx b/web/src/components/SubagentsPanel.tsx
+index f1aaa16..e244282 100644
+--- a/web/src/components/SubagentsPanel.tsx
++++ b/web/src/components/SubagentsPanel.tsx
+@@ -29,6 +29,7 @@ function stateLabel(block: ToolCallBlock): string {
+     return block.tool.state === 'completed' ? 'Completed' : block.tool.state === 'error' ? 'Failed' : block.tool.state === 'pending' ? 'Waiting' : 'Running'
+ }
+ export function SubagentsPanel(props: {
++    embedded?: boolean
+     blocks: readonly ChatBlock[]
+     metadata: SessionMetadataSummary | null
+     viewedId: string | null
+@@ -41,13 +42,13 @@ export function SubagentsPanel(props: {
+     const agents = useMemo(() => collectSubagents(props.blocks), [props.blocks])
+     const selected = agents.find(({ block }) => block.tool.id === props.viewedId)?.block
+     const running = agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length
+-    return <div className="shrink-0 border-b border-[var(--app-border)] px-3 py-1">
+-        <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
++    return <div className={props.embedded ? "min-w-0" : "shrink-0 border-b border-[var(--app-border)] px-3 py-1"}>
++        {props.embedded ? <h3 className="mb-2 text-xs font-medium text-[var(--app-hint)]">Subagents · {agents.length} recorded</h3> : <button type="button" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}
+             className="flex min-h-8 w-full items-center gap-2 text-left text-sm text-[var(--app-hint)]">
+             <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>Subagents ({agents.length})</span>
+             {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">{running} running</span> : null}
+-        </button>
+-        {expanded ? <div className="max-h-52 space-y-1 overflow-y-auto pb-2">
++        </button>}
++        {props.embedded || expanded ? <div className={props.embedded ? "space-y-1" : "max-h-52 space-y-1 overflow-y-auto pb-2"}>
+             {!agents.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No subagents in the loaded chat history.</p> : null}
+             {agents.map(({ block, depth }) => {
+                 const model = getSubagentModel(block.children, getInputStringAny(block.tool.input, ['model']))
+@@ -59,7 +60,7 @@ export function SubagentsPanel(props: {
+                     <span className="shrink-0 text-xs text-[var(--app-hint)]">{stateLabel(block)}</span><span aria-hidden="true">›</span>
+                 </button>
+             })}
+-            {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
++            {props.hasMore && !props.embedded ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
+                 className="min-h-9 px-2 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
+         </div> : null}
+         <Dialog open={Boolean(selected)} onOpenChange={open => { if (!open) props.onView(null) }}>
+diff --git a/web/src/components/ToolCard/ToolCard.test.ts b/web/src/components/ToolCard/ToolCard.test.ts
+index 4d04c44..1dce19c 100644
+--- a/web/src/components/ToolCard/ToolCard.test.ts
++++ b/web/src/components/ToolCard/ToolCard.test.ts
+@@ -223,3 +223,10 @@ describe('getSubagentModel', () => {
+         expect(getSubagentModel(children)).toBe('Haiku 4.5')
+     })
+ })
++
++it('does not claim a background launch receipt finished the process in zero seconds', () => {
++    const tool = makeToolCallChild().tool
++    expect(getToolTimingDetails({ ...tool, name: 'Bash', state: 'completed', startedAt: 1000, completedAt: 1000,
++        result: 'Command running in background with ID: task. Output is being written to: /tmp/task.output.' }, 2000))
++        .toEqual({ startedAt: 1000, completedAt: null, durationMs: null })
++})
+diff --git a/web/src/components/ToolCard/ToolCard.tsx b/web/src/components/ToolCard/ToolCard.tsx
+index 8181f4a..b86e485 100644
+--- a/web/src/components/ToolCard/ToolCard.tsx
++++ b/web/src/components/ToolCard/ToolCard.tsx
+@@ -17,6 +17,7 @@ import { getToolPresentation } from '@/components/ToolCard/knownTools'
+ import { getToolFullViewComponent, getToolViewComponent } from '@/components/ToolCard/views/_all'
+ import { getToolResultViewComponent } from '@/components/ToolCard/views/_results'
+ import { formatTaskChildLabel, TaskStateIcon } from '@/components/ToolCard/helpers'
++import { backgroundTaskReceipt } from '@/chat/backgroundTaskViews'
+ import { toolDurationMs } from '@/components/ToolCard/toolDuration'
+ import { formatDuration, formatMessageTimestampTitle } from '@/chat/presentation'
+ import type { TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+@@ -55,6 +56,10 @@ export function getToolTimingDetails(tool: ChatToolCall, now: number): {
+         return { startedAt: null, completedAt: null, durationMs: null }
+     }
+ 
++    if (TERMINAL_RELATED_TOOL_NAMES.has(tool.name) && backgroundTaskReceipt(tool.result)) {
++        return { startedAt: tool.startedAt ?? tool.createdAt, completedAt: null, durationMs: null }
++    }
++
+     const active = tool.state === 'running'
+     const hasExecPair = tool.execStartedAt != null && tool.execCompletedAt != null
+     const startedAt = active || !hasExecPair
+@@ -428,6 +433,7 @@ function ToolCardInner(props: ToolCardProps) {
+     ])
+ 
+     const toolName = props.block.tool.name
++    const backgroundLaunch = TERMINAL_RELATED_TOOL_NAMES.has(toolName) && Boolean(backgroundTaskReceipt(props.block.tool.result))
+     const toolTitle = presentation.title
+     const subtitle = presentation.subtitle ?? props.block.tool.description
+     const taskSummary = renderTaskSummary(props.block, props.metadata, t)
+@@ -510,9 +516,9 @@ function ToolCardInner(props: ToolCardProps) {
+                         {subagentModel}
+                     </span>
+                 ) : null}
+-                <span className={stateColor}>
++                {backgroundLaunch ? <span className="text-[10px] text-[var(--app-hint)]" title="Launch returned; inspect the task in Activity for its status">Background</span> : <span className={stateColor}>
+                     <ToolStatusIcon state={props.block.tool.state} />
+-                </span>
++                </span>}
+                 <span className="text-[var(--app-hint)]">
+                     <DetailsIcon />
+                 </span>

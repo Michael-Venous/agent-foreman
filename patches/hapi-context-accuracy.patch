@@ -1,0 +1,185 @@
+diff --git a/web/src/chat/contextUsage.test.ts b/web/src/chat/contextUsage.test.ts
+new file mode 100644
+index 0000000..4185794
+--- /dev/null
++++ b/web/src/chat/contextUsage.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'vitest'
++import { normalizeAgentRecord } from '@/chat/normalizeAgent'
++import { reduceChatBlocks } from '@/chat/reducer'
++import { getContextBudgetTokens, isMillionTokenClaudeModel } from '@/chat/modelConfig'
++import type { NormalizedMessage } from '@/chat/types'
++
++// Numbers below come from real records (2026-10-19 investigation of sessions b60c09d6, f54dd31a, 9f60efec).
++const claude = (id: string, model: string, usage: Record<string, number>, createdAt: number) => normalizeAgentRecord(id, null, createdAt, {
++    type: 'output',
++    data: { type: 'assistant', uuid: id, timestamp: new Date(createdAt).toISOString(), message: { role: 'assistant', model, content: [{ type: 'text', text: 'x' }], usage } }
++}) as NormalizedMessage
++
++describe('context window accuracy', () => {
++    it('treats Claude 5.x models as 1M even when the CLI seeded 200k on its first turn', () => {
++        const msg = claude('a', 'claude-opus-5-5', { input_tokens: 6, cache_creation_input_tokens: 2201, cache_read_input_tokens: 126000, output_tokens: 10, context_window: 200000 }, 1)
++        expect(msg.usage?.context_window).toBe(1_000_000)
++        const reduced = reduceChatBlocks([msg], null)
++        expect(reduced.latestUsage).toMatchObject({ contextSize: 128207, contextWindow: 1_000_000 })
++        // Older 200k models are left alone.
++        expect(claude('b', 'claude-sonnet-4-5', { input_tokens: 1, output_tokens: 1, context_window: 200000 }, 1).usage?.context_window).toBe(200000)
++        expect(isMillionTokenClaudeModel('claude-sonnet-5-5')).toBe(true)
++        expect(isMillionTokenClaudeModel('claude-haiku-5-5')).toBe(true)
++        expect(isMillionTokenClaudeModel('claude-sonnet-4-5')).toBe(false)
++        expect(getContextBudgetTokens('claude-opus-5-5', 'claude')).toBe(990_000)
++    })
++
++    it('ignores zero-usage synthetic replies such as "Goal set"', () => {
++        const real = claude('r', 'claude-opus-5-5', { input_tokens: 10, cache_read_input_tokens: 400000, output_tokens: 20, context_window: 1000000 }, 1)
++        const synthetic = claude('s', '<synthetic>', { input_tokens: 0, output_tokens: 0 }, 2)
++        expect(reduceChatBlocks([real, synthetic], null).latestUsage?.contextSize).toBe(400010)
++    })
++
++    it('shows the post-compaction size until the next reply', () => {
++        const before = claude('p', 'claude-opus-5-5', { input_tokens: 5, cache_read_input_tokens: 965479, output_tokens: 1, context_window: 1000000 }, 1)
++        const boundary = normalizeAgentRecord('c', null, 2, {
++            type: 'output', data: { type: 'system', subtype: 'compact_boundary', uuid: 'c', compactMetadata: { trigger: 'auto', preTokens: 965484, postTokens: 18176 } }
++        }) as NormalizedMessage
++        expect(reduceChatBlocks([before, boundary], null).latestUsage).toMatchObject({ contextSize: 18176, contextWindow: 1_000_000 })
++        const after = claude('n', 'claude-opus-5-5', { input_tokens: 5, cache_read_input_tokens: 25000, output_tokens: 1, context_window: 1000000 }, 3)
++        expect(reduceChatBlocks([before, boundary, after], null).latestUsage?.contextSize).toBe(25005)
++    })
++
++    it('uses the Codex turn total so compaction does not read as 0', () => {
++        const event = normalizeAgentRecord('t', null, 1, {
++            type: 'codex',
++            data: { type: 'token_count', flavor: 'codex', info: { last: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 25875 }, modelContextWindow: 258400 } }
++        }) as NormalizedMessage
++        expect(event.usage).toMatchObject({ context_tokens: 25875, context_window: 258400 })
++        const normal = normalizeAgentRecord('u', null, 2, {
++            type: 'codex',
++            data: { type: 'token_count', flavor: 'codex', info: { last: { inputTokens: 150000, cachedInputTokens: 140000, outputTokens: 2143, totalTokens: 152143 }, modelContextWindow: 258400 } }
++        }) as NormalizedMessage
++        expect(reduceChatBlocks([event, normal], null).latestUsage).toMatchObject({ contextSize: 152143, contextWindow: 258400 })
++    })
++})
+diff --git a/web/src/chat/modelConfig.ts b/web/src/chat/modelConfig.ts
+index 5cbecfd..e6d9caf 100644
+--- a/web/src/chat/modelConfig.ts
++++ b/web/src/chat/modelConfig.ts
+@@ -47,6 +47,12 @@ function parseCursorWireContextWindow(model: string): number | null {
+     return null
+ }
+ 
++/** Claude models whose context window is 1M without a `[1m]` suffix (verified from CLI result records). */
++export function isMillionTokenClaudeModel(model: string | null | undefined): boolean {
++    const id = model?.trim().toLowerCase() ?? ''
++    return id.endsWith('[1m]') || id === 'fable' || id.startsWith('claude-fable') || /^claude-(opus|sonnet|haiku)-5(?:[-.]|$)/.test(id)
++}
++
+ export function getContextBudgetTokens(model: string | null | undefined, flavor?: string | null): number | null {
+     if (flavor === 'codex') {
+         return Math.max(1, DEFAULT_CODEX_CONTEXT_WINDOW_TOKENS - CONTEXT_HEADROOM_TOKENS)
+@@ -83,7 +89,7 @@ export function getContextBudgetTokens(model: string | null | undefined, flavor?
+             const isFable = trimmedModel === 'fable'
+                 || trimmedModel === 'fable[1m]'
+                 || trimmedModel.startsWith('claude-fable')
+-            return trimmedModel.endsWith('[1m]') || isFable
++            return trimmedModel.endsWith('[1m]') || isFable || isMillionTokenClaudeModel(trimmedModel)
+                 ? LARGE_CLAUDE_CONTEXT_WINDOW_TOKENS
+                 : DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS
+         }
+diff --git a/web/src/chat/normalizeAgent.ts b/web/src/chat/normalizeAgent.ts
+index 3684c2f..6a913c7 100644
+--- a/web/src/chat/normalizeAgent.ts
++++ b/web/src/chat/normalizeAgent.ts
+@@ -3,6 +3,13 @@ import { inlineMediaSourceFromWire } from '@/chat/inlineMediaSource'
+ import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
+ import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
+ import { parseAgentTimestampMs } from '@/chat/agentTimestamp'
++import { isMillionTokenClaudeModel } from '@/chat/modelConfig'
++
++/** The Claude CLI seeds 200k until a turn's result reports the real window; 5.x models have 1M. */
++export function correctClaudeContextWindow(model: string | null, reported: number | null): number | null {
++    if (reported !== null && reported < 1_000_000 && isMillionTokenClaudeModel(model)) return 1_000_000
++    return reported
++}
+ 
+ function normalizeToolResultPermissions(value: unknown): ToolResultPermission | undefined {
+     if (!isObject(value)) return undefined
+@@ -162,6 +169,8 @@ function normalizeCodexTokenUsage(value: unknown, data?: Record<string, unknown>
+             ?? info.context_tokens
+             ?? usageSource.contextTokens
+             ?? usageSource.context_tokens
++            ?? usageSource.totalTokens
++            ?? usageSource.total_tokens
+         ) ?? inputTokens,
+         context_window: asNumber(info.modelContextWindow ?? info.model_context_window) ?? undefined,
+         thread_id: asString(
+@@ -348,7 +357,7 @@ function normalizeAssistantOutput(
+             cache_creation_input_tokens: asNumber(usage?.cache_creation_input_tokens) ?? undefined,
+             cache_read_input_tokens: asNumber(usage?.cache_read_input_tokens) ?? undefined,
+             service_tier: asString(usage?.service_tier) ?? undefined,
+-            context_window: asNumber(usage?.context_window) ?? undefined
++            context_window: correctClaudeContextWindow(model, asNumber(usage?.context_window)) ?? undefined
+         } : undefined
+     }
+ }
+@@ -840,7 +849,8 @@ export function normalizeAgentRecord(
+                 content: {
+                     type: 'compact',
+                     trigger: asString(metadata?.trigger) ?? 'auto',
+-                    preTokens: asNumber(metadata?.preTokens) ?? 0
++                    preTokens: asNumber(metadata?.preTokens) ?? 0,
++                    postTokens: asNumber(metadata?.postTokens) ?? undefined
+                 },
+                 isSidechain: false,
+                 meta
+@@ -1110,7 +1120,8 @@ export function normalizeAgentRecord(
+                 content: {
+                     type: 'compact',
+                     trigger: asString(data.trigger) ?? 'auto',
+-                    preTokens: asNumber(data.preTokens ?? data.pre_tokens) ?? 0
++                    preTokens: asNumber(data.preTokens ?? data.pre_tokens) ?? 0,
++                    postTokens: asNumber(data.postTokens ?? data.post_tokens) ?? undefined
+                 },
+                 isSidechain: false,
+                 meta
+diff --git a/web/src/chat/reducer.ts b/web/src/chat/reducer.ts
+index b01c0c1..7874653 100644
+--- a/web/src/chat/reducer.ts
++++ b/web/src/chat/reducer.ts
+@@ -176,15 +176,23 @@ export function reduceChatBlocks(
+ 
+     // Calculate latest usage from messages (find the most recent message with usage data)
+     let latestUsage: LatestUsage | null = null
++    // A compaction newer than the latest usage replaces the context size with its post-compaction size.
++    let compactedTo: number | null = null
+     for (let i = normalized.length - 1; i >= 0; i--) {
+         const msg = normalized[i]
++        if (compactedTo === null && msg.role === 'event' && !msg.isSidechain && msg.content.type === 'compact' && typeof msg.content.postTokens === 'number') {
++            compactedTo = msg.content.postTokens
++            continue
++        }
+         if (msg.usage && isUsageVisibleInParentContext(msg)) {
++            // Synthetic local replies (e.g. "Goal set") carry all-zero usage; they say nothing about context.
++            if (msg.model === '<synthetic>' || calculateContextSize(msg.usage) + msg.usage.output_tokens === 0) continue
+             latestUsage = {
+                 inputTokens: msg.usage.input_tokens,
+                 outputTokens: msg.usage.output_tokens,
+                 cacheCreation: msg.usage.cache_creation_input_tokens ?? 0,
+                 cacheRead: msg.usage.cache_read_input_tokens ?? 0,
+-                contextSize: calculateContextSize(msg.usage),
++                contextSize: compactedTo ?? calculateContextSize(msg.usage),
+                 contextWindow: msg.usage.context_window ?? null,
+                 model: msg.model ?? null,
+                 timestamp: msg.createdAt
+diff --git a/web/src/chat/types.ts b/web/src/chat/types.ts
+index e0bcdd3..93f7bb6 100644
+--- a/web/src/chat/types.ts
++++ b/web/src/chat/types.ts
+@@ -43,7 +43,7 @@ export type AgentEvent =
+     | { type: 'turn-summary'; summary: RoundSummary }
+     | { type: 'token-count'; info: unknown; provider?: 'codex'; model?: string | null }
+     | { type: 'microcompact'; trigger: string; preTokens: number; tokensSaved: number }
+-    | { type: 'compact'; trigger: string; preTokens: number }
++    | { type: 'compact'; trigger: string; preTokens: number; postTokens?: number }
+     // Structured result of Pi's compact RPC; rendered as a dedicated chat block.
+     | { type: 'compact-summary'; summary: string; tokensBefore?: number; estimatedTokensAfter?: number }
+     // Claude Code's automatic away-summary recap (TUI window blur 5min+, then focus).

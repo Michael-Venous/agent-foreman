@@ -1,0 +1,930 @@
+diff --git a/cli/src/claude/claudeRemote.test.ts b/cli/src/claude/claudeRemote.test.ts
+index 3fa15c7..6667f73 100644
+--- a/cli/src/claude/claudeRemote.test.ts
++++ b/cli/src/claude/claudeRemote.test.ts
+@@ -510,3 +510,32 @@ describe('claudeRemote /compact result reporting', () => {
+         expect(wireOrder).toEqual(['result', 'Compaction completed', 'ready']);
+     }, 15_000);
+ });
++
++
++describe('Claude mid-turn native input', () => {
++    it('exposes a live stdin sender during work and removes it when the turn ends', async () => {
++        const gate = deferred<void>();
++        const sendUserMessage = vi.fn(async () => {});
++        const querySpy = vi.spyOn(claudeSdk, 'query').mockReturnValue({
++            sendUserMessage,
++            async *[Symbol.asyncIterator]() { await gate.promise; yield { type: 'result', subtype: 'success' }; },
++        } as unknown as ReturnType<typeof claudeSdk.query>);
++        const { claudeRemote } = await import('./claudeRemote');
++        let sender: ((message: string, priority: 'now' | 'next') => Promise<void>) | null = null;
++        let first = true;
++        try {
++            const run = claudeRemote({
++                sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/hook.json',
++                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
++                nextMessage: async () => first ? (first = false, { message: 'initial', mode: { permissionMode: 'default' } }) : null,
++                onReady: () => {}, isAborted: () => false, onSessionFound: () => {}, onMessage: () => {},
++                onPriorityInput: value => { sender = value; },
++            });
++            await waitFor(() => sender !== null);
++            await sender!('correction', 'next');
++            expect(sendUserMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'user', priority: 'next', message: { role: 'user', content: 'correction' } }));
++            gate.resolve(); await run;
++            expect(sender).toBeNull();
++        } finally { gate.resolve(); querySpy.mockRestore(); }
++    });
++});
+diff --git a/cli/src/claude/claudeRemote.ts b/cli/src/claude/claudeRemote.ts
+index e2494cc..06f2a33 100644
+--- a/cli/src/claude/claudeRemote.ts
++++ b/cli/src/claude/claudeRemote.ts
+@@ -1,3 +1,4 @@
++import { randomUUID } from "node:crypto";
+ import { EnhancedMode, PermissionMode } from "./loop";
+ import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+ import { claudeCheckSession } from "./utils/claudeCheckSession";
+@@ -34,6 +35,7 @@ export async function claudeRemote(opts: {
+     isAborted: (toolCallId: string) => boolean,
+ 
+     // Callbacks
++    onPriorityInput?: (send: ((message: string, priority: 'now' | 'next') => Promise<void>) | null) => void,
+     onSessionFound: (id: string, extras?: { forkedFrom?: string }) => void,
+     onThinkingChange?: (thinking: boolean) => void,
+     onMessage: (message: SDKMessage) => void,
+@@ -212,6 +214,10 @@ export async function claudeRemote(opts: {
+     const updateThinking = (newThinking: boolean) => {
+         if (thinking !== newThinking) {
+             thinking = newThinking;
++            opts.onPriorityInput?.(newThinking ? async (content, priority) => {
++                if (!thinking || inputEnded || opts.signal?.aborted) throw new Error('No active Claude turn');
++                await response.sendUserMessage({ type: 'user', uuid: randomUUID(), priority, message: { role: 'user', content } });
++            } : null);
+             logger.debug(`[claudeRemote] Thinking state changed to: ${thinking}`);
+             if (opts.onThinkingChange) {
+                 opts.onThinkingChange(thinking);
+@@ -256,7 +262,8 @@ export async function claudeRemote(opts: {
+                     return;
+                 }
+                 mode = next.mode;
+-                messages.push({ type: 'user', message: { role: 'user', content: next.message } });
++                updateThinking(true);
++                messages.push({ type: 'user', priority: 'later', message: { role: 'user', content: next.message } });
+                 logger.debug(
+                     `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
+                     `messageLength=${next.message.length} permissionMode=${next.mode.permissionMode}`
+@@ -417,6 +424,7 @@ export async function claudeRemote(opts: {
+             `${debugPrefix} finally ` +
+             `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
+         );
++        opts.onPriorityInput?.(null);
+         updateThinking(false);
+     }
+ }
+diff --git a/cli/src/claude/claudeRemoteLauncher.ts b/cli/src/claude/claudeRemoteLauncher.ts
+index 4a99e55..57c33b5 100644
+--- a/cli/src/claude/claudeRemoteLauncher.ts
++++ b/cli/src/claude/claudeRemoteLauncher.ts
+@@ -1,4 +1,6 @@
+ import React from "react";
++import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
++import { deliverClaudePriority } from './priorityInput';
+ import { Session } from "./session";
+ import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
+ import { claudeRemote } from "./claudeRemote";
+@@ -47,6 +49,7 @@ function getRespawnBackoffMs(): number {
+ 
+ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+     private readonly session: Session;
++    private prioritySender: { send: (text: string, priority: 'now' | 'next') => Promise<void>; modeHash: string } | null = null;
+     private abortController: AbortController | null = null;
+     private abortFuture: Future<void> | null = null;
+     private permissionHandler: PermissionHandler | null = null;
+@@ -133,6 +136,12 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+             onSwitch: () => this.handleSwitchRequest()
+         });
+ 
++        session.client.rpcHandlerManager.registerHandler(RPC_METHODS.SteerQueuedMessage, (payload: unknown) => deliverClaudePriority({
++            payload, queue: session.queue, client: session.client,
++            getSender: () => this.prioritySender,
++            expand: (text) => session.expandSkillReference(text),
++        }));
++        session.client.updateMetadata((metadata) => ({ ...metadata, capabilities: { ...metadata.capabilities, claudeInputPriorities: true } }));
+         const permissionHandler = new PermissionHandler(session);
+         this.permissionHandler = permissionHandler;
+ 
+@@ -485,7 +494,14 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
+                             // launch attempt can still resume the original session.
+                             session.consumeOneTimeFlags();
+                         },
+-                        onThinkingChange: session.onThinkingChange,
++                        onPriorityInput: (send) => {
++                            this.prioritySender = send && modeHash ? { send, modeHash } : null;
++                        },
++                        onThinkingChange: (thinking) => {
++                            if (!thinking) this.prioritySender = null;
++                            session.client.updateAgentState((state) => ({ ...state, steeringActive: thinking }));
++                            session.onThinkingChange(thinking);
++                        },
+                         claudeEnvVars: session.claudeEnvVars,
+                         claudeArgs: session.claudeArgs,
+                         onMessage,
+diff --git a/cli/src/claude/priorityInput.test.ts b/cli/src/claude/priorityInput.test.ts
+new file mode 100644
+index 0000000..4efe7cf
+--- /dev/null
++++ b/cli/src/claude/priorityInput.test.ts
+@@ -0,0 +1,50 @@
++import { describe, it, expect, vi } from 'vitest';
++import { MessageQueue2 } from '@/utils/MessageQueue2';
++import { deliverClaudePriority } from './priorityInput';
++import type { EnhancedMode } from './loop';
++
++function setup() {
++    const mode: EnhancedMode = { permissionMode: 'default' };
++    const queue = new MessageQueue2<EnhancedMode>(JSON.stringify);
++    queue.push('older', mode, 'older'); queue.push('correction', mode, 'target');
++    const send = vi.fn(async (_text: string, _priority: 'now' | 'next') => {});
++    const target = { send, modeHash: JSON.stringify(mode) };
++    const client = { setSteerDeliveryState: vi.fn(async () => true), emitSteerIndeterminate: vi.fn(), emitMessagesConsumed: vi.fn(), notePendingHubPromptEcho: vi.fn() };
++    const input = { queue, client, getSender: () => target as typeof target | null, expand: (text: string) => text };
++    return { input, send, queue, client };
++}
++describe('Claude native priority dispatch', () => {
++    it.each(['now', 'next'] as const)('dispatches %s once, leaving other queued messages alone', async priority => {
++        const { input, send, queue, client } = setup();
++        expect(await deliverClaudePriority({ ...input, payload: { localId: 'target', priority } })).toEqual({ steered: true });
++        expect(send).toHaveBeenCalledWith('correction', priority);
++        expect(queue.queue.map(item => item.localId)).toEqual(['older']);
++        expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['target'], { steered: true });
++        await deliverClaudePriority({ ...input, payload: { localId: 'target', priority } });
++        expect(send).toHaveBeenCalledTimes(1);
++    });
++    it('holds uncertain writes outside the queue and refuses blind retries', async () => {
++        const { input, send, queue, client } = setup();
++        send.mockRejectedValueOnce(new Error('pipe closed'));
++        const payload = { localId: 'target', priority: 'now' };
++        expect((await deliverClaudePriority({ ...input, payload })).steered).toBe(false);
++        expect(client.emitSteerIndeterminate).toHaveBeenCalledWith(['target']);
++        expect(queue.queue.map(item => item.localId)).toEqual(['older']);
++        await deliverClaudePriority({ ...input, payload });
++        expect(send).toHaveBeenCalledTimes(1);
++    });
++    it('restores FIFO if the active turn changes while saving dispatch state', async () => {
++        const { input, send, queue, client } = setup();
++        client.setSteerDeliveryState.mockImplementationOnce(async () => { input.getSender = () => null; return true; });
++        await deliverClaudePriority({ ...input, getSender: () => input.getSender(), payload: { localId: 'target' } });
++        expect(send).not.toHaveBeenCalled();
++        expect(queue.queue.map(item => item.localId)).toEqual(['older', 'target']);
++    });
++    it('keeps slash commands queued', async () => {
++        const { input, send, queue } = setup();
++        queue.queue[1].message = '/clear';
++        await deliverClaudePriority({ ...input, payload: { localId: 'target' } });
++        expect(send).not.toHaveBeenCalled();
++        expect(queue.size()).toBe(2);
++    });
++});
+diff --git a/cli/src/claude/priorityInput.ts b/cli/src/claude/priorityInput.ts
+new file mode 100644
+index 0000000..233fe0a
+--- /dev/null
++++ b/cli/src/claude/priorityInput.ts
+@@ -0,0 +1,56 @@
++import type { MessageQueue2 } from '@/utils/MessageQueue2';
++import type { EnhancedMode } from './loop';
++
++type Client = {
++    setSteerDeliveryState(ids: string[], state: 'queued' | 'dispatching'): Promise<boolean>;
++    emitSteerIndeterminate(ids: string[]): void;
++    emitMessagesConsumed(ids: string[], options: { steered: boolean }): void;
++    notePendingHubPromptEcho(text: string, ids: string[]): void;
++};
++
++export async function deliverClaudePriority(input: {
++    payload: unknown;
++    queue: MessageQueue2<EnhancedMode>;
++    client: Client;
++    getSender: () => { send: (text: string, priority: 'now' | 'next') => Promise<void>; modeHash: string } | null;
++    expand: (text: string) => string;
++}): Promise<{ steered: boolean; error?: string }> {
++    const payload = input.payload as { localId?: unknown; priority?: unknown } | null;
++    if (typeof payload?.localId !== 'string' || !payload.localId) return { steered: false, error: 'Missing localId' };
++    if (payload.priority !== undefined && payload.priority !== 'now' && payload.priority !== 'next') return { steered: false, error: 'Invalid priority' };
++    const localId = payload.localId;
++    const target = input.getSender();
++    if (!target) return { steered: false, error: 'No active Claude turn' };
++    const taken = input.queue.takeByLocalId(localId);
++    if (!taken) return { steered: false, error: 'Message not in queue' };
++    // Unknown writes cannot safely be retried without native reconciliation.
++    if (taken.originIndeterminate) {
++        input.queue.markReservationIndeterminate(taken);
++        return { steered: false, error: 'Previous delivery is indeterminate' };
++    }
++    if (taken.item.isolate || taken.item.message.trimStart().startsWith('/') || taken.item.modeHash !== target.modeHash) {
++        input.queue.restoreReservation(taken);
++        return { steered: false, error: 'Commands and configuration changes must wait for the current turn' };
++    }
++    if (!input.queue.beginReservationDispatch(taken)) return { steered: false, error: 'Delivery cancelled' };
++    const unknown = () => {
++        input.queue.markReservationIndeterminate(taken);
++        input.client.emitSteerIndeterminate([localId]);
++        return { steered: false, error: 'Delivery is indeterminate; not automatically retried' };
++    };
++    if (!await input.client.setSteerDeliveryState([localId], 'dispatching')) return unknown();
++    // Revalidate after the asynchronous durable-state acknowledgment.
++    if (input.getSender()?.send !== target.send || taken.state !== 'dispatching') {
++        if (!await input.client.setSteerDeliveryState([localId], 'queued')) return unknown();
++        input.queue.restoreReservation(taken);
++        return { steered: false, error: 'Active Claude turn changed' };
++    }
++    try {
++        const text = input.expand(taken.item.message);
++        input.client.notePendingHubPromptEcho(text, [localId]);
++        await target.send(text, payload.priority === 'next' ? 'next' : 'now');
++    } catch { return unknown(); }
++    input.queue.commitReservation(taken);
++    input.client.emitMessagesConsumed([localId], { steered: true });
++    return { steered: true };
++}
+diff --git a/cli/src/claude/sdk/query.test.ts b/cli/src/claude/sdk/query.test.ts
+index df65179..62d40a1 100644
+--- a/cli/src/claude/sdk/query.test.ts
++++ b/cli/src/claude/sdk/query.test.ts
+@@ -118,3 +118,18 @@ describe('Query', () => {
+         child.emit('close', 0)
+     })
+ })
++
++
++describe('native priority stdin', () => {
++    it('writes a user frame with its priority without issuing an interrupt', async () => {
++        const { Query } = await import('./query');
++        const stdin = new PassThrough(); const stdout = new PassThrough();
++        const frames: string[] = [];
++        stdin.on('data', chunk => frames.push(String(chunk)));
++        const query = new Query(stdin, stdout, new Promise(() => {}));
++        await query.sendUserMessage({ type: 'user', priority: 'now', message: { role: 'user', content: 'correct direction' } });
++        expect(frames.map(frame => JSON.parse(frame))).toEqual([{ type: 'user', priority: 'now', message: { role: 'user', content: 'correct direction' } }]);
++        stdin.end(); stdout.end();
++        await expect(query.sendUserMessage({ type: 'user', priority: 'next', message: { role: 'user', content: 'late' } })).rejects.toThrow('closed');
++    });
++});
+diff --git a/cli/src/claude/sdk/query.ts b/cli/src/claude/sdk/query.ts
+index f8d4334..c5ca3b6 100644
+--- a/cli/src/claude/sdk/query.ts
++++ b/cli/src/claude/sdk/query.ts
+@@ -11,6 +11,7 @@ import {
+     type QueryOptions,
+     type QueryPrompt,
+     type SDKMessage,
++    type SDKUserMessage,
+     type ControlResponseHandler,
+     type SDKControlRequest,
+     type ControlRequest,
+@@ -165,9 +166,22 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
+         }
+     }
+ 
+-    /**
+-     * Send interrupt request to Claude
+-     */
++    /** Write a native priority user frame without interrupting the process. */
++    async sendUserMessage(message: SDKUserMessage): Promise<void> {
++        const stdin = this.childStdin
++        if (!stdin || stdin.destroyed || stdin.writableEnded) throw new Error('Claude input is closed')
++        await new Promise<void>((resolve, reject) => {
++            const onError = (error: Error) => reject(error)
++            stdin.once('error', onError)
++            stdin.write(JSON.stringify(message) + '\n', (error) => {
++                if (error) { reject(error); return }
++                stdin.removeListener('error', onError)
++                resolve()
++            })
++        })
++    }
++
++    /** Send an explicit interrupt request to Claude. */
+     async interrupt(): Promise<void> {
+         if (!this.childStdin) {
+             throw new Error('Interrupt requires --input-format stream-json')
+diff --git a/hub/src/sync/messageService.ts b/hub/src/sync/messageService.ts
+index cd0cfbd..7711daf 100644
+--- a/hub/src/sync/messageService.ts
++++ b/hub/src/sync/messageService.ts
+@@ -848,7 +848,7 @@ export class MessageService {
+             scheduledAt?: number | null
+             deliveryMode?: MessageDeliveryMode
+         }
+-    ): Promise<{ actualSessionId: string; createdAt: number }> {
++    ): Promise<{ actualSessionId: string; createdAt: number; inserted: boolean; messageId: string }> {
+         // Defence-in-depth invariant for non-REST callers (Telegram bot, MCP,
+         // internal callers).  Attachment paths live under the CLI session's
+         // upload directory which `cleanupUploadDir` purges on session end; a
+@@ -941,7 +941,7 @@ export class MessageService {
+                 ...(msg.deliveryState ? { deliveryState: msg.deliveryState } : {})
+             }
+         })
+-        return { actualSessionId, createdAt: msg.createdAt }
++        return { actualSessionId, createdAt: msg.createdAt, inserted: inserted.inserted, messageId: msg.id }
+     }
+ 
+     /**
+diff --git a/hub/src/sync/rpcGateway.ts b/hub/src/sync/rpcGateway.ts
+index 90346e1..68e6799 100644
+--- a/hub/src/sync/rpcGateway.ts
++++ b/hub/src/sync/rpcGateway.ts
+@@ -468,9 +468,10 @@ export class RpcGateway {
+      */
+     async steerQueuedMessage(
+         sessionId: string,
+-        localId: string
++        localId: string,
++        priority: 'now' | 'next' = 'now'
+     ): Promise<{ steered: boolean; error?: string }> {
+-        return await this.sessionRpc(sessionId, RPC_METHODS.SteerQueuedMessage, { localId }) as {
++        return await this.sessionRpc(sessionId, RPC_METHODS.SteerQueuedMessage, { localId, priority }) as {
+             steered: boolean
+             error?: string
+         }
+diff --git a/hub/src/sync/steerQueuedMessage.test.ts b/hub/src/sync/steerQueuedMessage.test.ts
+index 1704a95..081ff0d 100644
+--- a/hub/src/sync/steerQueuedMessage.test.ts
++++ b/hub/src/sync/steerQueuedMessage.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from 'bun:test'
++import { describe, expect, it, spyOn } from 'bun:test'
+ import { Store } from '../store'
+ import { RpcRegistry } from '../socket/rpcRegistry'
+ import { SyncEngine } from './syncEngine'
+@@ -63,7 +63,7 @@ describe('SyncEngine.steerQueuedMessage', () => {
+ 
+             expect(result).toEqual({
+                 status: 'failed',
+-                error: 'Steering is only supported for Pi, Codex, and Cursor ACP sessions',
++                error: 'This controller does not support native priority delivery',
+                 localId: null
+             })
+         } finally {
+@@ -71,3 +71,34 @@ describe('SyncEngine.steerQueuedMessage', () => {
+         }
+     })
+ })
++
++
++describe('composer native priority', () => {
++    it.each([
++        ['claude', 'next', 'next'], ['claude', 'steer', 'now'], ['codex', 'steer', 'now'],
++    ] as const)('dispatches %s %s once after saving the message', async (flavor, deliveryMode, priority) => {
++        const { store, engine } = createEngine();
++        try {
++            const session = engine.getOrCreateSession('native-input', { path: '/tmp', host: 'localhost', flavor, capabilities: { claudeInputPriorities: true } }, {}, 'default');
++            engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true, mode: 'remote' });
++            const steer = spyOn(engine, 'steerQueuedMessage').mockResolvedValue({ status: 'steered', localId: 'native-1' });
++            const payload = { text: 'correction', localId: 'native-1', deliveryMode };
++            await engine.sendMessage(session.id, payload);
++            expect(steer).toHaveBeenCalledTimes(1);
++            const row = store.messages.getMessages(session.id, 10)[0];
++            expect(steer).toHaveBeenCalledWith(session.id, row.id, priority);
++            await engine.sendMessage(session.id, payload);
++            expect(steer).toHaveBeenCalledTimes(1);
++        } finally { engine.stop(); }
++    });
++    it('keeps an accepted message saved and reports priority failure separately', async () => {
++        const { store, engine } = createEngine();
++        try {
++            const session = engine.getOrCreateSession('native-failure', { path: '/tmp', host: 'localhost', flavor: 'claude' }, {}, 'default');
++            engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true, mode: 'remote' });
++            const result = await engine.sendMessage(session.id, { text: 'correction', localId: 'native-1', deliveryMode: 'steer' });
++            expect(result.deliveryWarning).toContain('Message saved');
++            expect(store.messages.lookupQueuedMessage(session.id, 'native-1').status).toBe('queued');
++        } finally { engine.stop(); }
++    });
++});
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index f89103f..4b94d98 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1025,13 +1025,27 @@ export class SyncEngine {
+             scheduledAt?: number | null
+             deliveryMode?: MessageDeliveryMode
+         }
+-    ): Promise<void> {
++    ): Promise<{ deliveryWarning?: string }> {
+         if (this.historyActionsInFlight.has(sessionId)) {
+             throw new Error('Conversation history action already in progress')
+         }
+-        const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
++        const wasThinking = this.getSession(sessionId)?.thinking === true
++        const { actualSessionId, createdAt: activeTurnStartedAt, inserted, messageId } = await this.messageService.sendMessage(sessionId, payload)
+         this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
+         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
++        const flavor = this.getSession(actualSessionId)?.metadata?.flavor
++        if (wasThinking && payload.deliveryMode === 'next' && flavor !== 'claude') {
++            return { deliveryWarning: 'Message queued. Tool-boundary delivery is only available for Claude.' }
++        }
++        if (inserted && wasThinking && payload.scheduledAt == null
++            && (payload.deliveryMode === 'steer' || payload.deliveryMode === 'next')
++            && (flavor === 'codex' || flavor === 'claude')) {
++            const result = await this.steerQueuedMessage(actualSessionId, messageId, payload.deliveryMode === 'next' ? 'next' : 'now')
++            if (result.status !== 'steered' && result.status !== 'invoked') {
++                return { deliveryWarning: `Message saved; priority delivery was not confirmed. Check the waiting queue before retrying. ${result.status === 'failed' ? result.error : ''}` }
++            }
++        }
++        return {}
+     }
+ 
+     async cancelQueuedMessage(
+@@ -1057,14 +1071,15 @@ export class SyncEngine {
+      */
+     async steerQueuedMessage(
+         sessionId: string,
+-        messageId: string
++        messageId: string,
++        priority: 'now' | 'next' = 'now'
+     ): Promise<SteerQueuedMessageResponse> {
+         const session = this.getSession(sessionId)
+         if (!session) {
+             return { status: 'failed', error: 'Session not found', localId: null }
+         }
+         if (!isSteeringSupportedForSession(session.metadata)) {
+-            return { status: 'failed', error: 'Steering is only supported for Pi, Codex, and Cursor ACP sessions', localId: null }
++            return { status: 'failed', error: 'This controller does not support native priority delivery', localId: null }
+         }
+         if (session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
+             return { status: 'failed', error: 'Steering is only available for remote sessions', localId: null }
+@@ -1101,7 +1116,7 @@ export class SyncEngine {
+         }
+ 
+         try {
+-            const result = await this.rpcGateway.steerQueuedMessage(sessionId, localId)
++            const result = await this.rpcGateway.steerQueuedMessage(sessionId, localId, priority)
+             if (result.steered) {
+                 return { status: 'steered', localId }
+             }
+diff --git a/hub/src/web/routes/messages.ts b/hub/src/web/routes/messages.ts
+index 92e46e2..f32f5be 100644
+--- a/hub/src/web/routes/messages.ts
++++ b/hub/src/web/routes/messages.ts
+@@ -141,7 +141,7 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
+             return c.json({ error: 'Message requires text or attachments' }, 400)
+         }
+ 
+-        await engine.sendMessage(sessionId, {
++        const delivery = await engine.sendMessage(sessionId, {
+             text: parsed.data.text,
+             localId: parsed.data.localId,
+             attachments: parsed.data.attachments,
+@@ -149,7 +149,7 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
+             scheduledAt: parsed.data.scheduledAt,
+             deliveryMode: parsed.data.deliveryMode
+         })
+-        return c.json({ ok: true })
++        return c.json({ ok: true, ...delivery })
+     })
+ 
+     return app
+diff --git a/shared/src/apiTypes.ts b/shared/src/apiTypes.ts
+index 4a871fa..c0eba1a 100644
+--- a/shared/src/apiTypes.ts
++++ b/shared/src/apiTypes.ts
+@@ -523,7 +523,7 @@ export const MessagesQuerySchema = z.object({
+ 
+ export type MessagesQuery = z.infer<typeof MessagesQuerySchema>
+ 
+-export const MessageDeliveryModeSchema = z.enum(['queue', 'steer'])
++export const MessageDeliveryModeSchema = z.enum(['queue', 'steer', 'next'])
+ export type MessageDeliveryMode = z.infer<typeof MessageDeliveryModeSchema>
+ 
+ export const SendMessageRequestSchema = z.object({
+@@ -542,8 +542,8 @@ export const SendMessageRequestSchema = z.object({
+     (data) => data.scheduledAt == null || !data.attachments?.length,
+     { message: 'scheduled messages with attachments are not supported', path: ['attachments'] }
+ ).refine(
+-    (data) => data.scheduledAt == null || data.deliveryMode !== 'steer',
+-    { message: 'scheduled messages cannot use steer delivery', path: ['deliveryMode'] }
++    (data) => data.scheduledAt == null || (data.deliveryMode == null || data.deliveryMode === 'queue'),
++    { message: 'scheduled messages cannot use turn-scoped delivery', path: ['deliveryMode'] }
+ )
+ 
+ export type SendMessageRequest = z.infer<typeof SendMessageRequestSchema>
+diff --git a/shared/src/modes.ts b/shared/src/modes.ts
+index f12b503..00151c0 100644
+--- a/shared/src/modes.ts
++++ b/shared/src/modes.ts
+@@ -200,7 +200,7 @@ export function getCodexCollaborationModeOptions(): CodexCollaborationModeOption
+  *   stream-json Cursor sessions are NOT steerable — gate with
+  *   {@link isSteeringSupportedForSession}.
+  *
+- * Claude / others: not supported (no reachable soft-steer path) — UI hides Steer.
++ * Claude: native stream-json priorities, advertised by updated controllers.
+  */
+ export const STEERING_SUPPORTED_FLAVORS = ['codex', 'cursor', 'pi'] as const
+ 
+@@ -218,9 +218,11 @@ export function isSteeringSupportedForFlavor(flavor?: string | null): boolean {
+  */
+ export function isSteeringSupportedForSession(metadata?: {
+     flavor?: string | null
++    capabilities?: { claudeInputPriorities?: boolean } | null
+     cursorSessionId?: string | null
+     cursorSessionProtocol?: 'acp' | 'stream-json' | null
+ } | null): boolean {
++    if (metadata?.flavor === 'claude') return metadata.capabilities?.claudeInputPriorities === true
+     if (metadata?.flavor === 'codex' || metadata?.flavor === 'pi') {
+         return true
+     }
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+index 9177c80..fe4279b 100644
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -36,6 +36,7 @@ export type OpencodeClearOperation = z.infer<typeof OpencodeClearOperationSchema
+ 
+ const SessionCapabilitiesSchema = z.object({
+     concurrentClients: z.boolean().optional(),
++    claudeInputPriorities: z.boolean().optional(),
+     terminal: z.boolean().optional(),
+     conversationHistory: ConversationHistoryCapabilitiesSchema.optional()
+ })
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index f6224f7..6e9a2c2 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -562,8 +562,8 @@ export class ApiClient {
+         attachments?: AttachmentMetadata[],
+         scheduledAt?: number | null,
+         deliveryMode?: MessageDeliveryMode,
+-    ): Promise<void> {
+-        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
++    ): Promise<{ deliveryWarning?: string }> {
++        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+             method: 'POST',
+             body: JSON.stringify({
+                 text,
+diff --git a/web/src/components/AssistantChat/ComposerButtons.tsx b/web/src/components/AssistantChat/ComposerButtons.tsx
+index 2db2f0c..2d6b6bf 100644
+--- a/web/src/components/AssistantChat/ComposerButtons.tsx
++++ b/web/src/components/AssistantChat/ComposerButtons.tsx
+@@ -602,7 +602,8 @@ export function DictationButton(props: {
+ export function ComposerButtons(props: {
+     canSend: boolean
+     controlsDisabled: boolean
+-    onSendImmediately?: () => void
++    nativePriorityFlavor?: 'claude' | 'codex'
++    nativePriorityAvailable?: boolean
+     statisticsButton?: React.ReactNode
+     showSettingsButton: boolean
+     settingsButtonRef?: Ref<HTMLButtonElement>
+@@ -873,7 +874,7 @@ export function ComposerButtons(props: {
+ 
+             {props.modelMenu}
+ 
+-            {props.onSendImmediately && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
++            {props.nativePriorityFlavor && props.canSend && !props.pendingSchedule && !props.scratchlistMode && props.voiceStatus === 'disconnected' ? (
+                 <Popover.Root>
+                     <Popover.Trigger asChild>
+                         <button type="button" aria-label="Send options" title="Send options" disabled={props.controlsDisabled}
+@@ -884,16 +885,23 @@ export function ComposerButtons(props: {
+                     <Popover.Portal>
+                         <Popover.Content side="top" align="end" sideOffset={8} collisionPadding={12} aria-label="Send options"
+                             className="z-[100] w-64 max-w-[calc(100vw-24px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-xl">
++                            {!props.nativePriorityAvailable ? <p className="px-3 py-2 text-xs text-[var(--app-hint)]">Resume this chat with the updated controller to enable native delivery.</p> : null}
+                             <Popover.Close asChild>
+                                 <button type="button" onClick={() => props.onSend('queue')} disabled={props.controlsDisabled}
+                                     className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
+-                                    <span className="block font-medium">Queue message</span><span className="text-xs text-[var(--app-hint)]">Wait for the current response to finish.</span>
++                                    <span className="block font-medium">After current turn</span><span className="text-xs text-[var(--app-hint)]">Wait for the current response to finish.</span>
+                                 </button>
+                             </Popover.Close>
++                            {props.nativePriorityFlavor === 'claude' ? <Popover.Close asChild>
++                                <button type="button" onClick={() => props.onSend('next')} disabled={props.controlsDisabled || !props.nativePriorityAvailable}
++                                    className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
++                                    <span className="block font-medium">During current turn</span><span className="text-xs text-[var(--app-hint)]">Deliver at Claude’s next tool boundary.</span>
++                                </button>
++                            </Popover.Close> : null}
+                             <Popover.Close asChild>
+-                                <button type="button" onClick={props.onSendImmediately} disabled={props.controlsDisabled}
++                                <button type="button" onClick={() => props.onSend('steer')} disabled={props.controlsDisabled || !props.nativePriorityAvailable}
+                                     className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--app-secondary-bg)]">
+-                                    <span className="block font-medium">Send immediately</span><span className="text-xs text-[var(--app-hint)]">Interrupt Claude’s current response and send.</span>
++                                    <span className="block font-medium">Send immediately</span><span className="text-xs text-[var(--app-hint)]">{props.nativePriorityFlavor === 'claude' ? 'Use Claude’s native send-now priority.' : 'Steer the active Codex turn.'}</span>
+                                 </button>
+                             </Popover.Close>
+                         </Popover.Content>
+diff --git a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+index 3b9c0f0..a13242e 100644
+--- a/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.modelEffortButtons.test.tsx
+@@ -154,61 +154,48 @@ describe('HappyComposer generic model/effort value buttons', () => {
+         runtime.snapshot.composer = { text: 'Change direction now', attachments: [] }
+         runtime.setSnapshot = updater => { runtime.snapshot = updater(runtime.snapshot) }
+     }
+-    it('offers immediate send for a running Claude chat and waits for stop acknowledgement', async () => {
++    it.each([
++        ['After current turn', 'queue'],
++        ['During current turn', 'next'],
++        ['Send immediately', 'steer'],
++    ])('sends Claude with explicit %s intent', async (label, intent) => {
+         draft()
+-        let finish!: () => void
+-        const interrupt = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
+-        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        renderComposer('claude', { active: true, thinking: true, supportsNativePriority: true })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        fireEvent.click(screen.getByRole('button', { name: /Send immediately/ }))
+-        expect(interrupt).toHaveBeenCalledOnce()
+-        expect(runtime.sentIntents).toEqual([])
+-        expect(runtime.snapshot.composer.text).toBe('Change direction now')
+-        await act(async () => finish())
+-        expect(runtime.sentIntents).toEqual(['queue'])
+-    })
+-    it('preserves the draft and sends nothing when interruption fails', async () => {
++        await act(async () => { fireEvent.click(screen.getByRole('button', { name: new RegExp(label) })) })
++        expect(runtime.sentIntents).toEqual([intent])
++    })
++    it('offers Codex queue and steer, without the Claude tool-boundary option', async () => {
+         draft()
+-        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: vi.fn().mockRejectedValue(new Error('timeout')) })
++        renderComposer('codex', { active: true, thinking: true, supportsNativePriority: true })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
++        expect(screen.queryByRole('button', { name: /During current turn/ })).toBeNull()
++        expect(screen.getByRole('button', { name: /After current turn/ })).toBeTruthy()
+         await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Send immediately/ })) })
+-        expect(screen.getByRole('alert')).toHaveTextContent('Your message has not been sent')
+-        expect(runtime.sentIntents).toEqual([])
+-        expect(runtime.snapshot.composer.text).toBe('Change direction now')
++        expect(runtime.sentIntents).toEqual(['steer'])
+     })
+-    it('leaves ordinary send queued without interrupting Claude', async () => {
++    it('leaves ordinary send at the queue default', async () => {
+         draft()
+-        const interrupt = vi.fn()
+-        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        renderComposer('claude', { active: true, thinking: true, supportsNativePriority: true })
+         await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Send' })) })
+-        expect(interrupt).not.toHaveBeenCalled()
+         expect(runtime.sentIntents).toEqual(['default'])
+     })
+-    it('offers an explicit queue action without stopping the response', async () => {
++    it('does not offer turn-scoped delivery for a scheduled message', () => {
+         draft()
+-        const interrupt = vi.fn()
+-        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
+-        fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Queue message/ })) })
+-        expect(interrupt).not.toHaveBeenCalled()
+-        expect(runtime.sentIntents).toEqual(['queue'])
++        renderComposer('claude', { active: true, thinking: true, supportsNativePriority: true, onSchedule: vi.fn(), pendingSchedule: { type: 'absolute', ms: Date.now() + 60000 } })
++        expect(screen.queryByRole('button', { name: 'Send options' })).toBeNull()
+     })
+-    it('does not send into an old chat after navigation during interruption', async () => {
++    it('explains when an existing Claude controller needs a resume', () => {
+         draft()
+-        let finish!: () => void
+-        const interrupt = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
+-        const view = renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: interrupt })
++        renderComposer('claude', { active: true, thinking: true, supportsNativePriority: false })
+         fireEvent.click(screen.getByRole('button', { name: 'Send options' }))
+-        fireEvent.click(screen.getByRole('button', { name: /Send immediately/ }))
+-        view.unmount()
+-        await act(async () => finish())
+-        expect(runtime.sentIntents).toEqual([])
++        expect(screen.getByRole('button', { name: /Send immediately/ })).toBeDisabled()
++        expect(screen.getByText(/Resume this chat/)).toBeTruthy()
+     })
+-
+-    it('does not offer interruption for a scheduled message', () => {
+-        draft()
+-        renderComposer('claude', { active: true, thinking: true, onInterruptForImmediateSend: vi.fn(), onSchedule: vi.fn(), pendingSchedule: { type: 'absolute', ms: Date.now() + 60000 } })
+-        expect(screen.queryByRole('button', { name: 'Send options' })).toBeNull()
++    it('shows priority uncertainty without restoring a duplicate draft', () => {
++        renderComposer('claude', { sendSettlement: { attemptId: 'x', status: 'success', warning: 'Priority not confirmed; check waiting queue.' } })
++        expect(screen.getByText('Priority not confirmed; check waiting queue.')).toHaveAttribute('role', 'status')
++        expect(runtime.snapshot.composer.text).toBe('')
+     })
+ 
+     it('shows model and effort value buttons for Claude on wide viewports', () => {
+diff --git a/web/src/components/AssistantChat/HappyComposer.tsx b/web/src/components/AssistantChat/HappyComposer.tsx
+index 399d579..f5ca853 100644
+--- a/web/src/components/AssistantChat/HappyComposer.tsx
++++ b/web/src/components/AssistantChat/HappyComposer.tsx
+@@ -284,7 +284,7 @@ export function ModelEffortSettingsSection(props: {
+ }
+ 
+ export function HappyComposer(props: {
+-    onInterruptForImmediateSend?: () => Promise<void>
++    supportsNativePriority?: boolean
+     statisticsButton?: ReactNode
+     sessionId?: string
+     focusInputRef?: MutableRefObject<(() => void) | null>
+@@ -379,7 +379,7 @@ export function HappyComposer(props: {
+     /** Emitted by SessionChat after a send is accepted. Null attempt ids are settled scratchlist sends. */
+     sendAcceptance?: { attemptId: string | null } | null
+     /** Terminal result for a chat mutation, including attachment-bearing failures. */
+-    sendSettlement?: { attemptId: string; status: 'success' | 'error' } | null
++    sendSettlement?: { attemptId: string; status: 'success' | 'error'; warning?: string } | null
+     /**
+      * Resume/handoff path for inactive drafts that only exist in IndexedDB
+      * (no visible text/attachments for assistant-ui to append).
+@@ -532,17 +532,8 @@ export function HappyComposer(props: {
+         onScratchlistParkingChange?.(isParkingScratchlist)
+     }, [isParkingScratchlist, onScratchlistParkingChange])
+ 
+-    const [interruptingForSend, setInterruptingForSend] = useState(false)
+-    const [immediateSendError, setImmediateSendError] = useState<string | null>(null)
+-    const immediateSendPending = useRef(false)
+-    const mountedForImmediateSend = useRef(true)
+-    useEffect(() => {
+-        mountedForImmediateSend.current = true
+-        return () => { mountedForImmediateSend.current = false }
+-    }, [])
+-
+     const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
+-    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled || interruptingForSend
++    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
+     const trimmed = composerText.trim()
+     const hasText = trimmed.length > 0
+     const hasAttachments = attachments.length > 0
+@@ -1151,7 +1142,6 @@ export function HappyComposer(props: {
+     }, [pendingSendIntentRef])
+ 
+     const handleSend = useCallback(async (intent: ComposerSendIntent = 'default') => {
+-        if (immediateSendPending.current) return
+         // SessionChat preloads the ref only when restoring a rejected send:
+         // queue retries remain queue, while an ordinary fresh send always
+         // starts from the explicit/default argument. Capture it before the
+@@ -1265,28 +1255,6 @@ export function HappyComposer(props: {
+         resetPendingSendIntent,
+     ])
+ 
+-    const handleSendImmediately = useCallback(async () => {
+-        if (!canSend || immediateSendPending.current || !props.onInterruptForImmediateSend || pendingSchedule || props.scratchlistMode) return
+-        immediateSendPending.current = true
+-        setInterruptingForSend(true)
+-        setImmediateSendError(null)
+-        try {
+-            // Keep the draft and attachments until the stop is acknowledged.
+-            // A failed/uncertain interruption must not silently send or retry.
+-            await props.onInterruptForImmediateSend()
+-            if (mountedForImmediateSend.current) {
+-                immediateSendPending.current = false
+-                await handleSend('queue')
+-            }
+-        } catch {
+-            if (mountedForImmediateSend.current) setImmediateSendError('Could not confirm the interruption. Your message has not been sent; the draft is preserved.')
+-        } finally {
+-            immediateSendPending.current = false
+-            if (mountedForImmediateSend.current) setInterruptingForSend(false)
+-        }
+-    }, [canSend, props.onInterruptForImmediateSend, pendingSchedule, props.scratchlistMode, handleSend])
+-
+-
+     const flushAndSend = useCallback((intent: ComposerSendIntent = 'default') => {
+         void handleSend(intent)
+     }, [handleSend])
+@@ -2242,7 +2210,7 @@ export function HappyComposer(props: {
+                         </div>
+                     ) : null}
+ 
+-                    {immediateSendError ? <p role="alert" className="mb-2 text-sm text-red-600">{immediateSendError}</p> : null}
++                    {props.sendSettlement?.warning ? <p role="status" className="mb-2 text-sm text-amber-600">{props.sendSettlement.warning}</p> : null}
+                     {sendError ? (
+                         <div
+                             role="alert"
+@@ -2396,7 +2364,8 @@ export function HappyComposer(props: {
+                             </> : undefined}
+                             canSend={canSend}
+                             controlsDisabled={controlsDisabled}
+-                            onSendImmediately={agentFlavor === 'claude' && active && thinking && !controlledByUser && props.onInterruptForImmediateSend ? handleSendImmediately : undefined}
++                            nativePriorityFlavor={active && thinking && !controlledByUser && (agentFlavor === 'claude' || agentFlavor === 'codex') ? agentFlavor : undefined}
++                            nativePriorityAvailable={props.supportsNativePriority === true}
+                             statisticsButton={props.statisticsButton}
+                             showSettingsButton={showSettingsButton}
+                             settingsButtonRef={settingsButtonRef}
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+index fa3ddc4..c83922d 100644
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -2031,11 +2031,7 @@ function SessionChatInner(props: SessionChatProps) {
+                         <HappyComposer
+                         focusInputRef={focusComposerRef}
+                         key={`composer-${props.session.id}`}
+-                        onInterruptForImmediateSend={async () => {
+-                            const current = await props.api.getSession(props.session.id)
+-                            if (!current.session.active || current.session.metadata?.flavor !== 'claude' || current.session.agentState?.controlledByUser) throw new Error('Chat is no longer available for remote interruption')
+-                            if (current.session.thinking) await props.api.abortSession(props.session.id)
+-                        }}
++                        supportsNativePriority={agentFlavor === 'codex' || (agentFlavor === 'claude' && props.session.metadata?.capabilities?.claudeInputPriorities === true)}
+                         statisticsButton={<ChatStatisticsButton api={props.api} sessionId={props.session.id}
+                             flavor={props.session.metadata?.flavor ?? null}
+                             contextSize={reduced.latestUsage?.contextSize}
+diff --git a/web/src/hooks/mutations/useSendMessage.ts b/web/src/hooks/mutations/useSendMessage.ts
+index cee70d9..19f749c 100644
+--- a/web/src/hooks/mutations/useSendMessage.ts
++++ b/web/src/hooks/mutations/useSendMessage.ts
+@@ -30,6 +30,7 @@ export type SendMessageAcceptance = {
+ export type SendMessageSettlement = {
+     attemptId: string
+     status: 'success' | 'error'
++    warning?: string
+ }
+ 
+ type BlockedReason = 'no-api' | 'no-session' | 'pending'
+@@ -216,7 +217,7 @@ export function useSendMessage(
+             if (!api) {
+                 throw new Error('API unavailable')
+             }
+-            await api.sendMessage(
++            return await api.sendMessage(
+                 input.sessionId,
+                 input.text,
+                 input.localId,
+@@ -230,8 +231,8 @@ export function useSendMessage(
+             appendOptimisticMessage(input.sessionId, createOptimisticMessage(input, 'sending'))
+             return { successStatus }
+         },
+-        onSuccess: (_, input, context) => {
+-            setSendSettlement({ attemptId: input.localId, status: 'success' })
++        onSuccess: (result, input, context) => {
++            setSendSettlement({ attemptId: input.localId, status: 'success', warning: result?.deliveryWarning })
+             updateMessageStatus(
+                 input.sessionId,
+                 input.localId,
+diff --git a/web/src/lib/messageDelivery.test.ts b/web/src/lib/messageDelivery.test.ts
+index 90856ed..cf7abd7 100644
+--- a/web/src/lib/messageDelivery.test.ts
++++ b/web/src/lib/messageDelivery.test.ts
+@@ -61,3 +61,20 @@ describe('resolveMessageDeliveryMode', () => {
+         expect(resolveMessageDeliveryMode({ ...base, intent: retryIntent })).toBe('queue')
+     })
+ })
++
++
++describe('explicit native delivery', () => {
++    it.each([
++        ['claude', 'next', 'next'], ['claude', 'steer', 'steer'],
++        ['codex', 'steer', 'steer'], ['codex', 'next', 'queue'],
++    ] as const)('%s %s maps to %s', (agentFlavor, intent, expected) => {
++        const input = { agentFlavor, intent, isSessionThinking: true };
++        expect(resolveMessageDeliveryMode(input)).toBe(expected);
++        expect(resolveMessageDeliveryMode({ ...input, scheduledAt: 123 })).toBe('queue');
++        expect(resolveMessageDeliveryMode({ ...input, isSessionThinking: false })).toBe('queue');
++        expect(resolveMessageDeliveryMode({ ...input, routesToScratchlist: true })).toBe('queue');
++    });
++    it('never reapplies a stale next-boundary priority on retry', () => {
++        expect(getRetryDeliveryMode('next')).toBe('queue');
++    });
++});
+diff --git a/web/src/lib/messageDelivery.ts b/web/src/lib/messageDelivery.ts
+index 0e99428..bbd7b66 100644
+--- a/web/src/lib/messageDelivery.ts
++++ b/web/src/lib/messageDelivery.ts
+@@ -6,7 +6,7 @@ import type { MessageDeliveryMode } from '@hapi/protocol'
+  * state at the SessionChat boundary, while `queue` is an explicit operator
+  * request not to steer an in-flight Pi turn.
+  */
+-export type ComposerSendIntent = 'default' | 'queue'
++export type ComposerSendIntent = 'default' | 'queue' | 'steer' | 'next'
+ 
+ /** Structural shape shared by React's mutable ref and the runtime adapter. */
+ export type ComposerSendIntentRef = { current: ComposerSendIntent }
+@@ -28,9 +28,9 @@ export function consumeComposerSendIntent(ref?: ComposerSendIntentRef): Composer
+  * the durable HAPI queue instead of binding the retry to a later generation.
+  */
+ export function getRetryDeliveryMode(
+-    deliveryMode: MessageDeliveryMode | undefined,
++    _deliveryMode: MessageDeliveryMode | undefined,
+ ): 'queue' {
+-    return deliveryMode === 'steer' ? 'queue' : (deliveryMode ?? 'queue')
++    return 'queue'
+ }
+ 
+ /** Convert retry delivery into the composer's one-shot intent representation. */
+@@ -40,17 +40,7 @@ export function getRestoredComposerSendIntent(
+     return getRetryDeliveryMode(deliveryMode)
+ }
+ 
+-/**
+- * Resolve the web composer intent into the durable message delivery mode.
+- *
+- * Every composer submission queues by default — for every flavor. The Pi
+- * automatic steer (deliveryMode 'steer' while the main session is thinking)
+- * was removed in favor of the explicit per-queued-message Steer action
+- * (issue #1466), matching Codex/Claude behavior: a mid-turn message waits,
+- * and the operator presses Steer to deliver it into the running turn.
+- * Scheduled messages, scratchlist additions, and retries always queued
+- * already.
+- */
++/** Normal send queues; explicit native priority is scoped to the current turn. */
+ export function resolveMessageDeliveryMode(input: {
+     agentFlavor: string | null | undefined
+     isSessionThinking: boolean
+@@ -58,6 +48,8 @@ export function resolveMessageDeliveryMode(input: {
+     scheduledAt?: number | null
+     routesToScratchlist?: boolean
+ }): MessageDeliveryMode {
+-    void input
++    if (!input.isSessionThinking || input.scheduledAt != null || input.routesToScratchlist) return 'queue'
++    if (input.intent === 'steer' && (input.agentFlavor === 'codex' || input.agentFlavor === 'claude')) return 'steer'
++    if (input.intent === 'next' && input.agentFlavor === 'claude') return 'next'
+     return 'queue'
+ }

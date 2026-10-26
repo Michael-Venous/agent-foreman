@@ -1,0 +1,171 @@
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -277,6 +277,9 @@
+         }
+         if (method === 'thread/archived') { await this.host.end(this, false); return; }
+         if (method === 'thread/queue/changed') await this.queue.reconcile();
++        if (['thread/queue/changed', 'turn/started', 'turn/completed', 'item/completed'].includes(method)) {
++            try { await this.reconcileRecentInputs(); } catch (error) { logger.debug('[Codex shared] recent intake unavailable', error); }
++        }
+         await this.projection.notification(method, params, modelAtReceipt); this.alive();
+     }
+     async readThread(threadId = this.threadId): Promise<Record<string, unknown>> {
+@@ -291,6 +294,22 @@
+             thread.turns = turns;
+         } else thread = record(record(await this.client.request('thread/read', { threadId, includeTurns: true })).thread);
+         return thread;
++    }
++    private async reconcileRecentInputs(): Promise<void> {
++        // Queue disappearance is ambiguous. Only a public exact-ID user item
++        // proves intake; native queued turns can omit its live item notification.
++        if (!this.queue.hasUnconfirmedInputs()) return;
++        const page = record(await this.client.request('thread/turns/list', {
++            threadId: this.threadId, sortDirection: 'desc', itemsView: 'full', limit: 2
++        }));
++        for (const value of Array.isArray(page.data) ? [...page.data].reverse() : []) {
++            const turn = record(value);
++            for (const item of Array.isArray(turn.items) ? turn.items : []) {
++                const input = record(item), id = string(input.clientId ?? input.clientUserMessageId);
++                if (input.type !== 'userMessage' || !id || !this.queue.owns(id) || this.queue.state(id) === 'consumed') continue;
++                await this.projection.notification('item/completed', { threadId: this.threadId, turnId: turn.id, item });
++            }
++        }
+     }
+     refresh(): Promise<void> {
+         return this.refreshing ??= this.refreshNow().finally(() => { this.refreshing = undefined; });
+--- a/cli/src/codex/shared/root.test.ts
++++ b/cli/src/codex/shared/root.test.ts
+@@ -28,6 +28,7 @@
+         async request(method: string, params: Record<string, unknown> = {}) {
+             if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
+             if (method === 'thread/list') return { data: [] };
++            if (method === 'thread/turns/list') return { data: structuredClone([...this.thread.turns].reverse().slice(0, Number(params.limit ?? 2))) };
+             if (method === 'thread/queue/list') return { data: this.queue };
+             if (method === 'thread/goal/get') return { goal: this.goal };
+             if (method === 'thread/goal/set') { this.goal = { ...this.goal, ...params }; return { goal: this.goal }; }
+@@ -387,3 +388,22 @@
+         expect(request.mock.calls.some(([method]) => ['turn/start', 'turn/interrupt', 'turn/steer', 'thread/queue/add'].includes(method))).toBe(false);
+     });
+ });
++
++it('reconciles exact queued intake when native drains idle queue without live user-item events', async () => {
++    const f = await fixture(); await f.root.activate(); f.deliver('original prompt', 'idle-input');
++    await vi.waitFor(() => expect(f.native.queue).toHaveLength(1));
++    f.native.thread.turns = [{id:'accepted-turn',status:'inProgress',items:[{id:'native-user',type:'userMessage',clientId:'idle-input',content:[{type:'text',text:'original prompt'}]}]}];
++    f.native.queue=[];
++    f.native.notify('thread/queue/changed',{threadId:'thread'});
++    await vi.waitFor(() => expect(f.consumed.mock.calls.some(([ids])=>ids.includes('idle-input'))).toBe(true));
++    expect(f.native.queue).toHaveLength(0);
++})
++it('never infers queued input consumption from queue absence or matching text on another ID', async () => {
++    const f = await fixture(); await f.root.activate(); f.deliver('original prompt', 'unconfirmed-input');
++    await vi.waitFor(() => expect(f.native.queue).toHaveLength(1));
++    f.native.thread.turns=[{id:'other-turn',status:'inProgress',items:[{id:'other-user',type:'userMessage',clientId:'different-input',content:[{type:'text',text:'original prompt'}]}]}];
++    f.native.queue=[];f.native.notify('thread/queue/changed',{threadId:'thread'});
++    await new Promise(resolve=>setTimeout(resolve,20));
++    expect(f.consumed.mock.calls.some(([ids])=>ids.includes('unconfirmed-input'))).toBe(false);
++    expect(f.native.queue).toHaveLength(0);
++})
+--- a/cli/src/codex/shared/queue.ts
++++ b/cli/src/codex/shared/queue.ts
+@@ -42,6 +42,7 @@
+     private serial<T>(work: () => Promise<T>): Promise<T> {
+         const next = this.operations.catch(() => {}).then(work); this.operations = next; return next;
+     }
++    hasUnconfirmedInputs(): boolean { return Object.values(this.entries).some(entry => entry.state === 'unknown'); }
+     owns(id: string): boolean { return id in this.entries; }
+     state(id: string): Entry['state'] | undefined { return this.entries[id]?.state; }
+     isControlOnly(id: string): boolean { return this.entries[id]?.controlOnly === true; }
+--- a/web/src/hooks/mutations/useCancelQueuedMessage.ts
++++ b/web/src/hooks/mutations/useCancelQueuedMessage.ts
+@@ -35,8 +35,8 @@
+  *      appendOptimisticMessage with status='sent' shows the message in the thread correctly.
+  *  3c. On success with status='busy': the row is inside an async steer / unknown outcome.
+  *      First-time busy restores a held indeterminate copy so the user can retry or cancel.
+- *      Cancel/Edit on an *already* indeterminate row force-dismisses from the floating bar
+- *      (#1839) via queueDismissed — restored before getQueuedState so a concurrent
++ *      Cancel/Edit on an *already* indeterminate row keeps it visible in the floating bar
++ *      with queueDismissed:false — restored before getQueuedState so a concurrent
+  *      messages-consumed SSE can still mark the row sent, then left alone in onSuccess
+  *      so we do not overwrite that acknowledgement with an uninvoked snapshot.
+  *      If getQueuedState reports the row was already consumed, mutationFn upgrades the
+@@ -52,16 +52,16 @@
+                 throw new Error('API unavailable')
+             }
+             const result = await api.cancelMessage(input.sessionId, input.messageId)
+-            // Force-dismiss (#1839): learn whether the steer already landed before
++            // Retain uncertain input: learn whether the steer already landed before
+             // callers (Edit) decide to prefill. Returning synthetic `invoked` keeps
+             // the existing Edit toast path and avoids a duplicate composer send.
+             if (result.status === 'busy' && input.snapshot.deliveryState === 'indeterminate') {
+-                // Restore a hidden hold BEFORE the queued-state lookup so a
++                // Restore a visible hold BEFORE the queued-state lookup so a
+                 // messages-consumed SSE during that await can still land.
+                 appendOptimisticMessage(input.sessionId, {
+                     ...input.snapshot,
+                     deliveryState: 'indeterminate',
+-                    queueDismissed: true,
++                    queueDismissed: false,
+                 })
+                 try {
+                     const state = await api.getQueuedState(input.sessionId, [input.localId])
+@@ -85,7 +85,7 @@
+                         markMessagesRequeued(input.sessionId, [input.localId])
+                     }
+                 } catch {
+-                    // Fall through to busy force-dismiss; SSE / reconnect may still reconcile.
++                    // Keep the visible unconfirmed row; SSE / reconnect may still reconcile.
+                 }
+             }
+             return result
+@@ -97,7 +97,7 @@
+         onSuccess: async (result, input) => {
+             if (result.status === 'busy') {
+                 if (input.snapshot.deliveryState === 'indeterminate') {
+-                    // mutationFn already restored the queueDismissed hold (and may
++                    // mutationFn already restored the visible hold (and may
+                     // have been upgraded by a concurrent messages-consumed SSE).
+                     // Do not overwrite with a fresh uninvoked snapshot.
+                     return
+--- a/web/src/hooks/mutations/useCancelQueuedMessage.test.tsx
++++ b/web/src/hooks/mutations/useCancelQueuedMessage.test.tsx
+@@ -81,7 +81,7 @@
+         })
+     })
+ 
+-    it('force-dismisses an already-indeterminate row when cancel returns busy (#1839)', async () => {
++    it('keeps an already-indeterminate row visible when cancel returns busy', async () => {
+         const api = {
+             cancelMessage: vi.fn().mockResolvedValue({ status: 'busy', localId: 'local-1' }),
+             getQueuedState: vi.fn().mockResolvedValue({
+@@ -106,7 +106,7 @@
+         expect(storeMocks.removeOptimisticMessage).toHaveBeenCalledWith('session-1', 'local-1')
+         expect(storeMocks.appendOptimisticMessage).toHaveBeenCalledWith('session-1', expect.objectContaining({
+             deliveryState: 'indeterminate',
+-            queueDismissed: true,
++            queueDismissed: false,
+         }))
+         expect(storeMocks.markMessagesConsumed).not.toHaveBeenCalled()
+     })
+@@ -149,10 +149,10 @@
+                 invokedAt: 42,
+             }))
+         })
+-        // Hidden hold restored before getQueuedState, then sent after synthetic invoked.
++        // Visible hold restored before getQueuedState, then sent after synthetic invoked.
+         expect(storeMocks.appendOptimisticMessage).toHaveBeenCalledWith('session-1', expect.objectContaining({
+             deliveryState: 'indeterminate',
+-            queueDismissed: true,
++            queueDismissed: false,
+         }))
+         expect(storeMocks.appendOptimisticMessage).toHaveBeenCalledTimes(2)
+     })
+@@ -181,7 +181,7 @@
+ 
+         expect(cancelResult).toEqual({ status: 'busy', localId: 'local-1' })
+         expect(storeMocks.appendOptimisticMessage).toHaveBeenCalledWith('session-1', expect.objectContaining({
+-            queueDismissed: true,
++            queueDismissed: false,
+         }))
+         expect(storeMocks.markMessagesRequeued).toHaveBeenCalledWith('session-1', ['local-1'])
+     })

@@ -1,0 +1,153 @@
+--- a/web/src/lib/sessionManager.ts
++++ b/web/src/lib/sessionManager.ts
+@@ -8,7 +8,9 @@
+     return session.active && (session.thinking || (session.backgroundTaskCount ?? 0) > 0 || session.pendingRequestsCount > 0)
+ }
+ 
+-/** UI-only retention. Never writes to a session, controller, goal or history. */
++/** UI-only retention. Undefined managedIds means this observer has no roster
++ * knowledge; only an explicit roster snapshot may remove roster-only rows.
++ * Never writes to a session, controller, goal or history. */
+ export function observeSessions(previous: SessionManagerState, sessions: readonly SessionSummary[], managedIds?: ReadonlySet<string>): SessionManagerState {
+     let next = previous
+     const set = (id: string, entry: ManagedListEntry) => {
+@@ -22,7 +24,7 @@
+         const observedWork = old?.observedWork || sessionHasWork(old?.session ?? session) || sessionHasWork(session)
+         // A chat admitted solely by the current managed roster must leave when
+         // oversight is released. Actual observed work keeps normal retention.
+-        if (old && !observedWork && !managedIds?.has(session.id) && !old.dismissed) {
++        if (old && !observedWork && managedIds !== undefined && !managedIds.has(session.id) && !old.dismissed) {
+             if (next === previous) next = { ...previous }
+             delete next[session.id]
+             continue
+@@ -36,7 +38,7 @@
+     }
+     for (const [id, old] of Object.entries(previous)) {
+         if (!present.has(id)) {
+-            if (!old.observedWork && !sessionHasWork(old.session) && !managedIds?.has(id) && !old.dismissed) {
++            if (!old.observedWork && !sessionHasWork(old.session) && managedIds !== undefined && !managedIds.has(id) && !old.dismissed) {
+                 if (next === previous) next = { ...previous }
+                 delete next[id]
+             } else if (!old.missing) set(id, { ...old, missing: true, stopped: true, session: { ...old.session, active: false, thinking: false, backgroundTaskCount: 0, pendingRequestsCount: 0 } })
+--- a/web/src/hooks/useSessionManager.ts
++++ b/web/src/hooks/useSessionManager.ts
+@@ -11,7 +11,7 @@
+     })
+     useEffect(() => {
+         // Undefined means data not loaded; do not mistake loading for disconnect.
+-        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, new Set(Object.keys(managed ?? {}))))
++        if (sessions) client.setQueryData<SessionManagerState>(SESSION_MANAGER_KEY, old => observeSessions(old ?? {}, sessions, managed === undefined ? undefined : new Set(Object.keys(managed))))
+     }, [client, sessions, managed])
+     return {
+         entries,
+--- a/web/src/lib/sessionManager.test.ts
++++ b/web/src/lib/sessionManager.test.ts
+@@ -107,3 +107,18 @@
+     const seeded = observeSessions({}, [idle], new Set(['s']))
+     expect(observeSessions(seeded, [], new Set())).toEqual({})
+ })
++
++
++it('an observer without roster knowledge cannot remove idle managed rows', () => {
++    const idle = session({ thinking: false })
++    const seeded = observeSessions({}, [idle], new Set(['s']))
++    expect(observeSessions(seeded, [idle])).toBe(seeded)
++    const updated = observeSessions(seeded, [{ ...idle, updatedAt: 2 }])
++    expect(updated.s?.session.updatedAt).toBe(2)
++    expect(updated.s?.dismissed).toBe(false)
++    const missing = observeSessions(updated, [])
++    expect(missing.s?.missing).toBe(true)
++    // A loaded, explicitly empty roster still removes released roster-only rows.
++    expect(observeSessions(updated, [idle], new Set())).toEqual({})
++    expect(observeSessions(missing, [], new Set())).toEqual({})
++})
+--- a/web/src/components/SessionManagerButton.tsx
++++ b/web/src/components/SessionManagerButton.tsx
+@@ -22,7 +22,10 @@
+     const label = missing ? 'Unavailable' : pause.data?.pausedAt != null ? 'Paused'
+         : managementPaused ? (hasWork ? 'Management paused' : 'Paused')
+         : hasWork ? null : session.active ? 'Idle' : 'Inactive'
+-    return label ? <p className="px-2 pb-1 text-xs text-[var(--app-hint)]">{label}</p> : null
++    return label ? <div className="flex flex-wrap items-center gap-x-2 px-2 pb-1 text-xs text-[var(--app-hint)]">
++        {managed && !hasWork && <span aria-label="Managed session" className="font-medium text-violet-500">Managed</span>}
++        <p>{label}</p>
++    </div> : null
+ }
+ 
+ export function SessionManagerButton(props: {
+@@ -45,7 +48,8 @@
+     const visibleRows = rows.filter(e => (!managedOnly || isManaged(e.session.id))
+         && (activityFilter === 'all' || (activityFilter === 'active' ? sessionHasWork(e.session) : !sessionHasWork(e.session))))
+     const filtered = managedOnly || activityFilter !== 'all'
+-    const clearable = visibleRows.filter(e => e.stopped)
++    const clearable = visibleRows.filter(e => e.stopped && !(isManaged(e.session.id)
++        && (!e.observedWork || currentManaged[e.session.id]?.projectStatus === 'paused' || currentManaged[e.session.id]?.manualHold)))
+     const working = rows.filter(e => sessionHasWork(e.session)).length
+     return <>
+         <button type="button" onClick={() => setOpen(true)} aria-label="Session Manager"
+--- a/web/src/components/SessionManagerButton.test.tsx
++++ b/web/src/components/SessionManagerButton.test.tsx
+@@ -5,6 +5,9 @@
+ import type { SessionSummary } from '@/types/api'
+ import { I18nProvider } from '@/lib/i18n-context'
+ import { SessionManagerButton } from './SessionManagerButton'
++import { useSessions } from '@/hooks/queries/useSessions'
++import { useManagedSessions } from '@/hooks/useManagedSessions'
++import { queryKeys } from '@/lib/query-keys'
+ afterEach(cleanup)
+ const controls = { abortSession: vi.fn(async () => {}), unmanageSession: vi.fn(async () => {}) }
+ beforeEach(() => { vi.clearAllMocks() })
+@@ -169,3 +172,53 @@
+     expect(controls.unmanageSession).toHaveBeenCalledExactlyOnceWith('Idle roster')
+     expect(controls.abortSession).not.toHaveBeenCalled()
+ })
++
++
++it('keeps paused managed sessions when the real general session observer and roster observer run together', async () => {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++    const terrain = { ...session('Terrain', true, false), id: '329d6fba-a999-5aaf-8067-7982d4464f50' }
++    const localApi = {
++        ...controls,
++        getSessions: vi.fn(async () => ({ sessions: [terrain] })),
++        getManagedSessions: vi.fn(async () => ({ [terrain.id]: { role: 'worker', worker: '54fbef6f', projectStatus: 'paused' } })),
++        getManualPause: vi.fn(async () => ({ pausedAt: null })),
++    } as unknown as ApiClient
++    function ActualObservers() {
++        const { sessions } = useSessions(localApi)
++        const managed = useManagedSessions(localApi)
++        return <SessionManagerButton api={localApi} sessions={sessions} managed={managed} onSelect={vi.fn()}/>
++    }
++    render(<QueryClientProvider client={client}><I18nProvider><ActualObservers/></I18nProvider></QueryClientProvider>)
++    await waitFor(() => expect(client.getQueryData(['managed-sessions'])).toBeDefined())
++    await waitFor(() => expect(client.getQueryData(queryKeys.sessions)).toBeDefined())
++    open()
++    await screen.findByRole('button', { name: 'Open Terrain' })
++    expect(screen.getByText('Paused')).toBeInTheDocument()
++    // SSE/list refetch creates fresh snapshots while the chat remains idle.
++    for (let updatedAt = 2; updatedAt < 5; updatedAt++) {
++        client.setQueryData(queryKeys.sessions, { sessions: [{ ...terrain, updatedAt }] })
++        await waitFor(() => expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument())
++    }
++    fireEvent.click(screen.getByRole('button', { name: 'Managed' }))
++    expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})
++
++
++it('bulk Clear finished preserves current paused roster entries but clears recent unmanaged completion', async () => {
++    const client = new QueryClient()
++    const terrain = session('Terrain', true, false)
++    const managed = { Terrain: { role: 'worker' as const, projectStatus: 'paused' } }
++    const view = (thinking: boolean) => <QueryClientProvider client={client}><I18nProvider><SessionManagerButton api={api} sessions={[terrain, session('Recent result', true, thinking)]} managed={managed} onSelect={vi.fn()}/></I18nProvider></QueryClientProvider>
++    const { rerender } = render(view(true)); open()
++    await screen.findByRole('button', { name: 'Open Terrain' })
++    expect(screen.getByLabelText('Managed session')).toBeInTheDocument()
++    rerender(view(false))
++    await screen.findByRole('button', { name: 'Dismiss Recent result from Session Manager' })
++    fireEvent.click(screen.getByRole('button', { name: 'Clear finished' }))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Recent result' })).toBeNull())
++    expect(screen.getByRole('button', { name: 'Open Terrain' })).toBeInTheDocument()
++    expect(screen.getByText('Paused')).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Clear finished' })).toBeDisabled()
++    expect(controls.abortSession).not.toHaveBeenCalled(); expect(controls.unmanageSession).not.toHaveBeenCalled()
++})

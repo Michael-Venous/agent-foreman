@@ -1,0 +1,258 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -37,7 +37,7 @@
+     | { kind: 'box'; pointer: number; x: number; y: number; origin: GraphPoint; before: string[]; mode: 'replace' | 'add' | 'subtract'; moved: boolean }
+     | { kind: 'junction-move'; editLabel?: boolean; pointer: number; id: string; x: number; y: number; origin: GraphPoint; last: GraphPoint; moved: boolean; frames: NodeAnnotation[]; routing: NodeRouting }
+     | { kind: 'annotation'; editLabel?: boolean; pointer: number; x: number; y: number; origin: NodeAnnotation; last: NodeAnnotation; moved: boolean; resize: boolean; members: Record<string, GraphPoint>; frames: NodeAnnotation[]; routing: NodeRouting }
+-    | { kind: 'pan'; previewNode?: string; pointer: number; x: number; y: number; view: View }
++    | { kind: 'pan'; previewNode?: string; tapStartedAt?: number; moved?: boolean; pointer: number; x: number; y: number; view: View }
+     | { kind: 'pinch'; distance: number; mid: GraphPoint; view: View }
+     | { kind: 'node'; pointer: number; id: string; x: number; y: number; origin: GraphPoint; moved: boolean; last: GraphPoint; frames: NodeAnnotation[]; origins: NodeLayoutPositions; positions: NodeLayoutPositions }
+     | { kind: 'link'; pointer: number; from: string }
+@@ -59,6 +59,7 @@
+ const errorText = (error: unknown, fallback: string) => error instanceof Error && error.message ? error.message : fallback
+ const round = (point: GraphPoint): GraphPoint => ({ x: Math.round(point.x), y: Math.round(point.y) })
+ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
++const DOUBLE_TAP_MS = 350, DOUBLE_TAP_SLOP = 24
+ const iconButton = 'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:opacity-40'
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+@@ -124,7 +125,9 @@
+     const mutationBusy = useRef(false)
+     const pointers = useRef(new Map<number, GraphPoint>())
+     const gesture = useRef<Gesture | null>(null)
++    const lastCanvasTap = useRef<{ at: number; x: number; y: number; workspace: string } | null>(null)
+     const cancelSelectionGesture = () => {
++        lastCanvasTap.current = null
+         const current = gesture.current
+         if (current?.kind === 'box') { setSelectedNodes(current.before); setSelectionRect(null); setAddMenu(null) }
+         else if (current?.kind === 'node') {
+@@ -145,7 +148,7 @@
+     const touchMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const cancelTouchMenu = () => { if (touchMenuTimer.current) clearTimeout(touchMenuTimer.current); touchMenuTimer.current = null }
+     useEffect(() => () => cancelTouchMenu(), [])
+-    useEffect(() => { if (!visible) cancelTouchMenu() }, [visible])
++    useEffect(() => { if (!visible) { cancelTouchMenu(); lastCanvasTap.current = null } }, [visible])
+     const pendingSave = useRef<NodeLayoutPositions>({})
+     const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const fittedWorkspace = useRef<string | null>(null)
+@@ -207,7 +210,7 @@
+     useLayoutEffect(() => {
+         if (!graph || !layout || !visible || fittedWorkspace.current === graph.graph.workspaceId) return
+         fittedWorkspace.current = graph.graph.workspaceId; skipViewWrite.current = true
+-        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; setLink(null)
++        setOverrides({}); setAnnotationDrafts({}); setJunctionDrafts({}); setSelectedNode(null); setSelectionRect(null); setSelectedJunction(null); setMovingJunction(null); setSelectedAnnotation(null); setEditingAnnotation(null); setMenu(null); setObjectMenu(null); setHistory([]); historyRef.current = []; setRedoHistory([]); redoHistoryRef.current = []; cancelTouchMenu(); gesture.current = null; lastCanvasTap.current = null; setLink(null)
+         let saved: View | null = null
+         try { const value = JSON.parse(readChatWindowPreference('node-view:' + graph.graph.workspaceId) ?? 'null'); if (value && [value.x, value.y, value.k].every(Number.isFinite) && value.k > 0 && value.k <= 2.5) saved = value } catch { /* First view fits. */ }
+         if (saved) setView(saved); else fit()
+@@ -320,8 +323,14 @@
+         const r = canvas.current?.getBoundingClientRect()
+         setMenu(null); setObjectMenu({ id, x: clientX - (r?.left ?? 0), y: clientY - (r?.top ?? 0) })
+     }
++    const armTouchSelection = (pointer: number, at: GraphPoint, before: string[]) => {
++        gesture.current = { kind: 'box', pointer, x: at.x, y: at.y,
++            origin: toGraph(at.x, at.y), before, mode: 'replace', moved: false }
++        showAddMenu(at.x, at.y)
++    }
+     const pinchStart = () => {
+         cancelTouchMenu()
++        lastCanvasTap.current = null
+         const [a, b] = [...pointers.current.values()]
+         if (!a || !b) return
+         const previous = gesture.current
+@@ -339,6 +348,8 @@
+         setLink(null)
+     }
+     const down = (event: PointerEvent<HTMLDivElement>) => {
++        const previousTap = lastCanvasTap.current
++        lastCanvasTap.current = null
+         const target = event.target as Element
+         // React portals bubble through this component even though their DOM is
+         // outside the canvas. Capturing those pointers eats dialog clicks.
+@@ -406,19 +417,20 @@
+             gesture.current = mouse ? { kind: 'box', pointer: event.pointerId, x: event.clientX, y: event.clientY,
+                 origin: toGraph(event.clientX, event.clientY), before: selectedNodes,
+                 mode: event.ctrlKey || event.metaKey ? 'subtract' : event.shiftKey ? 'add' : 'replace', moved: false }
+-                : event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current } : null
++                : event.pointerType === 'touch' ? { kind: 'pan', pointer: event.pointerId, x: event.clientX, y: event.clientY, view: viewRef.current, tapStartedAt: performance.now(), moved: false } : null
+             if (event.pointerType === 'touch') {
+                 event.preventDefault()
+                 const at = { x: event.clientX, y: event.clientY }, pointer = event.pointerId
+-                touchMenuTimer.current = setTimeout(() => {
+-                    touchMenuTimer.current = null
+-                    if (gesture.current?.kind !== 'pan' || gesture.current.pointer !== pointer || pointers.current.size !== 1) return
+-                    // Keep the held pointer: releasing leaves Add open, while
+-                    // continuing to drag dismisses it and selects a rectangle.
+-                    gesture.current = { kind: 'box', pointer, x: at.x, y: at.y,
+-                        origin: toGraph(at.x, at.y), before: selectedNodes, mode: 'replace', moved: false }
+-                    showAddMenu(at.x, at.y)
+-                }, 550)
++                if (previousTap && previousTap.workspace === graph?.graph.workspaceId && performance.now() - previousTap.at <= DOUBLE_TAP_MS && Math.hypot(at.x - previousTap.x, at.y - previousTap.y) <= DOUBLE_TAP_SLOP) {
++                    armTouchSelection(pointer, at, selectedNodes)
++                } else {
++                    touchMenuTimer.current = setTimeout(() => {
++                        touchMenuTimer.current = null
++                        if (gesture.current?.kind !== 'pan' || gesture.current.pointer !== pointer || pointers.current.size !== 1) return
++                        // Keep the held pointer: release leaves Add open; drag selects.
++                        armTouchSelection(pointer, at, selectedNodes)
++                    }, 550)
++                }
+             }
+         }
+         // Touch has implicit capture; touch-action:none prevents native scrolling.
+@@ -439,7 +451,10 @@
+             return
+         }
+         if (g.pointer !== event.pointerId) return
+-        if ((g.kind === 'node' || g.kind === 'pan') && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) cancelTouchMenu()
++        if ((g.kind === 'node' || g.kind === 'pan') && Math.hypot(event.clientX - g.x, event.clientY - g.y) >= 6) {
++            cancelTouchMenu()
++            if (g.kind === 'pan') g.moved = true
++        }
+         if (g.kind === 'box') {
+             if (!g.moved && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) return
+             if (!g.moved) setAddMenu(null)
+@@ -523,6 +538,9 @@
+         if (g.pointer !== event.pointerId) return
+         gesture.current = null
+         const cancelled = event.type === 'pointercancel'
++        if (g.kind === 'pan' && g.tapStartedAt !== undefined && !g.moved && !cancelled && graph && performance.now() - g.tapStartedAt <= DOUBLE_TAP_MS && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) {
++            lastCanvasTap.current = { at: performance.now(), x: event.clientX, y: event.clientY, workspace: graph.graph.workspaceId }
++        }
+         if (g.kind === 'pan' && g.previewNode && !cancelled && Math.hypot(event.clientX - g.x, event.clientY - g.y) < 6) { selectNode(g.previewNode); return }
+         if (g.kind === 'junction-move') {
+             if (g.moved && !cancelled) void changeRouting(routing => {
+@@ -911,8 +929,8 @@
+         {(loadError || (error && !menu && !editingAnnotation)) && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[var(--app-badge-error-text)]">{error ?? loadError}</p>}
+         <div ref={canvas} aria-label="Node graph" role="application" tabIndex={0} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+             onDoubleClick={event => {
+-                // Touch uses hold-to-add; ignore compatibility double-clicks
+-                // even on browsers that ignore pointerdown preventDefault.
++                // Touch hold/double-tap is handled by pointers; ignore duplicate
++                // compatibility double-clicks even if preventDefault is ignored.
+                 if (lastPointerType.current === 'touch' || (event.nativeEvent as MouseEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } }).sourceCapabilities?.firesTouchEvents) return
+                 const target = event.target as Element
+                 if (!event.currentTarget.contains(target) || target.closest('[data-graph-ui],[data-node-id],[data-junction-id],[data-annotation-id],button,input,[role="dialog"]')) return
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1043,13 +1043,11 @@
+         fireEvent.click(within(editor).getByRole('button', { name: 'Cancel' }))
+         expect(api.editNodeAnnotation).not.toHaveBeenCalled()
+     })
+-    it('ignores touch double-tap compatibility events and preserves mouse double-click and native context menus', async () => {
++    it('ignores standalone touch compatibility double-clicks and preserves mouse double-click and native context menus', async () => {
+         setup(); const node = await screen.findByRole('button', { name: 'Node Alpha' })
+         const canvas = screen.getByRole('application'), point = { clientX: 600, clientY: 450 }
+-        for (let tap = 0; tap < 2; tap++) {
+-            fireEvent.pointerDown(canvas, { pointerId: 10, pointerType: 'touch', button: 0, ...point })
+-            fireEvent.pointerUp(canvas, { pointerId: 10, pointerType: 'touch', ...point })
+-        }
++        fireEvent.pointerDown(canvas, { pointerId: 10, pointerType: 'touch', button: 0, ...point })
++        fireEvent.pointerUp(canvas, { pointerId: 10, pointerType: 'touch', ...point })
+         fireEvent.doubleClick(canvas, point)
+         expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
+         expect(fireEvent.contextMenu(canvas, point)).toBe(false)
+@@ -1460,6 +1458,103 @@
+         fireEvent.pointerUp(canvas, { pointerId: 33, pointerType: 'touch' })
+         expect(screen.queryByTestId('graph-selection-box')).toBeNull()
+         expect(world.style.transform).not.toBe(before)
++    })
++})
++
++describe('mobile double-tap Add and selection', () => {
++    it('opens Add on the second touch, keeps it usable on release and ignores duplicate compatibility clicks', async () => {
++        const { api, onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = screen.getByRole('application'), point = { clientX: 600, clientY: 450 }
++        vi.useFakeTimers()
++        try {
++            fireEvent.pointerDown(canvas, { pointerId: 95, pointerType: 'touch', button: 0, ...point })
++            fireEvent.pointerUp(canvas, { pointerId: 95, pointerType: 'touch', ...point })
++            expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++            act(() => vi.advanceTimersByTime(100))
++            fireEvent.pointerDown(canvas, { pointerId: 96, pointerType: 'touch', button: 0, ...point })
++            expect(screen.getByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
++            const search = screen.getByRole('searchbox', { name: 'Search nodes' })
++            expect(search).not.toHaveFocus()
++            fireEvent.pointerUp(canvas, { pointerId: 96, pointerType: 'touch', ...point })
++            fireEvent.change(search, { target: { value: 'Text' } })
++            fireEvent.doubleClick(canvas, point)
++            expect(search).toHaveValue('Text')
++            expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++            fireEvent.click(screen.getByRole('button', { name: 'Text box' }))
++            expect(screen.getByRole('dialog', { name: 'Text box' })).toBeInTheDocument()
++            fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
++            expect(api.addNode).not.toHaveBeenCalled(); expect(api.editNodeAnnotation).not.toHaveBeenCalled()
++            expect(api.abortSession).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++        } finally { vi.useRealTimers() }
++    })
++
++    it('double-taps then drags to box-select in graph coordinates without panning or a delayed menu', async () => {
++        const { api, onOpenChat } = setup(); await screen.findByRole('button', { name: 'Node Bravo' })
++        fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
++        const canvas = screen.getByRole('application'), bounds = boxBounds('A', 'B')
++        const point = { clientX: bounds.left, clientY: bounds.top }
++        const world = document.querySelector<HTMLElement>('[data-node-id]')!.parentElement!, before = world.style.transform
++        vi.useFakeTimers()
++        try {
++            fireEvent.pointerDown(canvas, { pointerId: 95, pointerType: 'touch', button: 0, ...point })
++            fireEvent.pointerUp(canvas, { pointerId: 95, pointerType: 'touch', ...point })
++            act(() => vi.advanceTimersByTime(100))
++            fireEvent.pointerDown(canvas, { pointerId: 96, pointerType: 'touch', button: 0, ...point })
++            expect(screen.getByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
++            fireEvent.pointerMove(canvas, { pointerId: 96, pointerType: 'touch', clientX: bounds.right, clientY: bounds.bottom })
++            expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++            expect(screen.getByTestId('graph-selection-box')).toBeInTheDocument()
++            for (const name of ['Alpha', 'Bravo']) expect(screen.getByRole('button', { name: 'Node ' + name })).toHaveAttribute('aria-pressed', 'true')
++            expect(screen.getByRole('button', { name: 'Node Charlie' })).toHaveAttribute('aria-pressed', 'false')
++            expect(world.style.transform).toBe(before)
++            fireEvent.pointerUp(canvas, { pointerId: 96, pointerType: 'touch', clientX: bounds.right, clientY: bounds.bottom })
++            expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++            act(() => vi.advanceTimersByTime(600))
++            expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++            expect(api.addNode).not.toHaveBeenCalled(); expect(api.editNodeVisual).not.toHaveBeenCalled()
++            expect(api.abortSession).not.toHaveBeenCalled(); expect(onOpenChat).not.toHaveBeenCalled()
++        } finally { vi.useRealTimers() }
++    })
++
++    it.each(['slow', 'far', 'pan-and-return', 'cancelled', 'pinch', 'other-node', 'blur'])('does not treat %s touches as an empty-canvas double tap', async reason => {
++        setup(); const bravo = await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = screen.getByRole('application'), point = { clientX: 600, clientY: 450 }
++        vi.useFakeTimers()
++        try {
++            fireEvent.pointerDown(canvas, { pointerId: 95, pointerType: 'touch', button: 0, ...point })
++            if (reason === 'pan-and-return') {
++                fireEvent.pointerMove(canvas, { pointerId: 95, pointerType: 'touch', clientX: 620, clientY: 450 })
++                fireEvent.pointerMove(canvas, { pointerId: 95, pointerType: 'touch', ...point })
++            }
++            if (reason === 'pinch') {
++                fireEvent.pointerDown(canvas, { pointerId: 97, pointerType: 'touch', button: 0, clientX: 650, clientY: 450 })
++                fireEvent.pointerUp(canvas, { pointerId: 97, pointerType: 'touch', clientX: 650, clientY: 450 })
++            }
++            if (reason === 'cancelled') fireEvent.pointerCancel(canvas, { pointerId: 95, pointerType: 'touch', ...point })
++            else fireEvent.pointerUp(canvas, { pointerId: 95, pointerType: 'touch', ...point })
++            if (reason === 'other-node') {
++                fireEvent.pointerDown(bravo, { pointerId: 98, pointerType: 'touch', button: 0, ...nodeCentre('B') })
++                fireEvent.pointerUp(bravo, { pointerId: 98, pointerType: 'touch', ...nodeCentre('B') })
++            }
++            if (reason === 'blur') fireEvent.blur(window)
++            act(() => vi.advanceTimersByTime(reason === 'slow' ? 351 : 100))
++            fireEvent.pointerDown(canvas, { pointerId: 96, pointerType: 'touch', button: 0, clientX: reason === 'far' ? 640 : 600, clientY: 450 })
++            expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++            expect(screen.queryByTestId('graph-selection-box')).toBeNull()
++            fireEvent.pointerUp(canvas, { pointerId: 96, pointerType: 'touch', clientX: reason === 'far' ? 640 : 600, clientY: 450 })
++        } finally { vi.useRealTimers() }
++    })
++
++    it('leaves desktop pointer clicks and native double-click Add behavior unchanged', async () => {
++        setup(); await screen.findByRole('button', { name: 'Node Bravo' })
++        const canvas = screen.getByRole('application'), point = { clientX: 600, clientY: 450 }
++        for (const pointerId of [95, 96]) {
++            fireEvent.pointerDown(canvas, { pointerId, pointerType: 'mouse', button: 0, ...point })
++            fireEvent.pointerUp(canvas, { pointerId, pointerType: 'mouse', ...point })
++        }
++        expect(screen.queryByRole('dialog', { name: 'Add node' })).toBeNull()
++        fireEvent.doubleClick(canvas, point)
++        expect(screen.getByRole('dialog', { name: 'Add node' })).toBeInTheDocument()
+     })
+ })
+ 

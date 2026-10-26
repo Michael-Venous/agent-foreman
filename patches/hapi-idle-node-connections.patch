@@ -1,0 +1,82 @@
+diff --git a/hub/src/sync/nodeTree.test.ts b/hub/src/sync/nodeTree.test.ts
+--- a/hub/src/sync/nodeTree.test.ts
++++ b/hub/src/sync/nodeTree.test.ts
+@@ -28,7 +28,7 @@
+         return { status: response.status, json: await response.json() as any, cache: response.headers.get('Cache-Control') }
+     }
+     const snapshot = (id = ws) => engine.nodeGraph.snapshot('default', id)
+-    const edit = (changes: unknown[], options: { workspace?: string; version?: string; dryRun?: boolean } = {}) => call('/node-graph/workspaces/' + (options.workspace ?? ws) + '/edit', { version: options.version ?? snapshot(options.workspace).version, changes, dryRun: options.dryRun ?? false, createdBy: root.id })
++    const edit = (changes: unknown[], options: { workspace?: string; version?: string; dryRun?: boolean; preserveConnections?: boolean } = {}) => call('/node-graph/workspaces/' + (options.workspace ?? ws) + '/edit', { version: options.version ?? snapshot(options.workspace).version, changes, dryRun: options.dryRun ?? false, createdBy: root.id, preserveConnections: options.preserveConnections })
+     const controls = { abort: spyOn(engine, 'abortSession'), resume: spyOn(engine, 'resumeSession'), send: spyOn(engine, 'sendMessage') }
+     return { store, engine, create, root, a, b, foreign, ws, call, snapshot, edit, controls,
+         counts: () => ({ nudges, notifications }), close: () => { engine.stop(); store.close() } }
+@@ -37,6 +37,43 @@
+ const noControls = (f: ReturnType<typeof fixture>) => { for (const control of Object.values(f.controls)) expect(control).not.toHaveBeenCalled() }
+ 
+ describe('overseer workspace tree API', () => {
++    it('rolls back actor-protected node or ownership removal, including routing replacement', async () => {
++        const f = fixture()
++        try {
++            await f.edit([{ action: 'connect', owner: f.root.id, child: f.a.id }, { action: 'connect', owner: f.a.id, child: f.b.id }])
++            const before = f.snapshot(), counts = f.counts()
++            for (const change of [
++                { action: 'disconnect', child: f.b.id }, { action: 'remove', ids: [f.a.id] },
++                { action: 'routing', value: { junctions: [], edges: [{ owner: f.root.id, child: f.a.id }] } },
++            ]) {
++                const response = await f.edit([{ action: 'annotation', id: 'note', value: note }, change], { preserveConnections: true })
++                expect(response.status).toBe(409); expect(response.json.error).toContain('stay connected')
++                expect(f.snapshot()).toEqual(before); expect(f.counts()).toEqual(counts)
++            }
++            noControls(f)
++        } finally { f.close() }
++    })
++    it('permits visual edits and reparenting without retiring nodes under connection protection', async () => {
++        const f = fixture()
++        try {
++            await f.edit([{ action: 'connect', owner: f.root.id, child: f.a.id }, { action: 'connect', owner: f.a.id, child: f.b.id }])
++            const result = await f.edit([{ action: 'disconnect', child: f.b.id }, { action: 'connect', owner: f.root.id, child: f.b.id },
++                { action: 'annotation', id: 'note', value: note }], { preserveConnections: true })
++            expect(result.status).toBe(200); expect(result.json.graph.edges).toHaveLength(2)
++            expect(result.json.graph.edges.find((edge: any) => edge.child === f.b.id).owner).toBe(f.root.id)
++            noControls(f)
++        } finally { f.close() }
++    })
++    it('keeps direct user disconnect controls available when protection is not requested', async () => {
++        const f = fixture()
++        try {
++            await f.edit([{ action: 'connect', owner: f.root.id, child: f.a.id }])
++            const result = await f.edit([{ action: 'disconnect', child: f.a.id }], { preserveConnections: false })
++            expect(result.status).toBe(200); expect(result.json.graph.edges).toHaveLength(0)
++            expect(result.json.graph.nodes.some((node: any) => node.sessionId === f.a.id)).toBe(true)
++            noControls(f)
++        } finally { f.close() }
++    })
+     it('reads every stored workspace without activation, histories, or native control', async () => {
+         const f = fixture()
+         try {
+diff --git a/hub/src/web/routes/nodeGraph.ts b/hub/src/web/routes/nodeGraph.ts
+--- a/hub/src/web/routes/nodeGraph.ts
++++ b/hub/src/web/routes/nodeGraph.ts
+@@ -34,7 +34,7 @@
+ const position = z.object({ x: coordinate, y: coordinate }).strict()
+ const treeEdit = z.object({
+     version: z.string().regex(/^[a-f0-9]{64}$/), dryRun: z.boolean().optional(),
+-    createdBy: sessionId.optional(),
++    createdBy: sessionId.optional(), preserveConnections: z.boolean().optional(),
+     changes: z.array(z.discriminatedUnion('action', [
+         z.object({ action: z.literal('add'), sessionId }).strict(),
+         z.object({ action: z.literal('remove'), ids: z.array(sessionId).min(1).max(1000) }).strict(),
+@@ -136,6 +136,13 @@
+                             break
+                         }
+                         case 'rename': engine.nodeGraph.rename(namespace, workspaceId, change.name); break
++                    }
++                }
++                if (body.preserveConnections) {
++                    const after = engine.nodeGraph.graph(namespace, workspaceId)
++                    const members = new Set(after.nodes.map(node => node.sessionId)), owned = new Set(after.edges.map(edge => edge.child))
++                    if (before.graph.nodes.some(node => !members.has(node.sessionId)) || before.graph.edges.some(edge => !owned.has(edge.child))) {
++                        throw new Error('Idle/completed nodes stay connected. Removing nodes or ownership requires an explicit current user request.')
+                     }
+                 }
+             }, body.dryRun)
