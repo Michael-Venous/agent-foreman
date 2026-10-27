@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Launch isolated agent Firefox without taking ownership of normal desktop Firefox."""
 import fcntl
+import ipaddress
+import stat
 import json
 import re
 import tempfile
@@ -105,21 +107,72 @@ def stop_headless():
     return True
 
 
-def agent_profile_open():
-    # A stale symlink is deliberately conservative; never delete profile locks.
-    if (PROFILE/'lock').is_symlink():
-        return True
-    # .parentlock itself survives shutdown; its mere existence is not ownership.
-    try:
-        with (PROFILE/'.parentlock').open('r+b') as lock:
-            try:
-                fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.lockf(lock, fcntl.LOCK_UN)
-    except FileNotFoundError:
-        pass
+def profile_process_open(proc=Path('/proc')):
+    """Inspect exact profile arguments, including processes still starting up."""
+    for folder in proc.iterdir():
+        if not folder.name.isdigit():
+            continue
+        try:
+            if folder.stat().st_uid != os.getuid():
+                continue
+            args = (folder/'cmdline').read_bytes().decode().strip('\0').split('\0')
+            for index, arg in enumerate(args):
+                value = (args[index+1:index+2] or [''])[0] if arg in ('-profile', '--profile') else (
+                    arg.split('=', 1)[1] if arg.startswith('--profile=') else '')
+                if value and Path(value).resolve() == PROFILE.resolve():
+                    return True
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # Process exited during inspection.
     return False
+
+
+def profile_lock_snapshot():
+    path = PROFILE/'lock'
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(info.st_mode):
+        raise Busy('Unrecognized agent profile lock; leaving it untouched.')
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, os.readlink(path))
+
+
+def stale_local_lock(snapshot):
+    """Only a loopback lock with a conclusively nonexistent PID is stale."""
+    try:
+        host, pid_text = snapshot[-1].rsplit(':', 1)
+        if not ipaddress.ip_address(host).is_loopback or not re.fullmatch(r'\+?[1-9][0-9]*', pid_text):
+            return False
+        pid = int(pid_text.lstrip('+'))
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (ValueError, OverflowError, OSError):
+        return False
+    return False
+
+
+def agent_profile_open():
+    # Never remove locks. Unknown ownership always blocks a mode transition.
+    try:
+        snapshot = profile_lock_snapshot()
+        if snapshot is not None and not stale_local_lock(snapshot):
+            return True
+        try:
+            lock = (PROFILE/'.parentlock').open('r+b')
+        except FileNotFoundError:
+            # An old symlink needs positive advisory-lock evidence to be ignored.
+            return snapshot is not None or profile_process_open() or profile_lock_snapshot() is not None
+        with lock:
+            fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Hold the advisory lock through the process scan and identity recheck.
+            if profile_process_open() or profile_lock_snapshot() != snapshot:
+                return True
+            if snapshot is not None and not stale_local_lock(snapshot):
+                return True
+            return (PROFILE/'.parentlock').stat().st_ino != os.fstat(lock.fileno()).st_ino
+    except (OSError, ValueError, Busy):
+        return True
 
 
 def require_profile():

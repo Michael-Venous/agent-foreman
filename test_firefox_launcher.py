@@ -109,6 +109,59 @@ class FirefoxLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(launcher.Busy, 'expected isolated headless'):launcher.identity(123,root)
             self.assertIsNone(launcher.identity(999,root))
 
+    def test_stale_local_lock_is_allowed_without_removing_any_lock(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher, 'profile_process_open', return_value=False), patch.object(launcher.os, 'kill', side_effect=ProcessLookupError):
+            profile = Path(td)
+            (profile/'.parentlock').touch()
+            (profile/'lock').symlink_to('127.0.1.1:+987654')
+            before = (profile/'lock').lstat().st_ino
+            self.assertFalse(launcher.agent_profile_open())
+            self.assertEqual((profile/'lock').readlink(), Path('127.0.1.1:+987654'))
+            self.assertEqual((profile/'lock').lstat().st_ino, before)
+            self.assertTrue((profile/'.parentlock').exists())
+
+    def test_live_or_uninspectable_pid_and_unknown_hosts_block(self):
+        for target, failure in [('127.0.1.1:+1234', None), ('127.0.1.1:+1234', PermissionError()), ('192.0.2.1:+1234', ProcessLookupError()), ('unknown:+1234', ProcessLookupError()), ('127.0.0.1:+0', ProcessLookupError())]:
+            with self.subTest(target=target, failure=failure), tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher.os, 'kill', side_effect=failure):
+                (Path(td)/'.parentlock').touch()
+                (Path(td)/'lock').symlink_to(target)
+                self.assertTrue(launcher.agent_profile_open())
+
+    def test_stale_link_requires_advisory_lock_evidence(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher.os, 'kill', side_effect=ProcessLookupError):
+            (Path(td)/'lock').symlink_to('127.0.1.1:+987654')
+            self.assertTrue(launcher.agent_profile_open())
+
+    def test_profile_process_and_inspection_errors_block(self):
+        for options in [dict(return_value=True), dict(side_effect=PermissionError())]:
+            with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher, 'profile_process_open', **options):
+                (Path(td)/'.parentlock').touch()
+                self.assertTrue(launcher.agent_profile_open())
+
+    def test_lock_changed_during_scan_blocks(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)), patch.object(launcher, 'profile_process_open', return_value=False), patch.object(launcher, 'profile_lock_snapshot', side_effect=[None, (1, 2, 3, '127.0.0.1:+1234')]):
+            (Path(td)/'.parentlock').touch()
+            self.assertTrue(launcher.agent_profile_open())
+
+    def test_real_advisory_lock_held_by_another_process_blocks(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)):
+            lockpath = Path(td)/'.parentlock'
+            lockpath.touch()
+            process = subprocess.Popen(['python3', '-c', 'import fcntl,sys; f=open(sys.argv[1],"r+b"); fcntl.lockf(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()', str(lockpath)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(process.stdout.readline().strip(), 'ready')
+                self.assertTrue(launcher.agent_profile_open())
+            finally:
+                process.communicate('', timeout=5)
+
+    def test_process_scan_distinguishes_exact_profile_from_personal_firefox(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'PROFILE', Path(td)/'isolated'):
+            proc = Path(td)/'proc'; folder = proc/'123'; folder.mkdir(parents=True)
+            (folder/'cmdline').write_bytes(b'/usr/bin/firefox\0-profile\0/personal\0')
+            self.assertFalse(launcher.profile_process_open(proc))
+            (folder/'cmdline').write_bytes(('/usr/bin/firefox\0--profile='+str(launcher.PROFILE)+'\0').encode())
+            self.assertTrue(launcher.profile_process_open(proc))
+
     def test_shutdown_lockfile_presence_alone_does_not_block_future_headless_tasks(self):
         with tempfile.TemporaryDirectory() as td, patch.object(launcher,'PROFILE',Path(td)):
             (Path(td)/'.parentlock').touch()
