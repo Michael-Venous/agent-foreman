@@ -1,0 +1,145 @@
+--- a/cli/src/persistence.ts
++++ b/cli/src/persistence.ts
+@@ -6,7 +6,9 @@
+ 
+ import { FileHandle } from 'node:fs/promises'
+ import { readFile, writeFile, mkdir, open, unlink, rename, chmod } from 'node:fs/promises'
+-import { existsSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
++import { existsSync, writeFileSync, readFileSync, unlinkSync, openSync, closeSync, fsyncSync, renameSync, statSync } from 'node:fs'
++import { uptime } from 'node:os'
++import { randomUUID } from 'node:crypto'
+ import { withSettingsFileLock } from '@hapi/protocol/settingsFileLock'
+ import { configuration } from '@/configuration'
+ import { isProcessAlive } from '@/utils/process';
+@@ -181,7 +183,20 @@
+  * Write runner state to local file (synchronously for atomic operation)
+  */
+ export function writeRunnerState(state: RunnerLocallyPersistedState): void {
+-  writeFileSync(configuration.runnerStateFile, JSON.stringify(state, null, 2), 'utf-8');
++  const target = configuration.runnerStateFile;
++  const temporary = `${target}.${randomUUID()}.tmp`;
++  try {
++    const fd = openSync(temporary, 'wx', 0o600);
++    try {
++      writeFileSync(fd, JSON.stringify(state, null, 2), 'utf-8');
++      fsyncSync(fd);
++    } finally { closeSync(fd); }
++    renameSync(temporary, target);
++    const directory = openSync(configuration.happyHomeDir, 'r');
++    try { fsyncSync(directory); } finally { closeSync(directory); }
++  } finally {
++    if (existsSync(temporary)) unlinkSync(temporary);
++  }
+ }
+ 
+ /**
+@@ -221,6 +236,13 @@
+       if (error.code === 'EEXIST') {
+         // Lock file exists, check if process is still running
+         try {
++          // A lock from before this boot cannot have a living owner. PID
++          // reuse and interrupted zero-byte writes must not block recovery.
++          if (process.platform === 'linux'
++              && statSync(configuration.runnerLockFile).mtimeMs < Date.now() - uptime() * 1000 - 5000) {
++            unlinkSync(configuration.runnerLockFile);
++            continue;
++          }
+           const lockPid = readFileSync(configuration.runnerLockFile, 'utf-8').trim();
+           if (lockPid && !isNaN(Number(lockPid))) {
+             if (!isProcessAlive(Number(lockPid))) {
+--- a/cli/src/persistence.test.ts
++++ b/cli/src/persistence.test.ts
+@@ -23,7 +23,9 @@
+     },
+ }))
+ 
+-import { updateSettings } from './persistence'
++import { updateSettings, writeRunnerState, acquireRunnerLock, releaseRunnerLock } from './persistence'
++import { utimesSync, readdirSync } from 'node:fs'
++import { uptime } from 'node:os'
+ 
+ describe('updateSettings', () => {
+     afterEach(() => {
+@@ -46,3 +48,32 @@
+         expect(readFileSync(settingsFile, 'utf8')).toBe('{not-json')
+     })
+ })
++
++
++describe('runner persistence recovery', () => {
++    afterEach(() => {
++        rmSync(join(dir, 'runner.state.json'), { force: true })
++        rmSync(join(dir, 'runner.state.json.lock'), { force: true })
++    })
++    it('publishes complete runner state without leaving temporary files', () => {
++        const state = {pid: 123, httpPort: 456, startTime: 'now', startedWithCliVersion: 'test'}
++        writeRunnerState(state)
++        expect(JSON.parse(readFileSync(join(dir, 'runner.state.json'), 'utf8'))).toEqual(state)
++        writeRunnerState({...state, pid: 789})
++        expect(JSON.parse(readFileSync(join(dir, 'runner.state.json'), 'utf8')).pid).toBe(789)
++        expect(readdirSync(dir).filter(n => n.endsWith('.tmp'))).toEqual([])
++    })
++    it.skipIf(process.platform !== 'linux')('recovers an empty lock from before boot', async () => {
++        const lock = join(dir, 'runner.state.json.lock')
++        writeFileSync(lock, '')
++        const beforeBoot = new Date(Date.now() - (uptime() + 60) * 1000)
++        utimesSync(lock, beforeBoot, beforeBoot)
++        const handle = await acquireRunnerLock(2, 0)
++        expect(handle).not.toBeNull()
++        if (handle) await releaseRunnerLock(handle)
++    })
++    it('does not steal a newly created empty lock while another runner could be writing', async () => {
++        writeFileSync(join(dir, 'runner.state.json.lock'), '')
++        expect(await acquireRunnerLock(1, 0)).toBeNull()
++    })
++})
+--- a/cli/src/utils/process.ts
++++ b/cli/src/utils/process.ts
+@@ -1,5 +1,6 @@
+ import type { ChildProcess } from 'node:child_process';
+ import spawn from 'cross-spawn';
++import { readFileSync } from 'node:fs';
+ 
+ export const isWindows = (): boolean => process.platform === 'win32';
+ 
+@@ -19,6 +20,14 @@
+ /** Stable marker for one OS PID generation; null means the platform probe failed. */
+ export function getProcessStartMarker(pid: number): string | null {
+   if (!isProcessAlive(pid)) return null;
++  if (process.platform === 'linux') {
++    try {
++      const tgid = /^Tgid:\s+(\d+)/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'))?.[1];
++      // kill(pid, 0) accepts thread IDs, while ps -p does not list them.
++      // A native runtime process can never be a non-leader desktop thread.
++      if (tgid && Number(tgid) !== pid) return `linux-thread:${pid}:${tgid}`;
++    } catch { /* Keep an unsuccessful probe conservative. */ }
++  }
+   if (isWindows()) {
+     const powershell = spawn.sync('powershell', [
+       '-NoProfile', '-NonInteractive', '-Command',
+--- a/cli/src/utils/process.test.ts
++++ b/cli/src/utils/process.test.ts
+@@ -10,7 +10,8 @@
+     }
+ }))
+ 
+-import { getHapiRunnerProcessIdentity } from './process'
++import { getHapiRunnerProcessIdentity, getProcessStartMarker } from './process'
++import { readdirSync } from 'node:fs'
+ 
+ const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+ 
+@@ -189,3 +190,13 @@
+         expect(getHapiRunnerProcessIdentity(8328)).toBe('unknown')
+     })
+ })
++
++
++describe('Linux thread ID reuse', () => {
++    it.skipIf(process.platform !== 'linux')('distinguishes a worker thread from a runtime process even when ps omits it', () => {
++        const tid = readdirSync('/proc/self/task').map(Number).find(pid => pid !== process.pid)
++        expect(tid).toBeDefined()
++        spawnSyncMock.mockReturnValue(completed(''))
++        expect(getProcessStartMarker(tid!)).toBe(`linux-thread:${tid}:${process.pid}`)
++    })
++})
