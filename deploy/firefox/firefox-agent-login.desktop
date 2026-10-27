@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox — Agents (manual sign-in)
+Comment=Human sign-in with automation disabled, using the same isolated agent profile
+Exec=/home/user/.local/bin/firefox-agent-browser login %u
+Icon=firefox
+Terminal=false
+Categories=Network;WebBrowser;

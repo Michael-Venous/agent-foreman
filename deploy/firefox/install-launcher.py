@@ -27,7 +27,8 @@ def main():
     generated=desktop_entry(Path('/usr/share/applications/firefox.desktop').read_text(), helper)
     planned=[(helper,(here/'firefox-agent-browser').read_bytes(),0o755),(desktop,generated.encode(),0o644),
              (home/'.config/systemd/user/firefox-agent-headless.service',(here/'firefox-agent-headless.service').read_bytes(),0o644),
-             (home/'.local/share/applications/firefox-agent-control.desktop',(here/'firefox-agent-control.desktop').read_text().replace('/home/user', str(home)).encode(),0o644)]
+             (home/'.local/share/applications/firefox-agent-control.desktop',(here/'firefox-agent-control.desktop').read_text().replace('/home/user', str(home)).encode(),0o644),
+             (home/'.local/share/applications/firefox-agent-login.desktop',(here/'firefox-agent-login.desktop').read_text().replace('/home/user', str(home)).encode(),0o644)]
     backup=home/'.local/state/agent-foreman'/('firefox-launcher-'+datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     for destination,data,mode in planned:
         if destination.exists() and destination.read_bytes()==data:

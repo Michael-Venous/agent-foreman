@@ -7,3 +7,5 @@ Preserve running controllers, native conversation identities and explicit manual
 ## Browser default
 
 For authorized browser work, use `~/.local/bin/firefox-agent-browser start` and `fx_connect {port:2829}` by default. For visible work use `firefox-agent-browser gui`, which keeps the same isolated profile. Never launch raw Firefox with automation flags, attach to the personal profile/2828, or create a fresh profile as an automatic fallback. Coordinate a busy controller; preserve existing attached legacy work. The persistent clone must not be overwritten during ordinary tasks. Disconnect after work and finish the unused headless instance. See FIREFOX.md.
+
+If a site rejects automated sign-in, use the supported `firefox-agent-browser login` human mode only after the user has saved drafts and closed the isolated agent browser. It disables actual automation on that same profile. Never close a GUI automatically or spoof automation signals. Human sign-in and a later automation restart require separate user-controlled close/reopen steps; verify retained site session before proceeding. See FIREFOX.md.

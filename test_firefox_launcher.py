@@ -19,6 +19,9 @@ class FirefoxLauncherTests(unittest.TestCase):
         self.profile_guard = patch.object(launcher, 'require_profile')
         self.profile_guard.start()
         self.addCleanup(self.profile_guard.stop)
+        self.mode_guard = patch.object(launcher, 'prepare_mode')
+        self.mode_guard.start()
+        self.addCleanup(self.mode_guard.stop)
 
     def test_normal_desktop_passes_urls_and_private_flags_without_automation(self):
         with patch.object(launcher, 'unit_state', return_value=('inactive', 0)), patch.object(launcher.subprocess, 'run') as run:
@@ -148,5 +151,57 @@ class FirefoxLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(launcher.Busy, 'never fall back'):
                 launcher.execute('start', [])
             run.assert_not_called()
+
+
+    def test_manual_login_uses_same_profile_without_automation_or_shutdown(self):
+        with patch.object(launcher, 'unit_state', return_value=('inactive', 0)), patch.object(launcher, 'stop_headless') as stop:
+            args = launcher.execute('login', ['https://accounts.example.test/'])
+            self.assertEqual(args, ['/usr/bin/firefox', '--no-remote', '-profile', str(launcher.PROFILE), 'https://accounts.example.test/'])
+            self.assertNotIn('--marionette', args);self.assertNotIn('--headless', args)
+            launcher.prepare_mode.assert_called_once_with(False);stop.assert_not_called()
+
+    def test_manual_login_never_stops_a_service_or_accepts_automation_flags(self):
+        with patch.object(launcher, 'unit_state', return_value=('active', 123)), patch.object(launcher.subprocess, 'run') as run:
+            with self.assertRaisesRegex(launcher.Busy, 'nothing was stopped'):launcher.execute('login', [])
+            run.assert_not_called();launcher.prepare_mode.assert_not_called()
+        for args in [['--marionette'], ['--profile=/daily'], ['--headless']]:
+            with self.subTest(args=args), self.assertRaisesRegex(launcher.Busy, 'URLs only'):launcher.execute('login', args)
+
+    def test_manual_environment_disables_real_startup_controls_without_mutating_caller(self):
+        env={'MOZ_MARIONETTE':'1','MOZ_HEADLESS':'1','MOZ_REMOTE_ALLOW_SYSTEM_ACCESS':'1','DISPLAY':':0','UNCHANGED':'value'}
+        manual=launcher.launch_environment('login',env)
+        self.assertEqual(manual,{'DISPLAY':':0','UNCHANGED':'value'})
+        self.assertEqual(launcher.launch_environment('gui',env),env)
+        self.assertIn('MOZ_MARIONETTE',env)
+
+    def test_modes_retain_profile_session_files_and_security_preferences(self):
+        self.mode_guard.stop()
+        with tempfile.TemporaryDirectory() as td, patch.object(launcher,'PROFILE',Path(td)), patch.object(launcher,'agent_profile_open',return_value=False), patch.object(launcher,'socket_states',return_value=[]):
+            root=Path(td);prefs=root/'user.js'
+            prefs.write_text('user_pref("marionette.enabled", true);\nuser_pref("security.tls.version.min", 3);\nuser_pref("browser.startup.page", 0);\n')
+            (root/'sessionstore.jsonlz4').write_bytes(b'untouched-session-fixture');(root/'cookies.sqlite').write_bytes(b'untouched-cookie-fixture')
+            launcher.prepare_mode(False)
+            text=prefs.read_text();self.assertIn('"marionette.enabled", false',text);self.assertIn('"browser.startup.page", 3',text)
+            self.assertIn('"browser.sessionstore.resume_session_once", true',text);self.assertIn('"security.tls.version.min", 3',text)
+            self.assertEqual(text.count('"marionette.enabled"'),1);self.assertNotIn('dom.webdriver',text)
+            self.assertEqual(prefs.stat().st_mode&0o777,0o600)
+            launcher.prepare_mode(True);self.assertIn('"marionette.enabled", true',prefs.read_text())
+            self.assertEqual((root/'sessionstore.jsonlz4').read_bytes(),b'untouched-session-fixture')
+            self.assertEqual((root/'cookies.sqlite').read_bytes(),b'untouched-cookie-fixture')
+
+    def test_mode_change_refuses_live_profile_and_late_open_without_writes(self):
+        self.mode_guard.stop()
+        for opened in [[True],[False,True]]:
+            with tempfile.TemporaryDirectory() as td, patch.object(launcher,'PROFILE',Path(td)), patch.object(launcher,'agent_profile_open',side_effect=opened), patch.object(launcher,'socket_states',return_value=[]):
+                p=Path(td)/'user.js';p.write_text('existing prefs')
+                with self.assertRaises(launcher.Busy):launcher.prepare_mode(False)
+                self.assertEqual(p.read_text(),'existing prefs');self.assertFalse((Path(td)/'user.js.before-launch-mode').exists())
+
+    def test_automation_modes_prepare_real_automation_only_on_fresh_launch(self):
+        with patch.object(launcher, 'unit_state', return_value=('inactive', 0)), patch.object(launcher,'agent_profile_open',return_value=False), patch.object(launcher,'socket_states',return_value=[]), patch.object(launcher.subprocess,'run'):
+            launcher.execute('start',[]);launcher.prepare_mode.assert_called_once_with(True)
+        launcher.prepare_mode.reset_mock()
+        with patch.object(launcher,'stop_headless'):
+            launcher.execute('gui',[]);launcher.prepare_mode.assert_called_once_with(True)
 
 if __name__ == '__main__':unittest.main()

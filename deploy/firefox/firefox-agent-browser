@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Launch isolated agent Firefox without taking ownership of normal desktop Firefox."""
 import fcntl
+import json
+import re
+import tempfile
 import os
 from pathlib import Path
 import subprocess
@@ -129,15 +132,66 @@ def require_profile():
         raise Busy('Isolated agent profile is not initialized. See FIREFOX.md; never fall back to the daily profile.') from error
 
 
+
+def prepare_mode(automated):
+    """Change real startup configuration only when the isolated profile is closed."""
+    if agent_profile_open() or any(state in ('0A', '01') for state in socket_states()):
+        raise Busy('Agent Firefox is still open. Save drafts and close only the isolated agent browser yourself, then retry. No browser or settings were changed.')
+    prefs = PROFILE/'user.js'
+    if prefs.is_symlink():
+        raise Busy('Agent user.js is a symlink; refusing to modify a linked profile.')
+    original = prefs.read_text() if prefs.exists() else ''
+    values = {'marionette.enabled': automated, 'marionette.port': PORT,
+              'browser.startup.page': 3, 'browser.sessionstore.resume_session_once': True}
+    lines = [line for line in original.splitlines() if not any(
+        re.match(r"\s*user_pref\(\s*[\"']"+re.escape(key)+r"[\"']\s*,", line)
+        for key in values)]
+    text = '\n'.join(lines).rstrip()+'\n'+''.join(
+        'user_pref('+json.dumps(key)+', '+json.dumps(value)+');\n' for key,value in values.items())
+    # Recheck after reading; no caller may change a live browser's startup mode.
+    if agent_profile_open() or any(state in ('0A', '01') for state in socket_states()):
+        raise Busy('Agent Firefox opened during mode preparation; leaving settings unchanged.')
+    if prefs.exists():
+        backup = PROFILE/'user.js.before-launch-mode'
+        if backup.is_symlink():raise Busy('Mode backup is linked; leaving settings unchanged.')
+        backup.write_text(original);backup.chmod(0o600)
+    with tempfile.NamedTemporaryFile(mode='w', prefix='.launch-mode-', dir=PROFILE, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(text);stream.flush();os.fsync(stream.fileno())
+            temporary.chmod(0o600);temporary.replace(prefs)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def launch_environment(command, environ=None):
+    env = dict(os.environ if environ is None else environ)
+    if command == 'login':
+        # Disable actual automation; do not hide or override navigator.webdriver.
+        for key in ('MOZ_MARIONETTE', 'MOZ_HEADLESS', 'MOZ_REMOTE_ALLOW_SYSTEM_ACCESS'):
+            env.pop(key, None)
+    return env
+
+
 def execute(command, args):
     if command == 'desktop':
         # Independent profile: never inspect or stop the agent browser for a normal launch.
         return [FIREFOX, *args]
+    if command == 'login':
+        if any(arg.startswith('-') for arg in args):
+            raise Busy('Manual login accepts URLs only; automation/profile flags are not allowed.')
+        require_profile()
+        state, pid = unit_state()
+        if state not in ('inactive', 'failed') or pid:
+            raise Busy('Agent Firefox service is still running. Save drafts and close/finish it explicitly before manual login; nothing was stopped.')
+        prepare_mode(False)
+        return [FIREFOX, '--no-remote', '-profile', str(PROFILE), *args]
     if command == 'gui':
         if any(arg.split('=', 1)[0].lower() in ('-p', '-profile', '--profile', '-profilemanager', '--profilemanager') for arg in args):
             raise Busy('Agent Firefox profile is fixed; profile overrides are not allowed.')
         require_profile()
         stop_headless()
+        prepare_mode(True)
         return [FIREFOX, '--marionette', '--no-remote', '-profile', str(PROFILE), *args]
     if command in ('stop', 'finish'):
         stopped = stop_headless()
@@ -155,12 +209,13 @@ def execute(command, args):
             raise Busy('Headless Firefox is already starting/running without a ready endpoint; inspect its service before retrying.')
         if agent_profile_open():
             raise Busy('The isolated agent profile is already open or locked. Inspect its existing process; no lock was removed.')
+        prepare_mode(True)
         subprocess.run(['systemctl', '--user', 'start', UNIT], check=True, timeout=30)
         return None
     if command == 'status':
         subprocess.run(['systemctl', '--user', '--no-pager', 'status', UNIT], check=False)
         return None
-    raise ValueError('Usage: firefox-agent-browser start|gui [URLs]|desktop [Firefox arguments]|finish|stop|status')
+    raise ValueError('Usage: firefox-agent-browser start|gui [URLs]|login [URLs]|desktop [Firefox arguments]|finish|stop|status')
 
 
 def main():
@@ -172,10 +227,10 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX)
             launch = execute(command, args)
         if launch:
-            os.execv(launch[0], launch)
+            os.execve(launch[0], launch, launch_environment(command))
     except (Busy, OSError, ValueError, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)
-        if command in ('desktop', 'gui'):
+        if command in ('desktop', 'gui', 'login'):
             try:
                 subprocess.run(['/usr/bin/notify-send', '-a', 'Firefox', '-i', 'firefox', 'Firefox could not open', str(error)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
