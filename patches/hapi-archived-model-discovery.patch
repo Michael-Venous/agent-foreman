@@ -1,0 +1,91 @@
+--- a/web/src/hooks/queries/useCodexModels.ts
++++ b/web/src/hooks/queries/useCodexModels.ts
+@@ -6,6 +6,7 @@
+ 
+ export function useCodexModels(args: {
+     api: ApiClient | null
++    sessionActive?: boolean
+     sessionId?: string | null
+     machineId?: string | null
+     enabled?: boolean
+@@ -33,15 +34,18 @@
+         retry: false,
+     })
+ 
++    const machineTargetMissing = machineQuery.error instanceof ApiError
++        && machineQuery.error.code === RPC_TARGET_MISSING_ERROR_CODE
++    const inactiveWithoutCatalog = args.sessionActive === false
++        && (!machineId || machineTargetMissing)
++
+     // Successful machine discovery stays shared across chats and New Session.
+     // Only an absent machine RPC unlocks the per-session neutral fallback.
+     const useSessionFallback = Boolean(
+         enabled
+         && sessionId
+-        && (!machineId || (
+-            machineQuery.error instanceof ApiError
+-            && machineQuery.error.code === RPC_TARGET_MISSING_ERROR_CODE
+-        ))
++        && args.sessionActive !== false
++        && (!machineId || machineTargetMissing)
+     )
+     const sessionQuery = useQuery({
+         queryKey: queryKeys.sessionCodexModels(sessionId ?? 'unknown'),
+@@ -62,8 +66,10 @@
+ 
+     return {
+         models: query.data?.models ?? [],
+-        isLoading: query.isLoading,
+-        error: query.data?.success === false
++        isLoading: enabled && !inactiveWithoutCatalog && query.isLoading,
++        // An archived chat has no live session RPC. Its saved model remains
++        // visible; machine discovery can populate choices without reopening it.
++        error: !enabled || inactiveWithoutCatalog ? null : query.data?.success === false
+             ? (query.data.error ?? 'Failed to load Codex models')
+             : query.error instanceof Error
+                 ? query.error.message
+--- a/web/src/hooks/queries/useCodexModels.test.tsx
++++ b/web/src/hooks/queries/useCodexModels.test.tsx
+@@ -96,4 +96,32 @@
+             'session-2'
+         ])
+     })
++    it.each([null, 'machine-1'])('does not call an archived session when machine %s is unavailable', async (machineId) => {
++        const getMachineCodexModels = vi.fn(async () => {
++            throw new ApiError('missing', 503, RPC_TARGET_MISSING_ERROR_CODE)
++        })
++        const getSessionCodexModels = vi.fn()
++        const api = { getMachineCodexModels, getSessionCodexModels } as unknown as ApiClient
++        const queryClient = createQueryClient()
++        const view = renderHook(() => useCodexModels({
++            api, sessionId: 'archived', sessionActive: false, machineId, enabled: true
++        }), { wrapper: wrapper(queryClient) })
++        if (machineId) await waitFor(() => expect(queryClient.getQueryState(['machine-codex-models', machineId])?.status).toBe('error'))
++        expect(view.result.current.error).toBeNull()
++        expect(view.result.current.isLoading).toBe(false)
++        expect(getSessionCodexModels).not.toHaveBeenCalled()
++    })
++
++    it('uses machine discovery for an archived chat', async () => {
++        const api = {
++            getMachineCodexModels: vi.fn(async () => ({ success: true, models: [{id: 'available', displayName: 'Available', isDefault: true}] })),
++            getSessionCodexModels: vi.fn()
++        } as unknown as ApiClient
++        const view = renderHook(() => useCodexModels({
++            api, sessionId: 'archived', sessionActive: false, machineId: 'machine-1', enabled: true
++        }), { wrapper: wrapper(createQueryClient()) })
++        await waitFor(() => expect(view.result.current.models[0]?.id).toBe('available'))
++        expect(api.getSessionCodexModels).not.toHaveBeenCalled()
++    })
++
+ })
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1007,6 +1007,7 @@
+     const currentClaudeModel = claudeModels?.find(m => m.value === (props.session.model ?? 'default') || m.resolvedModel === props.session.model)
+     const claudeEfforts = currentClaudeModel?.supportedEffortLevels?.map(value => ({ value, name: value })) ?? []
+     const codexModelsState = useCodexModels({
++        sessionActive: props.session.active,
+         api: props.api,
+         sessionId: props.session.id,
+         machineId: props.session.metadata?.machineId ?? null,
