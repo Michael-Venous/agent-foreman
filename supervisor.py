@@ -1840,7 +1840,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    lines.append(' · '.join(parts))
   ids=','.join(str(ev['id']) for ev in events)
   guidance=''
-  if any(e['kind'] in ('finished','failed') or (e['kind']=='observation' and any(c.get('category') in ('status-changed','background-ended','native-terminal-ended','runtime-failure') for c in json.loads(e['detail']).get('changes',[]))) for e in events):
+  if any(e['kind'] in ('finished','failed') or (e['kind']=='observation' and (json.loads(e['detail']).get('status') in ('idle','waiting for input','waiting for dependency','failed') or any(c.get('category') in ('status-changed','background-ended','native-terminal-ended','runtime-failure') for c in json.loads(e['detail']).get('changes',[])))) for e in events):
    guidance='\nWhen a child becomes idle, inspect current scope, goal, output and background work. If complete, let it sleep. If unfinished and safe, issue one checkpoint-aware follow-up without replaying work or uncertain input; if blocked, tell the user. Respect pauses and existing retries; do not repeat without new evidence.'
   return '[supervisor update; not a user instruction] %d event%s; ack ids %s after handling\n'%(len(events),'' if len(events)==1 else 's',ids)+'\n'.join(lines)+guidance
  def sse(self):

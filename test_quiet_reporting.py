@@ -38,6 +38,10 @@ class QuietReporting(fixtures.IsolatedSupervisorTest):
   text=self.s.batch_text(self.observations())
   self.assertIn('If unfinished and safe',text);self.assertIn('if blocked, tell the user',text)
   self.assertIn('do not repeat without new evidence',text);self.assertEqual(self.api.sent,[])
+ def test_idle_completion_wake_contains_policy_even_without_category(self):
+  detail={'status':'idle','latest_tool':None,'latest_reply':'Done','pending_requests':[], 'trackerStatus':'running','reason':'important','changes':[{'reason':'Runtime turn/goal ended'}]}
+  self.s.event('completion',self.p,'w','observation',json.dumps(detail))
+  self.assertIn('If unfinished and safe',self.s.batch_text(self.observations()))
  def test_legacy_per_chat_override_and_reset(self):
   self.quiet_default();self.s.set('reporting:w',json.dumps({'fallback_minutes':45}))
   self.assertTrue(self.s.reporting('w')['routine_enabled']);self.assertEqual(self.s.reporting('w')['fallback_minutes'],45)
