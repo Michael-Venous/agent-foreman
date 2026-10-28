@@ -1,0 +1,470 @@
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+index 23f3bb8..5eef91e 100644
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -70,6 +70,11 @@ export const MetadataSchema = z.object({
+     // session as a branch of `<id>` instead of an unrelated duplicate.
+     forkedFrom: z.string().optional(),
+     codexSessionId: z.string().optional(),
++    // Read-only app-server snapshot; timestamps are used to expire stale claims.
++    codexBackgroundTerminals: z.object({
++        threadId: z.string().min(1), checkedAt: z.number().nonnegative(),
++        terminals: z.array(z.object({ processId: z.string().min(1).max(200), itemId: z.string().min(1).max(200), osPid: z.number().int().positive().nullable() })).max(2000)
++    }).optional(),
+     // 原始 Codex thread id。导入 Codex 历史后，HAPI 会 fork 出自己的续写 thread；
+     // codexSessionId 保存 fork 后的 thread，codexSourceSessionId 保留来源 thread 便于同步/展示。
+     codexSourceSessionId: z.string().optional(),
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+index 062c113..91d2f61 100644
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -641,6 +641,9 @@ export class SessionCache {
+ 
+     /** A single bounded local scan, shared across sessions; never invokes an agent. */
+     reconcileLocalProcesses(now = Date.now()): void {
++        // Refresh/expire controller-reported native snapshots for local and remote
++        // sessions even when no local process probe is configured.
++        for (const session of this.sessions.values()) this.publishBackgroundCount(session, false, now)
+         const machine = process.env.HAPI_LOCAL_CATALOG_MACHINE
+         const targets: LocalProcessTarget[] = process.platform !== 'linux' || !machine ? [] : this.getSessions()
+             .filter(session => session.namespace === 'default' && session.metadata?.machineId === machine
+@@ -691,8 +694,15 @@ export class SessionCache {
+         this.publishBackgroundCount(session, true)
+     }
+ 
+-    private publishBackgroundCount(session: Session, includeProcesses = false): void {
+-        const next = (this.backgroundTasks.get(session.id)?.count ?? 0) + (session.backgroundProcesses?.length ?? 0)
++    private publishBackgroundCount(session: Session, includeProcesses = false, now = Date.now()): void {
++        const meta = session.metadata
++        const snapshot = meta?.codexBackgroundTerminals
++        const fresh = session.active && meta?.flavor === 'codex' && snapshot && snapshot.threadId === meta.codexSessionId
++            && snapshot.checkedAt <= now + 1000 && now - snapshot.checkedAt <= 45_000
++        // Native terminals and local process families can describe the same job.
++        // A max avoids falsely adding duplicate counts without claiming exact matching.
++        const native = fresh && snapshot ? snapshot.terminals.length : 0
++        const next = (this.backgroundTasks.get(session.id)?.count ?? 0) + Math.max(native, session.backgroundProcesses?.length ?? 0)
+         if (!includeProcesses && next === (session.backgroundTaskCount ?? 0)) return
+         session.backgroundTaskCount = next
+         session.backgroundTasksUpdatedAt = this.store.nextBackgroundTasksVersion(session.id,
+diff --git a/hub/src/sync/sessionCache.localProcesses.test.ts b/hub/src/sync/sessionCache.localProcesses.test.ts
+index e67641e..d0ec61a 100644
+--- a/hub/src/sync/sessionCache.localProcesses.test.ts
++++ b/hub/src/sync/sessionCache.localProcesses.test.ts
+@@ -156,3 +156,33 @@ describe('SessionCache verified local background work', () => {
+         } finally { store.close() }
+     })
+ })
++
++
++describe('native Codex background terminal snapshots', () => {
++    it('reports fresh native work, including remote work, without double-counting local families', async () => {
++        const f=setup()
++        try {
++            const now=Date.now(); f.session.active=true
++            f.session.metadata!.codexBackgroundTerminals={threadId:nativeId,checkedAt:now,terminals:[{processId:'42',itemId:'item',osPid:123}]}
++            f.jobs([liveJob()]); f.cache.reconcileLocalProcesses(now); await tick()
++            expect(f.session.backgroundTaskCount).toBe(1)
++            f.session.metadata!.machineId='remote'; f.cache.reconcileLocalProcesses(now+5001); await tick()
++            expect(f.session.backgroundTaskCount).toBe(1)
++            f.cache.reconcileLocalProcesses(now+46_000); await tick()
++            expect(f.session.backgroundTaskCount).toBe(0)
++        } finally { f.store.close() }
++    })
++    it('rejects wrong thread, future snapshots and offline controllers', async () => {
++        const f=setup()
++        try {
++            const now=Date.now(); f.session.active=true
++            const snap={threadId:'wrong',checkedAt:now,terminals:[{processId:'42',itemId:'item',osPid:123}]}
++            f.session.metadata!.codexBackgroundTerminals=snap; f.cache.reconcileLocalProcesses(now); await tick()
++            expect(f.session.backgroundTaskCount).toBe(0)
++            snap.threadId=nativeId; snap.checkedAt=now+60_000; f.cache.reconcileLocalProcesses(now+5001); await tick()
++            expect(f.session.backgroundTaskCount).toBe(0)
++            snap.checkedAt=now+5001; f.session.active=false; f.cache.reconcileLocalProcesses(now+10_002); await tick()
++            expect(f.session.backgroundTaskCount).toBe(0)
++        } finally { f.store.close() }
++    })
++})
+diff --git a/cli/src/codex/shared/root.ts b/cli/src/codex/shared/root.ts
+index 53a33b0..6c5ab9a 100644
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -20,6 +20,7 @@ import { SharedCodexQueue } from './queue';
+ import { SharedCodexProjection, inputText } from './projection';
+ import { getCodexSystemPrompt } from '../utils/systemPrompt';
+ import { record, string } from './gateway';
++import { readNativeBackground } from './nativeBackground';
+ import { initializeSharedClient, type SharedLaunchOptions } from './launch';
+ import { inheritedSandbox, settingsMatch } from './settings';
+ import { planImplementationMessageId, planProposalForItem, planProposalForTurn } from './plan';
+@@ -51,6 +52,12 @@ export class SharedCodexRoot {
+     private readonly children = new Map<string, SharedCodexProjection>();
+     private readonly ancestry = new Map<string, string | null>();
+     private heartbeat?: ReturnType<typeof setInterval>;
++    private backgroundPending = true;
++    private backgroundBusy = false;
++    private backgroundLastAttempt = 0;
++    private backgroundLive = false;
++    private backgroundFailures = 0;
++    private backgroundUnsupported = false;
+     private work: Promise<unknown> = Promise.resolve();
+     private notifications = Promise.resolve();
+     private currentTurn: string | undefined;
+@@ -84,12 +91,12 @@ export class SharedCodexRoot {
+             if (method === 'thread/settings/updated' && record(params).threadId === this.threadId) this.acceptSettings(record(record(params).threadSettings));
+             if (record(params).threadId === this.threadId) {
+                 if (method === 'turn/started') {
+-                    this.turnRevision++; this.currentTurn = string(record(record(params).turn).id); this.interrupted = false;
++                    this.turnRevision++; this.currentTurn = string(record(record(params).turn).id); this.interrupted = false; this.backgroundPending = true;
+                     if (this.currentTurn) this.latestTurn = { id: this.currentTurn, status: 'inProgress' };
+                     this.publishSteering();
+                 }
+                 if (method === 'turn/completed' && (!this.currentTurn || record(record(params).turn).id === this.currentTurn)) {
+-                    this.turnRevision++; this.currentTurn = undefined; this.interrupted = record(record(params).turn).status === 'interrupted';
++                    this.turnRevision++; this.currentTurn = undefined; this.interrupted = record(record(params).turn).status === 'interrupted'; this.backgroundPending = true;
+                     this.publishSteering();
+                 }
+                 const p = record(params);
+@@ -224,8 +231,29 @@ export class SharedCodexRoot {
+     private alive(): void {
+         this.publishSteering();
+         this.publishPlan();
++        void this.refreshBackground();
+         if (!this.closed) this.session.keepAlive(Boolean(this.currentTurn), undefined, this.settings);
+     }
++    private async refreshBackground(): Promise<void> {
++        if (this.closed || this.stopping || this.reconnecting || this.backgroundUnsupported || !this.threadId || !this.client.isInitialized()
++            || this.backgroundBusy || (!this.currentTurn && !this.backgroundPending && !this.backgroundLive)
++            || Date.now() - this.backgroundLastAttempt < Math.min(120_000, 15_000 * 2 ** Math.min(this.backgroundFailures, 3))) return;
++        const threadId = this.threadId;
++        this.backgroundBusy = true; this.backgroundLastAttempt = Date.now(); this.backgroundPending = false;
++        try {
++            const terminals = await readNativeBackground(this.client, threadId);
++            if (this.closed || this.stopping || this.reconnecting || this.threadId !== threadId) return;
++            this.backgroundFailures = 0; this.backgroundLive = terminals.length > 0;
++            this.session.updateMetadata(metadata => ({ ...metadata, codexBackgroundTerminals: { threadId, checkedAt: Date.now(), terminals } }));
++        } catch (error) {
++            // Unsupported server, timeout or partial pages are never evidence of completion.
++            // Retry with a bounded cadence while work is active; stale evidence expires in the hub.
++            this.backgroundFailures++;
++            if (/method not found|unknown method|not supported/i.test(String(error))) this.backgroundUnsupported = true;
++            else if (this.currentTurn || this.backgroundLive || this.backgroundFailures <= 2) this.backgroundPending = true;
++            logger.debug('[Codex shared] background snapshot unavailable', error);
++        } finally { this.backgroundBusy = false; }
++    }
+     private availablePlanId(): string | null {
+         if (this.currentTurn || this.latestTurn?.status !== 'completed' || this.settings.collaborationMode !== 'plan'
+             || this.stopping || this.closed || this.reconnecting || this.submittingPlan || !this.client.isInitialized()) return null;
+diff --git a/cli/src/codex/shared/root.test.ts b/cli/src/codex/shared/root.test.ts
+index b4e8e50..fb8ae30 100644
+--- a/cli/src/codex/shared/root.test.ts
++++ b/cli/src/codex/shared/root.test.ts
+@@ -15,6 +15,7 @@ vi.mock('../codexAppServerClient', () => ({
+         thread = { id: 'thread', turns: [] as NativeTurn[] };
+         settings: Record<string, unknown> = { model: 'mock', collaborationMode: { mode: 'default' } };
+         goal: Record<string, unknown> | null = { objective: 'Original objective', status: 'blocked' };
++        backgroundTerminals: Array<Record<string, unknown>> = [];
+         queue: Array<{ id: string; clientUserMessageId: unknown; input: unknown }> = [];
+         notify?: (method: string, params: unknown) => void;
+         abandoned?: () => void;
+@@ -26,6 +27,7 @@ vi.mock('../codexAppServerClient', () => ({
+         isInitialized() { return this.initialized; }
+         async disconnect() { this.initialized = false; }
+         async request(method: string, params: Record<string, unknown> = {}) {
++            if (method === 'thread/backgroundTerminals/list') return { data: this.backgroundTerminals };
+             if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
+             if (method === 'thread/list') return { data: [] };
+             if (method === 'thread/turns/list') return { data: structuredClone([...this.thread.turns].reverse().slice(0, Number(params.limit ?? 2))) };
+@@ -94,6 +96,7 @@ async function fixture() {
+         notify(method: string, params: unknown): void;
+         abandoned(): void;
+         goal: Record<string, unknown> | null;
++        backgroundTerminals: Array<Record<string, unknown>>;
+         request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+     };
+     const deliver = (text: string, localId: string) => receive!({ role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'webapp', deliveryMode: 'queue' } }, localId);
+@@ -407,3 +410,32 @@ it('never infers queued input consumption from queue absence or matching text on
+     expect(f.consumed.mock.calls.some(([ids])=>ids.includes('unconfirmed-input'))).toBe(false);
+     expect(f.native.queue).toHaveLength(0);
+ })
++
++
++it('publishes only complete native background snapshots and stays quiet once idle', async () => {
++    const f=await fixture()
++    const probe=f.root as unknown as { refreshBackground(): Promise<void>; backgroundLastAttempt: number; backgroundPending: boolean }
++    f.native.backgroundTerminals=[{processId:'42',itemId:'item',osPid:123,command:'private command'}]
++    probe.backgroundLastAttempt=0;probe.backgroundPending=true
++    await probe.refreshBackground()
++    expect(f.metadata().codexBackgroundTerminals?.terminals).toEqual([{processId:'42',itemId:'item',osPid:123}])
++    f.native.backgroundTerminals=[]; probe.backgroundLastAttempt=0
++    await probe.refreshBackground()
++    expect(f.metadata().codexBackgroundTerminals?.terminals).toEqual([])
++    const request=vi.spyOn(f.native,'request');probe.backgroundLastAttempt=0
++    await probe.refreshBackground()
++    expect(request).not.toHaveBeenCalledWith('thread/backgroundTerminals/list',expect.anything())
++})
++
++it('backs off failed snapshots without turning an uncertain job into a completion', async () => {
++    const f=await fixture()
++    const probe=f.root as unknown as { refreshBackground(): Promise<void>; backgroundLastAttempt: number; backgroundPending: boolean; backgroundFailures: number }
++    f.native.backgroundTerminals=[{processId:'42',itemId:'item',osPid:123}]
++    probe.backgroundLastAttempt=0;probe.backgroundPending=true;await probe.refreshBackground()
++    const original=f.native.request.bind(f.native)
++    const request=vi.spyOn(f.native,'request').mockImplementation((method,params) => method==='thread/backgroundTerminals/list' ? Promise.reject(new Error('transport timeout')) : original(method,params))
++    probe.backgroundLastAttempt=0;await probe.refreshBackground()
++    expect(probe.backgroundFailures).toBe(1)
++    expect(f.metadata().codexBackgroundTerminals?.terminals).toHaveLength(1)
++    const count=request.mock.calls.length;await probe.refreshBackground();expect(request).toHaveBeenCalledTimes(count)
++})
+diff --git a/web/src/types/api.ts b/web/src/types/api.ts
+index f94eb3f..1f35e7a 100644
+--- a/web/src/types/api.ts
++++ b/web/src/types/api.ts
+@@ -105,6 +105,8 @@ export type SessionMetadataSummary = {
+             rewindToMessage?: boolean
+         }
+     }
++    codexBackgroundTerminals?: { threadId: string; checkedAt: number; terminals: Array<{ processId: string; itemId: string; osPid: number | null }> }
++    codexSessionId?: string
+     conversationHistoryPoints?: Record<string, true>
+     conversationHistoryIndexes?: Record<string, number>
+     conversationHistoryTurns?: Record<string, string>
+diff --git a/web/src/chat/backgroundTaskViews.ts b/web/src/chat/backgroundTaskViews.ts
+index 2773fc2..fe8d007 100644
+--- a/web/src/chat/backgroundTaskViews.ts
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -4,7 +4,7 @@ import { getInputStringAny } from '@/lib/toolInputUtils'
+ 
+ export type BackgroundTaskView = {
+     id: string; provider: 'claude' | 'codex'; command: string; cwd: string | null; block: ToolCallBlock;
+-    state: 'running' | 'completed' | 'failed' | 'stopped' | 'unknown'; captured: string; capturedTruncated: boolean; liveOutput: boolean
++    state: 'running' | 'completed' | 'failed' | 'stopped' | 'unknown'; captured: string; capturedTruncated: boolean; liveOutput: boolean; nativePid?: number | null
+ }
+ /** Output may contain a copied/printed trailer. This is evidence in a log, never terminal status. */
+ export function backgroundOutputExitCode(output: string): number | null {
+@@ -38,7 +38,8 @@ function command(block: ToolCallBlock): string {
+     if (isObject(block.tool.input) && Array.isArray(block.tool.input.command)) return block.tool.input.command.join(' ')
+     return block.tool.description ?? block.tool.name
+ }
+-export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, count?: number): BackgroundTaskView[] {
++export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: readonly NormalizedMessage[], active: boolean, count?: number,
++    native?: { threadId: string; checkedAt: number; terminals: Array<{ processId: string; itemId: string; osPid: number | null }> }, threadId?: string): BackgroundTaskView[] {
+     const found = new Map<string, BackgroundTaskView>()
+     const all = tools(blocks)
+     for (const block of all) {
+@@ -103,5 +104,15 @@ export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: r
+             else if (status === 'stopped' || status === 'cancelled' || status === 'killed') task.state = 'stopped'
+         }
+     }
++    // Native processId and itemId must both match this exact launch; aggregate
++    // counts or an old/reused handle are never enough to mark it running.
++    if (active && native && threadId && native.threadId === threadId && native.checkedAt <= Date.now() + 1000 && Date.now() - native.checkedAt <= 45_000) {
++        for (const terminal of native.terminals) {
++            const task = found.get(`codex:${terminal.processId}`)
++            if (task && task.block.tool.id === terminal.itemId && task.state === 'unknown') {
++                task.state = 'running'; task.nativePid = terminal.osPid
++            }
++        }
++    }
+     return [...found.values()].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running') || b.block.createdAt - a.block.createdAt)
+ }
+diff --git a/web/src/chat/backgroundTaskViews.test.ts b/web/src/chat/backgroundTaskViews.test.ts
+index 95243be..b45b300 100644
+--- a/web/src/chat/backgroundTaskViews.test.ts
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -86,3 +86,14 @@ it('uses exact Codex poll receipts and structured exit codes, not text inside ou
+     const complete = block('complete', { session_id: 42 }, 'Chunk ID: abc123\nWall time: 1.002 seconds\nProcess exited with code 0\nOutput: ok')
+     expect(collectBackgroundTasks([spawn, complete], [], true, 0)[0].state).toBe('completed')
+ })
++
++
++it('matches both the native process handle and originating item, with fresh thread-bound evidence', () => {
++    const task=block('spawn', {cmd:'render'}, 'Process running with session ID 42')
++    const native={threadId:'thread',checkedAt:Date.now(),terminals:[{processId:'42',itemId:'spawn',osPid:123}]}
++    const view=() => collectBackgroundTasks([task], [], true, 0, native, 'thread')[0]
++    expect(view()).toMatchObject({state:'running',nativePid:123})
++    native.terminals[0].itemId='other'; expect(view().state).toBe('unknown')
++    native.terminals[0].itemId='spawn'; native.threadId='other'; expect(view().state).toBe('unknown')
++    native.threadId='thread'; native.checkedAt=Date.now()-46_000; expect(view().state).toBe('unknown')
++})
+diff --git a/web/src/components/BackgroundTasksPanel.tsx b/web/src/components/BackgroundTasksPanel.tsx
+index 4bad9f5..9675be0 100644
+--- a/web/src/components/BackgroundTasksPanel.tsx
++++ b/web/src/components/BackgroundTasksPanel.tsx
+@@ -10,13 +10,18 @@ const label = (state: BackgroundTaskView['state']) => state === 'unknown' ? 'Sta
+ export function BackgroundTasksPanel(props: {
+     embedded?: boolean; visible?: boolean;
+     api: ApiClient; sessionId: string; blocks: readonly ChatBlock[]; messages: readonly NormalizedMessage[];
+-    active: boolean; count?: number; processes?: readonly BackgroundProcess[]; viewedId: string | null; onView: (id: string | null) => void;
++    active: boolean; count?: number; processes?: readonly BackgroundProcess[]; nativeTerminals?: { threadId: string; checkedAt: number; terminals: Array<{ processId: string; itemId: string; osPid: number | null }> }; nativeThreadId?: string; viewedId: string | null; onView: (id: string | null) => void;
+     hasMore: boolean; loadingMore: boolean; onLoadEarlier: () => void
+ }) {
+     const [expanded, setExpanded] = useState(false)
+     const processes = props.processes ?? []
+     const nativeCount = props.count === undefined ? undefined : Math.max(0, props.count - processes.length)
+-    const recordedTasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount), [props.blocks, props.messages, props.active, nativeCount])
++    const recordedTasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount, props.nativeTerminals, props.nativeThreadId), [props.blocks, props.messages, props.active, nativeCount, props.nativeTerminals, props.nativeThreadId])
++    const snapshot = props.nativeTerminals
++    const nativeFresh = props.active && snapshot && props.nativeThreadId === snapshot.threadId
++        && snapshot.checkedAt <= Date.now() + 1000 && Date.now() - snapshot.checkedAt <= 45_000
++    const unmatchedNative = nativeFresh ? snapshot.terminals.filter(terminal =>
++        !recordedTasks.some(task => task.id === `codex:${terminal.processId}` && task.block.tool.id === terminal.itemId)) : []
+     const client = useQueryClient()
+     const listVisible = props.visible !== false && (props.embedded || expanded)
+     const canRead = typeof props.api.getBackgroundTaskOutput === 'function'
+@@ -81,15 +86,19 @@ export function BackgroundTasksPanel(props: {
+             {running ? <span className="ml-auto text-xs text-[var(--app-badge-success-text)]">Runtime reports {running} pending</span> : null}
+         </button>}
+         {props.embedded || expanded ? <div className={props.embedded ? "space-y-1" : "max-h-52 space-y-1 overflow-y-auto pb-2"}>
+-            {!tasks.length && !processes.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
++            {!tasks.length && !processes.length && !unmatchedNative.length ? <p className="px-2 py-1 text-sm text-[var(--app-hint)]">No background tasks in the loaded chat history.</p> : null}
+             {props.active && (props.count ?? 0) > tasks.length + processes.length ? <p className="px-2 py-1 text-xs text-[var(--app-hint)]">Some reported background work has no command details in the loaded history. Load earlier activity to check older records.</p> : null}
++            {unmatchedNative.map(terminal => <div key={`${terminal.itemId}:${terminal.processId}`} className="rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-sm" data-native-background-terminal={terminal.processId}>
++                <span className="block truncate">Runtime terminal {terminal.processId}</span>
++                <span className="block text-xs text-[var(--app-hint)]">{terminal.osPid ? `PID ${terminal.osPid} on the controller machine` : 'PID unavailable'} · Native snapshot</span>
++            </div>)}
+             {processes.map(process => <details key={process.id} className="rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-sm" data-verified-background-process={process.id}>
+                 <summary className="flex min-h-9 cursor-pointer items-center gap-2"><span className="min-w-0 flex-1"><code className="block truncate">{process.command}</code><span className="block text-xs text-[var(--app-hint)]">PID {process.pid}</span></span><span className="shrink-0 text-xs text-[var(--app-badge-success-text)]">{Date.now() - process.checkedAt <= 15_000 ? 'Process alive' : 'Last seen (unconfirmed)'}</span></summary>
+                 <div className="mt-2 space-y-1"><CodeBlock code={process.command} language="bash" /><p className="text-xs text-[var(--app-hint)]">Observed locally at {new Date(process.checkedAt).toLocaleTimeString()}. Liveness does not verify useful work, progress or success; browser helpers and servers may remain alive while idle. This process can outlive the agent's turn or Stop.</p></div>
+             </details>)}
+             {tasks.map(task => <button type="button" key={task.id} onClick={() => props.onView(task.id)} aria-label={`View background task: ${task.id}`}
+                 className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-[var(--app-secondary-bg)] px-2 py-1.5 text-left text-sm hover:bg-[var(--app-subtle-bg)]">
+-                <span className="min-w-0 flex-1"><code className="block truncate">{task.command}</code><span className="block text-xs text-[var(--app-hint)]">{task.id}</span></span>
++                <span className="min-w-0 flex-1"><code className="block truncate">{task.command}</code><span className="block text-xs text-[var(--app-hint)]">{task.id}{task.nativePid ? ` · runtime PID ${task.nativePid}` : ''}</span></span>
+                 <span className="shrink-0 text-xs text-[var(--app-hint)]">{taskLabel(task)}</span><span aria-hidden="true">›</span>
+             </button>)}
+             {props.hasMore && !props.embedded ? <button type="button" onClick={props.onLoadEarlier} disabled={props.loadingMore}
+diff --git a/web/src/components/BackgroundTasksPanel.test.tsx b/web/src/components/BackgroundTasksPanel.test.tsx
+index 0aa2b42..68fc732 100644
+--- a/web/src/components/BackgroundTasksPanel.test.tsx
++++ b/web/src/components/BackgroundTasksPanel.test.tsx
+@@ -120,3 +120,16 @@ it('reads an idle historical log once without recurring polling', async () => {
+     await act(async () => { await vi.advanceTimersByTimeAsync(60000) })
+     expect(get).toHaveBeenCalledTimes(1)
+ })
++
++it('shows unmatched native terminals with the controller-machine PID and expires stale snapshots', () => {
++    const client=new QueryClient()
++    const native={threadId:'thread',checkedAt:Date.now(),terminals:[{processId:'42',itemId:'item',osPid:123}]}
++    const panel=(checkedAt:number) => <QueryClientProvider client={client}><I18nProvider><BackgroundTasksPanel embedded api={{} as ApiClient} sessionId="parent" blocks={[]} messages={[]}
++        active count={1} nativeThreadId="thread" nativeTerminals={{...native,checkedAt}} viewedId={null} onView={() => {}} hasMore={false} loadingMore={false} onLoadEarlier={() => {}} /></I18nProvider></QueryClientProvider>
++    const view=render(panel(native.checkedAt))
++    expect(screen.getByText('Runtime terminal 42')).toBeInTheDocument()
++    expect(screen.queryByText('No background tasks in the loaded chat history.')).not.toBeInTheDocument()
++    expect(screen.getByText(/PID 123 on the controller machine/)).toBeInTheDocument()
++    view.rerender(panel(Date.now()-46_000))
++    expect(screen.queryByText('Runtime terminal 42')).not.toBeInTheDocument()
++})
+diff --git a/web/src/components/SessionActivityPanel.tsx b/web/src/components/SessionActivityPanel.tsx
+index d630100..7019d27 100644
+--- a/web/src/components/SessionActivityPanel.tsx
++++ b/web/src/components/SessionActivityPanel.tsx
+@@ -26,15 +26,19 @@ export function SessionActivityPanel(props: {
+     const agents = useMemo(() => collectSubagents(props.blocks), [props.blocks])
+     const verified = props.processes?.length ?? 0
+     const nativeCount = props.count === undefined ? undefined : Math.max(0, props.count - verified)
+-    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount), [props.blocks, props.messages, props.active, nativeCount])
++    const tasks = useMemo(() => collectBackgroundTasks(props.blocks, props.messages, props.active, nativeCount, props.metadata?.codexBackgroundTerminals, props.metadata?.codexSessionId), [props.blocks, props.messages, props.active, nativeCount, props.metadata])
+     const runningAgents = props.active ? agents.filter(({ block }) => block.tool.state === 'running' || block.tool.state === 'pending').length : 0
+     const runningTasks = props.active ? Math.max(props.count ?? 0, verified + tasks.filter(task => task.provider === 'codex' && task.state === 'running').length) : 0
+     const summary = [verified ? `${verified} live local process${verified === 1 ? '' : 'es'}` : null, nativeCount ? `Runtime reports ${nativeCount} pending task${nativeCount === 1 ? '' : 's'}` : null, runningAgents ? `${runningAgents} subagent${runningAgents === 1 ? '' : 's'}` : null].filter(Boolean)
+     const state = !props.active ? `Agent offline${verified ? ` · ${verified} verified background process${verified === 1 ? '' : 'es'}` : ''}` : `${props.thinking ? 'Agent working' : (nativeCount ?? 0) > 0 || runningAgents > 0 ? 'Background' : verified ? 'Processes' : 'Agent idle'}${summary.length ? ` · ${summary.join(' · ')}` : ''}`
++    const nativeSnapshot = props.metadata?.codexBackgroundTerminals
++    const nativeUnconfirmed = props.active && nativeSnapshot?.threadId === props.metadata?.codexSessionId
++        && (nativeSnapshot?.terminals.length ?? 0) > 0
++        && (nativeSnapshot!.checkedAt > Date.now() + 1000 || Date.now() - nativeSnapshot!.checkedAt > 45_000)
+     const oversight = oversightEvidence(props.management ?? (props.managed ? { role: 'worker' } : undefined))
+     const todos = props.status?.tasks ?? []
+     const hasHistory = verified > 0 || agents.length > 0 || tasks.length > 0 || todos.length > 0 || Boolean(props.status?.goal)
+-    return <ChatHeaderPopover label={`Activity · ${oversight.label + ' · '}${state}`} title="Activity"
++    return <ChatHeaderPopover label={`Activity · ${oversight.label + ' · '}${state}${nativeUnconfirmed ? ' · Background status unconfirmed' : ''}`} title="Activity"
+         open={expanded} onOpenChange={setExpanded}
+         icon={<svg aria-hidden="true" viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4" /></svg>}
+         badge={runningTasks + runningAgents > 0 ? <span aria-hidden="true" className="absolute -right-0.5 -top-0.5 rounded-full bg-[var(--app-secondary-bg)] px-1 text-[9px] leading-3">{Math.min(99, runningTasks + runningAgents)}</span> : undefined}>
+@@ -51,9 +55,10 @@ export function SessionActivityPanel(props: {
+             {agents.length ? <SubagentsPanel embedded blocks={props.blocks} metadata={props.metadata} viewedId={props.viewedSubagentId} onView={props.onViewSubagent}
+                 hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
+             {tasks.length || runningTasks || verified ? <BackgroundTasksPanel embedded visible={expanded} api={props.api} sessionId={props.sessionId} blocks={props.blocks} messages={props.messages}
+-                active={props.active} count={props.count} processes={props.processes} viewedId={props.viewedBackgroundId} onView={props.onViewBackground}
++                active={props.active} count={props.count} processes={props.processes} nativeTerminals={props.metadata?.codexBackgroundTerminals} nativeThreadId={props.metadata?.codexSessionId} viewedId={props.viewedBackgroundId} onView={props.onViewBackground}
+                 hasMore={false} loadingMore={props.loadingMore} onLoadEarlier={props.onLoadEarlier} /> : null}
+-            {!hasHistory && !runningTasks ? <p className="text-sm text-[var(--app-hint)]">No activity in the loaded chat history.</p> : null}
++            {nativeUnconfirmed ? <p className="text-xs text-[var(--app-hint)]">Previous native background work is no longer confirmed. An observation gap does not prove it finished.</p> : null}
++            {!hasHistory && !runningTasks && !nativeUnconfirmed ? <p className="text-sm text-[var(--app-hint)]">No activity in the loaded chat history.</p> : null}
+             {props.hasMore ? <button type="button" disabled={props.loadingMore} onClick={props.onLoadEarlier}
+                 className="min-h-9 text-sm text-[var(--app-link)] disabled:opacity-40">{props.loadingMore ? 'Loading…' : 'Load earlier activity'}</button> : null}
+         </section>
+diff --git a/web/src/components/SessionActivityPanel.test.tsx b/web/src/components/SessionActivityPanel.test.tsx
+index 34d56ce..d861f4e 100644
+--- a/web/src/components/SessionActivityPanel.test.tsx
++++ b/web/src/components/SessionActivityPanel.test.tsx
+@@ -109,3 +109,13 @@ it('keeps an idle chat distinct from its historical blocked goal without runtime
+     expect(screen.getByText(/Saved goal state, separate from current activity/)).toBeInTheDocument()
+     expect(api.getBackgroundTaskOutput).not.toHaveBeenCalled()
+ })
++
++it('marks an expired native background snapshot unconfirmed instead of implying it finished', () => {
++    const client=new QueryClient()
++    render(<QueryClientProvider client={client}><I18nProvider><SessionActivityPanel api={{} as ApiClient} sessionId="s" blocks={[]} messages={[]}
++        metadata={{path:'/project',host:'remote',codexSessionId:'thread',codexBackgroundTerminals:{threadId:'thread',checkedAt:Date.now()-46_000,terminals:[{processId:'42',itemId:'item',osPid:123}]}}}
++        active thinking={false} count={0} status={null} viewedSubagentId={null} onViewSubagent={() => {}} viewedBackgroundId={null} onViewBackground={() => {}}
++        hasMore={false} loadingMore={false} onLoadEarlier={() => {}} /></I18nProvider></QueryClientProvider>)
++    fireEvent.click(screen.getByRole('button',{name:/Background status unconfirmed/}))
++    expect(screen.getByText(/observation gap does not prove it finished/)).toBeInTheDocument()
++})
+diff --git a/cli/src/codex/shared/nativeBackground.ts b/cli/src/codex/shared/nativeBackground.ts
+new file mode 100644
+index 0000000..3c9ddb9
+--- /dev/null
++++ b/cli/src/codex/shared/nativeBackground.ts
+@@ -0,0 +1,25 @@
++import { record } from './gateway';
++
++export type NativeTerminal = { processId: string; itemId: string; osPid: number | null };
++/** Read-only, bounded snapshot: never return a partial page as a complete list. */
++export async function readNativeBackground(client: { request(method: string, params: unknown): Promise<unknown> }, threadId: string): Promise<NativeTerminal[]> {
++    const all: NativeTerminal[] = [], seen = new Set<string>(), cursors = new Set<string>();
++    let cursor: string | undefined;
++    for (let page = 0; page < 20; page++) {
++        const result = record(await client.request('thread/backgroundTerminals/list', { threadId, limit: 100, ...(cursor ? { cursor } : {}) }));
++        if (!Array.isArray(result.data)) throw new Error('Invalid native background terminal response');
++        for (const value of result.data) {
++            const item = record(value), pid = item.osPid;
++            if (typeof item.processId !== 'string' || !item.processId || item.processId.length > 200
++                || typeof item.itemId !== 'string' || !item.itemId || item.itemId.length > 200
++                || (pid != null && (!Number.isSafeInteger(pid) || (pid as number) <= 0)) || seen.has(item.processId))
++                throw new Error('Invalid or duplicate native background terminal');
++            seen.add(item.processId);
++            all.push({ processId: item.processId, itemId: item.itemId, osPid: (pid ?? null) as number | null });
++        }
++        if (result.nextCursor == null) return all;
++        if (typeof result.nextCursor !== 'string' || !result.nextCursor || cursors.has(result.nextCursor)) throw new Error('Invalid native terminal cursor');
++        cursor = result.nextCursor; cursors.add(cursor);
++    }
++    throw new Error('Native background terminal snapshot exceeded page limit');
++}
+diff --git a/cli/src/codex/shared/nativeBackground.test.ts b/cli/src/codex/shared/nativeBackground.test.ts
+new file mode 100644
+index 0000000..51af129
+--- /dev/null
++++ b/cli/src/codex/shared/nativeBackground.test.ts
+@@ -0,0 +1,20 @@
++import { describe, expect, it } from 'vitest';
++import { readNativeBackground } from './nativeBackground';
++
++describe('read-only Codex background terminal snapshots', () => {
++    it('reads every page and keeps handle, item and OS PID without command or environment', async () => {
++        const calls: unknown[] = [];
++        const client = { async request(method: string, p: unknown) {
++            calls.push([method, p]);
++            return calls.length === 1 ? { data: [{ processId: '42', itemId: 'a', osPid: 123, command: 'private' }], nextCursor: 'next' }
++                : { data: [{ processId: '43', itemId: 'b', osPid: null }] };
++        } };
++        expect(await readNativeBackground(client, 'thread')).toEqual([{ processId: '42', itemId: 'a', osPid: 123 }, { processId: '43', itemId: 'b', osPid: null }]);
++        expect(calls).toEqual([['thread/backgroundTerminals/list', { threadId: 'thread', limit: 100 }], ['thread/backgroundTerminals/list', { threadId: 'thread', limit: 100, cursor: 'next' }]]);
++    });
++    it('rejects incomplete, duplicate and cyclic snapshots instead of inventing completion', async () => {
++        for (const reply of [{}, { data: [{ processId: '1', itemId: 'x', osPid: -1 }] }, { data: [{ processId: '1', itemId: 'x' }, { processId: '1', itemId: 'y' }] }])
++            await expect(readNativeBackground({ request: async () => reply }, 't')).rejects.toThrow();
++        await expect(readNativeBackground({ request: async () => ({ data: [], nextCursor: 'loop' }) }, 't')).rejects.toThrow();
++    });
++});

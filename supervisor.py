@@ -574,6 +574,29 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
     candidates.append({'category':'runtime-failure','reason':'Runtime reported a failed invocation. Inspect the saved error and checkpoint; idle controller does not mean successful completion. No automatic retry was sent.', 'failure':failure})
    state['failureNotice']=version
   elif not failure:state.pop('failureNotice',None)
+  # Native snapshots bind a process handle to its exact originating item/PID.
+  # Only two fresh complete snapshots can establish a disappearance; timeouts,
+  # stale snapshots and a different controller/thread are never completion.
+  from native_background import fresh_snapshot, intent_key
+  native_now=fresh_snapshot(s,now);native_old=old.get('codexNativeBackground')
+  if native_now:
+   state.pop('codexNativeUnconfirmed',None)
+   state['codexNativeBackground']=native_now
+   if (policy['important'] and s.get('manualPausedAt') is None and native_old and native_old.get('terminals')
+       and now-native_old.get('checkedAt',0)/1000>45 and any(k not in native_now['terminals'] for k in native_old['terminals'])):
+    candidates.append({'category':'native-terminal-unconfirmed','reason':'A native terminal disappeared during an observation gap. Its outcome is unconfirmed; do not assume completion or replay work.'})
+   if policy['important'] and s.get('manualPausedAt') is None and native_old and native_old.get('threadId')==native_now['threadId'] and native_now['checkedAt']>native_old.get('checkedAt',0) and 0<=now-native_old.get('checkedAt',0)/1000<=45:
+    for identity,job in native_old.get('terminals',{}).items():
+     if identity in native_now['terminals']:continue
+     raw=self.get(intent_key(w['id'],job,native_now['threadId']));intent=json.loads(raw) if raw else None
+     if s.get('thinking') and (not intent or intent.get('intent')!='review'):continue
+     candidates.append({'category':'native-terminal-ended','reason':'Native terminal is no longer listed; inspect exit and any declared review before claiming success. No worker was resumed.',
+                        'terminal':job,'intent':intent})
+  else:
+   state.pop('codexNativeBackground',None)
+   if policy['important'] and s.get('active') and s.get('manualPausedAt') is None and native_old and native_old.get('terminals') and not old.get('codexNativeUnconfirmed'):
+    candidates.append({'category':'native-terminal-unconfirmed','reason':'The last native terminal snapshot expired or became unavailable. Background work status is unconfirmed; do not assume completion or replay work.'})
+    state['codexNativeUnconfirmed']=True
   from coordination import observe as observe_coordination, update_watches
   prior_coordination=old.get('coordination')
   if prior_coordination is None and old:
@@ -659,8 +682,10 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   native_after=bool(native_background_exits and (prior_background or (pending_native and 0<=now-pending_native<=300)))
   if policy['important'] and idle_after and ((prior_background and (old.get('backgroundProcesses') or background_exits)) or native_after):
    state.pop('pendingNativeFinish',None)
+   native_terminal_changes=[c for c in candidates if c.get('category')=='native-terminal-ended']
+   candidates=[c for c in candidates if c.get('category')!='native-terminal-ended']
    candidates.append({'category':'background-ended','reason':'Background work is no longer reported; inspect exit evidence and any pending final review before declaring completion or arranging a scoped follow-up. No worker was resumed.',
-    'previousProcesses':old.get('backgroundProcesses',[]),'exits':background_exits,'nativeTaskExits':native_background_exits})
+    'previousProcesses':old.get('backgroundProcesses',[]),'exits':background_exits,'nativeTaskExits':native_background_exits,'nativeTerminals':native_terminal_changes})
   if old.get('snapshot',{}).get('status') in ('running','background') and snap['status']=='disconnected':
    candidates.append({'reason':'Transport disconnected during work; outcome unknown, do not restart automatically'})
   # Successful ordinary prompts do not reactivate a blocked native goal.
@@ -735,7 +760,14 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   if status in ('running','idle') and not s.get('backgroundTaskCount',0) and waiting_snapshot(msgs):status='waiting for dependency'
   processes=s.get('backgroundProcesses') or []
   background={'reportedTasks':max(0,(s.get('backgroundTaskCount') or 0)-len(processes)),'localProcesses':[{'pid':p.get('pid'),'command':p.get('command'),'checkedAt':p.get('checkedAt')} for p in processes[:8]],'limits':'Process liveness is not useful progress or render health; helpers and servers can remain alive while idle. Remote/detached work may be invisible.'}
-  return {'failure':s.get('lastFailure'),'backgroundEvidence':background,'status':status,'latest_reply':reply,'latest_tool':step,'evidence_message':evidence,
+  from native_background import fresh_snapshot, intent_key
+  native_jobs=fresh_snapshot(s)
+  native_intents=[]
+  if native_jobs:
+   for job in native_jobs['terminals'].values():
+    raw=self.get(intent_key(w['id'],job,native_jobs['threadId']))
+    native_intents.append({**job,'intent':json.loads(raw) if raw else None})
+  return {'failure':s.get('lastFailure'),'backgroundEvidence':background,'nativeBackground':{'snapshot':native_jobs,'jobs':native_intents},'status':status,'latest_reply':reply,'latest_tool':step,'evidence_message':evidence,
    'pending_requests':[summarize_request(k,v) for k,v in sorted(requests.items())]}
  def progress_status(self,w,s):
   """Wait states outrank stale runtime activity flags; this never resumes work."""
@@ -896,6 +928,9 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   except Exception:self.db.execute('ROLLBACK');raise
  def dispatch(self,o):
   op=o['op']
+  if op=='background_intent':
+   from native_background import set_intent
+   return set_intent(self,o)
   import node_graph
   node_graph.actor_check(self,o)
   result=node_graph.dispatch(self,o)

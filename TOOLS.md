@@ -315,3 +315,27 @@ Nothing is deleted: suppressed events remain acknowledged in the events table an
 Claude native task-completion notifications can nominate a single background-ended review when the chat stops reporting work; the notice includes the native task ID and completed/failed status. It does not claim the assignment finished or resume the worker. A mere count correction or successful TaskStop remains silent. Completion notices that appear only in Claude's native transcript may clear the count without appearing in HAPI's message stream; such a count change alone is not evidence for a review notification.
 
 The activity panel treats Codex process handles as unknown unless a matching poll supplies terminal evidence. A session-wide background count cannot establish which historical handle remains live. Matching structured exit codes and leading native exit receipts identify completion/failure; a copied exit string inside program output does not. Verified local process families remain separate evidence and may not map to a specific native process handle. Neither source proves the agent intends to wait for, or review, the job; remote or detached jobs can be invisible.
+
+### Codex native terminals and review intent
+
+Shared Codex controllers can read `thread/backgroundTerminals/list` from their own app-server while a turn or listed terminal is active. A complete snapshot records native thread, originating item, process handle and optional OS PID, without command arguments or environment values. It refreshes every 15 seconds while active and stops polling an idle empty thread. Snapshots older than 45 seconds, partial pages, unsupported methods, different threads and inactive controllers are not treated as live. A PID belongs to the controller's machine; it is not assumed to be local to the hub. The session background count combines native terminals and locally observed process families conservatively, so overlapping sources do not inflate it; that count is not an exact count of distinct jobs.
+
+The Activity panel matches a historical handle only when both process handle and originating native item match the fresh snapshot. Otherwise it displays native terminals separately rather than guessing a PID. A disappearance between complete fresh snapshots is evidence that a native terminal is no longer listed, not proof of a successful render, remote child exit, or completed objective. Detached processes outside that native terminal and remote jobs that outlive SSH may remain invisible. The supervisor can nominate one review event from this transition; it neither sends the worker a prompt nor restarts a job.
+
+An active managed worker can explicitly mark **its own** currently listed native terminal for later review:
+
+```json
+{"op":"background_intent","process_id":"NATIVE_PROCESS_HANDLE","intent":"review","note":"Review the result before reporting completion"}
+```
+
+Run this through `managerctl.py` from that worker's HAPI session, after the fresh native snapshot includes the handle. Alternatives are `independent` or `unknown`; a note is optional and at most 500 characters. The supervisor binds the record to the caller, current native thread, exact originating item and process handle; it refuses another chat, stale evidence or ambiguous IDs. The annotation changes no process, turn, goal, pause, or assignment. The manager's digest exposes the current native terminals and annotations. Intent is only known if explicitly recorded; an unannotated job is not assumed to be awaited. For remote commands keep the native SSH/command session open where practical, or arrange a separately authorized remote monitor; an SSH process exiting after launching a remote detached job does not prove that remote job exited.
+
+Existing controllers load the native snapshot capability only when they next start normally with the updated CLI. Updating the hub or web bundle does not retrofit code into running controllers; do not restart them merely for monitoring. The method is experimental and may be unsupported by older Codex versions; absence or failure leaves status unconfirmed, never a synthetic completion.
+
+For a known detached Linux process on an already-authorized SSH host, `python3 deploy/watch-remote-process.py --host SSH_ALIAS --pid PID --identify` reads its boot ID and process-start ticks without changing it. Start the watcher as a background Codex command with the returned values:
+
+```sh
+python3 deploy/watch-remote-process.py --host SSH_ALIAS --pid PID --boot-id BOOT_ID --start-ticks START_TICKS --interval 30 --timeout 21600
+```
+
+It uses noninteractive SSH, checks only the same SSH user's process and identity, and is bounded to at most one day. Register the watcher's native handle with `background_intent` if the result needs review. Exit 0 means only that the identified process is no longer present in the remote observed process namespace; it does not establish job success. Exit 75 means connection/inspection failure or watcher expiry, so status is unknown and must not be treated as completion. It sends no signal or command to the watched process. It cannot discover an unregistered detached job, prove progress, or observe other users' hidden processes. The worker must verify PID ownership and preserve its launch evidence before identifying it; remote tools need Python 3 and usable batch SSH. No host is contacted until a worker intentionally runs this command.

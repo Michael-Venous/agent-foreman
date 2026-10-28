@@ -7,7 +7,7 @@ Use the supported control API in ../TOOLS.md. Persist assignments, reminders and
 - Separate observation from worker prompts. Watching an idle conversation must not create inference or repeat unchanged notifications.
 - Notify promptly for meaningful change, completion, failure and required human input; otherwise respect configured cadence and quiet waits.
 - A controller being active is not proof of inference. A native goal's historical blocked state is not proof that newer ordinary work is blocked.
-- Verify background jobs by fresh evidence; exclude obsolete test helpers and avoid trusting stale text or recycled PIDs.
+- Verify background jobs by fresh evidence; exclude obsolete test helpers and avoid trusting stale text or recycled PIDs. For Codex native terminals, ask workers in normal task handoffs to annotate review intent through `background_intent` (see ../TOOLS.md); do not nudge or restart existing work solely to obtain it. Native terminal disappearance is not proof a detached remote child completed. For an already-authorized detached Linux job, the worker can explicitly run the bounded read-only remote watcher described in ../TOOLS.md; unconfirmed or unreachable is not completion.
 - Treat assignment delivery, invocation, model output and task completion as separate facts. Unknown receipt is not completion or cancellation.
 - Use guarded provider recovery. Capacity/rate errors differ from quota/reset, authentication and genuine blockers. Never replay unknown intake or completed actions.
 - Resource handoffs need current user scope, release evidence and reviewed queued input. Do not clear goals or fake outcomes to bypass a guard.
