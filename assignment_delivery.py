@@ -201,6 +201,48 @@ def _binding(s, worker, assignment):
     return session
 
 
+def _spawn_session_receipt(s, worker, assignment, intent, messages=None, historical=False):
+    """Recover only exact session-scoped intake; never infer the native binding at dispatch."""
+    from supervisor import native
+    sid = worker.get('session'); aid = assignment.get('id')
+    if (not sid or not aid or assignment.get('worker') != worker.get('id')
+            or assignment.get('task_key') != 'spawn:' + worker.get('id', '')
+            or not isinstance(intent, dict) or 'native_id' not in intent or intent['native_id'] is not None
+            or intent.get('worker') != worker.get('id') or intent.get('session') != sid):
+        return None
+    first = s.session(sid)
+    if first.get('id') != sid or not worker.get('native_id') or native(first) != worker['native_id']:
+        return None
+    if messages is None:
+        if historical:
+            from public_history import read_inputs
+            messages, _ = read_inputs(s.api, sid, local_ids=[aid])
+        else:
+            messages = s.api.call('/sessions/' + quote(sid, safe='') + '/messages?limit=200')['messages']
+    matches = [m for m in messages if m.get('localId') == aid and _record(m).get('role') == 'user']
+    if len(matches) != 1:
+        return None
+    message = matches[0]; inner = _record(message).get('content')
+    text = inner if isinstance(inner, str) else _object(inner).get('text')
+    if text != assignment.get('text') or not isinstance(message.get('id'), str):
+        return None
+    proof = s.api.call('/sessions/' + quote(sid, safe='') + '/messages/queued-state', {'localIds': [aid]})
+    if not all(isinstance(proof.get(k), list) for k in ('queuedLocalIds', 'indeterminateLocalIds', 'invokedLocalMessages')):
+        return None
+    invoked = [r for r in proof['invokedLocalMessages'] if r.get('localId') == aid and _number(r.get('invokedAt'))]
+    receipt = describe_message(message, include_wait=False)
+    if (aid in proof['queuedLocalIds'] or aid in proof['indeterminateLocalIds'] or len(invoked) != 1
+            or receipt['state'] not in ('consumed', 'steered', 'control-consumed')
+            or receipt['invokedAt'] != invoked[0]['invokedAt']):
+        return None
+    fresh = s.session(sid)
+    if fresh.get('id') != sid or native(fresh) != worker['native_id']:
+        return None
+    return {'state': receipt['state'], 'messageId': message['id'], 'localId': aid,
+            'invokedAt': receipt['invokedAt'], 'scope': 'hapi-session',
+            'nativeAtDispatchVerified': False, 'compliance': 'unverified'}
+
+
 def inspect_assignment(supervisor, worker, assignment, messages=None, historical=False):
     """Read exact bound queue/receipt evidence; failed reads remain unknown, never replay."""
     s = supervisor
@@ -288,6 +330,14 @@ def inspect_assignment(supervisor, worker, assignment, messages=None, historical
         return result
     except Exception as error:
         result.update(state='unknown', bindingVerified=False, reason=str(error)[:200] if isinstance(error, ValueError) else 'Delivery inspection unavailable')
+        # Only the asynchronous initial spawn has a provably session-bound, native-unbound intent.
+        # Session receipts do not unlock native-binding guards or imply task completion.
+        if isinstance(error, ValueError) and str(error) == 'Assignment input binding changed':
+            try:
+                receipt = _spawn_session_receipt(s, worker, assignment, intent, messages, historical)
+                if receipt is not None: result['sessionReceipt'] = receipt
+            except Exception:
+                pass  # Missing or conflicting evidence stays unknown.
         return result
 
 

@@ -1319,6 +1319,10 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
     return {**old[0],'delivery':delivery}
    s=self.session(w['session']) if w['state']=='released' else self.scan(w)
    if s is None:raise ValueError('Worker observation or authorized resume confirmation is pending; inspect the exact native/controller binding before retrying. No assignment sent.')
+   # scan may have discovered the native ID after this worker was fetched.
+   w=self.worker(w['id'])
+   if w['state']=='released' and not ur:raise ValueError('Worker was released during observation; do not send automatically')
+   if s.get('id')!=w['session']:raise ValueError('Worker session changed during observation; no assignment sent')
    p=self.project(w['project']) if ur else self.running(w['project'])
    import transient_recovery
    if not ur and transient_recovery.blocked(self,w['session']):raise ValueError('Transient provider recovery pending; do not send a competing retry')

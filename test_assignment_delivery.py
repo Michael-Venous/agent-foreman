@@ -154,6 +154,55 @@ class AssignmentDelivery(IsolatedSupervisorTest):
         self.assertEqual(self.inspect()['state'], 'steered')
         self.assertEqual(self.writes(), [])
 
+    def test_assignment_records_native_discovered_by_scan(self):
+        self.s.db.execute("UPDATE workers SET native_id=NULL WHERE id='w'")
+        def scan(worker):
+            self.s.db.execute("UPDATE workers SET native_id='native' WHERE id='w'")
+            return self.api.session
+        with patch.object(self.s,'scan',side_effect=scan):
+            result=self.s.dispatch({'op':'assign','worker':'w','key':'fresh-native','text':'A task','user_requested':True})
+        intent=json.loads(self.s.get('assignment-input:'+result['id']))
+        self.assertEqual(intent['native_id'],'native')
+
+    def test_assignment_refuses_release_during_scan(self):
+        def scan(worker):
+            self.s.db.execute("UPDATE workers SET state='released' WHERE id='w'")
+            return self.api.session
+        with patch.object(self.s,'scan',side_effect=scan),self.assertRaisesRegex(ValueError,'released during observation'):
+            self.s.dispatch({'op':'assign','worker':'w','key':'released','text':'A task'})
+        self.assertEqual(self.writes(), [])
+
+    def test_spawn_null_native_keeps_binding_unknown_but_reports_exact_session_intake(self):
+        self.s.db.execute("UPDATE assignments SET task_key='spawn:w' WHERE id='a'")
+        self.intent(native_id=None)
+        self.api.messages = [user(invoked=2000)]
+        self.api.queue = {'queuedLocalIds': [], 'indeterminateLocalIds': [], 'invokedLocalMessages': [{'localId': 'a', 'invokedAt': 2000}]}
+        result = self.inspect()
+        self.assertEqual(result['state'], 'unknown'); self.assertFalse(result['bindingVerified'])
+        self.assertEqual(result['sessionReceipt']['state'], 'consumed')
+        self.assertFalse(result['sessionReceipt']['nativeAtDispatchVerified'])
+        self.assertEqual(result['sessionReceipt']['invokedAt'], 2000)
+        with self.assertRaises(ValueError): promote_assignment(self.s, self.request())
+        self.assertEqual(self.writes(), [])
+
+    def test_spawn_session_receipt_rejects_conflicts_or_identity_changes(self):
+        self.s.db.execute("UPDATE assignments SET task_key='spawn:w' WHERE id='a'")
+        self.intent(native_id=None); good=user(invoked=2000)
+        proof={'queuedLocalIds': [], 'indeterminateLocalIds': [], 'invokedLocalMessages': [{'localId': 'a', 'invokedAt': 2000}]}
+        for change in ('queued', 'different-time', 'different-text', 'duplicate', 'native', 'session', 'custom-key'):
+            with self.subTest(change=change):
+                self.api.messages=[good];self.api.queue=dict(proof);self.api.session['metadata']['codexSessionId']='native';self.intent(native_id=None)
+                self.s.db.execute("UPDATE assignments SET task_key='spawn:w' WHERE id='a'")
+                if change=='queued':self.api.queue={**proof,'queuedLocalIds':['a']}
+                if change=='different-time':self.api.queue={**proof,'invokedLocalMessages':[{'localId':'a','invokedAt':3000}]}
+                if change=='different-text':self.api.messages=[user(invoked=2000,text='not original')]
+                if change=='duplicate':self.api.messages=[good,good]
+                if change=='native':self.api.session['metadata']['codexSessionId']='other'
+                if change=='session':self.intent(native_id=None,session='other')
+                if change=='custom-key':self.s.db.execute("UPDATE assignments SET task_key='other' WHERE id='a'")
+                result=self.inspect();self.assertEqual(result['state'],'unknown');self.assertNotIn('sessionReceipt',result)
+        self.assertEqual(self.writes(), [])
+
     def test_goal_outside_recent_window_keeps_control_only_semantics(self):
         self.s.db.execute("UPDATE assignments SET text='/goal New objective',goal=1 WHERE id='a'")
         self.api.messages = []
