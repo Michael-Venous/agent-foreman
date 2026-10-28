@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
 ''')
   import transient_recovery
   transient_recovery.install(self)
+  import gpu_unclaim
+  gpu_unclaim.install(self)
   # 'checkout' (default) holds the worker's directory; 'external' declares no checkout access.
   for column in ("scope TEXT DEFAULT 'checkout'","goal INTEGER DEFAULT 0"):
    try:self.db.execute('ALTER TABLE assignments ADD COLUMN '+column)
@@ -957,6 +959,9 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   if op=='resource_handoff':
    from resource_handoff import resource_handoff
    return resource_handoff(self,o)
+  if op=='gpu_unclaim':
+   from gpu_unclaim import unclaim
+   return unclaim(self,o)
   if op=='resume_chat':
    if o.get('user_requested') is not True or not isinstance(o.get('basis'),str) or not o['basis'].strip() or not isinstance(o.get('requested_at'),(int,float)) or not 0<=time.time()-o['requested_at']<=300:raise ValueError('resume_chat requires a current explicit user request and quoted basis (fresh managerctl submission)')
    sid=self.worker(o['worker'])['session'] if o.get('worker') else o.get('session')
