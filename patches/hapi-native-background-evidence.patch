@@ -1,0 +1,64 @@
+diff --git a/web/src/chat/backgroundTaskViews.ts b/web/src/chat/backgroundTaskViews.ts
+index 96ab3e2..2773fc2 100644
+--- a/web/src/chat/backgroundTaskViews.ts
++++ b/web/src/chat/backgroundTaskViews.ts
+@@ -51,7 +51,8 @@ export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: r
+         if (existing) continue
+         found.set(id, { id, provider, block, command: command(block),
+             cwd: getInputStringAny(block.tool.input, ['cwd', 'workdir']),
+-            state: active && count !== 0 && provider === 'codex' ? 'running' : 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
++            // A session-wide count cannot prove this particular historical handle is live.
++            state: 'unknown', captured: output.slice(-65536), capturedTruncated: output.length > 65536,
+             liveOutput: Boolean(provider === 'claude' && /Output is being written to:/.test(output)) })
+     }
+     for (const block of all) {
+@@ -67,8 +68,18 @@ export function collectBackgroundTasks(blocks: readonly ChatBlock[], messages: r
+             task.capturedTruncated ||= next.length > 65536
+             task.captured = next.slice(-65536)
+         }
+-        const exit = output.match(/Process exited with code\s+(-?\d+)/i)?.[1]
+-        if (exit !== undefined) task.state = exit === '0' ? 'completed' : 'failed'
++        // Only the exact process poll's structured result or a leading runtime
++        // receipt is terminal evidence; arbitrary program output may contain examples.
++        const result = block.tool.result
++        const structuredCode = isObject(result) && typeof result.exit_code === 'number' && Number.isInteger(result.exit_code)
++            ? result.exit_code : null
++        const lines = output.split(/\r?\n/)
++        let i = 0
++        if (/^Chunk ID: [\w-]+$/.test(lines[i] ?? '')) i++
++        if (/^Wall time: [\d.]+ seconds$/.test(lines[i] ?? '')) i++
++        const receipt = lines[i]?.match(/^Process exited with code (-?\d+)$/)?.[1]
++        const exit = structuredCode ?? (receipt === undefined ? null : Number(receipt))
++        if (exit !== null && id && task.id === id) task.state = exit === 0 ? 'completed' : 'failed'
+         const status = output.match(/<status>\s*([^<]+?)\s*<\/status>/)?.[1]
+         if (status === 'completed') {
+             const code = output.match(/<exit_code>\s*(-?\d+)\s*<\/exit_code>/)?.[1]
+diff --git a/web/src/chat/backgroundTaskViews.test.ts b/web/src/chat/backgroundTaskViews.test.ts
+index e7d8bbf..95243be 100644
+--- a/web/src/chat/backgroundTaskViews.test.ts
++++ b/web/src/chat/backgroundTaskViews.test.ts
+@@ -66,5 +66,23 @@ it('does not invent tasks from fixture strings read in files, diffs or grep outp
+ it('does not mark historical Codex task receipts running when the native-only count is zero', () => {
+     const task = block('old', { command: 'old command' }, 'Process running with session ID 42')
+     expect(collectBackgroundTasks([task], [], true, 0)[0].state).toBe('unknown')
+-    expect(collectBackgroundTasks([task], [], true, 1)[0].state).toBe('running')
++    expect(collectBackgroundTasks([task], [], true, 1)[0].state).toBe('unknown')
++})
++
++
++it('does not assign another task’s aggregate background count to historical Codex handles', () => {
++    const blocks = [block('old', { cmd: 'old' }, 'Process running with session ID 41'), block('new', { cmd: 'new' }, 'Process running with session ID 42')]
++    expect(collectBackgroundTasks(blocks, [], true, 1).map(t => t.state)).toEqual(['unknown', 'unknown'])
++})
++
++it('uses exact Codex poll receipts and structured exit codes, not text inside output', () => {
++    const spawn = block('spawn', { cmd: 'build' }, 'Process running with session ID 42')
++    const fake = block('fake', { session_id: 42 }, 'readme example:\nProcess exited with code 0')
++    expect(collectBackgroundTasks([spawn, fake], [], true, 1)[0].state).toBe('unknown')
++    const other = block('other', { session_id: 43 }, { exit_code: 0, output: 'done' })
++    expect(collectBackgroundTasks([spawn, other], [], true, 1)[0].state).toBe('unknown')
++    const failed = block('failed', { session_id: 42 }, { exit_code: 2, output: 'failed' })
++    expect(collectBackgroundTasks([spawn, failed], [], true, 1)[0].state).toBe('failed')
++    const complete = block('complete', { session_id: 42 }, 'Chunk ID: abc123\nWall time: 1.002 seconds\nProcess exited with code 0\nOutput: ok')
++    expect(collectBackgroundTasks([spawn, complete], [], true, 0)[0].state).toBe('completed')
+ })

@@ -309,3 +309,9 @@ Automatic recovery after a 429/capacity rejection (`transient_recovery.py`) stil
 - reports the first failure of an outage and every 4th repeat only (`consecutiveFailures` in the event); human-needed quota waits are always reported;
 - does not raise `runtime-failure`, "turn ended" or input-receipt observations for a chat with a pending automatic retry, nor for the supervisor's own recovery message. If the retry is cancelled or stops, the failure is reported normally.
 Nothing is deleted: suppressed events remain acknowledged in the events table and `transient_recovery` has the state.
+
+### Background task evidence
+
+Claude native task-completion notifications can nominate a single background-ended review when the chat stops reporting work; the notice includes the native task ID and completed/failed status. It does not claim the assignment finished or resume the worker. A mere count correction or successful TaskStop remains silent. Completion notices that appear only in Claude's native transcript may clear the count without appearing in HAPI's message stream; such a count change alone is not evidence for a review notification.
+
+The activity panel treats Codex process handles as unknown unless a matching poll supplies terminal evidence. A session-wide background count cannot establish which historical handle remains live. Matching structured exit codes and leading native exit receipts identify completion/failure; a copied exit string inside program output does not. Verified local process families remain separate evidence and may not map to a specific native process handle. Neither source proves the agent intends to wait for, or review, the job; remote or detached jobs can be invisible.

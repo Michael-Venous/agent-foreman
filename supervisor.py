@@ -563,7 +563,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   if not self.reporting_allowed(w):
    # Do not replay activity accrued during a pause/quiet/off period on re-enable.
    self.discard_routine_updates(w['id'])
-   state['startedAt']=now;state['suppressed']=True;self.set(key,json.dumps(state));return
+   state.pop('pendingNativeFinish',None);state['startedAt']=now;state['suppressed']=True;self.set(key,json.dumps(state));return
   policy=self.reporting(w['id']);context=old.get('context',[]);reported=old.get('reported',[]);candidates=[]
   failure=s.get('lastFailure')
   import transient_recovery
@@ -605,7 +605,8 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    candidates.extend(watch_candidates)
    candidates.extend(coordination_candidates)
    candidates.extend(update_watches(self,w,coordination_candidates,ordered,s))
-  message_versions={};background_exits=[]
+  message_versions={};background_exits=[];native_background_exits=[]
+  from background_evidence import claude_completed
   for m in ordered:
    c=content(m);d=c.get('content',{});data=d.get('data',{}) if isinstance(d,dict) else {}
    if not isinstance(data,dict) or c.get('role')!='agent' or data.get('isSidechain'):continue
@@ -623,6 +624,9 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
      candidates.append({'reason':reason,'text':text,'message':m['id']});reported.append(fingerprint)
     if not old:reported.append(fingerprint)
     context=(context+[text])[-12:]
+   if m.get('seq',0)>old.get('seq',0):
+    receipt=claude_completed(m)
+    if receipt:native_background_exits.append(receipt)
    kind=data.get('type')
    # A turn end is evidence to review, never proof a larger goal is complete.
    terminal=kind in ('task_complete','task_failed','turn_aborted') or (kind=='thread_goal_updated' and (data.get('goal') or {}).get('status') in ('complete','completed')) or (d.get('type')=='event' and kind in ('ready','error','abort-restore')) or (kind=='system' and data.get('subtype')=='turn_duration')
@@ -644,9 +648,19 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   # Their final transition to idle has no new model terminal record. Nominate a
   # review, not success or an automatic continuation. Count-only corrections
   # (e.g. stale TaskStop accounting) must not manufacture completion notices.
-  if policy['important'] and old.get('snapshot',{}).get('status')=='background' and snap['status'] in ('idle','waiting for dependency','disconnected') and not s.get('backgroundTaskCount',0) and (old.get('backgroundProcesses') or background_exits):
+  prior_background=old.get('snapshot',{}).get('status')=='background'
+  idle_after=snap['status'] in ('idle','waiting for dependency','disconnected') and not s.get('backgroundTaskCount',0)
+  pending_native=old.get('pendingNativeFinish')
+  # The count patch and native receipt can arrive in either order. Keep only a
+  # short, silent correlation window, never resurrecting a task or dispatching work.
+  if prior_background and idle_after and (old.get('snapshot',{}).get('backgroundEvidence') or {}).get('reportedTasks',0)>0 and not native_background_exits:
+   state['pendingNativeFinish']=now
+  elif not idle_after or (pending_native and now-pending_native>300):state.pop('pendingNativeFinish',None)
+  native_after=bool(native_background_exits and (prior_background or (pending_native and 0<=now-pending_native<=300)))
+  if policy['important'] and idle_after and ((prior_background and (old.get('backgroundProcesses') or background_exits)) or native_after):
+   state.pop('pendingNativeFinish',None)
    candidates.append({'category':'background-ended','reason':'Background work is no longer reported; inspect exit evidence and any pending final review before declaring completion or arranging a scoped follow-up. No worker was resumed.',
-    'previousProcesses':old.get('backgroundProcesses',[]),'exits':background_exits})
+    'previousProcesses':old.get('backgroundProcesses',[]),'exits':background_exits,'nativeTaskExits':native_background_exits})
   if old.get('snapshot',{}).get('status') in ('running','background') and snap['status']=='disconnected':
    candidates.append({'reason':'Transport disconnected during work; outcome unknown, do not restart automatically'})
   # Successful ordinary prompts do not reactivate a blocked native goal.
