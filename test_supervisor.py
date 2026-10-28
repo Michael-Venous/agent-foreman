@@ -605,6 +605,24 @@ class Tests(IsolatedSupervisorTest):
   self.assertTrue(lines[0].startswith('[supervisor update; not a user instruction] 2 events; ack ids'))
   self.assertRegex(lines[1],r'^#\d+ finished · test · codex:w · task=outreach-v1 · Turn ended')
   self.assertLessEqual(len(lines[2]),260);self.assertNotIn('event_key',text);self.assertNotIn('wake_id',text)
+ def test_answered_question_is_not_delivered_but_pending_or_unverified_is(self):
+  self.api.session['metadata']['codexSessionId']='native'
+  self.api.session['agentState']={'requests':{},'completedRequests':{'old':{'status':'approved','completedAt':123}}}
+  self.s.event('approval:old',self.p,'w','input-required','old question')
+  self.s.event('approval:new',self.p,'w','input-required','new question')
+  self.api.session['agentState']['requests']['new']={'tool':'AskUserQuestion'}
+  self.assertTrue(self.s.input_event_deliverable(self.s.one("SELECT * FROM events WHERE event_key='approval:new'")))
+  self.api.session['agentState']['requests']={}
+  self.s.set('manager','s');self.s.notify_manager()
+  self.assertEqual(self.s.one("SELECT acked FROM events WHERE event_key='approval:old'")['acked'],1)
+  self.assertNotIn('old question',self.api.sent[-1]['text']);self.assertIn('new question',self.api.sent[-1]['text'])
+  self.s.event('approval:unknown',self.p,'w','input-required','unverified')
+  e=self.s.one("SELECT * FROM events WHERE event_key='approval:unknown'")
+  self.assertTrue(self.s.input_event_deliverable(e))
+  self.api.session['metadata']['codexSessionId']='different'
+  self.s.event('approval:old2',self.p,'w','input-required','other identity')
+  self.api.session['agentState']['completedRequests']['old2']={'status':'approved','completedAt':123}
+  self.assertTrue(self.s.input_event_deliverable(self.s.one("SELECT * FROM events WHERE event_key='approval:old2'")))
  def test_reconcile_failures_are_isolated_and_lost_batches_are_released(self):
   import supervisor
   self.s.event('result:x',self.p,'w','finished','done')

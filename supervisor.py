@@ -739,7 +739,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   if w['native_id'] and native(s) and native(s)!=w['native_id']:raise ValueError('Native identity mismatch')
   msgs=msgs if msgs is not None else self.api.call('/sessions/'+w['session']+'/messages?limit=100')['messages']
   from resource_handoff import public_reply
-  reply=None;step=None;evidence=None
+  reply=None;step=None;evidence=None;reply_message=None
   for m in sorted(msgs,key=lambda m:(m.get('seq',0),m.get('createdAt',0)),reverse=True):
    c=content(m);d=c.get('content',{})
    if c.get('role')!='agent' or not isinstance(d,dict):continue
@@ -751,7 +751,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    text=public_reply(m,include_terminal=True)
    if isinstance(text,str) and text.startswith('Claude AI usage limit '):text=None
    if not reply and isinstance(text,str) and text.strip():
-    reply=' '.join(text.split())[:reply_limit];evidence=m.get('id')
+    reply=' '.join(text.split())[:reply_limit];evidence=m.get('id');reply_message=m
    if not step:
     tool=next((x for x in reversed(parts) if isinstance(x,dict) and x.get('type')=='tool_use'),None)
     if tool:
@@ -764,7 +764,9 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    if reply and step:break
   requests=(s.get('agentState') or {}).get('requests') or {}
   status=self.progress_status(w,s)
-  from coordination import waiting_snapshot
+  from coordination import waiting_snapshot, latest_instruction
+  instruction=latest_instruction(msgs)
+  reply_before_instruction=bool(reply_message and instruction and (reply_message.get('seq',0),reply_message.get('createdAt',0)) < (instruction.get('seq',0),instruction.get('createdAt',0)))
   if status in ('running','idle') and not s.get('backgroundTaskCount',0) and waiting_snapshot(msgs):status='waiting for dependency'
   processes=s.get('backgroundProcesses') or []
   background={'reportedTasks':max(0,(s.get('backgroundTaskCount') or 0)-len(processes)),'localProcesses':[{'pid':p.get('pid'),'command':p.get('command'),'checkedAt':p.get('checkedAt')} for p in processes[:8]],'limits':'Process liveness is not useful progress or render health; helpers and servers can remain alive while idle. Remote/detached work may be invisible.'}
@@ -775,7 +777,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    for job in native_jobs['terminals'].values():
     raw=self.get(intent_key(w['id'],job,native_jobs['threadId']))
     native_intents.append({**job,'intent':json.loads(raw) if raw else None})
-  return {'failure':s.get('lastFailure'),'backgroundEvidence':background,'nativeBackground':{'snapshot':native_jobs,'jobs':native_intents},'status':status,'latest_reply':reply,'latest_tool':step,'evidence_message':evidence,
+  return {'failure':s.get('lastFailure'),'backgroundEvidence':background,'nativeBackground':{'snapshot':native_jobs,'jobs':native_intents},'status':status,'latest_reply':reply,'latest_reply_before_instruction':reply_before_instruction,'latest_tool':step,'evidence_message':evidence,
    'pending_requests':[summarize_request(k,v) for k,v in sorted(requests.items())]}
  def progress_status(self,w,s):
   """Wait states outrank stale runtime activity flags; this never resumes work."""
@@ -1762,7 +1764,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   pending=[]
   for e in self.rows('SELECT * FROM events WHERE acked=0 AND wake_id IS NULL ORDER BY id'):
    try:
-    eligible=self.retirement_deliverable(e) or ((not e['worker'] or not self.get('unmanaged:'+e['worker'])) and (e['kind'] in ('check-in','progress') or not e['worker'] or self.watch(e['worker'])['mode']=='events') and (e['kind'] not in ('progress','observation') or self.progress_deliverable(e)))
+    eligible=self.retirement_deliverable(e) or ((not e['worker'] or not self.get('unmanaged:'+e['worker'])) and (e['kind'] in ('check-in','progress') or not e['worker'] or self.watch(e['worker'])['mode']=='events') and (e['kind'] not in ('progress','observation') or self.progress_deliverable(e)) and (e['kind']!='input-required' or self.input_event_deliverable(e)))
     if eligible:pending.append(e)
    except Exception as error:
     # A failed freshness check affects this event only, not other workers' input
@@ -1779,6 +1781,20 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   for recipient,events in groups.items():
    try:self.wake_owner(recipient,events[:20],recipient==sid)
    except Exception as error:log.warning('wake %s: %s',recipient,error)
+ def input_event_deliverable(self,e):
+  """Retire only an exact request with authoritative completed evidence."""
+  if not e['worker'] or not e['event_key'].startswith('approval:'):return True
+  w=self.worker(e['worker']);s=self.session(w['session'])
+  if s.get('id')!=w['session'] or (w['native_id'] and native(s)!=w['native_id']):return True
+  state=s.get('agentState')
+  if not isinstance(state,dict):return True
+  requests=state.get('requests');completed=state.get('completedRequests')
+  if not isinstance(requests,dict) or not isinstance(completed,dict):return True
+  rid=e['event_key'][len('approval:'):];record=completed.get(rid)
+  if rid not in requests and isinstance(record,dict) and record.get('status') in ('approved','denied','cancelled','canceled') and record.get('completedAt'):
+   self.db.execute('UPDATE events SET acked=1 WHERE id=? AND wake_id IS NULL',(e['id'],))
+   return False
+  return True
  def wake_owner(self,sid,events,overseer):
   s=self.session(sid)
   import transient_recovery
@@ -1834,7 +1850,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    if ev['worker']:parts.append('%s:%s'%(w[0]['runtime'] if w else 'worker',ev['worker'][:8]))
    if task:parts.append('task='+task[0]['task_key'])
    if ev['kind'] in ('progress','observation'):
-    snap=json.loads(ev['detail']);detail='Read-only; '+snap['status']+'; latest tool: '+str(snap['latest_tool'] or 'unknown')+'; latest public update: '+str(snap['latest_reply'] or 'No public update available')+'; pending input: '+str(len(snap['pending_requests']))+'; tracker: '+snap['trackerStatus']
+    snap=json.loads(ev['detail']);detail='Read-only; '+snap['status']+'; latest tool: '+str(snap['latest_tool'] or 'unknown')+'; '+('historical public update before newer input' if snap.get('latest_reply_before_instruction') else 'latest public update')+': '+str(snap['latest_reply'] or 'No public update available')+'; pending input: '+str(len(snap['pending_requests']))+'; tracker: '+snap['trackerStatus']
    if ev['kind']=='observation':
     detail+='; report reason: '+snap['reason']+'; evidence changes: '+json.dumps(snap['changes'],ensure_ascii=False)
    limit=1800 if ev['kind']=='observation' else 900 if ev['kind']=='progress' else 160

@@ -43,6 +43,11 @@ def observe(supervisor, worker, messages, previous):
         if content(m).get('role') == 'user':
             if is_instruction_message(m) and seq > state.get('user_seq', -1):
                 state = {'user_seq': seq, 'user': m['id'], 'seen': [], 'wait_messages': []}
+                # Backfilled messages can precede a newer instruction in the same
+                # scan. Their conditions are historical, not current alerts.
+                if m.get('invokedAt') is not None:
+                    candidates = [candidate for candidate in candidates
+                                  if candidate.get('category') not in ('dependency-wait', 'native-wait-loop')]
             continue
         if seq <= state.get('user_seq', -1):
             continue

@@ -94,6 +94,33 @@ class CoordinationTests(IsolatedSupervisorTest):
         self.api.messages.append(reply('Terrain stays paused. GPU is free.', 3)); self.scan(1000); self.scan(1001)
         self.assertEqual(self.candidates(), [])
 
+    def test_backfilled_waits_before_consumed_instruction_are_not_current_alerts(self):
+        previous = {'user_seq': 1, 'seen': [], 'wait_messages': []}
+        current = prompt(6); current['invokedAt'] = 6001
+        messages = [prompt(1), reply('Terrain stays on hold.', 2), reply('Still on hold.', 3),
+                    reply('Terrain remains on hold.', 4), current]
+        _, changes = observe(self.s, self.s.worker('w'), messages, previous)
+        self.assertEqual(changes, [])
+        snap = self.s.progress_snapshot(self.s.worker('w'), self.api.session, messages)
+        self.assertTrue(snap['latest_reply_before_instruction'])
+        self.assertNotEqual(snap['status'], 'waiting for dependency')
+        messages.append(reply('Terrain is on hold until Drift finishes.', 7))
+        _, changes = observe(self.s, self.s.worker('w'), messages, previous)
+        self.assertIn('dependency-wait', [c['category'] for c in changes])
+
+    def test_queued_instruction_does_not_erase_existing_wait_evidence(self):
+        previous = {'user_seq': 1, 'seen': [], 'wait_messages': []}
+        _, changes = observe(self.s, self.s.worker('w'),
+                             [prompt(1), reply('Terrain stays on hold.', 2), prompt(3)], previous)
+        self.assertIn('dependency-wait', [c['category'] for c in changes])
+
+    def test_consumed_instruction_does_not_drop_resource_release(self):
+        current = prompt(3); current['invokedAt'] = 3001
+        _, changes = observe(self.s, self.s.worker('w'),
+                             [prompt(1), reply('The GPU is free.', 2), current],
+                             {'user_seq': 1, 'seen': [], 'wait_messages': []})
+        self.assertIn('resource-release', [c['category'] for c in changes])
+
     def test_real_tool_after_wait_is_working(self):
         self.api.session['thinking'] = True
         self.api.messages += [reply('Waiting for GPU handoff.', 3), {'id': 'tool', 'seq': 4, 'content': {'role': 'agent', 'content': {'type': 'codex', 'data': {'type': 'tool-call', 'name': 'Bash'}}}}]
