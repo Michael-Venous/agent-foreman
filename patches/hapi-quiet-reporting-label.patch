@@ -1,0 +1,54 @@
+diff --git a/hub/src/web/routes/managedSessions.ts b/hub/src/web/routes/managedSessions.ts
+index 6fa574b..4e971cf 100644
+--- a/hub/src/web/routes/managedSessions.ts
++++ b/hub/src/web/routes/managedSessions.ts
+@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ 
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number } }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean } }
+ 
+ /** Chats an external manager supervises, published as JSON (HAPI_MANAGED_SESSIONS_FILE). */
+ export function readManagedSessions(path = process.env.HAPI_MANAGED_SESSIONS_FILE): Record<string, ManagedSession> {
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 5bbbb7d..8d143af 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -79,7 +79,7 @@ export function nodeGraphOf(raw: unknown): NodeGraphResponse | null {
+     const inner = raw && typeof raw === 'object' ? (raw as { graph?: unknown }).graph : undefined
+     return isGraph(inner) ? nodeGraphOf(inner) : null
+ }
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number } }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean } }
+ 
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+ export type SessionGoal = {
+diff --git a/web/src/lib/sessionEvidence.ts b/web/src/lib/sessionEvidence.ts
+index 9c255c1..89dee03 100644
+--- a/web/src/lib/sessionEvidence.ts
++++ b/web/src/lib/sessionEvidence.ts
+@@ -23,6 +23,6 @@ export function oversightEvidence(managed?: ManagedSession, now = Date.now()) {
+     const last = state.observedAt ? `Last chat observation: ${new Date(state.observedAt * 1000).toLocaleTimeString()}. ` : 'No successful chat observation recorded yet. '
+     return { label, description: last + (state.pendingUpdates ? `${state.pendingUpdates} update${state.pendingUpdates === 1 ? '' : 's'} awaiting manager handling. ` : '') + (state.state === 'idle' ? 'Idle chat: detailed scans sleep until activity resumes. ' : state.state === 'held' ? 'Management is on hold. ' : '')
+         + (state.ownerState === 'paused' || state.ownerState === 'offline' ? 'Observations may continue, but the manager cannot act until available. ' : '')
+-        + (state.notifications ? `Important changes, completion and input requests can notify the manager; routine updates during work use ${state.fallbackMinutes} minutes. ` : 'User-facing progress notifications are disabled. ')
++        + (state.notifications ? (state.routineEnabled === false ? 'Status changes, completion and input requests can notify the manager; routine updates are off. ' : `Important changes, completion and input requests can notify the manager; routine updates during work use ${state.fallbackMinutes} minutes. `) : 'User-facing progress notifications are disabled. ')
+         + 'Observes chat events and reported process liveness, not continuous render-log or output-quality validation. A follow-up still needs the manager to handle the event.' }
+ }
+diff --git a/web/src/lib/sessionEvidence.test.ts b/web/src/lib/sessionEvidence.test.ts
+index dadd003..893bab7 100644
+--- a/web/src/lib/sessionEvidence.test.ts
++++ b/web/src/lib/sessionEvidence.test.ts
+@@ -25,3 +25,11 @@ it('never equates configured management with verified observation or an availabl
+     m.oversight!.state = 'attention';expect(oversightEvidence(m, now).label).toBe('Watch error')
+     m.oversight!.state = 'quiet';expect(oversightEvidence(m, now).label).toBe('Reports off')
+ })
++
++it('distinguishes routine updates being off from all reporting being off', () => {
++    const m=managed();m.oversight!.routineEnabled=false
++    expect(oversightEvidence(m,now).description).toContain('routine updates are off')
++    expect(oversightEvidence(m,now).description).toContain('completion and input requests')
++    m.oversight!.routineEnabled=true
++    expect(oversightEvidence(m,now).description).toContain('routine updates during work use 30 minutes')
++})

@@ -21,6 +21,7 @@ class FakeHapi:
 class Tests(IsolatedSupervisorTest):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.api=FakeHapi();self.s=Supervisor(self.tmp.name+'/db',self.api)
+  self.s.set('reporting-default',json.dumps({'enabled':True,'fallback_minutes':30,'important':True,'routine_enabled':True,'semantic_updates':True,'status_changes':False}))
   self.p=self.s.dispatch({'op':'register','name':'test','repo':self.tmp.name,'objective':'test'})['id']
   self.s.dispatch({'op':'resume','project':self.p})
   self.s.db.execute('INSERT INTO workers VALUES(?,?,?,?,?,?,?,?)',('w',self.p,'codex','native','s',self.tmp.name,'managed',time.time()-10))
@@ -779,7 +780,7 @@ class Tests(IsolatedSupervisorTest):
   self.assertEqual(json.loads(self.observations()[0]['detail'])['status'],'running')
   self.assertEqual(self.api.sent,[])
  def test_reporting_defaults_persist_and_keep_overrides(self):
-  self.assertEqual(self.s.reporting('w'),{'enabled':True,'fallback_minutes':30,'important':True})
+  self.assertEqual(self.s.reporting('w'),{'enabled':True,'fallback_minutes':30,'important':True,'routine_enabled':True,'semantic_updates':True,'status_changes':False})
   self.s.dispatch({'op':'reporting','worker':'w','fallback_minutes':45,'important':False})
   self.s.dispatch({'op':'reporting','fallback_minutes':60})
   self.s.db.close();self.s=Supervisor(self.tmp.name+'/db',self.api)

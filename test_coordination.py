@@ -88,7 +88,7 @@ class CoordinationTests(IsolatedSupervisorTest):
         self.api.messages.append(prompt(4)); self.scan(1002)
         self.assertNotEqual(self.s.progress_snapshot(self.s.worker('w'))['status'], 'waiting for dependency')
         self.api.messages.append(reply('The GPU is free.', 5)); self.scan(1003)
-        self.assertEqual([c.get('category') for c in self.candidates()], ['resource-release'])
+        self.assertEqual([c.get('category') for c in self.candidates()], ['status-changed', 'resource-release'])
 
     def test_initial_history_is_not_replayed(self):
         self.api.messages.append(reply('Terrain stays paused. GPU is free.', 3)); self.scan(1000); self.scan(1001)

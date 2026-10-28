@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SEED_NOTE = 'Managed before the node graph; seeded as an overseer child'
-MID_LEVEL_OPS = {'assignment_delivery', 'steer_assignment', 'assign', 'answer', 'interrupt', 'remind', 'cancel_queued', 'cancel_reminder', 'read', 'read_native',
+MID_LEVEL_OPS = {'check_status', 'assignment_delivery', 'steer_assignment', 'assign', 'answer', 'interrupt', 'remind', 'cancel_queued', 'cancel_reminder', 'read', 'read_native',
                  'events', 'ack', 'status', 'requests', 'digest', 'sessions', 'reminders', 'node_graph', 'node_spawn',
                  'node_detach', 'gpu', 'node_sync', 'node_tree', 'node_edit'}
 # A node controls the graph below itself: only these node_edit actions, only on chats beneath it.

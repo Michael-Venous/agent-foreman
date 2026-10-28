@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    try:self.db.execute('ALTER TABLE assignments ADD COLUMN '+column)
    except sqlite3.OperationalError as e:
     if 'duplicate column' not in str(e):raise
-  self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)',('reporting-default',json.dumps({'enabled':True,'fallback_minutes':30,'important':True})))
+  self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)',('reporting-default',json.dumps({'enabled':True,'fallback_minutes':30,'important':True,'routine_enabled':False,'semantic_updates':False,'status_changes':True})))
   pending={p.stem for p in CONTROL.glob('*.req')}
   for r in self.rows('SELECT id FROM requests WHERE length(result)>4096'):
    if r['id'] not in pending:self.db.execute('UPDATE requests SET result=? WHERE id=?',(DELIVERED,r['id']))
@@ -510,7 +510,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
     policy=self.reporting(w['id'])
     state='held' if w['status']=='paused' or w['manual'] else 'quiet' if mode!='events' or not policy['enabled'] else 'idle' if asleep else 'attention' if self.get('scan-error:'+w['id']) else 'watching' if observed and time.time()-observed<=120 else 'unknown'
     pending=self.one('SELECT COUNT(*) AS n FROM events WHERE worker=? AND acked=0',(w['id'],))['n']
-    out[w['session']]['oversight']={'pendingUpdates':pending,'state':state,'observedAt':observed,'publishedAt':time.time(),'owner':owner,'ownerState':owner_state,'notifications':bool(mode=='events' and policy['enabled']),'fallbackMinutes':policy['fallback_minutes']}
+    out[w['session']]['oversight']={'pendingUpdates':pending,'state':state,'observedAt':observed,'publishedAt':time.time(),'owner':owner,'ownerState':owner_state,'notifications':bool(mode=='events' and policy['enabled']),'fallbackMinutes':policy['fallback_minutes'],'routineEnabled':policy['routine_enabled']}
 
   if self.get('manager'):out[self.get('manager')]={'role':'manager'}
   path=Path(path or STATE/'managed-sessions.json');tmp=path.with_suffix('.tmp')
@@ -520,7 +520,12 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   return json.loads(self.get('watch:'+wid) or '{"mode":"events","note":""}')
  def reporting(self,wid=None):
   base=json.loads(self.get('reporting-default'))
+  # Existing installations retain their stored interval, while the user's new
+  # default disables routine wakes. An explicit per-chat interval remains an override.
+  base.setdefault('routine_enabled',False);base.setdefault('semantic_updates',False);base.setdefault('status_changes',True)
   override=json.loads(self.get('reporting:'+wid) or '{}') if wid else {}
+  if 'fallback_minutes' in override and 'routine_enabled' not in override:override['routine_enabled']=True
+  if override.get('important') is True and 'semantic_updates' not in override:override['semantic_updates']=True
   return {**base,**override}
  def reporting_allowed(self,w):
   p=self.project(w['project'])
@@ -642,7 +647,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
     background_exits.append({'message':m['id'],'callId':data.get('callId'),'exitCode':output['exit_code']})
    if text:
     fingerprint=hashlib.sha256(text.encode()).hexdigest()
-    reason=self.important_change(text,context) if old and policy['important'] else None
+    reason=self.important_change(text,context) if old and policy['important'] and policy['semantic_updates'] else None
     if reason and fingerprint not in reported:
      candidates.append({'reason':reason,'text':text,'message':m['id']});reported.append(fingerprint)
     if not old:reported.append(fingerprint)
@@ -715,7 +720,10 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   state['routineSince']=since if working else now
   due=now-max(last,state['routineSince'])>=policy['fallback_minutes']*60
   if not working:self.discard_routine_updates(w['id'])
-  if candidates or (due and working and not scheduled):
+  previous_status=old.get('snapshot',{}).get('status')
+  if policy['status_changes'] and previous_status and previous_status!=snap['status'] and snap['status']!='running' and not candidates:
+   candidates.append({'category':'status-changed','reason':'Observed status changed from '+previous_status+' to '+snap['status']+'; inspect the current task and evidence before deciding whether follow-up is needed.'})
+  if candidates or (policy['routine_enabled'] and due and working and not scheduled):
    self.queue_observation(w,snap,candidates,now)
   self.set(key,json.dumps(state))
  def queue_observation(self,w,snap,candidates,now):
@@ -813,6 +821,8 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   w=self.worker(e['worker']);p=self.project(w['project'])
   if w['state']!='managed' or p['status']=='paused' or p['manual'] or self.watch(w['id'])['mode']=='off':return False
   if e['kind']=='observation' and not self.reporting_allowed(w):return False
+  if e['kind']=='observation' and self.routine_update(e) and not self.reporting(w['id'])['routine_enabled']:
+   self.db.execute('UPDATE events SET acked=1 WHERE id=? AND wake_id IS NULL',(e['id'],));return False
   # Recheck at delivery: a queued routine report can outlive the work it describes.
   if self.routine_update(e) and self.progress_snapshot(w)['status'] not in ('running','background'):
    self.discard_routine_updates(w['id']);return False
@@ -1154,7 +1164,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    key='reporting:'+wid if wid else 'reporting-default'
    value=json.loads(self.get(key) or '{}')
    if o.get('reset') and wid:value={}
-   for field in ('enabled','important'):
+   for field in ('enabled','important','routine_enabled','semantic_updates','status_changes'):
     if field in o:
      if not isinstance(o[field],bool):raise ValueError(field+' must be boolean')
      value[field]=o[field]
@@ -1162,6 +1172,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
     minutes=float(o['fallback_minutes'])
     if not math.isfinite(minutes) or minutes<5:raise ValueError('fallback_minutes must be finite and at least 5')
     value['fallback_minutes']=minutes
+    if 'routine_enabled' not in o:value['routine_enabled']=True
    if o.get('replace_reminder'):
     if not wid:raise ValueError('replace_reminder requires worker')
     r=self.one('SELECT * FROM reminders WHERE id=?',(o['replace_reminder'],))
@@ -1256,7 +1267,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    self.event('answered:'+o['request'],w[0]['project'] if w else None,w[0]['id'] if w else None,'answered','Manager answered '+summarize_request(o['request'],request)[:200]+' per: '+str(o['basis'])[:200])
    self.db.execute('UPDATE events SET acked=1 WHERE event_key=?',('answered:'+o['request'],))
    return {'ok':True,'result':result}
-  if op=='digest':
+  if op in ('digest','check_status'):
    # On-demand update for quiet/hands-off chats: pending events plus the latest reply.
    w=self.worker(o['worker'])
    evs=self.rows('SELECT * FROM events WHERE worker=? AND acked=0 ORDER BY id',(w['id'],))
@@ -1828,7 +1839,10 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    if note:parts.append('user preference: '+note[:160])
    lines.append(' · '.join(parts))
   ids=','.join(str(ev['id']) for ev in events)
-  return '[supervisor update; not a user instruction] %d event%s; ack ids %s after handling\n'%(len(events),'' if len(events)==1 else 's',ids)+'\n'.join(lines)
+  guidance=''
+  if any(e['kind'] in ('finished','failed') or (e['kind']=='observation' and any(c.get('category') in ('status-changed','background-ended','native-terminal-ended','runtime-failure') for c in json.loads(e['detail']).get('changes',[]))) for e in events):
+   guidance='\nWhen a child becomes idle, inspect current scope, goal, output and background work. If complete, let it sleep. If unfinished and safe, issue one checkpoint-aware follow-up without replaying work or uncertain input; if blocked, tell the user. Respect pauses and existing retries; do not repeat without new evidence.'
+  return '[supervisor update; not a user instruction] %d event%s; ack ids %s after handling\n'%(len(events),'' if len(events)==1 else 's',ids)+'\n'.join(lines)+guidance
  def sse(self):
   while True:
    try:
