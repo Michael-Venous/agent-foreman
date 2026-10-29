@@ -1,0 +1,272 @@
+--- a/hub/src/store/sessions.ts
++++ b/hub/src/store/sessions.ts
+@@ -159,7 +159,22 @@
+ }
+ 
+ function toStoredSession(row: DbSessionRow): StoredSession {
+-    return {
++    // Most socket receipts only need identity/activity fields. Large history
++    // maps must not be decoded for every replayed message or consumption ACK.
++    // Retain ordinary enumerable, writable values after the first access.
++    const jsonField = (key: string, value: string | null) => ({
++        enumerable: true,
++        configurable: true,
++        get(this: StoredSession): unknown {
++            const parsed = safeJsonParse(value)
++            Object.defineProperty(this, key, { value: parsed, writable: true, enumerable: true, configurable: true })
++            return parsed
++        },
++        set(this: StoredSession, next: unknown) {
++            Object.defineProperty(this, key, { value: next, writable: true, enumerable: true, configurable: true })
++        }
++    })
++    const session: StoredSession = {
+         id: row.id,
+         tag: row.tag,
+         namespace: row.namespace,
+@@ -168,22 +183,28 @@
+         updatedAt: row.updated_at,
+         pinned: row.pinned === 1,
+         globalPinned: row.global_pinned === 1,
+-        metadata: safeJsonParse(row.metadata),
++        metadata: null,
+         metadataVersion: row.metadata_version,
+-        agentState: safeJsonParse(row.agent_state),
++        agentState: null,
+         agentStateVersion: row.agent_state_version,
+         model: row.model,
+         modelReasoningEffort: row.model_reasoning_effort,
+         effort: row.effort,
+         serviceTier: row.service_tier,
+-        todos: safeJsonParse(row.todos),
++        todos: null,
+         todosUpdatedAt: row.todos_updated_at,
+-        teamState: safeJsonParse(row.team_state),
++        teamState: null,
+         teamStateUpdatedAt: row.team_state_updated_at,
+         active: row.active === 1,
+         activeAt: row.active_at,
+         seq: row.seq
+     }
++    return Object.defineProperties(session, {
++        metadata: jsonField('metadata', row.metadata),
++        agentState: jsonField('agentState', row.agent_state),
++        todos: jsonField('todos', row.todos),
++        teamState: jsonField('teamState', row.team_state)
++    })
+ }
+ 
+ export function getOrCreateSession(
+--- a/hub/src/store/sessions.test.ts
++++ b/hub/src/store/sessions.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from 'bun:test'
++import { describe, expect, it, spyOn } from 'bun:test'
+ import { Store } from './index'
+ import { randomUUID } from 'node:crypto'
+ import { SessionIdentityConflictError } from './sessions'
+@@ -11,6 +11,32 @@
+     const row = store.sessions.getSession(id)
+     return (row?.metadata ?? null) as Record<string, unknown> | null
+ }
++
++describe('large session receipt replay', () => {
++    it('checks access and records replayed receipts without parsing history metadata', () => {
++        const store = makeStore()
++        const metadata = { path: '/tmp', host: 'test', conversationHistoryTurns: Object.fromEntries(
++            Array.from({ length: 1500 }, (_, i) => [`input-${i}`, `turn-${i}`])) }
++        const session = store.sessions.getOrCreateSession('replay', metadata, null, 'default')
++        const parse = spyOn(JSON, 'parse')
++        try {
++            for (let i = 0; i < 100; i++) {
++                expect(store.sessions.getSessionByNamespace(session.id, 'default')?.namespace).toBe('default')
++                store.recordMessagesConsumed(session.id, ['already-consumed'], Date.now(), 'default')
++            }
++            expect(parse.mock.calls.filter(([raw]) => typeof raw === 'string' && raw.includes('conversationHistoryTurns'))).toHaveLength(0)
++            const loaded = store.sessions.getSession(session.id)!
++            expect(loaded.metadata).toEqual(metadata)
++            expect(loaded.metadata).toBe(loaded.metadata)
++            expect(JSON.parse(JSON.stringify(loaded)).metadata).toEqual(metadata)
++            loaded.metadata = { changed: true }
++            expect(loaded.metadata).toEqual({ changed: true })
++        } finally {
++            parse.mockRestore()
++            store.close()
++        }
++    })
++})
+ 
+ describe('getOrCreateSession: active_at', () => {
+     it('persists a non-null active_at on insert (never NULL)', () => {
+--- a/cli/src/codex/shared/projection.ts
++++ b/cli/src/codex/shared/projection.ts
+@@ -33,6 +33,10 @@
+     private readonly emitted = new Set<string>();
+     private readonly turns = new Map<string, string>();
+     private readonly turnModels = new Map<string, string>();
++    private readonly historyPoints = new Set<string>();
++    private readonly pendingHistoryPoints = new Set<string>();
++    private historyDepth = 0;
++    private historyDirty = false;
+     // Unlike transcript emission, title side effects survive reset/replay.
+     private readonly pendingTitles = new Map<string, string>();
+     private readonly completedTitles = new Set<string>();
+@@ -40,6 +44,17 @@
+     constructor(private readonly session: ApiSessionClient, readonly threadId: string,
+         private readonly committed: (id: string) => Promise<void>, private readonly parentThreadId?: string) {
+         if (!parentThreadId) for (const [id, turn] of Object.entries(session.getMetadata()?.conversationHistoryTurns ?? {})) this.turns.set(id, turn);
++        if (!parentThreadId) for (const [id, value] of Object.entries(session.getMetadata()?.conversationHistoryPoints ?? {})) if (value) this.historyPoints.add(id);
++    }
++
++    private publishHistory(): void {
++        if (this.historyDepth || !this.historyDirty) return;
++        this.historyDirty = false;
++        const turns = Object.fromEntries(this.turns);
++        const points = Object.fromEntries([...this.pendingHistoryPoints].map(id => [id, true as const]));
++        this.pendingHistoryPoints.clear();
++        this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: turns,
++            conversationHistoryPoints: { ...metadata.conversationHistoryPoints, ...points } }));
+     }
+ 
+     turnFor(id: string): string | undefined { return this.turns.get(id); }
+@@ -96,14 +111,22 @@
+             const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.threadId}:user:${itemId}` : undefined);
+             if (id) {
+                 const firstInTurn = turnId ? [...this.turns].find(([, value]) => value === turnId)?.[0] : undefined;
+-                if (turnId) this.turns.set(id, turnId);
++                if (turnId && this.turns.get(id) !== turnId) {
++                    this.turns.set(id, turnId);
++                    this.historyDirty = true;
++                }
++                if (turnId && (!firstInTurn || firstInTurn === id) && !this.historyPoints.has(id)) {
++                    this.historyPoints.add(id);
++                    this.pendingHistoryPoints.add(id);
++                    this.historyDirty = true;
++                }
+                 await this.committed(id);
+                 const text = inputText(item.content);
+                 if (text) this.session.sendUserMessage(text, undefined, id);
+-                this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
+-                    ...(turnId && (!firstInTurn || firstInTurn === id) ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
+-                }));
+-            }
++                this.publishHistory();
++            }
++            // Already projected above; the converter does not handle user items.
++            return;
+         }
+         if (this.parentThreadId && (method === 'turn/started' || method === 'turn/completed')) {
+             this.send({ type: 'agent-run-update', agentId: this.threadId, cardId: `codex-agent:${this.threadId}`,
+@@ -169,6 +192,8 @@
+         if (!Array.isArray(turns)) return;
+         const titleRevision = this.titleRevision;
+         let latestTitle: string | undefined;
++        this.historyDepth++;
++        try {
+         for (const value of turns) {
+             const turn = record(value);
+             if (!Array.isArray(turn.items)) continue;
+@@ -195,6 +220,10 @@
+                 }
+             }
+         }
++        } finally {
++            this.historyDepth--;
++            this.publishHistory();
++        }
+         // Repair sessions created while remote title projection was missing.
+         // Recheck inside the metadata lock: live updates may still be queued,
+         // and a replay must never replace an existing or newer title.
+--- a/cli/src/codex/shared/projection.test.ts
++++ b/cli/src/codex/shared/projection.test.ts
+@@ -4,6 +4,30 @@
+ import { codexPlanProposalId } from './plan';
+ 
+ describe('shared history projection', () => {
++    it('publishes one history map for a large snapshot and none for unchanged replay', async () => {
++        let metadata: Record<string, unknown> = {};
++        const updateMetadata = vi.fn(handler => { metadata = handler(metadata); });
++        const committed = vi.fn(async () => {}), user = vi.fn();
++        const session = { getMetadata: () => metadata, updateMetadata, sendAgentMessage: vi.fn(), sendUserMessage: user } as unknown as ApiSessionClient;
++        const projection = new SharedCodexProjection(session, 'thread', committed);
++        const turns = Array.from({ length: 1000 }, (_, i) => ({ id: `turn-${i}`, status: 'completed',
++            items: [{ id: `item-${i}`, type: 'userMessage', clientId: `input-${i}`, content: [{ type: 'text', text: 'message' }] }] }));
++        await projection.history({ turns });
++        expect(updateMetadata).toHaveBeenCalledTimes(1);
++        expect(Object.keys(metadata.conversationHistoryTurns as object)).toHaveLength(1000);
++        expect(Object.keys(metadata.conversationHistoryPoints as object)).toHaveLength(1000);
++        projection.reset(); await projection.history({ turns });
++        expect(updateMetadata).toHaveBeenCalledTimes(1);
++        // A fresh wrapper also starts from the persisted maps.
++        await new SharedCodexProjection(session, 'thread', committed).history({ turns });
++        expect(updateMetadata).toHaveBeenCalledTimes(1);
++        const item = { id: 'new-item', type: 'userMessage', clientId: 'new-input', content: [{ type: 'text', text: 'new' }] };
++        await projection.notification('item/started', { threadId: 'thread', turnId: 'new-turn', item });
++        await projection.notification('item/completed', { threadId: 'thread', turnId: 'new-turn', item });
++        expect(updateMetadata).toHaveBeenCalledTimes(2);
++        expect((metadata.conversationHistoryTurns as Record<string, string>)['new-input']).toBe('new-turn');
++        expect(committed).toHaveBeenCalledWith('new-input');
++    });
+     it.each([undefined, 'root'])('persists proposals without approval and replays the same IDs (parent: %s)', async parentThreadId => {
+         const send = vi.fn();
+         const session = { getMetadata: () => ({}), sendAgentMessage: send } as unknown as ApiSessionClient;
+--- a/cli/src/codex/shared/queue.ts
++++ b/cli/src/codex/shared/queue.ts
+@@ -69,6 +69,13 @@
+     async committed(id: string): Promise<void> {
+         // History may prove acceptance after execution replacement, before hub
+         // redelivery. Remember it even when this generation did not enqueue it.
++        if (this.entries[id]?.state === 'consumed') {
++            // A concurrent first commit may still be writing this state.
++            // A failed write must never turn a replay into a premature ACK.
++            await this.writes;
++            this.acknowledge(id);
++            return;
++        }
+         const entry = this.entries[id] ??= { state: 'consumed', input: [] };
+         entry.state = 'consumed';
+         await this.save(); this.acknowledge(id);
+--- a/cli/src/codex/shared/queue.test.ts
++++ b/cli/src/codex/shared/queue.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+-import { mkdtemp, rm } from 'node:fs/promises';
++import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
++import { readFileSync } from 'node:fs';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { SharedCodexQueue } from './queue';
+@@ -17,6 +18,33 @@
+     return { queue, rpc, consumed, uncertain, client, dir };
+ }
+ describe('shared native queue', () => {
++    it('waits for a concurrent first commit to persist before acknowledging its replay', async () => {
++        const { queue, consumed, dir } = await fixture();
++        consumed.mockImplementation(([id]) => {
++            expect(JSON.parse(readFileSync(join(dir, 'ledger.json'), 'utf8'))[id].state).toBe('consumed');
++        });
++        await Promise.all(Array.from({ length: 10 }, () => queue.committed('same-input')));
++        expect(consumed).toHaveBeenCalledTimes(10);
++    });
++    it('never acknowledges a consumed replay whose durable write failed', async () => {
++        const { queue, consumed, dir } = await fixture();
++        await rm(dir, { recursive: true }); await writeFile(dir, 'blocked-directory');
++        await expect(queue.committed('not-durable')).rejects.toThrow();
++        await expect(queue.committed('not-durable')).rejects.toThrow();
++        expect(consumed).not.toHaveBeenCalled();
++    });
++    it('re-acknowledges consumed history without replacing the durable ledger', async () => {
++        const { queue, consumed, dir, client } = await fixture();
++        await queue.committed('old-input');
++        const path = join(dir, 'ledger.json'), before = await stat(path);
++        for (let i = 0; i < 100; i++) await queue.committed('old-input');
++        expect((await stat(path)).ino).toBe(before.ino);
++        expect(consumed).toHaveBeenCalledTimes(101);
++        const restarted = new SharedCodexQueue(client, 'thread', path, consumed, vi.fn());
++        await restarted.load(); await restarted.committed('old-input');
++        expect((await stat(path)).ino).toBe(before.ino);
++        expect(restarted.state('old-input')).toBe('consumed');
++    });
+     it('does not restore potentially stale input when the shutdown snapshot is unavailable', async () => {
+         const { queue, rpc, uncertain } = await fixture();
+         rpc.mockResolvedValueOnce({ queuedSubmission: { id: 'n', input, clientUserMessageId: 'local' } }); await queue.enqueue('local', input);
