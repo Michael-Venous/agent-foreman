@@ -1,0 +1,34 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -895,3 +895,4 @@
+         if (!graph || id === overseer || pending || gesture.current) return
+-        if (!sessionsById.has(id) || (!nodeIsIdle(sessionsById.get(id)) && !stopped[id] && graph.pausedAt?.[id] == null)) { setError(`Stop ${title(id)} before removing it from the workspace.`); return }
++        if (!sessions) { setError('Wait for chats to load before removing a node.'); return }
++        if (!nodeIsIdle(sessionsById.get(id)) && !stopped[id] && graph.pausedAt?.[id] == null) { setError(`Stop ${title(id)} before removing it from the workspace.`); return }
+
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -375,2 +375,23 @@
+
++    it('removes a node whose chat no longer exists, without stopping other chats', async () => {
++        const { api } = setup(makeApi(), sessions.filter(s => s.id !== 'L'))
++        const menu = await openNode('L')
++        expect(within(menu).getByRole('button', { name: 'Open chat' })).toBeDisabled()
++        fireEvent.click(within(menu).getByRole('button', { name: 'Remove from workspace' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['L']))
++        await waitFor(() => expect(screen.queryByRole('button', { name: 'Node L' })).toBeNull())
++        expect(api.abortSession).not.toHaveBeenCalled()
++        expect(screen.getByRole('button', { name: 'Node Alpha' })).toBeInTheDocument()
++    })
++
++    it('keeps a missing chat node if the server reports it is still busy', async () => {
++        const { api } = setup(makeApi({ skip: ['L'] }), sessions.filter(s => s.id !== 'L'))
++        const menu = await openNode('L')
++        fireEvent.click(within(menu).getByRole('button', { name: 'Remove from workspace' }))
++        await waitFor(() => expect(api.removeNodes).toHaveBeenCalledWith(['L']))
++        expect(await within(menu).findByRole('alert')).toHaveTextContent('was not removed')
++        expect(screen.getByRole('button', { name: 'Node L' })).toBeInTheDocument()
++        expect(api.abortSession).not.toHaveBeenCalled()
++    })
++
+     it('accepts serialized sidebar data in another window and persists a lone node at the drop point', async () => {
