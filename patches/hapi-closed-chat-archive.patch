@@ -1,0 +1,176 @@
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1897,2 +1897,9 @@
+
++    archiveClosedSession(sessionId: string): void {
++        const session = this.getSession(sessionId)
++        if (!session || session.active || !session.metadata) throw new Error('Chat is not safely closed')
++        // Metadata only: do not contact a controller or delete a temporary chat.
++        this.sessionCache.markSessionArchivedFromHub(sessionId, 'Archived by user')
++    }
++
+     async archiveSession(sessionId: string): Promise<void> {
+--- /dev/null
++++ b/hub/src/sync/archiveInactive.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it, spyOn } from 'bun:test'
++import { Store } from '../store'
++import { RpcRegistry } from '../socket/rpcRegistry'
++import { SyncEngine } from './syncEngine'
++
++describe('archiving closed sessions', () => {
++    it('updates metadata without contacting a controller or deleting a temporary chat', async () => {
++        const store = new Store(':memory:')
++        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++        const session = engine.getOrCreateSession('closed-temp', { path: '/tmp/project', host: 'localhost', flavor: 'codex', temporary: true }, null, 'default')
++        const kill = spyOn((engine as any).rpcGateway, 'killSession')
++        const remove = spyOn(engine, 'deleteSession')
++        expect(engine.getSession(session.id)?.active).toBe(false)
++        engine.archiveClosedSession(session.id)
++        expect(engine.getSession(session.id)?.metadata?.lifecycleState).toBe('archived')
++        expect(store.sessions.getSession(session.id)).toBeTruthy()
++        expect(kill).not.toHaveBeenCalled()
++        expect(remove).not.toHaveBeenCalled()
++    })
++
++    it('refuses to mark an active chat closed', () => {
++        const store = new Store(':memory:')
++        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
++        const session = engine.getOrCreateSession('active', { path: '/tmp/project', host: 'localhost', flavor: 'codex' }, null, 'default')
++        engine.handleSessionAlive({ sid: session.id, time: Date.now(), thinking: true })
++        expect(() => engine.archiveClosedSession(session.id)).toThrow('not safely closed')
++        expect(engine.getSession(session.id)?.metadata?.lifecycleState).not.toBe('archived')
++    })
++})
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -508,8 +508,4 @@
+     app.post('/sessions/:id/archive', async (c) => {
+-        // tiann/hapi#916: relax the blanket `requireActive: true` guard so
+-        // the endpoint is idempotent for already-archived rows AND can clean
+-        // up split-brain rows after a hub-restart cascade (inactive in cache
+-        // but metadata.lifecycleState still 'running'). Normal inactive rows
+-        // that are not archived (completed stubs, UI Delete/Reopen targets)
+-        // keep the old 409 contract.
++        // Closed chats can be archived without restarting their controller.
++        // Already-archived inactive chats are idempotent.
+         const engine = requireSyncEngine(c, getSyncEngine)
+@@ -529,8 +525,5 @@
+
+-        if (!sessionResult.session.active && lifecycleState !== 'running') {
+-            return c.json({ error: 'Session is inactive' }, 409)
+-        }
+-
+         engine.pauseSession(sessionResult.sessionId)
+-        await engine.archiveSession(sessionResult.sessionId)
++        if (sessionResult.session.active) await engine.archiveSession(sessionResult.sessionId)
++        else engine.archiveClosedSession(sessionResult.sessionId)
+         return c.json({ ok: true })
+--- a/hub/src/web/routes/sessions.test.ts
++++ b/hub/src/web/routes/sessions.test.ts
+@@ -65,2 +65,3 @@
+     archiveSession?: (sessionId: string) => Promise<void>
++    archiveClosedSession?: (sessionId: string) => void
+     getCursorChatStoreStatus?: SyncEngine['getCursorChatStoreStatus']
+@@ -151,2 +152,3 @@
+         archiveSession: archiveSessionMock,
++        archiveClosedSession: opts?.archiveClosedSession ?? (() => {}),
+         setSessionPinned: opts?.setSessionPinned ?? (() => {}),
+@@ -1484,3 +1486,3 @@
+             const { app } = createApp(session, {
+-                archiveSession: async () => { called = true }
++                archiveClosedSession: () => { called = true }
+             })
+@@ -1535,3 +1537,3 @@
+
+-        it('returns 409 for an inactive non-archived row whose lifecycle is not running', async () => {
++        it('archives an inactive non-archived row without reopening it', async () => {
+             let called = false
+@@ -1539,3 +1541,3 @@
+             const { app } = createApp(session, {
+-                archiveSession: async () => { called = true }
++                archiveClosedSession: () => { called = true }
+             })
+@@ -1544,5 +1546,5 @@
+
+-            expect(response.status).toBe(409)
+-            expect(await response.json()).toEqual({ error: 'Session is inactive' })
+-            expect(called).toBe(false)
++            expect(response.status).toBe(200)
++            expect(await response.json()).toEqual({ ok: true })
++            expect(called).toBe(true)
+         })
+@@ -1561,3 +1563,3 @@
+             const { app } = createApp(session, {
+-                archiveSession: async (sessionId: string) => { calls.push(sessionId) }
++                archiveClosedSession: (sessionId: string) => { calls.push(sessionId) }
+             })
+--- a/web/src/components/SessionActionMenu.tsx
++++ b/web/src/components/SessionActionMenu.tsx
+@@ -16,2 +16,3 @@
+     sessionActive: boolean
++    sessionArchived?: boolean
+     onRename: () => void
+@@ -209,2 +210,3 @@
+         sessionActive,
++        sessionArchived = false,
+         onRename,
+@@ -428,3 +430,3 @@
+
+-                {sessionActive ? (
++                {(sessionActive || !sessionArchived) && (
+                     <button
+@@ -438,3 +440,4 @@
+                     </button>
+-                ) : (
++                )}
++                {!sessionActive && (
+                     <>
+--- a/web/src/components/SessionActionMenu.test.tsx
++++ b/web/src/components/SessionActionMenu.test.tsx
+@@ -226,4 +226,13 @@
+         expect(screen.getByRole('menuitem', { name: /Delete/ })).toBeInTheDocument()
+-        // Archive should not show up for inactive sessions (it is the active-session destructive).
++        expect(screen.getByRole('menuitem', { name: /Archive/ })).toBeInTheDocument()
++    })
++
++    it('offers Archive for a closed chat but not an already archived chat', () => {
++        const onArchive = vi.fn()
++        const { rerender } = renderMenu({ sessionActive: false, sessionArchived: false, onArchive })
++        fireEvent.click(screen.getByRole('menuitem', { name: /Archive/ }))
++        expect(onArchive).toHaveBeenCalledOnce()
++        rerender(<I18nProvider><SessionActionMenu isOpen onClose={() => {}} sessionId="x" sessionTitle="X" sessionActive={false} sessionArchived onRename={() => {}} onArchive={() => {}} onDelete={() => {}} anchorPoint={{ x: 0, y: 0 }} /></I18nProvider>)
+         expect(screen.queryByRole('menuitem', { name: /Archive/ })).toBeNull()
++        expect(screen.getByRole('menuitem', { name: /Delete/ })).toBeInTheDocument()
+     })
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -1094,2 +1094,3 @@
+                 sessionActive={s.active}
++                sessionArchived={s.metadata?.lifecycleState === 'archived'}
+                 sessionPinned={Boolean(s.pinned)}
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -508,2 +508,3 @@
+                 sessionActive={session.active}
++                sessionArchived={session.metadata?.lifecycleState === 'archived'}
+                 sessionPinned={Boolean(session.pinned)}
+--- a/web/src/components/SessionRowSummary.tsx
++++ b/web/src/components/SessionRowSummary.tsx
+@@ -192,2 +192,3 @@
+                     {management && <SessionOversightBadge managed={management} interactive={false} />}{!alignActivityColumns ? activity : null}
++                    {!s.active && <span className="shrink-0 text-[11px] text-[var(--app-hint)]">{s.metadata?.lifecycleState === 'archived' ? 'Archived' : 'Closed'}</span>}
+                     {!s.thinking && (!s.active || failure) && (s.backgroundProcesses?.length ?? 0) > 0 ? <span className="shrink-0 text-[11px] text-[var(--app-hint)]" title="Verified background processes continue independently of the agent turn">Processes · {s.backgroundProcesses!.length}</span> : null}
+--- a/web/src/components/SessionRowSummary.test.tsx
++++ b/web/src/components/SessionRowSummary.test.tsx
+@@ -44,2 +44,10 @@
+ describe('SessionRowSummary background status', () => {
++    it('distinguishes archived and closed inactive chats', () => {
++        const closed = makeSummary({ active: false, backgroundTaskCount: 0 })
++        const view = render(<I18nProvider><SessionRowSummary session={closed} /></I18nProvider>)
++        expect(screen.getByText('Closed', { exact: true })).toBeInTheDocument()
++        view.rerender(<I18nProvider><SessionRowSummary session={{ ...closed, metadata: { ...closed.metadata!, lifecycleState: 'archived' } }} /></I18nProvider>)
++        expect(screen.getByText('Archived', { exact: true })).toBeInTheDocument()
++        expect(screen.queryByText('Closed', { exact: true })).toBeNull()
++    })
+     beforeEach(() => {
