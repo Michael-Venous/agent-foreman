@@ -1,0 +1,228 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -11,2 +11,3 @@
+ import { RenameSessionDialog } from './RenameSessionDialog'
++import { NewGraphSessionDialog } from './NewGraphSessionDialog'
+ import * as Popover from '@radix-ui/react-popover'
+@@ -159,3 +160,8 @@
+     const [addMenu, setAddMenu] = useState<{ x: number; y: number; point: GraphPoint; workspace: string } | null>(null)
++    const [newSessionPlacement, setNewSessionPlacement] = useState<{ point: GraphPoint; workspace: string } | null>(null)
+     const [addQuery, setAddQuery] = useState('')
++    const [existingOpen, setExistingOpen] = useState(false)
++    const [existingQuery, setExistingQuery] = useState('')
++    const addSearchRef = useRef<HTMLInputElement>(null)
++    const existingSearchRef = useRef<HTMLInputElement>(null)
+     useEffect(() => { setAddMenu(null); setRenamingSession(null) }, [graph?.graph.workspaceId])
+@@ -1038,3 +1044,3 @@
+         const rect = canvas.current?.getBoundingClientRect()
+-        setMenu(null); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddQuery(''); setError(null)
++        setMenu(null); setSelectedAnnotation(null); setSelectedJunction(null); setMovingJunction(null); setAddQuery(''); setExistingQuery(''); setExistingOpen(false); setError(null)
+         setAddMenu({ x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0), point: round(toGraph(clientX, clientY)), workspace: graph.graph.workspaceId })
+@@ -1057,3 +1063,6 @@
+     </div> : null
++    const existingSessions = (sessions ?? []).filter(session => session.id !== overseer && !ids.includes(session.id))
+     const addOptions = [
++        { id: 'create-session', label: 'New chat', search: 'new create chat session', run: () => { if (addMenu) setNewSessionPlacement({ point: addMenu.point, workspace: addMenu.workspace }) } },
++        { id: 'existing-sessions', label: 'Existing session', search: 'existing session', run: () => setExistingOpen(true) },
+         { id: 'frame', label: 'Frame', search: 'frame group', run: () => addAnnotation('frame', addMenu?.point) },
+@@ -1061,9 +1070,9 @@
+         { id: 'junction', label: 'Branch junction', search: 'branch junction dot reroute', run: () => addJunction(addMenu?.point) },
+-        ...(sessions ?? []).filter(session => session.id !== overseer && !ids.includes(session.id)).map(session => ({
+-            id: session.id, label: title(session.id), search: title(session.id), run: () => placeChat(session.id, addMenu!.point)
+-        }))
+-    ].filter(option => option.search.toLowerCase().includes(addQuery.trim().toLowerCase())).slice(0, 53)
++        ...(addQuery.trim() ? existingSessions.map(session => ({
++            id: session.id, label: `Existing session › ${title(session.id)}`, search: title(session.id), run: () => placeChat(session.id, addMenu!.point)
++        })) : [])
++    ].filter(option => option.search.toLowerCase().includes(addQuery.trim().toLowerCase()))
+     const chooseAdd = (run: () => void) => {
+         if (!addMenu || addMenu.workspace !== graph?.graph.workspaceId) return
+-        run(); setAddMenu(null)
++        run(); setExistingOpen(false); setAddMenu(null)
+     }
+@@ -1121,3 +1130,14 @@
+                 style={{ left: view.x + selectionRect.x * view.k, top: view.y + selectionRect.y * view.k, width: selectionRect.width * view.k, height: selectionRect.height * view.k }} />}
+-            <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) setAddMenu(null) }}>
++            {newSessionPlacement && api && <NewGraphSessionDialog api={api} onClose={() => setNewSessionPlacement(null)} onCreated={id => {
++                const placement = newSessionPlacement
++                setNewSessionPlacement(null)
++                void api.getNodeGraph().then(fresh => {
++                    if (previewRef.current || fresh.activeWorkspaceId !== placement.workspace || graph?.graph.workspaceId !== placement.workspace) {
++                        setError('Chat was created, but the workspace changed. Add it from the chat list.')
++                        return
++                    }
++                    placeChat(id, placement.point)
++                }).catch(() => setError('Chat was created, but could not be added to the graph. Add it from the chat list.'))
++            }} />}
++            <Popover.Root open={Boolean(addMenu)} onOpenChange={open => { if (!open) { setAddMenu(null); setExistingOpen(false) } }}>
+                 <Popover.Anchor asChild><span data-graph-ui className="pointer-events-none absolute" style={{ left: addMenu?.x ?? 0, top: addMenu?.y ?? 0 }} /></Popover.Anchor>
+@@ -1128,7 +1148,16 @@
+                     <div className="px-2 py-1 text-xs font-semibold text-[var(--app-hint)]">Add node</div>
+-                    <input type="search" aria-label="Search nodes" placeholder="Search…" value={addQuery} onChange={event => setAddQuery(event.target.value)}
++                    <input ref={addSearchRef} type="search" aria-label="Search nodes" placeholder="Search…" value={addQuery} onPointerEnter={event => { if (existingOpen && event.pointerType !== 'touch') { setExistingOpen(false); event.currentTarget.focus() } }} onChange={event => { setAddQuery(event.target.value); setExistingOpen(false) }}
+                         className="my-1 min-h-10 w-full rounded-lg bg-[var(--app-subtle-bg)] px-2 text-sm" />
+                     <div className="max-h-72 overflow-y-auto overscroll-contain" aria-label="Available nodes">
+-                        {addOptions.map(option => <button type="button" key={option.id} data-add-option data-add-session={sessionsById.has(option.id) ? option.id : undefined} className={menuItem}
+-                            onClick={() => chooseAdd(option.run)}>{option.label}</button>)}
++                        {addOptions.map(option => option.id === 'existing-sessions' ? <Popover.Root key={option.id} open={existingOpen} onOpenChange={setExistingOpen}>
++                            <Popover.Trigger asChild><button type="button" data-add-option className={`${menuItem} flex items-center justify-between`} onPointerEnter={event => { if (event.pointerType !== 'touch') setExistingOpen(true) }}>Existing session <span aria-hidden="true">›</span></button></Popover.Trigger>
++                            <Popover.Portal><Popover.Content data-graph-ui aria-label="Existing sessions" side="right" align="start" sideOffset={2} collisionPadding={8} onPointerEnter={event => { if (event.pointerType !== 'touch') existingSearchRef.current?.focus() }}
++                                onKeyDown={event => { event.stopPropagation(); if (event.key === 'Enter' && event.target instanceof HTMLInputElement) { event.preventDefault(); event.currentTarget.querySelector<HTMLButtonElement>('[data-existing-session]')?.click() } }}
++                                className="z-[120] max-h-[calc(100dvh-24px)] w-64 max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] p-2 shadow-xl">
++                                <input ref={existingSearchRef} type="search" aria-label="Search existing sessions" placeholder="Search sessions…" value={existingQuery} onChange={event => setExistingQuery(event.target.value)} className="my-1 min-h-10 w-full rounded-lg bg-[var(--app-subtle-bg)] px-2 text-sm" />
++                                {existingSessions.filter(session => title(session.id).toLowerCase().includes(existingQuery.trim().toLowerCase())).map(session => <button type="button" data-existing-session key={session.id} className={menuItem} onClick={() => chooseAdd(() => placeChat(session.id, addMenu!.point))}>{title(session.id)}</button>)}
++                                {!existingSessions.some(session => title(session.id).toLowerCase().includes(existingQuery.trim().toLowerCase())) && <p className="px-2 py-2 text-xs text-[var(--app-hint)]">No matching sessions</p>}
++                            </Popover.Content></Popover.Portal>
++                        </Popover.Root> : <button type="button" key={option.id} data-add-option data-add-session={sessionsById.has(option.id) ? option.id : undefined} className={menuItem}
++                            onPointerEnter={event => { if (existingOpen && event.pointerType !== 'touch') { setExistingOpen(false); addSearchRef.current?.focus() } }} onClick={() => chooseAdd(option.run)}>{option.label}</button>)}
+                         {!addOptions.length && <p className="px-2 py-2 text-xs text-[var(--app-hint)]">No matching nodes</p>}
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -15,2 +15,4 @@
+
++vi.mock('./NewGraphSessionDialog', () => ({ NewGraphSessionDialog: (props: { onClose: () => void; onCreated: (id: string) => void }) => <div role="dialog" aria-label="Create graph session"><button onClick={() => props.onCreated('NEW')}>Create test chat</button><button onClick={props.onClose}>Cancel</button></div> }))
++
+ beforeEach(() => {
+@@ -1118,3 +1120,3 @@
+         const menu = await screen.findByRole('dialog', { name: 'Add node' })
+-        expect(within(menu).getAllByRole('button').map(button => button.textContent)).toEqual(['Frame', 'Text box', 'Branch junction', 'New chat'])
++        expect(within(menu).getAllByRole('button').map(button => button.textContent)).toEqual(['New chat', 'Existing session ›', 'Frame', 'Text box', 'Branch junction'])
+         const search = within(menu).getByRole('searchbox')
+@@ -1132,2 +1134,62 @@
+     })
++
++    it('creates a chat through the session form and places it in the graph', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(screen.getByRole('application'), { clientX: 400, clientY: 300 })
++        fireEvent.click(within(await screen.findByRole('dialog', { name: 'Add node' })).getByRole('button', { name: 'New chat' }))
++        fireEvent.click(within(await screen.findByRole('dialog', { name: 'Create graph session' })).getByRole('button', { name: 'Create test chat' }))
++        await waitFor(() => expect(api.addNode).toHaveBeenCalledWith('NEW'))
++        await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledWith(expect.objectContaining({ NEW: expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }) })))
++        expect(api.abortSession).not.toHaveBeenCalled()
++        expect(api.setNodeOwner).not.toHaveBeenCalled()
++    })
++
++    it('opens a scoped existing-session submenu on hover or click', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(screen.getByRole('application'), { clientX: 400, clientY: 300 })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        fireEvent.pointerEnter(within(menu).getByRole('button', { name: 'Existing session' }), { pointerType: 'mouse' })
++        const submenu = await screen.findByRole('dialog', { name: 'Existing sessions' })
++        const search = within(submenu).getByRole('searchbox', { name: 'Search existing sessions' })
++        fireEvent.pointerEnter(submenu, { pointerType: 'mouse' })
++        expect(search).toHaveFocus()
++        fireEvent.change(search, { target: { value: 'junction' } })
++        expect(within(submenu).getByText('No matching sessions')).toBeInTheDocument()
++        expect(within(submenu).queryByRole('button', { name: 'Branch junction' })).toBeNull()
++        const globalSearch = within(menu).getByRole('searchbox', { name: 'Search nodes' })
++        fireEvent.pointerEnter(globalSearch, { pointerType: 'mouse' })
++        expect(globalSearch).toHaveFocus()
++        fireEvent.change(globalSearch, { target: { value: 'junction' } })
++        expect(within(menu).getByRole('button', { name: 'Branch junction' })).toBeInTheDocument()
++        fireEvent.change(globalSearch, { target: { value: '' } })
++        fireEvent.click(within(menu).getByRole('button', { name: 'Existing session' }))
++        const reopened = await screen.findByRole('dialog', { name: 'Existing sessions' })
++        const sessionSearch = within(reopened).getByRole('searchbox', { name: 'Search existing sessions' })
++        fireEvent.change(sessionSearch, { target: { value: 'New' } })
++        fireEvent.keyDown(sessionSearch, { key: 'Enter' })
++        await waitFor(() => expect(api.addNode).toHaveBeenCalledWith('N'))
++    })
++
++    it('keeps all existing sessions available in the submenu', async () => {
++        const many = Array.from({ length: 110 }, (_, i) => session(`extra-${i}`, `Extra ${i}`))
++        setup(makeApi(), [...sessions, ...many]); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(screen.getByRole('application'), { clientX: 400, clientY: 300 })
++        const menu = await screen.findByRole('dialog', { name: 'Add node' })
++        fireEvent.click(within(menu).getByRole('button', { name: 'Existing session' }))
++        const submenu = await screen.findByRole('dialog', { name: 'Existing sessions' })
++        expect(within(submenu).getByRole('button', { name: 'Extra 109' })).toBeInTheDocument()
++    })
++
++    it('does not add the created chat to a workspace switched during creation', async () => {
++        const { api } = setup(); await screen.findByRole('button', { name: 'Node Alpha' })
++        fireEvent.doubleClick(screen.getByRole('application'), { clientX: 400, clientY: 300 })
++        fireEvent.click(within(await screen.findByRole('dialog', { name: 'Add node' })).getByRole('button', { name: 'New chat' }))
++        const dialog = await screen.findByRole('dialog', { name: 'Create graph session' })
++        const changed = initial(); changed.activeWorkspaceId = 'p1'
++        api.getNodeGraph.mockResolvedValueOnce(changed)
++        fireEvent.click(within(dialog).getByRole('button', { name: 'Create test chat' }))
++        expect(await screen.findByRole('alert')).toHaveTextContent('Chat was created, but the workspace changed')
++        expect(api.addNode).not.toHaveBeenCalled()
++        expect(api.saveNodeLayout).not.toHaveBeenCalled()
++    })
+     it('ignores standalone touch compatibility double-clicks and preserves mouse double-click and native context menus', async () => {
+@@ -1193,3 +1255,3 @@
+         expect(within(menu).queryByRole('button', { name: 'Alpha' })).toBeNull()
+-        fireEvent.click(within(menu).getByRole('button', { name: 'New chat' }))
++        fireEvent.click(within(menu).getByRole('button', { name: 'Existing session › New chat' }))
+         await waitFor(() => expect(api.saveNodeLayout).toHaveBeenCalledWith({ N: { x: Math.round((610 - x!) / k!), y: Math.round((390 - y!) / k!) } }))
+--- /dev/null
++++ b/web/src/components/NewGraphSessionDialog.tsx
+@@ -0,0 +1,35 @@
++import { useState } from 'react'
++import type { ApiClient } from '@/api/client'
++import { useMachines } from '@/hooks/queries/useMachines'
++import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
++import { NewSession } from '@/components/NewSession'
++import { clearNewSessionFormDraft } from '@/components/NewSession/newSessionFormDraft'
++import { WorkspaceBrowser } from '@/components/WorkspaceBrowser'
++
++/** Uses the regular session form while retaining the graph placement on folder browse. */
++export function NewGraphSessionDialog({ api, onClose, onCreated }: {
++    api: ApiClient
++    onClose: () => void
++    onCreated: (id: string) => void
++}) {
++    const { machines, isLoading, error } = useMachines(api, true)
++    const [browse, setBrowse] = useState<{ machineId: string | null; directory: string } | null>(null)
++    const [chosen, setChosen] = useState<{ machineId: string | null; directory: string } | null>(null)
++    const close = () => { clearNewSessionFormDraft(); onClose() }
++    return <Dialog open onOpenChange={open => { if (!open) close() }}>
++        <DialogContent data-graph-ui aria-describedby={undefined} className="utility-panel flex max-h-[min(80dvh,800px)] w-[calc(100vw-24px)] max-w-[44rem] flex-col overflow-hidden border border-[var(--app-border)] p-0" closeButtonClassName="right-1.5 top-1.5">
++            <div className="app-section-header app-window-chrome pr-12"><DialogTitle className="text-sm">{browse ? 'Choose folder' : 'New session'}</DialogTitle></div>
++            <div className="app-scroll-y min-h-0 flex-1">
++                {error && <p role="alert" className="p-3 text-sm text-[var(--app-badge-error-text)]">{error}</p>}
++                {browse ? <>
++                    <button type="button" onClick={() => { setChosen(browse); setBrowse(null) }} className="px-3 py-2 text-sm">Back</button>
++                    <WorkspaceBrowser api={api} machines={machines} machinesLoading={isLoading} initialMachineId={browse.machineId ?? undefined}
++                        onStartSession={(machineId, directory) => { setChosen({ machineId, directory }); setBrowse(null) }} />
++                </> : <NewSession api={api} machines={machines} isLoading={isLoading} onCancel={close}
++                    initialDirectory={chosen?.directory} initialMachineId={chosen?.machineId ?? undefined}
++                    onChooseFolder={setBrowse}
++                    onSuccess={id => { onClose(); onCreated(id) }} />}
++            </div>
++        </DialogContent>
++    </Dialog>
++}
+--- /dev/null
++++ b/web/src/components/NewGraphSessionDialog.test.tsx
+@@ -0,0 +1,29 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import type { ApiClient } from '@/api/client'
++import { I18nProvider } from '@/lib/i18n-context'
++import { NewGraphSessionDialog } from './NewGraphSessionDialog'
++
++vi.mock('@/hooks/queries/useMachines', () => ({ useMachines: () => ({ machines: [], isLoading: false, error: null }) }))
++vi.mock('@/components/NewSession', () => ({ NewSession: (props: { initialDirectory?: string; onChooseFolder: (args: { machineId: string | null; directory: string }) => void; onSuccess: (id: string) => void }) => <div><span>{props.initialDirectory ?? 'initial'}</span><button onClick={() => props.onChooseFolder({ machineId: 'm', directory: '/home' })}>Browse</button><button onClick={() => props.onSuccess('new')}>Create</button></div> }))
++vi.mock('@/components/WorkspaceBrowser', () => ({ WorkspaceBrowser: (props: { onStartSession: (machine: string, directory: string) => void }) => <button onClick={() => props.onStartSession('m', '/project')}>Choose project</button> }))
++afterEach(cleanup)
++
++describe('new graph session dialog', () => {
++    it('returns from the folder picker to the session form and reports the created id', () => {
++        const onClose = vi.fn(), onCreated = vi.fn()
++        render(<I18nProvider><NewGraphSessionDialog api={{} as ApiClient} onClose={onClose} onCreated={onCreated} /></I18nProvider>)
++        fireEvent.click(screen.getByText('Browse'))
++        fireEvent.click(screen.getByText('Choose project'))
++        expect(screen.getByText('/project')).toBeInTheDocument()
++        fireEvent.click(screen.getByText('Create'))
++        expect(onClose).toHaveBeenCalledOnce()
++        expect(onCreated).toHaveBeenCalledWith('new')
++    })
++    it('returns to the original directory when backing out of the folder picker', () => {
++        render(<I18nProvider><NewGraphSessionDialog api={{} as ApiClient} onClose={() => {}} onCreated={() => {}} /></I18nProvider>)
++        fireEvent.click(screen.getByText('Browse'))
++        fireEvent.click(screen.getByText('Back'))
++        expect(screen.getByText('/home')).toBeInTheDocument()
++    })
++})
