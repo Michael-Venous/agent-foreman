@@ -1,0 +1,112 @@
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -46,3 +46,3 @@
+ }
+-function targetFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false) {
++function targetFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false, sticky = true) {
+     const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
+@@ -51,6 +51,12 @@
+     const excluded = new Set(own ? [id, ...frameMemberIds(own, annotations)] : [])
++    const overlapsFrame = (a: NodeAnnotation) => {
++        const width = p.width ?? NODE_SIZE.width, height = p.height ?? NODE_SIZE.height
++        const x = Math.max(0, Math.min(p.x + width, a.x + a.width) - Math.max(p.x, a.x))
++        const y = Math.max(0, Math.min(p.y + height, a.y + a.height) - Math.max(p.y, a.y))
++        return x * y >= width * height * 0.25
++    }
+     return annotations.filter(a => a.kind === 'frame' && !excluded.has('frame:' + a.id)
+         && (own ? p.x >= a.x && p.y >= a.y && p.x + (p.width ?? 0) <= a.x + a.width && p.y + (p.height ?? 0) <= a.y + a.height
+-            : p.x + (p.width ?? NODE_SIZE.width) / 2 >= a.x && p.x + (p.width ?? NODE_SIZE.width) / 2 <= a.x + a.width && p.y + (p.height ?? NODE_SIZE.height) / 2 >= a.y && p.y + (p.height ?? NODE_SIZE.height) / 2 <= a.y + a.height))
+-        .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? current
++            : overlapsFrame(a)))
++        .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? (sticky ? current : undefined)
+ }
+@@ -67,4 +73,10 @@
+ /** Resolve every drop against the same frame geometry, then fit once. */
+-export function placeSelectionInFrames(annotations: NodeAnnotation[], ids: string[], positions: Record<string, FramePoint>): NodeAnnotation[] {
+-    const targets = new Map(ids.map(id => [id, targetFrame(annotations, id, positions)?.id]))
++export function placeSelectionInFrames(annotations: NodeAnnotation[], ids: string[], positions: Record<string, FramePoint>, anchorId?: string): NodeAnnotation[] {
++    // Dropping a selected object onto a frame expresses intent for the whole
++    // selection, even when other selected objects lie outside its tight bounds.
++    const target = ids.length > 1 && anchorId && ids.includes(anchorId) ? targetFrame(annotations, anchorId, positions, false, false) : undefined
++    const descendants = new Set(target ? frameMemberIds(target, annotations) : [])
++    const targets = new Map(ids.map(id => [id, target
++        ? descendants.has(id) ? annotations.find(a => a.kind === 'frame' && a.members?.includes(id))?.id : target.id
++        : targetFrame(annotations, id, positions)?.id]))
+     return fitFrames(annotations.map(frame => {
+@@ -72,3 +84,3 @@
+         const members = (frame.members ?? []).filter(id => !targets.has(id) || targets.get(id) === frame.id)
+-        for (const id of ids) if (targets.get(id) === frame.id && !members.includes(id)) members.push(id)
++        for (const id of [...ids].sort()) if (targets.get(id) === frame.id && !members.includes(id)) members.push(id)
+         return members.length || frame.members ? { ...frame, members } : frame
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -51,2 +51,34 @@
+ })
++it('drops an entire selection into the frame under the dragged item, regardless of the other objects’ locations', () => {
++    const target = { ...frame, width: 300, height: 200 }
++    const points = { A: { x: 190, y: 50 }, B: { x: 400, y: 50 }, 'junction:dot': { x: 650, y: 50, width: 16, height: 16 }, 'text:note': { x: 750, y: 50, width: 180, height: 100 } }
++    const forward = placeSelectionInFrames([target], ['A', 'B', 'junction:dot', 'text:note'], points, 'A')
++    const reverse = placeSelectionInFrames([target], ['text:note', 'junction:dot', 'B', 'A'], points, 'A')
++    expect(forward).toEqual(reverse)
++    expect(forward[0].members).toEqual(['A', 'B', 'junction:dot', 'text:note'])
++    expect(forward[0].x + forward[0].width).toBe(942)
++})
++it('accepts a meaningful overlap without capturing a card that merely grazes the frame', () => {
++    const target = { ...frame, width: 300, height: 200 }
++    expect(placeInFrame([target], 'A', { A: { x: 240, y: 50 } })[0].members).toEqual(['A'])
++    expect(placeInFrame([target], 'B', { B: { x: 295, y: 50 } })[0].members ?? []).toEqual([])
++})
++it('allows adding another card to a frame that tightened around its first member', () => {
++    const points = { A: { x: 100, y: 120 }, B: { x: 250, y: 120 } }
++    const first = placeInFrame([frame], 'A', points)
++    expect(first[0].width).toBe(224)
++    const second = placeInFrame(first, 'B', points)
++    expect(second[0].members).toEqual(['A', 'B'])
++    expect(second[0].width).toBeGreaterThan(first[0].width)
++})
++it('keeps nested membership and does not use a sticky frame as a group drop target', () => {
++    const outer = { ...frame, id: 'outer', width: 700, height: 500, members: ['frame:inner'] }
++    const inner = { ...frame, id: 'inner', x: 80, y: 70, width: 250, height: 150, members: ['A'] }
++    const placed = placeSelectionInFrames([outer, inner], ['A', 'B'], { A: { x: 90, y: 90 }, B: { x: 850, y: 90 }, 'frame:inner': inner }, 'A')
++    expect(placed.find(a => a.id === 'inner')?.members).toEqual(['A', 'B'])
++    expect(placed.find(a => a.id === 'outer')?.members).toEqual(['frame:inner'])
++    const sticky = placeSelectionInFrames([outer, inner], ['A', 'B'], { A: { x: 900, y: 900 }, B: { x: 1200, y: 900 }, 'frame:inner': inner }, 'A')
++    expect(sticky.find(a => a.id === 'inner')?.members).toEqual(['A'])
++    expect(sticky.find(a => a.id === 'outer')?.members).toEqual(['frame:inner'])
++})
+ it('keeps existing group membership, text and junction bounds while fitting moved cards', () => {
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -399,3 +399,3 @@
+         const routing = g.routing ? { ...g.routing, junctions: g.routing.junctions.map(j => ({ ...j, ...moved['junction:' + j.id] })) } : undefined
+-        return { positions: real, annotations: placeSelectionInFrames(frames, Object.keys(moved), framePoints({ ...g.positions, ...real }, frames, routing?.junctions ?? junctionsRef.current)), ...(routing ? { routing } : {}) }
++        return { positions: real, annotations: placeSelectionInFrames(frames, Object.keys(moved), framePoints({ ...g.positions, ...real }, frames, routing?.junctions ?? junctionsRef.current), g.id), ...(routing ? { routing } : {}) }
+     }
+@@ -630,3 +630,3 @@
+                     const points = framePoints({ ...g.positions, ...moved }, g.frames, junctionsRef.current)
+-                    const frames = visual?.annotations ?? (Object.keys(g.origins).length > 1 ? placeSelectionInFrames(g.frames, Object.keys(g.origins), points) : placeInFrame(g.frames, g.id, points))
++                    const frames = visual?.annotations ?? (Object.keys(g.origins).length > 1 ? placeSelectionInFrames(g.frames, Object.keys(g.origins), points, g.id) : placeInFrame(g.frames, g.id, points))
+                     setAnnotationDrafts(Object.fromEntries(frames.filter((a, i) => JSON.stringify(a) !== JSON.stringify(g.frames[i])).map(a => [a.id, a])))
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -1889,2 +1889,20 @@
+
++it('adds the entire selected pair when the dragged card lands in a tight frame, and undoes it together', async () => {
++    const api = makeApi()
++    await api.saveNodeLayout({ A: { x: 1000, y: 1000 }, B: { x: 1300, y: 1000 } }); api.saveNodeLayout.mockClear()
++    const frame: NodeAnnotation = { id: 'group', kind: 'frame', text: 'Group', color: 'blue', x: 1420, y: 980, width: 180, height: 160 }
++    await api.editNodeAnnotation('default', frame.id, frame, null); api.editNodeAnnotation.mockClear()
++    setup(api); await screen.findByRole('button', { name: 'Node Bravo' }); selectPair()
++    const canvas = startGroupDrag(), moved = cardPositions()
++    fireEvent.pointerUp(canvas, { pointerId: 81 })
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledOnce())
++    const after = api.editNodeVisual.mock.calls[0][1]
++    expect(after.annotations[0].members).toEqual(['A', 'B'])
++    expect(after.annotations[0]).toEqual(fitNodeFrame({ ...frame, members: ['A', 'B'] }, moved))
++    fireEvent.click(screen.getByRole('button', { name: 'Undo graph edit' }))
++    await waitFor(() => expect(api.editNodeVisual).toHaveBeenCalledTimes(2))
++    expect(api.editNodeVisual.mock.calls[1][1].annotations[0].members ?? []).toEqual([])
++    expect(api.abortSession).not.toHaveBeenCalled()
++})
++
+ it('opens a node in a distinct chat view without changing selection, ownership or runtime', async () => {
