@@ -1,0 +1,630 @@
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -1252,6 +1252,18 @@
+         throw new Error('Session was modified concurrently during reopen rollback')
+     }
+ 
++    promoteTemporarySession(sessionId: string): void {
++        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
++            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
++            if (!session?.metadata?.temporary) throw new Error('Session is not temporary')
++            const result = this.store.sessions.updateSessionMetadata(sessionId, { ...session.metadata, temporary: false }, session.metadataVersion, session.namespace, { touchUpdatedAt: false })
++            if (result.result === 'success') { this.refreshSession(sessionId); return }
++            if (result.result === 'error') throw new Error('Failed to promote temporary session')
++            this.refreshSession(sessionId)
++        }
++        throw new Error('Session was modified concurrently during promotion')
++    }
++
+     async deleteSession(sessionId: string): Promise<void> {
+         const session = this.sessions.get(sessionId)
+         if (!session) {
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -205,6 +205,9 @@
+     private readonly opencodeClearTails = new Map<string, Promise<ClearOpencodeSessionResult>>()
+     /** Serialize fork/rewind per session so concurrent native rollbacks cannot stack. */
+     private readonly historyActionsInFlight = new Set<string>()
++    private readonly temporaryCloseInFlight = new Set<string>()
++    private readonly expiredTemporaryIds = new Set<string>()
++    private temporaryExpiryInFlight = false
+     private readonly legacyImmediateSends = new Map<string, Promise<SteerQueuedMessageResponse>>()
+     /**
+      * Hub owner id for accountable work-graph principals (A2A P1/P3).
+@@ -272,7 +275,11 @@
+         this.titleSuggestionService = createTitleSuggestionService(store)
+         this.rpcGateway = new RpcGateway(io, rpcRegistry)
+         this.reloadAll()
++        // Only sessions present at startup expire. New sessions in this hub lifetime
++        // are unaffected; promotion can cancel expiry before cleanup begins.
++        for (const session of this.getSessions()) if (session.metadata?.temporary) this.expiredTemporaryIds.add(session.id)
+         this.inactivityTimer = setInterval(() => this.expireInactive(), 5_000)
++        this.temporaryExpiryTimer = setInterval(() => void this.expireTemporarySessions(), 5_000)
+     }
+ 
+     setHubOwnerUserId(ownerUserId: string | number): void {
+@@ -280,12 +287,43 @@
+     }
+ 
+     stop(): void {
++        if (this.temporaryExpiryTimer) { clearInterval(this.temporaryExpiryTimer); this.temporaryExpiryTimer = null }
+         if (this.inactivityTimer) {
+             clearInterval(this.inactivityTimer)
+             this.inactivityTimer = null
+         }
+     }
+ 
++    private temporaryExpiryTimer: ReturnType<typeof setInterval> | null = null
++
++    private async expireTemporarySessions(): Promise<void> {
++        if (this.temporaryExpiryInFlight) return
++        this.temporaryExpiryInFlight = true
++        try {
++            for (const id of this.expiredTemporaryIds) {
++                const session = this.getSession(id)
++                if (!session?.metadata?.temporary) { this.expiredTemporaryIds.delete(id); continue }
++                const machineId = session.metadata.machineId
++                if (!machineId || this.temporaryCloseInFlight.has(id)) continue
++                this.temporaryCloseInFlight.add(id)
++                try {
++                    const status = await this.rpcGateway.stopRunnerSession(machineId, id)
++                    if (status === 'still_alive') continue
++                    // The runner confirms this exact controller is gone before deleting.
++                    this.handleSessionEnd({ sid: id, time: Date.now() })
++                    const current = this.getSession(id)
++                    if (!current?.metadata?.temporary || current.active) continue
++                    for (const workspace of this.store.nodeGraph.workspaces(session.namespace)) this.store.nodeGraph.removeNodes(session.namespace, [id], workspace.id)
++                    this.store.sessionManager.dismiss(session.namespace, [id])
++                    this.nodeGraphChanged(session.namespace)
++                    await this.deleteSession(id)
++                    this.expiredTemporaryIds.delete(id)
++                } catch { /* Runner disconnected or outcome unknown; retry without deleting. */ }
++                finally { this.temporaryCloseInFlight.delete(id) }
++            }
++        } finally { this.temporaryExpiryInFlight = false }
++    }
++
+     subscribe(listener: SyncEventListener): () => void {
+         return this.eventPublisher.subscribe(listener)
+     }
+@@ -2158,6 +2196,36 @@
+         await this.sessionCache.deleteSession(sessionId)
+     }
+ 
++    promoteTemporarySession(sessionId: string): void {
++        if (this.temporaryCloseInFlight.has(sessionId)) throw new Error('Temporary session is closing')
++        this.sessionCache.promoteTemporarySession(sessionId)
++    }
++
++    async closeTemporarySession(sessionId: string): Promise<void> {
++        if (this.temporaryCloseInFlight.has(sessionId)) throw new Error('Temporary session is closing')
++        const session = this.getSession(sessionId)
++        if (!session?.metadata?.temporary) throw new Error('Session is not temporary')
++        this.temporaryCloseInFlight.add(sessionId)
++        try {
++            this.pauseSession(sessionId)
++            // An inactive heartbeat is not proof the detached controller exited.
++            // Temporary chats are runner-created; require its exact-session receipt.
++            const machineId = session.metadata.machineId
++            if (!machineId) throw new Error('Cannot verify the temporary chat controller without its machine')
++            const status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
++            if (status === 'still_alive') throw new Error('Temporary chat controller is still stopping')
++            this.handleSessionEnd({ sid: sessionId, time: Date.now() })
++            const current = this.getSession(sessionId)
++            if (!current?.metadata?.temporary || current.active) throw new Error('Temporary session changed while closing')
++            for (const workspace of this.store.nodeGraph.workspaces(session.namespace)) {
++                this.store.nodeGraph.removeNodes(session.namespace, [sessionId], workspace.id)
++            }
++            this.store.sessionManager.dismiss(session.namespace, [sessionId])
++            this.nodeGraphChanged(session.namespace)
++            await this.deleteSession(sessionId)
++        } finally { this.temporaryCloseInFlight.delete(sessionId) }
++    }
++
+     async applySessionConfig(
+         sessionId: string,
+         config: {
+diff --git a/hub/src/sync/temporarySession.test.ts b/hub/src/sync/temporarySession.test.ts
+--- a/hub/src/sync/temporarySession.test.ts
++++ b/hub/src/sync/temporarySession.test.ts
+@@ -12,6 +12,7 @@
+     const gateway = (engine as unknown as { rpcGateway: {
+         spawnSession: (...args: unknown[]) => Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string; code?: 'agent_unavailable' }>
+         killSession: (id: string) => Promise<void>
++        stopRunnerSession: (machine: string, id: string) => Promise<'already_gone' | 'stopped' | 'still_alive'>
+     } }).rpcGateway
+     return { store, engine, gateway }
+ }
+@@ -22,6 +23,58 @@
+ }
+ 
+ describe('temporary HAPI sessions', () => {
++    it('promotes a chat without stopping it or losing its history', async () => {
++        const { store, engine, gateway } = setup()
++        try {
++            const s = engine.getOrCreateSession('promote', { path: '/tmp', host: 'host', temporary: true }, {}, 'ns')
++            store.messages.addMessage(s.id, { text: 'keep' }, 'one')
++            gateway.killSession = mock(async () => {})
++            engine.promoteTemporarySession(s.id)
++            expect(store.sessions.getSession(s.id)?.metadata).toMatchObject({ temporary: false })
++            expect(store.messages.getMessages(s.id, 10)).toHaveLength(1)
++            expect(gateway.killSession).not.toHaveBeenCalled()
++            await expect(engine.closeTemporarySession(s.id)).rejects.toThrow('not temporary')
++        } finally { engine.stop() }
++    })
++    it('closes an inactive temporary chat and removes graph nodes', async () => {
++        const { store, engine, gateway } = setup()
++        try {
++            const s = engine.getOrCreateSession('close', { path: '/tmp', host: 'host', machineId: 'machine', temporary: true }, {}, 'ns')
++            gateway.stopRunnerSession = mock(async () => 'already_gone' as const)
++            engine.addSessionManagerEntry(s.id, 'ns')
++            await engine.closeTemporarySession(s.id)
++            expect(store.sessions.getSession(s.id)).toBeNull()
++            expect(store.nodeGraph.members('ns')).not.toContain(s.id)
++        } finally { engine.stop() }
++    })
++    it('keeps a temporary chat and graph when its controller stop is unconfirmed', async () => {
++        const { store, engine, gateway } = setup()
++        try {
++            const s = engine.getOrCreateSession('uncertain-close', { path: '/tmp', host: 'host', machineId: 'machine', temporary: true }, {}, 'ns')
++            engine.addSessionManagerEntry(s.id, 'ns')
++            gateway.stopRunnerSession = mock(async () => 'still_alive' as const)
++            await expect(engine.closeTemporarySession(s.id)).rejects.toThrow('still stopping')
++            expect(store.sessions.getSession(s.id)).toBeTruthy()
++            expect(store.nodeGraph.members('ns')).toContain(s.id)
++        } finally { engine.stop() }
++    })
++    it('expires only startup temporary chats after the runner confirms the controller is gone', async () => {
++        const { store, engine } = setup()
++        const old = engine.getOrCreateSession('old', { path: '/tmp', host: 'host', machineId: 'machine', temporary: true }, {}, 'ns')
++        engine.stop()
++        const restarted = new SyncEngine(store, { of: () => ({ to: () => ({ emit() {} }) }) } as never, new RpcRegistry(), { broadcast() {} } as never)
++        try {
++            const fresh = restarted.getOrCreateSession('fresh', { path: '/tmp', host: 'host', machineId: 'machine', temporary: true }, {}, 'ns')
++            const internals = restarted as unknown as { rpcGateway: { stopRunnerSession: (machine: string, id: string) => Promise<'still_alive' | 'already_gone'> }, expireTemporarySessions: () => Promise<void> }
++            internals.rpcGateway.stopRunnerSession = mock(async () => 'still_alive' as const)
++            await internals.expireTemporarySessions()
++            expect(store.sessions.getSession(old.id)).toBeTruthy()
++            internals.rpcGateway.stopRunnerSession = mock(async () => 'already_gone' as const)
++            await internals.expireTemporarySessions()
++            expect(store.sessions.getSession(old.id)).toBeNull()
++            expect(store.sessions.getSession(fresh.id)).toBeTruthy()
++        } finally { restarted.stop() }
++    })
+     it('persists the fresh identity and temporary marker before starting the controller', async () => {
+         const { store, engine, gateway } = setup()
+         try {
+diff --git a/hub/src/web/routes/sessions.ts b/hub/src/web/routes/sessions.ts
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -505,6 +505,26 @@
+         return c.json({ success: true as const })
+     })
+ 
++    app.post('/sessions/:id/temporary-close', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const session = requireSessionFromParam(c, engine)
++        if (session instanceof Response) return session
++        if (!session.session.metadata?.temporary) return c.json({ error: 'Session is not temporary' }, 409)
++        try { await engine.closeTemporarySession(session.sessionId); return c.json({ ok: true }) }
++        catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Unable to close temporary session' }, 409) }
++    })
++
++    app.post('/sessions/:id/temporary-promote', async (c) => {
++        const engine = requireSyncEngine(c, getSyncEngine)
++        if (engine instanceof Response) return engine
++        const session = requireSessionFromParam(c, engine)
++        if (session instanceof Response) return session
++        if (!session.session.metadata?.temporary) return c.json({ error: 'Session is not temporary' }, 409)
++        try { engine.promoteTemporarySession(session.sessionId); return c.json({ ok: true }) }
++        catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Unable to promote temporary session' }, 409) }
++    })
++
+     app.post('/sessions/:id/archive', async (c) => {
+         // Closed chats can be archived without restarting their controller.
+         // Already-archived inactive chats are idempotent.
+@@ -518,6 +538,10 @@
+             return sessionResult
+         }
+ 
++        if (sessionResult.session.metadata?.temporary) {
++            try { await engine.closeTemporarySession(sessionResult.sessionId); return c.json({ ok: true }) }
++            catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Unable to close temporary session' }, 409) }
++        }
+         const lifecycleState = sessionResult.session.metadata?.lifecycleState
+         if (!sessionResult.session.active && lifecycleState === 'archived') {
+             return c.json({ ok: true, alreadyArchived: true })
+diff --git a/shared/src/sessionSummary.ts b/shared/src/sessionSummary.ts
+--- a/shared/src/sessionSummary.ts
++++ b/shared/src/sessionSummary.ts
+@@ -41,6 +41,7 @@
+     worktree?: WorktreeMetadata
+     agentSessionId?: string
+     lifecycleState?: string
++    temporary?: boolean
+     /** Loopback MCP URL when session CLI happy server is running (#956). */
+     hapiMcpUrl?: string
+ }
+@@ -203,6 +204,7 @@
+         worktree: metadata.worktree,
+         agentSessionId: getSummaryAgentSessionId(metadata),
+         lifecycleState: metadata.lifecycleState,
++        temporary: metadata.temporary,
+         hapiMcpUrl: metadata.hapiMcpUrl ?? undefined
+     }
+ }
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -691,6 +691,14 @@
+         )
+     }
+ 
++    async closeTemporarySession(sessionId: string): Promise<void> {
++        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/temporary-close`, { method: 'POST', body: '{}' })
++    }
++
++    async promoteTemporarySession(sessionId: string): Promise<void> {
++        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/temporary-promote`, { method: 'POST', body: '{}' })
++    }
++
+     async archiveSession(sessionId: string): Promise<void> {
+         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/archive`, {
+             method: 'POST',
+diff --git a/web/src/components/NewSession/ActionButtons.test.tsx b/web/src/components/NewSession/ActionButtons.test.tsx
+--- a/web/src/components/NewSession/ActionButtons.test.tsx
++++ b/web/src/components/NewSession/ActionButtons.test.tsx
+@@ -4,14 +4,14 @@
+ import { ActionButtons } from './ActionButtons'
+ 
+ describe('new chat actions', () => {
+-    it('places the purple temporary action immediately left of Create and invokes it once', () => {
++    it('places a subtle underlined temporary action immediately left of Create', () => {
+         const temporary = vi.fn(), create = vi.fn()
+         render(<I18nProvider><ActionButtons isPending={false} canCreate isDisabled={false}
+             onCancel={() => {}} onCreateTemporary={temporary} onCreate={create} /></I18nProvider>)
+         const button = screen.getByRole('button', { name: 'Create temporary' })
+         expect(button.nextElementSibling).toHaveTextContent('Create')
+-        expect(button.className).toContain('bg-violet-600')
+-        expect(button.title).toContain('Project files and provider history remain')
++        expect(button.className).toContain('underline')
++        expect(button.className).not.toContain('bg-violet')
+         fireEvent.click(button)
+         expect(temporary).toHaveBeenCalledTimes(1)
+         expect(create).not.toHaveBeenCalled()
+diff --git a/web/src/components/NewSession/ActionButtons.tsx b/web/src/components/NewSession/ActionButtons.tsx
+--- a/web/src/components/NewSession/ActionButtons.tsx
++++ b/web/src/components/NewSession/ActionButtons.tsx
+@@ -23,12 +23,12 @@
+             >
+                 {t('button.cancel')}
+             </Button>
+-            {props.onCreateTemporary ? <Button
++            {props.onCreateTemporary ? <button type="button"
+                 onClick={props.onCreateTemporary}
+                 disabled={!props.canCreate || props.isDisabled || props.isPending}
+-                title="Deletes this HAPI chat when you choose Archive. Project files and provider history remain."
+-                className="gap-2 bg-violet-600 text-white hover:bg-violet-700"
+-            >Create temporary</Button> : null}
++                title="Temporary chat"
++                className="self-center px-1 text-xs text-[var(--app-hint)] underline underline-offset-2 hover:text-[var(--app-fg)] disabled:opacity-40"
++            >Create temporary</button> : null}
+             <Button
+                 onClick={props.onCreate}
+                 disabled={!props.canCreate || props.isDisabled || props.isPending}
+diff --git a/web/src/components/NewSession/index.test.tsx b/web/src/components/NewSession/index.test.tsx
+--- a/web/src/components/NewSession/index.test.tsx
++++ b/web/src/components/NewSession/index.test.tsx
+@@ -368,6 +368,19 @@
+         expect(mocks.onSuccess).toHaveBeenCalledWith('named-chat')
+     })
+ 
++    it('creates a regular chat when Enter is pressed in the name field', async () => {
++        const renameSession = vi.fn().mockResolvedValue(undefined)
++        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'enter-chat' })
++        render(<NewSession api={{ renameSession } as unknown as ApiClient} machines={[machine]} onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions'))
++        const input = screen.getByLabelText('Name (optional)')
++        fireEvent.change(input, { target: { value: 'Example' } })
++        fireEvent.keyDown(input, { key: 'Enter' })
++        await waitFor(() => expect(mocks.spawnSession).toHaveBeenCalledTimes(1))
++        expect(mocks.spawnSession).toHaveBeenCalledWith(expect.objectContaining({ temporary: undefined }))
++        await waitFor(() => expect(renameSession).toHaveBeenCalledWith('enter-chat', 'Example'))
++    })
++
+     it('opens the already created chat and warns if naming fails', async () => {
+         const renameSession = vi.fn().mockRejectedValue(new Error('unavailable'))
+         mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'created-chat' })
+diff --git a/web/src/components/NewSession/index.tsx b/web/src/components/NewSession/index.tsx
+--- a/web/src/components/NewSession/index.tsx
++++ b/web/src/components/NewSession/index.tsx
+@@ -1740,7 +1740,13 @@
+     )
+ 
+     return (
+-        <div className="flex flex-col divide-y divide-[var(--app-divider)] [&>div]:pr-[10px] lg:[&>div]:pr-3">
++        <div className="flex flex-col divide-y divide-[var(--app-divider)] [&>div]:pr-[10px] lg:[&>div]:pr-3" onKeyDown={event => {
++            const target = event.target as HTMLElement
++            if (event.key !== 'Enter' || event.defaultPrevented || event.nativeEvent.isComposing || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey || !event.currentTarget.contains(target)) return
++            if (target.closest('textarea, select, button, [contenteditable="true"]') || !canCreate) return
++            event.preventDefault()
++            void handleCreate()
++        }}>
+             <div className="flex flex-col gap-1.5 px-3 py-3">
+                 <label htmlFor="new-session-name" className="text-xs font-medium text-[var(--app-hint)]">Name (optional)</label>
+                 <input id="new-session-name" value={sessionName} onChange={event => setSessionName(event.target.value)} maxLength={255} disabled={isFormDisabled} className="rounded-lg border border-[var(--app-divider)] bg-[var(--app-bg)] px-3 py-2 text-sm text-[var(--app-text)]" />
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -604,7 +604,7 @@
+             setAnnotationDrafts(old => ({ ...old, [g.origin.id]: g.last }))
+             try {
+             if (g.origin.kind === 'frame' && !g.resize) {
+-                const visual = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
++                const visual = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y }, toGraph(event.clientX, event.clientY))
+                 setOverrides(old => ({ ...old, ...visual.positions }))
+                 setAnnotationDrafts(Object.fromEntries(visual.annotations.map(a => [a.id, a])))
+                 setJunctionDrafts(Object.fromEntries(visual.routing!.junctions.map(j => [j.id, { x: j.x, y: j.y }])))
+@@ -683,7 +683,7 @@
+             }
+             if (g.moved && !cancelled && Object.keys(g.members).length) {
+                 try {
+-                    const after = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y })
++                    const after = translateFrame(g.origin, g.frames, { ...positionsRef.current, ...g.members }, g.routing, { x: g.last.x - g.origin.x, y: g.last.y - g.origin.y }, toGraph(event.clientX, event.clientY))
+                     const before = { positions: Object.fromEntries(Object.entries(g.members).filter(([id]) => !id.startsWith('text:') && !id.startsWith('junction:') && !id.startsWith('frame:'))), annotations: g.frames, routing: g.routing }
+                     void changeVisual(before, after).finally(clear)
+                 } catch (cause) { setError(errorText(cause, 'Could not fit frame')); clear() }
+diff --git a/web/src/components/SessionActionMenu.test.tsx b/web/src/components/SessionActionMenu.test.tsx
+--- a/web/src/components/SessionActionMenu.test.tsx
++++ b/web/src/components/SessionActionMenu.test.tsx
+@@ -74,6 +74,20 @@
+     })
+ })
+ 
++describe('temporary chat actions', () => {
++    it('offers direct close and promotion rather than archive or delete', () => {
++        const close = vi.fn(), promote = vi.fn()
++        const { rerender } = renderMenu({ sessionTemporary: true, onCloseTemporary: close, onPromoteTemporary: promote })
++        expect(screen.queryByRole('menuitem', { name: /archive/i })).not.toBeInTheDocument()
++        expect(screen.queryByRole('menuitem', { name: /^delete/i })).not.toBeInTheDocument()
++        fireEvent.click(screen.getByRole('menuitem', { name: /keep as regular chat/i }))
++        expect(promote).toHaveBeenCalledOnce()
++        rerender(<I18nProvider><SessionActionMenu isOpen onClose={() => {}} sessionId="x" sessionTitle="X" sessionActive sessionTemporary onCloseTemporary={close} onRename={() => {}} onArchive={() => {}} onDelete={() => {}} anchorPoint={{ x: 0, y: 0 }} /></I18nProvider>)
++        fireEvent.click(screen.getByRole('menuitem', { name: /close temporary chat/i }))
++        expect(close).toHaveBeenCalledOnce()
++    })
++})
++
+ describe('SessionActionMenu - Mark unread action', () => {
+     it('fires the mark-unread handler and closes the menu', () => {
+         const onMarkUnread = vi.fn()
+diff --git a/web/src/components/SessionActionMenu.tsx b/web/src/components/SessionActionMenu.tsx
+--- a/web/src/components/SessionActionMenu.tsx
++++ b/web/src/components/SessionActionMenu.tsx
+@@ -15,6 +15,9 @@
+     sessionTitle: string
+     sessionActive: boolean
+     sessionArchived?: boolean
++    sessionTemporary?: boolean
++    onCloseTemporary?: () => void
++    onPromoteTemporary?: () => void
+     onRename: () => void
+     sessionPinned?: boolean
+     sessionGlobalPinned?: boolean
+@@ -209,6 +212,9 @@
+         sessionTitle,
+         sessionActive,
+         sessionArchived = false,
++        sessionTemporary = false,
++        onCloseTemporary,
++        onPromoteTemporary,
+         onRename,
+         sessionPinned = false,
+         sessionGlobalPinned = false,
+@@ -428,7 +434,15 @@
+                     </button>
+                 ) : null}
+ 
+-                {(sessionActive || !sessionArchived) && (
++                {sessionTemporary && <>
++                    <button type="button" role="menuitem" className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`} onClick={() => { onClose(); onPromoteTemporary?.() }}>
++                        <PinIcon className="text-[var(--app-hint)]" /> Keep as regular chat
++                    </button>
++                    <button type="button" role="menuitem" className={`${baseItemClassName} text-red-500 hover:bg-red-500/10`} onClick={() => { onClose(); onCloseTemporary?.() }}>
++                        <TrashIcon className="text-red-500" /> Close temporary chat
++                    </button>
++                </>}
++                {!sessionTemporary && (sessionActive || !sessionArchived) && (
+                     <button
+                         type="button"
+                         role="menuitem"
+@@ -439,7 +453,7 @@
+                         {t('session.action.archive')}
+                     </button>
+                 )}
+-                {!sessionActive && (
++                {!sessionTemporary && !sessionActive && (
+                     <>
+                         {onReopen || reopenDisabledReason || reopenHint ? (
+                             <HoverTooltip
+diff --git a/web/src/components/SessionHeader.tsx b/web/src/components/SessionHeader.tsx
+--- a/web/src/components/SessionHeader.tsx
++++ b/web/src/components/SessionHeader.tsx
+@@ -222,7 +222,7 @@
+     const [isSyncingCodex, setIsSyncingCodex] = useState(false)
+     const [isSyncingPi, setIsSyncingPi] = useState(false)
+ 
+-    const { archiveSession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, setPinMode, deleteSession, isPending } = useSessionActions(
++    const { archiveSession, closeTemporarySession, promoteTemporarySession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, setPinMode, deleteSession, isPending } = useSessionActions(
+         api,
+         session.id,
+         session.metadata?.flavor ?? null
+@@ -379,7 +379,7 @@
+                     <div className="min-w-0 flex-1">
+                         <Popover.Trigger asChild><button type="button" aria-label="Session details" title="Session details" className="max-w-full truncate text-left text-sm font-semibold hover:text-[var(--app-link)]">
+                             {title}
+-                            {session.metadata?.temporary ? <span title="Deleted from HAPI when you choose Archive" className="ml-2 rounded bg-violet-500/15 px-1.5 py-0.5 text-xs font-normal text-violet-500">Temporary</span> : null}
++                            {session.metadata?.temporary ? <span title="Temporary chat" className="ml-2 rounded bg-violet-500/15 px-1.5 py-0.5 text-xs font-normal text-violet-500">Temporary</span> : null}
+                         </button></Popover.Trigger>
+                         <Popover.Portal><Popover.Content side="bottom" align="start" collisionPadding={8} aria-label="Session details" className="z-[110] w-80 max-w-[calc(100vw-16px)] rounded-xl border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 shadow-xl">
+                         {showMobileMetadata ? (
+@@ -507,6 +507,9 @@
+                 sessionTitle={title}
+                 sessionActive={session.active}
+                 sessionArchived={session.metadata?.lifecycleState === 'archived'}
++                sessionTemporary={session.metadata?.temporary === true}
++                onCloseTemporary={() => void closeTemporarySession().then(() => onSessionDeleted?.()).catch(error => addToast({ title: 'Could not close temporary chat', body: String(error), sessionId: session.id, url: `/sessions/${session.id}` }))}
++                onPromoteTemporary={() => void promoteTemporarySession().catch(error => addToast({ title: 'Could not keep chat', body: String(error), sessionId: session.id, url: `/sessions/${session.id}` }))}
+                 sessionPinned={Boolean(session.pinned)}
+                 sessionGlobalPinned={Boolean(session.globalPinned)}
+                 onRename={() => setRenameOpen(true)}
+diff --git a/web/src/components/SessionList.tsx b/web/src/components/SessionList.tsx
+--- a/web/src/components/SessionList.tsx
++++ b/web/src/components/SessionList.tsx
+@@ -979,7 +979,7 @@
+         ? t('session.action.reopenCursorUnverified')
+         : undefined
+ 
+-    const { archiveSession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, deleteSession, setPinMode, isPending } = useSessionActions(
++    const { archiveSession, closeTemporarySession, promoteTemporarySession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, deleteSession, setPinMode, isPending } = useSessionActions(
+         api,
+         s.id,
+         s.metadata?.flavor ?? null
+@@ -1093,6 +1093,9 @@
+                 sessionTitle={sessionName}
+                 sessionActive={s.active}
+                 sessionArchived={s.metadata?.lifecycleState === 'archived'}
++                sessionTemporary={s.metadata?.temporary === true}
++                onCloseTemporary={() => void closeTemporarySession().catch(error => addToast({ title: 'Could not close temporary chat', body: String(error), sessionId: s.id, url: `/sessions/${s.id}` }))}
++                onPromoteTemporary={() => void promoteTemporarySession().catch(error => addToast({ title: 'Could not keep chat', body: String(error), sessionId: s.id, url: `/sessions/${s.id}` }))}
+                 sessionPinned={Boolean(s.pinned)}
+                 sessionGlobalPinned={Boolean(s.globalPinned)}
+                 onSetPinMode={isManagerSession(s) ? undefined : (mode) => void handleSetPinMode(mode)}
+diff --git a/web/src/hooks/mutations/useSessionActions.ts b/web/src/hooks/mutations/useSessionActions.ts
+--- a/web/src/hooks/mutations/useSessionActions.ts
++++ b/web/src/hooks/mutations/useSessionActions.ts
+@@ -17,6 +17,8 @@
+ ): {
+     abortSession: () => Promise<void>
+     archiveSession: () => Promise<void>
++    closeTemporarySession: () => Promise<void>
++    promoteTemporarySession: () => Promise<void>
+     reopenSession: () => Promise<ReopenSessionResponse>
+     switchSession: () => Promise<void>
+     setPermissionMode: (mode: PermissionMode) => Promise<void>
+@@ -99,6 +101,15 @@
+         onSuccess: () => void invalidateSession(),
+     })
+ 
++    const closeTemporaryMutation = useMutation({
++        mutationFn: async () => { if (!api || !sessionId) throw new Error('Session unavailable'); await api.closeTemporarySession(sessionId) },
++        onSuccess: () => void invalidateSession(),
++    })
++    const promoteTemporaryMutation = useMutation({
++        mutationFn: async () => { if (!api || !sessionId) throw new Error('Session unavailable'); await api.promoteTemporarySession(sessionId) },
++        onSuccess: () => void invalidateSession(),
++    })
++
+     const reopenMutation = useMutation<ReopenSessionResponse, Error, void>({
+         mutationFn: async () => {
+             if (!api || !sessionId) {
+@@ -285,6 +296,8 @@
+     return {
+         abortSession: abortMutation.mutateAsync,
+         archiveSession: archiveMutation.mutateAsync,
++        closeTemporarySession: closeTemporaryMutation.mutateAsync,
++        promoteTemporarySession: promoteTemporaryMutation.mutateAsync,
+         reopenSession: reopenMutation.mutateAsync,
+         switchSession: switchMutation.mutateAsync,
+         setPermissionMode: permissionMutation.mutateAsync,
+@@ -303,6 +316,7 @@
+         deleteSession: deleteMutation.mutateAsync,
+         isPending: abortMutation.isPending
+             || archiveMutation.isPending
++            || closeTemporaryMutation.isPending || promoteTemporaryMutation.isPending
+             || reopenMutation.isPending
+             || switchMutation.isPending
+             || permissionMutation.isPending
+diff --git a/web/src/hooks/useSSE.ts b/web/src/hooks/useSSE.ts
+--- a/web/src/hooks/useSSE.ts
++++ b/web/src/hooks/useSSE.ts
+@@ -150,6 +150,7 @@
+         && current.flavor === next.flavor
+         && current.agentSessionId === next.agentSessionId
+         && current.lifecycleState === next.lifecycleState
++        && current.temporary === next.temporary
+         && current.worktree?.basePath === next.worktree?.basePath
+         && current.worktree?.branch === next.worktree?.branch
+         && current.worktree?.name === next.worktree?.name
+diff --git a/web/src/lib/nodeFrames.test.ts b/web/src/lib/nodeFrames.test.ts
+--- a/web/src/lib/nodeFrames.test.ts
++++ b/web/src/lib/nodeFrames.test.ts
+@@ -113,6 +113,22 @@
+     const result = placeInFrame([outer, inner], 'frame:outer', framePoints({}, [outer, inner], []))
+     expect(result.find(a => a.id === 'inner')?.members ?? []).not.toContain('frame:outer')
+ })
++it('nests a larger dragged frame in the smaller frame under the pointer and expands it', () => {
++    const parent = { ...frame, id: 'dev', x: 100, y: 100, width: 220, height: 140, members: ['A'] }
++    const child = { ...frame, id: 'large', x: 400, y: 100, width: 700, height: 400, members: ['B'] }
++    const routing = { junctions: [], edges: [] }
++    const points = framePoints({ A: { x: 120, y: 130 }, B: { x: 450, y: 140 } }, [parent, child], [])
++    const result = translateFrame(child, [parent, child], points, routing, { x: -200, y: 0 }, { x: 250, y: 110 })
++    expect(result.annotations.find(a => a.id === 'dev')?.members).toContain('frame:large')
++    expect(result.annotations.find(a => a.id === 'large')?.members).toEqual(['B'])
++    expect(result.annotations.find(a => a.id === 'dev')!.width).toBeGreaterThan(220)
++})
++it('does not create a cycle when the drop pointer is over a descendant', () => {
++    const parent = { ...frame, id: 'outer', members: ['frame:inner'] }
++    const child = { ...frame, id: 'inner', x: 100, y: 100, width: 300, height: 200 }
++    const result = translateFrame(parent, [parent, child], framePoints({}, [parent, child], []), { junctions: [], edges: [] }, { x: 0, y: 0 }, { x: 120, y: 120 })
++    expect(result.annotations.find(a => a.id === 'inner')?.members ?? []).not.toContain('frame:outer')
++})
+ 
+ // Header clearance includes the card's top input port, without the old tall gutter.
+ it('keeps compact frame clearance for cards and labelled/unlabelled junctions', () => {
+diff --git a/web/src/lib/nodeFrames.ts b/web/src/lib/nodeFrames.ts
+--- a/web/src/lib/nodeFrames.ts
++++ b/web/src/lib/nodeFrames.ts
+@@ -44,7 +44,7 @@
+     }
+     return annotations.map(fit)
+ }
+-function targetFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false, sticky = true) {
++function targetFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false, sticky = true, dropPoint?: GraphPoint) {
+     const p = positions[id], current = annotations.find(a => a.kind === 'frame' && a.members?.includes(id))
+     if (detach || !p) return undefined
+     const own = id.startsWith('frame:') ? annotations.find(a => a.id === id.slice(6)) : undefined
+@@ -56,13 +56,13 @@
+         return x * y >= width * height * 0.25
+     }
+     return annotations.filter(a => a.kind === 'frame' && !excluded.has('frame:' + a.id)
+-        && (own ? p.x >= a.x && p.y >= a.y && p.x + (p.width ?? 0) <= a.x + a.width && p.y + (p.height ?? 0) <= a.y + a.height
++        && (own ? dropPoint ? dropPoint.x >= a.x && dropPoint.x <= a.x + a.width && dropPoint.y >= a.y && dropPoint.y <= a.y + a.height : p.x >= a.x && p.y >= a.y && p.x + (p.width ?? 0) <= a.x + a.width && p.y + (p.height ?? 0) <= a.y + a.height
+             : overlapsFrame(a)))
+         .sort((a, b) => a.width * a.height - b.width * b.height)[0] ?? (sticky ? current : undefined)
+ }
+ /** Existing membership is sticky; explicit Remove from frame releases it. */
+-export function placeInFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false): NodeAnnotation[] {
+-    const target = targetFrame(annotations, id, positions, detach)
++export function placeInFrame(annotations: NodeAnnotation[], id: string, positions: Record<string, FramePoint>, detach = false, dropPoint?: GraphPoint): NodeAnnotation[] {
++    const target = targetFrame(annotations, id, positions, detach, true, dropPoint)
+     return fitFrames(annotations.map(a => {
+         if (a.kind !== 'frame') return a
+         const members = (a.members ?? []).filter(member => member !== id)
+@@ -86,11 +86,11 @@
+         return members.length || frame.members ? { ...frame, members } : frame
+     }), positions)
+ }
+-export function translateFrame(frame: NodeAnnotation, annotations: NodeAnnotation[], positions: Record<string, FramePoint>, routing: NodeRouting, delta: GraphPoint): NodeVisualState {
++export function translateFrame(frame: NodeAnnotation, annotations: NodeAnnotation[], positions: Record<string, FramePoint>, routing: NodeRouting, delta: GraphPoint, dropPoint?: GraphPoint): NodeVisualState {
+     const members = new Set(frameMemberIds(frame, annotations))
+     const moved = Object.fromEntries(Object.entries(positions).filter(([id]) => members.has(id)).map(([id, p]) => [id, { ...p, x: p.x + delta.x, y: p.y + delta.y }]))
+     const changed = annotations.map(a => a.id === frame.id || members.has(a.kind + ':' + a.id) ? { ...a, x: a.x + delta.x, y: a.y + delta.y } : a)
+     const nextRouting = { ...routing, junctions: routing.junctions.map(j => members.has('junction:' + j.id) ? { ...j, x: j.x + delta.x, y: j.y + delta.y } : j) }
+     const next = fitFrames(changed, { ...positions, ...moved })
+-    return { positions: Object.fromEntries(Object.entries(moved).filter(([id]) => !/^(text|junction|frame):/.test(id))), annotations: placeInFrame(next, 'frame:' + frame.id, framePoints({ ...positions, ...moved }, next, nextRouting.junctions)), routing: nextRouting }
++    return { positions: Object.fromEntries(Object.entries(moved).filter(([id]) => !/^(text|junction|frame):/.test(id))), annotations: placeInFrame(next, 'frame:' + frame.id, framePoints({ ...positions, ...moved }, next, nextRouting.junctions), false, dropPoint), routing: nextRouting }
+ }
