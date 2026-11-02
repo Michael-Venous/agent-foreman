@@ -9,6 +9,7 @@ PATCHES+=(hapi-history-replay-performance.patch)
 PATCHES+=(hapi-orphan-node-removal.patch)
 PATCHES+=(hapi-closed-chat-archive.patch)
 PATCHES+=(hapi-provider-new-chat-defaults.patch)
+PATCHES+=(hapi-compact-create-session.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi

@@ -1,0 +1,172 @@
+--- a/web/src/components/NewSession/index.tsx
++++ b/web/src/components/NewSession/index.tsx
+@@ -104,2 +104,3 @@
+     const [directory, setDirectory] = useState(props.initialDirectory ?? (import.meta.env.VITE_DEFAULT_NEW_SESSION_DIRECTORY || '/home/user'))
++    const [sessionName, setSessionName] = useState('')
+     const [suppressSuggestions, setSuppressSuggestions] = useState(false)
+@@ -242,2 +243,3 @@
+         preserveRestoredDraftRef.current = true
++        setSessionName(draft.sessionName ?? '')
+         setAgent(draft.agent)
+@@ -1393,2 +1395,3 @@
+         saveNewSessionFormDraft({
++            sessionName,
+             agent,
+@@ -1415,2 +1418,3 @@
+         props.onChooseFolder,
++        sessionName,
+         agent,
+@@ -1658,2 +1662,9 @@
+             if (result.type === 'success') {
++                if (sessionName.trim()) {
++                    try {
++                        await props.api.renameSession(result.sessionId, sessionName.trim())
++                    } catch {
++                        addToast({ title: 'Chat created', body: 'Could not set its name. You can rename it from the chat menu.', sessionId: result.sessionId, url: `/sessions/${result.sessionId}` })
++                    }
++                }
+                 haptic.notification('success')
+@@ -1732,9 +1743,6 @@
+         <div className="flex flex-col divide-y divide-[var(--app-divider)] [&>div]:pr-[10px] lg:[&>div]:pr-3">
+-            <MachineSelector
+-                machines={props.machines}
+-                machineId={machineId}
+-                isLoading={props.isLoading}
+-                isDisabled={isFormDisabled}
+-                onChange={handleMachineChange}
+-            />
++            <div className="flex flex-col gap-1.5 px-3 py-3">
++                <label htmlFor="new-session-name" className="text-xs font-medium text-[var(--app-hint)]">Name (optional)</label>
++                <input id="new-session-name" value={sessionName} onChange={event => setSessionName(event.target.value)} maxLength={255} disabled={isFormDisabled} className="rounded-lg border border-[var(--app-divider)] bg-[var(--app-bg)] px-3 py-2 text-sm text-[var(--app-text)]" />
++            </div>
+             {runnerSpawnError ? (
+@@ -1744,26 +1752,2 @@
+             ) : null}
+-            <DirectorySection
+-                directory={directory}
+-                suggestions={suggestions}
+-                selectedIndex={selectedIndex}
+-                isDisabled={isFormDisabled}
+-                recentPaths={recentPaths}
+-                statusMessage={directoryStatusMessage}
+-                statusTone={directoryStatusTone}
+-                onDirectoryChange={handleDirectoryChange}
+-                onDirectoryFocus={handleDirectoryFocus}
+-                onDirectoryBlur={handleDirectoryBlur}
+-                onDirectoryKeyDown={handleDirectoryKeyDown}
+-                onSuggestionSelect={handleSuggestionSelect}
+-                onPathClick={handlePathClick}
+-                onChooseFolder={props.onChooseFolder ? handleChooseFolderClick : undefined}
+-            />
+-            <SessionTypeSelector
+-                sessionType={sessionType}
+-                worktreeName={worktreeName}
+-                worktreeInputRef={worktreeInputRef}
+-                isDisabled={isFormDisabled}
+-                onSessionTypeChange={setSessionType}
+-                onWorktreeNameChange={setWorktreeName}
+-            />
+             <AgentSelector
+@@ -1820,2 +1804,4 @@
+             ) : null}
++            <div className="grid grid-cols-2 items-start">
++                <div className="min-w-0">
+             {agent === 'dsh' ? null : agent === 'agy' ? (
+@@ -1928,2 +1914,4 @@
+             )}
++                </div>
++                <div className="min-w-0">
+             {showPiLaunchConfig ? (
+@@ -1943,2 +1931,37 @@
+             ) : null}
++                </div>
++            </div>
++            <details className="group">
++                <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-3 text-sm font-medium text-[var(--app-text)]">More <span aria-hidden="true" className="transition-transform group-open:rotate-180">⌄</span></summary>
++            <MachineSelector
++                machines={props.machines}
++                machineId={machineId}
++                isLoading={props.isLoading}
++                isDisabled={isFormDisabled}
++                onChange={handleMachineChange}
++            />
++            <DirectorySection
++                directory={directory}
++                suggestions={suggestions}
++                selectedIndex={selectedIndex}
++                isDisabled={isFormDisabled}
++                recentPaths={recentPaths}
++                statusMessage={directoryStatusMessage}
++                statusTone={directoryStatusTone}
++                onDirectoryChange={handleDirectoryChange}
++                onDirectoryFocus={handleDirectoryFocus}
++                onDirectoryBlur={handleDirectoryBlur}
++                onDirectoryKeyDown={handleDirectoryKeyDown}
++                onSuggestionSelect={handleSuggestionSelect}
++                onPathClick={handlePathClick}
++                onChooseFolder={props.onChooseFolder ? handleChooseFolderClick : undefined}
++            />
++            <SessionTypeSelector
++                sessionType={sessionType}
++                worktreeName={worktreeName}
++                worktreeInputRef={worktreeInputRef}
++                isDisabled={isFormDisabled}
++                onSessionTypeChange={setSessionType}
++                onWorktreeNameChange={setWorktreeName}
++            />
+             <PermissionField
+@@ -1977,2 +2000,4 @@
+
++            </details>
++
+             {(error ?? spawnError) ? (
+--- a/web/src/components/NewSession/index.test.tsx
++++ b/web/src/components/NewSession/index.test.tsx
+@@ -356,2 +356,28 @@
+
++    it('names the new chat and keeps advanced options under More', async () => {
++        const renameSession = vi.fn().mockResolvedValue(undefined)
++        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'named-chat' })
++        render(<NewSession api={{ renameSession } as unknown as ApiClient} machines={[machine]} onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        fireEvent.change(screen.getByLabelText('Name (optional)'), { target: { value: '  Research  ' } })
++        const more = screen.getByText('More').closest('details')!
++        expect(more).not.toHaveAttribute('open')
++        expect(more).toContainElement(screen.getByTestId('permission-mode'))
++        await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions'))
++        fireEvent.click(screen.getByTestId('create'))
++        await waitFor(() => expect(renameSession).toHaveBeenCalledWith('named-chat', 'Research'))
++        expect(mocks.onSuccess).toHaveBeenCalledWith('named-chat')
++    })
++
++    it('opens the already created chat and warns if naming fails', async () => {
++        const renameSession = vi.fn().mockRejectedValue(new Error('unavailable'))
++        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'created-chat' })
++        render(<NewSession api={{ renameSession } as unknown as ApiClient} machines={[machine]} onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        fireEvent.change(screen.getByLabelText('Name (optional)'), { target: { value: 'Work' } })
++        await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions'))
++        fireEvent.click(screen.getByTestId('create'))
++        await waitFor(() => expect(mocks.onSuccess).toHaveBeenCalledWith('created-chat'))
++        expect(mocks.spawnSession).toHaveBeenCalledTimes(1)
++        expect(mocks.addToast).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Could not set its name') }))
++    })
++
+     it('hides unavailable Agents and falls back to the first available Agent', async () => {
+--- a/web/src/components/NewSession/newSessionFormDraft.ts
++++ b/web/src/components/NewSession/newSessionFormDraft.ts
+@@ -17,2 +17,3 @@
+ export type NewSessionFormDraft = {
++    sessionName?: string
+     agent: AgentType
+@@ -60,2 +61,3 @@
+         return {
++            ...(typeof parsed.sessionName === 'string' ? { sessionName: parsed.sessionName } : {}),
+             agent: restoredAgent,
+--- a/web/src/components/NewSession/newSessionFormDraft.test.ts
++++ b/web/src/components/NewSession/newSessionFormDraft.test.ts
+@@ -10,2 +10,6 @@
+ describe('newSessionFormDraft', () => {
++    it('retains the chat name when returning from the folder picker', () => {
++        sessionStorage.setItem('hapi:new-session-form-draft', JSON.stringify({ agent: 'codex', model: 'auto', sessionName: 'Research' }))
++        expect(loadNewSessionFormDraft()).toMatchObject({ sessionName: 'Research' })
++    })
+     it('drops Safe Yolo from a saved Codex draft without dropping other settings', () => {
