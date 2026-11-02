@@ -1,0 +1,114 @@
+--- a/web/src/components/NewSession/index.tsx
++++ b/web/src/components/NewSession/index.tsx
+@@ -103,3 +103,3 @@
+     const [machineId, setMachineId] = useState<string | null>(props.initialMachineId ?? null)
+-    const [directory, setDirectory] = useState(props.initialDirectory ?? '/home/user')
++    const [directory, setDirectory] = useState(props.initialDirectory ?? (import.meta.env.VITE_DEFAULT_NEW_SESSION_DIRECTORY || '/home/user'))
+     const [suppressSuggestions, setSuppressSuggestions] = useState(false)
+@@ -865,11 +865,12 @@
+
+-        const preferred = resolvePreferredLaunchSettings(
+-            agent,
+-            agent === 'claude' && props.initialDirectory === undefined
+-                ? { model: 'claude-opus-5-5', cursorSelectedBase: 'auto', effort: 'low', modelReasoningEffort: 'default', permissionMode: 'bypassPermissions' }
+-                : loadPreferredLaunchSettings(machineId, agent),
+-            legacyYoloAgent === agent
++        const requestedDefault = agent === 'claude'
++            ? { model: 'claude-opus-5-5', cursorSelectedBase: 'auto', effort: 'medium', modelReasoningEffort: 'default', permissionMode: 'bypassPermissions' as const }
++            : agent === 'codex'
++                ? { model: 'gpt-6.1-terra', cursorSelectedBase: 'auto', effort: 'auto', modelReasoningEffort: 'medium', permissionMode: 'yolo' as const }
++                : null
++        const preferred = requestedDefault ?? resolvePreferredLaunchSettings(
++            agent, loadPreferredLaunchSettings(machineId, agent), legacyYoloAgent === agent
+         )
+
+-        setModel(agent === 'claude' && props.initialDirectory === undefined ? 'claude-opus-5-5' : agent === 'opencode' ? 'auto' : preferred.model)
++        setModel(agent === 'opencode' ? 'auto' : preferred.model)
+         setCursorSelectedBase(preferred.cursorSelectedBase)
+--- a/web/src/components/NewSession/index.test.tsx
++++ b/web/src/components/NewSession/index.test.tsx
+@@ -95,2 +95,8 @@
+             {
++                id: 'gpt-6.1-terra',
++                displayName: 'GPT-6.1 Terra',
++                isDefault: false,
++                supportedReasoningEfforts: ['low', 'medium', 'high']
++            },
++            {
+                 id: 'gpt-5.6-sol',
+@@ -283,2 +289,3 @@
+     beforeEach(() => {
++        vi.stubEnv('VITE_DEFAULT_NEW_SESSION_DIRECTORY', '/home/example')
+         localStorage.clear()
+@@ -327,3 +334,22 @@
+         expect(screen.getByTestId('model')).toHaveTextContent('claude-opus-5-5')
+-        expect(screen.getByTestId('launch-effort')).toHaveTextContent('low')
++        expect(screen.getByTestId('launch-effort')).toHaveTextContent('medium')
++    })
++
++    it.each([
++        ['claude', 'claude-opus-5-5', 'medium', undefined, 'bypassPermissions'],
++        ['codex', 'gpt-6.1-terra', undefined, 'medium', 'yolo'],
++    ])('sends the requested %s defaults and home directory when creating a chat', async (provider, model, effort, reasoning, permission) => {
++        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'new-chat' })
++        render(<NewSession api={api} machines={[machine]} onSuccess={mocks.onSuccess} onCancel={() => {}} />)
++        await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions'))
++        if (provider === 'codex') {
++            fireEvent.click(screen.getByDisplayValue('codex'))
++            await waitFor(() => expect(screen.getByTestId('model')).toHaveTextContent('gpt-6.1-terra'))
++            await waitFor(() => expect(screen.getByTestId('permission-mode')).toHaveTextContent('yolo'))
++        }
++        fireEvent.click(screen.getByTestId('create'))
++        await waitFor(() => expect(mocks.spawnSession).toHaveBeenCalledWith(expect.objectContaining({
++            agent: provider, directory: '/home/example', model, effort,
++            modelReasoningEffort: reasoning, permissionMode: permission,
++        })))
+     })
+@@ -389,3 +415,3 @@
+
+-    it('restores the last successful model and reasoning effort for the machine and agent', async () => {
++    it('uses the requested Codex defaults despite older saved settings', async () => {
+         savePreferredLaunchSettings('machine-1', 'codex', {
+@@ -410,5 +436,5 @@
+         await waitFor(() => {
+-            expect(screen.getByTestId('model')).toHaveTextContent('gpt-5.6-sol')
+-            expect(screen.getByTestId('reasoning')).toHaveTextContent('xhigh')
+-            expect(screen.getByTestId('permission-mode')).toHaveTextContent('default')
++            expect(screen.getByTestId('model')).toHaveTextContent('gpt-6.1-terra')
++            expect(screen.getByTestId('reasoning')).toHaveTextContent('medium')
++            expect(screen.getByTestId('permission-mode')).toHaveTextContent('yolo')
+         })
+@@ -416,3 +442,3 @@
+
+-    it('does not migrate a legacy YOLO value owned by a non-Codex agent', async () => {
++    it('uses the Codex YOLO default after switching from Claude', async () => {
+         savePreferredAgent('claude')
+@@ -434,3 +460,3 @@
+         await waitFor(() => {
+-            expect(screen.getByTestId('permission-mode')).toHaveTextContent('default')
++            expect(screen.getByTestId('permission-mode')).toHaveTextContent('yolo')
+         })
+@@ -689,3 +715,3 @@
+
+-    it('does not carry a permission mode picked under another flavor into the Claude spawn payload', async () => {
++    it('uses Claude bypass mode when switching from Codex', async () => {
+         savePreferredAgent('codex')
+@@ -706,3 +732,3 @@
+             agent: 'claude',
+-            permissionMode: 'default'
++            permissionMode: 'bypassPermissions'
+         }))
+@@ -721,7 +747,3 @@
+
+-    it('does not preselect bypassPermissions for Claude from a legacy YOLO value owned by another flavor', async () => {
+-        // hapi:newSession:yolo is a flavor-agnostic global key. The legacyYoloAgent
+-        // snapshot (captured once at mount, see index.tsx) is what stops a YOLO
+-        // toggle left on under cursor from silently preselecting bypassPermissions
+-        // the next time Claude is picked.
++    it('uses the Claude bypass default after switching from another provider', async () => {
+         savePreferredAgent('cursor')
+@@ -735,3 +757,3 @@
+         await waitFor(() => {
+-            expect(screen.getByTestId('permission-mode')).toHaveTextContent('default')
++            expect(screen.getByTestId('permission-mode')).toHaveTextContent('bypassPermissions')
+         })

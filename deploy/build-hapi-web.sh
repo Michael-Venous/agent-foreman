@@ -8,6 +8,7 @@ PATCHES=(hapi-mobile-models.patch hapi-sidebar-chats.patch hapi-chat-folders.pat
 PATCHES+=(hapi-history-replay-performance.patch)
 PATCHES+=(hapi-orphan-node-removal.patch)
 PATCHES+=(hapi-closed-chat-archive.patch)
+PATCHES+=(hapi-provider-new-chat-defaults.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi
@@ -31,6 +32,7 @@ done
 # User requested selecting Desktop Midnight once per browser; later choices persist.
 (cd hub && "$BUN" test src/sync/archiveInactive.test.ts)
 export VITE_DESKTOP_THEME_SELECTION="${VITE_DESKTOP_THEME_SELECTION-desktop-midnight-v1}"
+export VITE_DEFAULT_NEW_SESSION_DIRECTORY="${VITE_DEFAULT_NEW_SESSION_DIRECTORY:-$HOME}"
 # Deployment identity stays in ignored local state, never in public source.
 if [[ -z "${VITE_MANAGER_SESSION_ID:-}" && -f "$ROOT/state/local-config.json" ]]; then
     VITE_MANAGER_SESSION_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("manager_session_id", ""))' "$ROOT/state/local-config.json")
