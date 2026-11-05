@@ -1,0 +1,386 @@
+diff --git a/hub/src/sse/sseManager.test.ts b/hub/src/sse/sseManager.test.ts
+--- a/hub/src/sse/sseManager.test.ts
++++ b/hub/src/sse/sseManager.test.ts
+@@ -377,6 +377,16 @@
+ describe('SSEManager stalled connections', () => {
+     const neverSettles = () => new Promise<void>(() => {})
+ 
++    it('bounds an unsettled event burst even before the stall timer elapses', () => {
++        const manager = new SSEManager(0, new VisibilityTracker(), () => 0)
++        let closed = 0, delivered = 0
++        manager.subscribe({ id: 'stalled', namespace: 'alpha', all: true, send: () => { delivered++; return neverSettles() }, sendHeartbeat: () => {}, close: () => { closed++ } })
++        for (let i = 0; i < 9000; i++) manager.broadcast({ type: 'session-updated', sessionId: `s${i}`, namespace: 'alpha' })
++        expect(closed).toBe(1)
++        expect(delivered).toBe(8000)
++        expect(manager.hasSubscription('stalled')).toBe(false)
++    })
++
+     it('drops a connection with a backlog and no progress past the stall window', async () => {
+         let clock = 1_000_000
+         const manager = new SSEManager(0, new VisibilityTracker(), () => clock)
+diff --git a/hub/src/sse/sseManager.ts b/hub/src/sse/sseManager.ts
+--- a/hub/src/sse/sseManager.ts
++++ b/hub/src/sse/sseManager.ts
+@@ -56,6 +56,9 @@
+  * Healthy clients briefly exceed the soft limits during synchronous bursts.
+  */
+ const CONNECTION_SOFT_IN_FLIGHT_EVENTS = 2000
++// Bound synchronous replay bursts too: a stalled client can accumulate tens
++// of thousands of promises before the time-based stall window has elapsed.
++const CONNECTION_HARD_IN_FLIGHT_EVENTS = 8000
+ const CONNECTION_SOFT_IN_FLIGHT_BYTES = 8 * 1024 * 1024
+ const CONNECTION_HARD_IN_FLIGHT_BYTES = 256 * 1024 * 1024
+ const CONNECTION_STALL_MS = 15_000
+@@ -258,6 +261,7 @@
+ 
+     private isStalled(connection: SSEConnection, nextBytes: number): boolean {
+         const bytes = connection.inFlightBytes + nextBytes
++        if (connection.inFlight + (connection.pending?.length ?? 0) >= CONNECTION_HARD_IN_FLIGHT_EVENTS) return true
+         if (bytes > CONNECTION_HARD_IN_FLIGHT_BYTES) {
+             return true
+         }
+diff --git a/web/src/api/client.test.ts b/web/src/api/client.test.ts
+--- a/web/src/api/client.test.ts
++++ b/web/src/api/client.test.ts
+@@ -1,6 +1,21 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { ApiClient, ApiError } from './client'
+ 
++it('times out a stalled upload instead of leaving it pending indefinitely', async () => {
++    vi.useFakeTimers()
++    const original = globalThis.fetch
++    globalThis.fetch = vi.fn((_url, init) => new Promise((_resolve, reject) => {
++        const signal = (init as RequestInit).signal!
++        signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
++    })) as typeof fetch
++    try {
++        const pending = new ApiClient('token').uploadFile('s', 'image.png', 'YQ==', 'image/png')
++        const rejection = expect(pending).rejects.toThrow('Aborted')
++        await vi.advanceTimersByTimeAsync(75_000)
++        await rejection
++    } finally { globalThis.fetch = original; vi.useRealTimers() }
++})
++
+ describe('ApiClient error mapping', () => {
+     let originalFetch: typeof globalThis.fetch
+     let fetchMock: ReturnType<typeof vi.fn>
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -539,10 +539,14 @@
+     }
+ 
+     async uploadFile(sessionId: string, filename: string, content: string, mimeType: string): Promise<UploadFileResponse> {
+-        return await this.request<UploadFileResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload`, {
+-            method: 'POST',
+-            body: JSON.stringify({ filename, content, mimeType })
+-        })
++        const controller = new AbortController()
++        const timer = setTimeout(() => controller.abort(), 75_000)
++        try {
++            return await this.request<UploadFileResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload`, {
++                method: 'POST', signal: controller.signal,
++                body: JSON.stringify({ filename, content, mimeType })
++            })
++        } finally { clearTimeout(timer) }
+     }
+ 
+     async deleteUploadFile(sessionId: string, path: string): Promise<DeleteUploadResponse> {
+diff --git a/web/src/components/AssistantChat/AttachmentItem.test.tsx b/web/src/components/AssistantChat/AttachmentItem.test.tsx
+--- a/web/src/components/AssistantChat/AttachmentItem.test.tsx
++++ b/web/src/components/AssistantChat/AttachmentItem.test.tsx
+@@ -49,6 +49,13 @@
+ }
+ 
+ describe('AttachmentItem', () => {
++    it('keeps the preview visible and indicates failure if upload fails', () => {
++        mocks.attachment = { name: 'failed.png', status: { type: 'incomplete', reason: 'error' }, previewUrl: 'data:image/png;base64,cGhvdG8=' }
++        renderAttachment()
++        expect(screen.getByRole('img', { name: 'failed.png' })).toBeInTheDocument()
++        expect(screen.getByText('Upload failed')).toBeInTheDocument()
++        expect(screen.getByRole('button', { name: 'Remove attachment' })).toBeInTheDocument()
++    })
+     it('renders an image preview with its filename and an always-visible remove button', () => {
+         mocks.attachment = {
+             name: 'photo.png',
+@@ -125,7 +132,7 @@
+         }
+     })
+ 
+-    it('keeps upload errors in the existing error layout', () => {
++    it('shows an upload error over the retained local image', () => {
+         mocks.attachment = {
+             name: 'broken.png',
+             status: { type: 'incomplete', reason: 'error' },
+@@ -134,8 +141,7 @@
+ 
+         renderAttachment()
+ 
+-        expect(screen.queryByRole('img')).not.toBeInTheDocument()
++        expect(screen.getByRole('img', { name: 'broken.png' })).toBeInTheDocument()
+         expect(screen.getByText('Upload failed')).toBeInTheDocument()
+-        expect(screen.getByText('broken.png')).toHaveClass('line-through')
+     })
+ })
+diff --git a/web/src/components/AssistantChat/AttachmentItem.tsx b/web/src/components/AssistantChat/AttachmentItem.tsx
+--- a/web/src/components/AssistantChat/AttachmentItem.tsx
++++ b/web/src/components/AssistantChat/AttachmentItem.tsx
+@@ -109,7 +109,7 @@
+         }
+         : undefined
+ 
+-    if (previewUrl && !isError) {
++    if (previewUrl) {
+         return (
+             <AttachmentPrimitive.Root
+                 className="group relative h-16 w-24 overflow-hidden rounded-lg bg-[var(--app-subtle-bg)]"
+@@ -140,6 +140,7 @@
+                         <Spinner size="sm" label={null} className="text-white" />
+                     </div>
+                 ) : null}
++                {isError ? <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-red-900/90 px-1 py-0.5 text-center text-[10px] text-white">Upload failed</div> : null}
+                 {!isParking ? (
+                     <AttachmentPrimitive.Remove
+                         className="hapi-composer-attachment-control absolute right-1 top-1 z-20 flex h-8 w-8 items-start justify-end rounded-md bg-transparent text-white transition-colors hover:bg-black/15 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white"
+diff --git a/web/src/components/SessionChat.tsx b/web/src/components/SessionChat.tsx
+--- a/web/src/components/SessionChat.tsx
++++ b/web/src/components/SessionChat.tsx
+@@ -1831,19 +1831,22 @@
+         }
+     }, [agentFlavor, onSendForComposer, props.session.thinking, nativeReady, scratchlistMode, updatePendingSchedule])
+ 
++    // Keep the adapter (and its in-flight uploads) stable while an inactive
++    // session resumes and while the router refreshes callback identities.
++    const uploadStateRef = useRef({ active: props.session.active, resolve: props.resolveSessionIdForUpload, onResolved: props.onUploadSessionResolved })
++    const uploadGenerationRef = useRef(0)
++    if (uploadStateRef.current.active && !props.session.active) uploadGenerationRef.current += 1
++    uploadStateRef.current = { active: props.session.active, resolve: props.resolveSessionIdForUpload, onResolved: props.onUploadSessionResolved }
++    const canAttach = props.session.active || Boolean(inactiveCanResume && props.resolveSessionIdForUpload)
++    const useScratchlistAdapter = props.session.active && scratchlistMode
+     const attachmentAdapter = useMemo(() => {
+-        if (props.session.active && scratchlistMode) {
++        if (useScratchlistAdapter) {
+             const adapter = createScratchlistAttachmentAdapter(props.api, props.session.id)
+             scratchlistAdapterRef.current = adapter
+             return adapter
+         }
+         scratchlistAdapterRef.current = null
+-        if (props.session.active) {
+-            return createAttachmentAdapter(props.api, props.session.id)
+-        }
+-        // Only offer attachments on inactive sessions that can actually resume;
+-        // otherwise file picks become stuck error attachments that cannot send.
+-        if (!inactiveCanResume || !props.resolveSessionIdForUpload) {
++        if (!canAttach) {
+             return undefined
+         }
+         // Keep one resume promise for every generator created by this adapter
+@@ -1851,8 +1854,13 @@
+         // the router cache, so a second file must reuse this closure's promise
+         // instead of starting a fresh resume against the retired source id.
+         let uploadResolution: Promise<string> | undefined
++        let uploadGeneration = uploadGenerationRef.current
+         const resolveUploadSession = () => {
+-            uploadResolution ??= props.resolveSessionIdForUpload!(props.session.id).catch((error) => {
++            if (uploadStateRef.current.active) return Promise.resolve(props.session.id)
++            const resolve = uploadStateRef.current.resolve
++            if (!resolve) return Promise.reject(new Error('Chat cannot be resumed'))
++            if (uploadGeneration !== uploadGenerationRef.current) { uploadResolution = undefined; uploadGeneration = uploadGenerationRef.current }
++            uploadResolution ??= resolve(props.session.id).catch((error) => {
+                 uploadResolution = undefined
+                 throw error
+             })
+@@ -1872,12 +1880,13 @@
+                     resolvedSessionId,
+                     pending,
+                     async (targetSessionId) => {
+-                        props.onUploadSessionResolved?.(targetSessionId)
++                        uploadStateRef.current.onResolved?.(targetSessionId)
+                     },
+                 )
+             },
++            () => uploadStateRef.current.active,
+         )
+-    }, [props.api, props.session.id, props.session.active, props.resolveSessionIdForUpload, scratchlistMode, inactiveCanResume])
++    }, [props.api, props.session.id, canAttach, useScratchlistAdapter])
+ 
+ 
+     const runtime = useHappyRuntime({
+diff --git a/web/src/components/ToolCard/views/_results.test.tsx b/web/src/components/ToolCard/views/_results.test.tsx
+--- a/web/src/components/ToolCard/views/_results.test.tsx
++++ b/web/src/components/ToolCard/views/_results.test.tsx
+@@ -3,6 +3,7 @@
+ import type { ToolCallBlock } from '@/chat/types'
+ import { extractCodexBashDisplay, extractTextFromResult, getMutationResultRenderMode, getToolResultViewComponent, parseNumberedFileLines } from '@/components/ToolCard/views/_results'
+ import { I18nProvider } from '@/lib/i18n-context'
++import { HappyChatProvider } from '@/components/AssistantChat/context'
+ 
+ vi.mock('@/components/MarkdownRenderer', () => ({
+     MarkdownRenderer: (props: { content: string; className?: string }) => (
+@@ -21,6 +22,16 @@
+     )
+ }))
+ 
++it('previews the current image file for a successful image read with no textual output', async () => {
++    const ResultView = getToolResultViewComponent('Read')!
++    const readSessionFile = vi.fn().mockResolvedValue({ success: true, content: 'aW1hZ2U=' })
++    const block = { id: 'read-image', localId: null, createdAt: 0, kind: 'tool-call', children: [], tool: { id: 'read-image', name: 'Read', state: 'completed', input: { file_path: '/tmp/render.jpg' }, result: {}, createdAt: 0, startedAt: null, completedAt: 0, execStartedAt: null, execCompletedAt: null, description: null } } as ToolCallBlock
++    render(<I18nProvider><HappyChatProvider value={{ api: { readSessionFile }, sessionId: 'test' } as never}><ResultView block={block} metadata={null} surface="dialog" /></HappyChatProvider></I18nProvider>)
++    expect(await screen.findByRole('img', { name: 'render.jpg' })).toHaveAttribute('src', 'data:image/jpeg;base64,aW1hZ2U=')
++    expect(readSessionFile).toHaveBeenCalledWith('test', '/tmp/render.jpg')
++    expect(screen.getByText('Current file')).toBeInTheDocument()
++})
++
+ describe('extractTextFromResult', () => {
+     it('returns string directly', () => {
+         expect(extractTextFromResult('hello')).toBe('hello')
+diff --git a/web/src/components/ToolCard/views/_results.tsx b/web/src/components/ToolCard/views/_results.tsx
+--- a/web/src/components/ToolCard/views/_results.tsx
++++ b/web/src/components/ToolCard/views/_results.tsx
+@@ -1,5 +1,8 @@
+ import type { ToolViewComponent, ToolViewProps } from '@/components/ToolCard/views/_all'
+ import type { ReactNode } from 'react'
++import { useEffect, useState } from 'react'
++import { useOptionalHappyChatContext } from '@/components/AssistantChat/context'
++import { ImagePreview } from '@/components/ImagePreview'
+ import { isObject, safeStringify } from '@hapi/protocol'
+ import { CodeBlock } from '@/components/CodeBlock'
+ import { MarkdownRenderer } from '@/components/MarkdownRenderer'
+@@ -640,8 +643,35 @@
+     )
+ }
+ 
++function ReadImagePreview({ path, mimeType }: { path: string; mimeType: string }) {
++    const ctx = useOptionalHappyChatContext()
++    const [state, setState] = useState<{ path: string; src?: string; error?: string }>({ path })
++    useEffect(() => {
++        let disposed = false
++        setState({ path })
++        if (!ctx?.api || !ctx.sessionId) return
++        void ctx.api.readSessionFile(ctx.sessionId, path).then(result => {
++            if (disposed) return
++            if (!result.success || !result.content) setState({ path, error: result.error || 'File is unavailable' })
++            else setState({ path, src: `data:${mimeType};base64,${result.content}` })
++        }).catch(() => { if (!disposed) setState({ path, error: 'File is unavailable' }) })
++        return () => { disposed = true }
++    }, [ctx?.api, ctx?.sessionId, path, mimeType])
++    if (!ctx) return <ResultStatusPill text="Image preview unavailable" />
++    if (state.path !== path || (!state.src && !state.error)) return <ResultStatusPill text="Loading image…" />
++    if (state.error) return <ResultStatusPill text={state.error} />
++    return <div className="space-y-1"><div className="text-xs text-[var(--app-hint)]">Current file</div><ImagePreview src={state.src!} fileName={basename(path)} label={basename(path)} buttonClassName="block max-w-full cursor-zoom-in rounded-lg" imageClassName="max-h-80 max-w-full rounded-lg object-contain" /></div>
++}
++
+ const ReadResultView: ToolViewComponent = (props: ToolViewProps) => {
+     const result = props.block.tool.result
++    const path = extractReadPathFromInput(props.block.tool.input)
++    const ext = path?.split('.').pop()?.toLowerCase()
++    const mime = ext && ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' } as Record<string, string>)[ext]
++    if (props.block.tool.state === 'completed' && path && mime && !extractTextFromResult(result)) {
++        if (props.surface === 'inline') return <ResultStatusPill text="Image — open details to preview" />
++        return <ReadImagePreview path={path} mimeType={mime} />
++    }
+ 
+     if (result === undefined || result === null) {
+         return <ResultStatusPill text={placeholderForState(props.block.tool.state)} />
+diff --git a/web/src/lib/attachmentAdapter.test.ts b/web/src/lib/attachmentAdapter.test.ts
+--- a/web/src/lib/attachmentAdapter.test.ts
++++ b/web/src/lib/attachmentAdapter.test.ts
+@@ -26,6 +26,31 @@
+         vi.unstubAllGlobals()
+     })
+ 
++    it('reuses a same-session upload after the chat becomes active without restarting it', async () => {
++        const drafts = await import('./composer-attachment-drafts')
++        const { createAttachmentAdapter } = await import('./attachmentAdapter')
++        const file = new File(['image'], 'ready.png', { type: 'image/png' })
++        drafts.saveDraftAttachments('session-1', [{ id: 'ready', file, path: '/uploads/ready.png', uploadSessionId: 'session-1' }])
++        const [restored] = await drafts.getDraftAttachments('session-1')
++        const uploadFile = vi.fn(), resume = vi.fn()
++        const adapter = createAttachmentAdapter({ uploadFile } as never, 'session-1', resume, undefined, () => true)
++        const emitted = []
++        for await (const item of adapter.add({ file: restored }) as AsyncIterable<Record<string, unknown>>) emitted.push(item)
++        expect(emitted).toHaveLength(1)
++        expect(emitted[0].path).toBe('/uploads/ready.png')
++        expect(uploadFile).not.toHaveBeenCalled()
++        expect(resume).not.toHaveBeenCalled()
++    })
++
++    it('retains the local image preview when upload or resume fails', async () => {
++        const { createAttachmentAdapter } = await import('./attachmentAdapter')
++        const file = new File(['image'], 'proof.png', { type: 'image/png' })
++        const adapter = createAttachmentAdapter({ uploadFile: vi.fn().mockRejectedValue(new Error('offline')) } as never, 'session-1')
++        const emitted = []
++        for await (const item of adapter.add({ file }) as AsyncIterable<Record<string, unknown>>) emitted.push(item)
++        expect(emitted.at(-1)).toMatchObject({ status: { type: 'incomplete' }, previewUrl: 'data:image/png;base64,aW1hZ2U=' })
++    })
++
+     it('uses the assistant-ui wildcard sentinel so all files reach the adapter', async () => {
+         const { createAttachmentAdapter } = await import('./attachmentAdapter')
+         const adapter = createAttachmentAdapter({} as never, 'session-1')
+diff --git a/web/src/lib/attachmentAdapter.ts b/web/src/lib/attachmentAdapter.ts
+--- a/web/src/lib/attachmentAdapter.ts
++++ b/web/src/lib/attachmentAdapter.ts
+@@ -24,6 +24,7 @@
+     // the pick is cancelled — so the caller can navigate off a deleted source.
+     // Cancellation is re-checked at transfer save time via isCancelled().
+     onSessionResolved?: (sessionId: string, pending: AttachmentDraftHandoff) => Promise<void>,
++    canReuseRestored?: () => boolean,
+ ): AttachmentAdapter {
+     const cancelledAttachmentIds = new Set<string>()
+ 
+@@ -50,7 +51,7 @@
+             // metadata still supplies a stable id so draft merge cannot
+             // duplicate the same File across persistence passes.
+             const restored = getRestoredUploadMetadata(file)
+-            if (!resolveSessionId && restored?.path) {
++            if ((!resolveSessionId || canReuseRestored?.()) && restored?.path && (!restored.uploadSessionId || restored.uploadSessionId === sessionId)) {
+                 yield {
+                     id: restored.id,
+                     type: 'file',
+@@ -67,9 +68,9 @@
+ 
+             const id = restored?.id ?? randomId()
+             const contentType = file.type || 'application/octet-stream'
++            let previewUrl: string | undefined
+ 
+             try {
+-                let previewUrl: string | undefined
+                 if (isImageMimeType(contentType) && file.size <= MAX_PREVIEW_BYTES) {
+                     try {
+                         previewUrl = await fileToDataUrl(file)
+@@ -99,8 +100,9 @@
+                         name: file.name,
+                         contentType,
+                         file,
+-                        status: { type: 'incomplete', reason: 'error' }
+-                    }
++                        status: { type: 'incomplete', reason: 'error' },
++                        previewUrl,
++                    } as PendingUploadAttachment
+                     return
+                 }
+ 
+@@ -154,8 +156,9 @@
+                         name: file.name,
+                         contentType,
+                         file,
+-                        status: { type: 'incomplete', reason: 'error' }
+-                    }
++                        status: { type: 'incomplete', reason: 'error' },
++                        previewUrl,
++                    } as PendingUploadAttachment
+                     return
+                 }
+ 
+@@ -178,8 +181,9 @@
+                     name: file.name,
+                     contentType,
+                     file,
+-                    status: { type: 'incomplete', reason: 'error' }
+-                }
++                    status: { type: 'incomplete', reason: 'error' },
++                    previewUrl,
++                } as PendingUploadAttachment
+             }
+         },
+ 

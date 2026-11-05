@@ -1,0 +1,101 @@
+--- a/hub/src/sse/sseManager.ts
++++ b/hub/src/sse/sseManager.ts
+@@ -59,6 +59,13 @@
+ const CONNECTION_SOFT_IN_FLIGHT_BYTES = 8 * 1024 * 1024
+ const CONNECTION_HARD_IN_FLIGHT_BYTES = 256 * 1024 * 1024
+ const CONNECTION_STALL_MS = 15_000
++/**
++ * Any unsettled write older than this marks a dead connection regardless of
++ * backlog size. Proxied disconnects (Tailscale serve) are not always surfaced
++ * to the stream, so without this, zombie subscriptions pile up during a client
++ * reconnect storm and multiply every broadcast. Heartbeats re-check it.
++ */
++const CONNECTION_DEAD_MS = 45_000
+ const HEARTBEAT_BYTES = 128
+ 
+ export class SSEManager {
+@@ -257,7 +264,11 @@
+         const backlog = connection.inFlight >= CONNECTION_SOFT_IN_FLIGHT_EVENTS
+             || bytes > CONNECTION_SOFT_IN_FLIGHT_BYTES
+             || (connection.pending?.length ?? 0) >= CONNECTION_SOFT_IN_FLIGHT_EVENTS
+-        return backlog && this.now() - connection.lastProgressAt > CONNECTION_STALL_MS
++        const idleFor = this.now() - connection.lastProgressAt
++        if (connection.inFlight > 0 && idleFor > CONNECTION_DEAD_MS) {
++            return true
++        }
++        return backlog && idleFor > CONNECTION_STALL_MS
+     }
+ 
+     private dropStalled(connection: SSEConnection): void {
+--- a/hub/src/sse/sseManager.test.ts
++++ b/hub/src/sse/sseManager.test.ts
+@@ -438,4 +438,22 @@
+         }
+         expect(manager.hasSubscription('slow')).toBe(true)
+     })
++
++    it('drops a connection whose small write stays unsettled past the dead window', () => {
++        let clock = 0
++        const manager = new SSEManager(0, new VisibilityTracker(), () => clock)
++        let closed = 0
++        manager.subscribe({
++            id: 'zombie', namespace: 'alpha', all: true,
++            send: neverSettles, sendHeartbeat: () => {}, close: () => { closed += 1 }
++        })
++        manager.broadcast({ type: 'session-updated', sessionId: 's1', namespace: 'alpha' })
++        clock += 30_000
++        manager.broadcast({ type: 'session-updated', sessionId: 's2', namespace: 'alpha' })
++        expect(manager.hasSubscription('zombie')).toBe(true)
++        clock += 20_000
++        manager.broadcast({ type: 'session-updated', sessionId: 's3', namespace: 'alpha' })
++        expect(manager.hasSubscription('zombie')).toBe(false)
++        expect(closed).toBe(1)
++    })
+ })
+--- a/web/src/hooks/useSSE.ts
++++ b/web/src/hooks/useSSE.ts
+@@ -101,6 +101,10 @@
+ // Retrying every 30s forever costs a full TLS handshake per attempt through
+ // the relay, so widen the ceiling once the fast retries have clearly failed.
+ const RECONNECT_SLOW_AFTER_ATTEMPTS = 8
++// Backoff resets only after a connection has stayed open this long. Resetting
++// on open let a connection that is torn down right after opening (e.g. an
++// HTTP/2 GOAWAY loop through the proxy) reconnect immediately forever.
++const RECONNECT_STABLE_RESET_MS = 30_000
+ const RECONNECT_SLOW_MAX_DELAY_MS = 300_000
+ const INVALIDATION_BATCH_MS = 16
+ 
+@@ -853,13 +857,22 @@
+             requestReconnect('connect-timeout', true)
+         }, CONNECT_TIMEOUT_MS)
+ 
++        let stableResetTimer: ReturnType<typeof setTimeout> | null = null
+         eventSource.onopen = () => {
+             clearTimeout(connectDeadlineTimer)
+             if (reconnectTimerRef.current) {
+                 clearTimeout(reconnectTimerRef.current)
+                 reconnectTimerRef.current = null
+             }
+-            reconnectAttemptRef.current = 0
++            if (stableResetTimer) {
++                clearTimeout(stableResetTimer)
++            }
++            stableResetTimer = setTimeout(() => {
++                stableResetTimer = null
++                if (eventSourceRef.current === eventSource && eventSource.readyState === EventSource.OPEN) {
++                    reconnectAttemptRef.current = 0
++                }
++            }, RECONNECT_STABLE_RESET_MS)
+             reconnectDeferredRef.current = false
+             disconnectNotified = false
+             lastActivityAtRef.current = Date.now()
+@@ -919,6 +932,9 @@
+         return () => {
+             clearInterval(watchdogTimer)
+             clearTimeout(connectDeadlineTimer)
++            if (stableResetTimer) {
++                clearTimeout(stableResetTimer)
++            }
+             document.removeEventListener('visibilitychange', onVisibilityChange)
+             if (invalidationTimerRef.current) {
+                 clearTimeout(invalidationTimerRef.current)

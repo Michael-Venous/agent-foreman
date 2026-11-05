@@ -1,0 +1,285 @@
+--- a/hub/src/sse/sseManager.ts
++++ b/hub/src/sse/sseManager.ts
+@@ -20,6 +20,17 @@
+      * their original order. `drainPending` flushes and clears it.
+      */
+     pending: Array<{ event: SyncEvent; eventId: string }> | null
++    /** Closes the underlying stream; the client reconnects and resyncs. */
++    close?: () => void
++    /**
++     * Writes handed to `send` that have not settled. A client that stops
++     * reading never settles them (the stream swallows write errors), so each
++     * one pins its payload until the connection is dropped.
++     */
++    inFlight: number
++    inFlightBytes: number
++    /** Last time a write settled, or the backlog was empty when one started. */
++    lastProgressAt: number
+ }
+ 
+ export type SSEResumeResult = {
+@@ -36,6 +47,19 @@
+  * cursors resync via REST like they always did.
+  */
+ const EVENT_BUFFER_MAX_BYTES = 2 * 1024 * 1024
++/**
++ * Per-connection backlog limits. A stalled client (backgrounded phone,
++ * sleeping laptop behind the Tailscale proxy) otherwise buffers every
++ * broadcast in hub memory; history replay during a resume pushes tens of GB.
++ * A connection over the soft limits that has made no progress for the stall
++ * window, or over the hard byte cap, is closed and the client resyncs via REST.
++ * Healthy clients briefly exceed the soft limits during synchronous bursts.
++ */
++const CONNECTION_SOFT_IN_FLIGHT_EVENTS = 2000
++const CONNECTION_SOFT_IN_FLIGHT_BYTES = 8 * 1024 * 1024
++const CONNECTION_HARD_IN_FLIGHT_BYTES = 256 * 1024 * 1024
++const CONNECTION_STALL_MS = 15_000
++const HEARTBEAT_BYTES = 128
+ 
+ export class SSEManager {
+     private readonly connections: Map<string, SSEConnection> = new Map()
+@@ -57,9 +81,12 @@
+     private eventBufferBytes = 0
+     private readonly namespaceTags = new Map<string, string>()
+ 
+-    constructor(heartbeatMs = 30_000, visibilityTracker: VisibilityTracker) {
++    private readonly now: () => number
++
++    constructor(heartbeatMs = 30_000, visibilityTracker: VisibilityTracker, now: () => number = Date.now) {
+         this.heartbeatMs = heartbeatMs
+         this.visibilityTracker = visibilityTracker
++        this.now = now
+     }
+ 
+     subscribe(options: {
+@@ -73,6 +100,7 @@
+         resumeFrom?: string | null
+         send: (event: SyncEvent, eventId?: string) => void | Promise<void>
+         sendHeartbeat: () => void | Promise<void>
++        close?: () => void
+     }): SSESubscription & SSEResumeResult {
+         const subscription: SSEConnection = {
+             id: options.id,
+@@ -82,7 +110,11 @@
+             machineId: options.machineId ?? null,
+             send: options.send,
+             sendHeartbeat: options.sendHeartbeat,
+-            pending: null
++            pending: null,
++            close: options.close,
++            inFlight: 0,
++            inFlightBytes: 0,
++            lastProgressAt: this.now()
+         }
+ 
+         const { resume, replay } = this.resolveResume(subscription, options.resumeFrom ?? null)
+@@ -131,6 +163,7 @@
+             for (const item of batch) {
+                 try {
+                     await connection.send(item.event, item.eventId)
++                    connection.lastProgressAt = this.now()
+                 } catch {
+                     this.unsubscribe(connection.id)
+                     return
+@@ -185,7 +218,66 @@
+         return { resume: 'ok', replay }
+     }
+ 
+-    private recordEvent(event: SyncEvent): number {
++    /**
++     * Hands one write to the connection while bounding its unsettled backlog.
++     * `send` is invoked synchronously so writes keep their broadcast order.
++     */
++    private deliver(connection: SSEConnection, bytes: number, send: () => void | Promise<void>): void {
++        if (this.isStalled(connection, bytes)) {
++            this.dropStalled(connection)
++            return
++        }
++        if (connection.inFlight === 0) {
++            connection.lastProgressAt = this.now()
++        }
++        connection.inFlight += 1
++        connection.inFlightBytes += bytes
++        const settle = () => {
++            connection.inFlight -= 1
++            connection.inFlightBytes -= bytes
++            connection.lastProgressAt = this.now()
++        }
++        let delivery: Promise<void>
++        try {
++            delivery = Promise.resolve(send())
++        } catch (error) {
++            delivery = Promise.reject(error)
++        }
++        delivery.then(settle, () => {
++            settle()
++            this.unsubscribe(connection.id)
++        })
++    }
++
++    private isStalled(connection: SSEConnection, nextBytes: number): boolean {
++        const bytes = connection.inFlightBytes + nextBytes
++        if (bytes > CONNECTION_HARD_IN_FLIGHT_BYTES) {
++            return true
++        }
++        const backlog = connection.inFlight >= CONNECTION_SOFT_IN_FLIGHT_EVENTS
++            || bytes > CONNECTION_SOFT_IN_FLIGHT_BYTES
++            || (connection.pending?.length ?? 0) >= CONNECTION_SOFT_IN_FLIGHT_EVENTS
++        return backlog && this.now() - connection.lastProgressAt > CONNECTION_STALL_MS
++    }
++
++    private dropStalled(connection: SSEConnection): void {
++        if (!this.connections.has(connection.id)) {
++            return
++        }
++        console.warn('[SSE] dropping stalled connection', {
++            id: connection.id,
++            inFlight: connection.inFlight,
++            inFlightBytes: connection.inFlightBytes,
++            pending: connection.pending?.length ?? 0
++        })
++        this.unsubscribe(connection.id)
++        try {
++            connection.close?.()
++        } catch {
++        }
++    }
++
++    private recordEvent(event: SyncEvent): { seq: number; bytes: number } {
+         const seq = this.nextSeq++
+         const bytes = JSON.stringify(event).length
+         this.eventBuffer.push({ seq, event, bytes })
+@@ -199,7 +291,7 @@
+                 this.eventBufferBytes -= evicted.bytes
+             }
+         }
+-        return seq
++        return { seq, bytes }
+     }
+ 
+     unsubscribe(id: string): void {
+@@ -249,8 +341,8 @@
+     }
+ 
+     broadcast(event: SyncEvent): void {
+-        const seq = this.recordEvent(event)
+-        for (const connection of this.connections.values()) {
++        const { seq, bytes } = this.recordEvent(event)
++        for (const connection of [...this.connections.values()]) {
+             if (!this.shouldSend(connection, event)) {
+                 continue
+             }
+@@ -259,13 +351,15 @@
+             // the receiving namespace so the cursor stays bound to it.
+             const eventId = this.eventIdFor(seq, connection.namespace)
+             if (connection.pending) {
++                if (this.isStalled(connection, 0)) {
++                    this.dropStalled(connection)
++                    continue
++                }
+                 connection.pending.push({ event, eventId })
+                 continue
+             }
+ 
+-            void Promise.resolve(connection.send(event, eventId)).catch(() => {
+-                this.unsubscribe(connection.id)
+-            })
++            this.deliver(connection, bytes, () => connection.send(event, eventId))
+         }
+     }
+ 
+@@ -283,10 +377,8 @@
+         }
+ 
+         this.heartbeatTimer = setInterval(() => {
+-            for (const connection of this.connections.values()) {
+-                void Promise.resolve(connection.sendHeartbeat()).catch(() => {
+-                    this.unsubscribe(connection.id)
+-                })
++            for (const connection of [...this.connections.values()]) {
++                this.deliver(connection, HEARTBEAT_BYTES, () => connection.sendHeartbeat())
+             }
+         }, this.heartbeatMs)
+     }
+--- a/hub/src/sse/sseManager.test.ts
++++ b/hub/src/sse/sseManager.test.ts
+@@ -373,3 +373,69 @@
+         expect(globalBeta).toHaveLength(0)
+     })
+ })
++
++describe('SSEManager stalled connections', () => {
++    const neverSettles = () => new Promise<void>(() => {})
++
++    it('drops a connection with a backlog and no progress past the stall window', async () => {
++        let clock = 1_000_000
++        const manager = new SSEManager(0, new VisibilityTracker(), () => clock)
++        let closed = 0
++        let healthyReceived = 0
++        manager.subscribe({
++            id: 'stalled', namespace: 'alpha', all: true,
++            send: neverSettles, sendHeartbeat: () => {}, close: () => { closed += 1 }
++        })
++        manager.subscribe({
++            id: 'healthy', namespace: 'alpha', all: true,
++            send: () => { healthyReceived += 1 }, sendHeartbeat: () => {}
++        })
++
++        for (let i = 0; i < 2500; i++) {
++            manager.broadcast({ type: 'session-updated', sessionId: `s${i}`, namespace: 'alpha' })
++        }
++        // A burst alone is not a stall.
++        expect(manager.hasSubscription('stalled')).toBe(true)
++
++        await new Promise((resolve) => setTimeout(resolve, 0))
++        clock += 16_000
++        manager.broadcast({ type: 'session-updated', sessionId: 'late', namespace: 'alpha' })
++
++        expect(manager.hasSubscription('stalled')).toBe(false)
++        expect(closed).toBe(1)
++        expect(manager.hasSubscription('healthy')).toBe(true)
++        expect(healthyReceived).toBe(2501)
++    })
++
++    it('drops at the hard byte cap without waiting for the stall window', () => {
++        const manager = new SSEManager(0, new VisibilityTracker(), () => 0)
++        let closed = 0
++        manager.subscribe({
++            id: 'stalled', namespace: 'alpha', all: true,
++            send: neverSettles, sendHeartbeat: () => {}, close: () => { closed += 1 }
++        })
++        const big = 'x'.repeat(8 * 1024 * 1024)
++        for (let i = 0; i < 40; i++) {
++            manager.broadcast({ type: 'session-updated', sessionId: big, namespace: 'alpha' } as SyncEvent)
++        }
++        expect(manager.hasSubscription('stalled')).toBe(false)
++        expect(closed).toBe(1)
++    })
++
++    it('keeps a slow connection whose writes keep settling', async () => {
++        let clock = 0
++        const manager = new SSEManager(0, new VisibilityTracker(), () => clock)
++        manager.subscribe({
++            id: 'slow', namespace: 'alpha', all: true,
++            send: () => Promise.resolve(), sendHeartbeat: () => {}
++        })
++        for (let round = 0; round < 5; round++) {
++            for (let i = 0; i < 2500; i++) {
++                manager.broadcast({ type: 'session-updated', sessionId: `s${i}`, namespace: 'alpha' })
++            }
++            await new Promise((resolve) => setTimeout(resolve, 0))
++            clock += 20_000
++        }
++        expect(manager.hasSubscription('slow')).toBe(true)
++    })
++})
+--- a/hub/src/web/routes/events.ts
++++ b/hub/src/web/routes/events.ts
+@@ -97,6 +97,7 @@
+                 visibility,
+                 resumeFrom,
+                 send: (event, eventId) => stream.writeSSE({ data: JSON.stringify(event), id: eventId }),
++                close: () => stream.abort(),
+                 sendHeartbeat: async () => {
+                     await stream.writeSSE({
+                         data: JSON.stringify({
