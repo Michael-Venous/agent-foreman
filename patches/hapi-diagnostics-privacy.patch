@@ -1,0 +1,293 @@
+diff --git a/hub/src/diagnostics.test.ts b/hub/src/diagnostics.test.ts
+new file mode 100644
+--- /dev/null
++++ b/hub/src/diagnostics.test.ts
+@@ -0,0 +1,74 @@
++import { describe, expect, it, jest, mock } from 'bun:test'
++import { Hono } from 'hono'
++import { diagnosticRoute, requestDiagnostics, startDiagnosticsMonitor } from './diagnostics'
++import { createSessionsRoutes } from './web/routes/sessions'
++
++describe('diagnostics', () => {
++    it('uses fixed route categories and never includes path or query values', () => {
++        expect(diagnosticRoute('/api/sessions/private-session/upload')).toBe('session.upload')
++        expect(diagnosticRoute('/api/sessions/private-session/messages')).toBe('session.messages')
++        expect(diagnosticRoute('/user/private-name')).toBe('other')
++    })
++
++    it('logs failing requests without the token, path id, headers or body', async () => {
++        const old = console.warn, sink = mock((..._args: unknown[]) => {})
++        console.warn = sink
++        try {
++            const app = new Hono()
++            app.use('*', requestDiagnostics)
++            app.post('/api/sessions/:id/upload', c => c.json({ error: 'not available' }, 503))
++            const response = await app.request('/api/sessions/private-id/upload?token=secret-token', { method: 'POST', headers: { authorization: 'Bearer secret-header' }, body: 'secret-body' })
++            expect(response.status).toBe(503)
++            const output = JSON.stringify(sink.mock.calls)
++            expect(output).toContain('session.upload')
++            expect(output).toContain('503')
++            for (const secret of ['secret-token', 'secret-header', 'secret-body', 'private-id']) expect(output).not.toContain(secret)
++        } finally { console.warn = old }
++    })
++
++    it('records a still-pending chat resume before it finishes', async () => {
++        const old = console.warn, sink = mock((..._args: unknown[]) => {})
++        console.warn = sink
++        jest.useFakeTimers()
++        try {
++            let release!: () => void
++            const waiting = new Promise<void>(resolve => { release = resolve })
++            const app = new Hono()
++            app.use('*', requestDiagnostics)
++            app.post('/api/sessions/:id/resume', async c => { await waiting; return c.json({ ok: true }) })
++            const response = app.request('/api/sessions/private-id/resume?token=secret-token', { method: 'POST' })
++            await Promise.resolve()
++            jest.advanceTimersByTime(5000)
++            const records = sink.mock.calls.map(call => JSON.parse(String(call[1])))
++            expect(records[0]).toMatchObject({ event: 'http_pending', route: 'session.resume' })
++            expect(JSON.stringify(records)).not.toContain('secret-token')
++            release()
++            expect((await response).status).toBe(200)
++        } finally { jest.useRealTimers(); console.warn = old }
++    })
++
++    it('can stop its background sampler', () => {
++        const stop = startDiagnosticsMonitor()
++        stop()
++    })
++
++    it('correlates upload start and finish without logging file contents or name', async () => {
++        const old = console.warn, sink = mock((..._args: unknown[]) => {})
++        console.warn = sink
++        try {
++            const session = { id: 'aabbccdd-1234', namespace: 'default', active: true }
++            const engine = { resolveSessionAccess: () => ({ ok: true, sessionId: session.id, session }), uploadFile: async () => ({ success: true, path: '/private/output' }) }
++            const app = new Hono<any>()
++            app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
++            app.route('/api', createSessionsRoutes(() => engine as never))
++            const response = await app.request('/api/sessions/aabbccdd-1234/upload', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filename: 'private-filename.png', content: 'c2VjcmV0', mimeType: 'image/png' }) })
++            expect(response.status).toBe(200)
++            const records = sink.mock.calls.map(call => JSON.parse(String(call[1])))
++            expect(records.map(record => record.event)).toEqual(['upload_start', 'upload_finish'])
++            expect(records[0].requestId).toBe(records[1].requestId)
++            expect(records[0].bytes).toBe(6)
++            const output = JSON.stringify(records)
++            for (const secret of ['private-filename', 'c2VjcmV0', '/private/output']) expect(output).not.toContain(secret)
++        } finally { console.warn = old }
++    })
++})
+diff --git a/hub/src/diagnostics.ts b/hub/src/diagnostics.ts
+new file mode 100644
+--- /dev/null
++++ b/hub/src/diagnostics.ts
+@@ -0,0 +1,60 @@
++import { createMiddleware } from 'hono/factory'
++import { randomUUID } from 'node:crypto'
++
++/** Only fixed route labels are logged: never URLs, query strings, bodies or headers. */
++export function diagnosticRoute(pathname: string): string {
++    if (pathname === '/api/events') return 'events'
++    const match = /^\/api\/sessions\/[^/]+\/(resume|reopen|upload|messages|file)$/.exec(pathname)
++    if (match) return `session.${match[1]}`
++    if (pathname === '/api/sessions') return 'sessions.list'
++    return 'other'
++}
++
++export function diagnosticMemory() {
++    const m = process.memoryUsage()
++    return { rssBytes: m.rss, heapUsedBytes: m.heapUsed, externalBytes: m.external, arrayBufferBytes: m.arrayBuffers ?? 0 }
++}
++
++export function logDiagnostic(event: string, fields: Record<string, string | number | boolean | null> = {}): void {
++    console.warn('[diagnostics]', JSON.stringify({ event, ...fields }))
++}
++
++/** Slow/failing requests only; no query strings or user-supplied payloads. */
++export const requestDiagnostics = createMiddleware(async (c, next) => {
++    const started = performance.now()
++    const route = diagnosticRoute(new URL(c.req.url).pathname)
++    const requestId = randomUUID().slice(0, 8)
++    const watched = route === 'session.resume' || route === 'session.reopen' || route === 'session.upload' || route === 'session.messages' || route === 'sessions.list'
++    const timer = watched ? setTimeout(() => {
++        logDiagnostic('http_pending', { requestId, route, method: c.req.method, elapsedMs: Math.round(performance.now() - started), ...diagnosticMemory() })
++    }, 5000) : null
++    timer?.unref?.()
++    try { await next() }
++    finally {
++        if (timer) clearTimeout(timer)
++        const elapsedMs = Math.round(performance.now() - started)
++        if (elapsedMs >= 1500 || c.res.status >= 400) {
++            logDiagnostic('http', { requestId, route, method: c.req.method, status: c.res.status, elapsedMs, ...diagnosticMemory() })
++        }
++    }
++})
++
++/** Low-frequency memory baseline and bounded warnings for event-loop stalls. */
++export function startDiagnosticsMonitor(): () => void {
++    const periodMs = 10_000
++    const started = performance.now()
++    let due = started + periodMs, lastSample = started, lastStall = 0
++    logDiagnostic('memory_sample', { lagMs: 0, ...diagnosticMemory() })
++    const timer = setInterval(() => {
++        const now = performance.now(), lagMs = Math.max(0, Math.round(now - due))
++        due = now + periodMs
++        if (now - lastSample >= 300_000 || (lagMs >= 1500 && now - lastStall >= 60_000)) {
++            const stalled = lagMs >= 1500
++            logDiagnostic(stalled ? 'event_loop_stall' : 'memory_sample', { lagMs, ...diagnosticMemory() })
++            lastSample = now
++            if (stalled) lastStall = now
++        }
++    }, periodMs)
++    timer.unref?.()
++    return () => clearInterval(timer)
++}
+diff --git a/hub/src/sse/sseManager.test.ts b/hub/src/sse/sseManager.test.ts
+--- a/hub/src/sse/sseManager.test.ts
++++ b/hub/src/sse/sseManager.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from 'bun:test'
++import { describe, expect, it, mock } from 'bun:test'
+ import { SSEManager } from './sseManager'
+ import type { SyncEvent } from '../sync/syncEngine'
+ import { VisibilityTracker } from '../visibility/visibilityTracker'
+@@ -380,11 +380,17 @@
+     it('bounds an unsettled event burst even before the stall timer elapses', () => {
+         const manager = new SSEManager(0, new VisibilityTracker(), () => 0)
+         let closed = 0, delivered = 0
++        const oldWarn = console.warn, warn = mock(() => {})
++        console.warn = warn
++        try {
+         manager.subscribe({ id: 'stalled', namespace: 'alpha', all: true, send: () => { delivered++; return neverSettles() }, sendHeartbeat: () => {}, close: () => { closed++ } })
+         for (let i = 0; i < 9000; i++) manager.broadcast({ type: 'session-updated', sessionId: `s${i}`, namespace: 'alpha' })
+         expect(closed).toBe(1)
+         expect(delivered).toBe(8000)
+         expect(manager.hasSubscription('stalled')).toBe(false)
++        expect(JSON.stringify(warn.mock.calls)).toContain('event_limit')
++        expect(JSON.stringify(warn.mock.calls)).toContain('rssBytes')
++        } finally { console.warn = oldWarn }
+     })
+ 
+     it('drops a connection with a backlog and no progress past the stall window', async () => {
+diff --git a/hub/src/sse/sseManager.ts b/hub/src/sse/sseManager.ts
+--- a/hub/src/sse/sseManager.ts
++++ b/hub/src/sse/sseManager.ts
+@@ -1,4 +1,5 @@
+ import { createHash, randomUUID } from 'node:crypto'
++import { diagnosticMemory, logDiagnostic } from '../diagnostics'
+ import type { SyncEvent } from '../sync/syncEngine'
+ import type { VisibilityState } from '../visibility/visibilityTracker'
+ import type { VisibilityTracker } from '../visibility/visibilityTracker'
+@@ -234,7 +235,7 @@
+      */
+     private deliver(connection: SSEConnection, bytes: number, send: () => void | Promise<void>): void {
+         if (this.isStalled(connection, bytes)) {
+-            this.dropStalled(connection)
++            this.dropStalled(connection, bytes)
+             return
+         }
+         if (connection.inFlight === 0) {
+@@ -275,15 +276,23 @@
+         return backlog && idleFor > CONNECTION_STALL_MS
+     }
+ 
+-    private dropStalled(connection: SSEConnection): void {
++    private dropStalled(connection: SSEConnection, nextBytes = 0): void {
+         if (!this.connections.has(connection.id)) {
+             return
+         }
+-        console.warn('[SSE] dropping stalled connection', {
+-            id: connection.id,
++        const idleMs = Math.max(0, this.now() - connection.lastProgressAt)
++        const pending = connection.pending?.length ?? 0
++        const reason = connection.inFlight + pending >= CONNECTION_HARD_IN_FLIGHT_EVENTS ? 'event_limit'
++            : connection.inFlightBytes + nextBytes > CONNECTION_HARD_IN_FLIGHT_BYTES ? 'byte_limit'
++                : idleMs > CONNECTION_DEAD_MS ? 'dead_timeout' : 'backlog_timeout'
++        logDiagnostic('sse_drop', {
++            reason,
+             inFlight: connection.inFlight,
+             inFlightBytes: connection.inFlightBytes,
+-            pending: connection.pending?.length ?? 0
++            nextBytes,
++            pending,
++            idleMs,
++            ...diagnosticMemory()
+         })
+         this.unsubscribe(connection.id)
+         try {
+diff --git a/hub/src/startHub.ts b/hub/src/startHub.ts
+--- a/hub/src/startHub.ts
++++ b/hub/src/startHub.ts
+@@ -107,6 +107,8 @@
+     args?: string[]
+ }
+ 
++import { startDiagnosticsMonitor } from './diagnostics'
++
+ export async function startHub(options: StartHubOptions = {}): Promise<HubInstance> {
+     console.log('HAPI Hub starting...')
+ 
+@@ -388,8 +390,11 @@
+     console.log('')
+     console.log('HAPI Hub is ready!')
+ 
++    const stopDiagnostics = startDiagnosticsMonitor()
++
+     return {
+         stop: async () => {
++            stopDiagnostics()
+             await tunnelManager?.stop()
+             await happyBot?.stop()
+             notificationHub?.stop()
+diff --git a/hub/src/web/routes/sessions.ts b/hub/src/web/routes/sessions.ts
+--- a/hub/src/web/routes/sessions.ts
++++ b/hub/src/web/routes/sessions.ts
+@@ -1,4 +1,6 @@
+ import { readManagedSessions } from './managedSessions'
++import { randomUUID } from 'node:crypto'
++import { diagnosticMemory, logDiagnostic } from '../../diagnostics'
+ import {
+     CursorMigrateToAcpRequestSchema,
+     DeleteUploadRequestSchema,
+@@ -344,6 +346,9 @@
+             return c.json({ success: false, error: 'File too large (max 50MB)' }, 413)
+         }
+ 
++        const diagnosticId = randomUUID().slice(0, 8)
++        const started = performance.now()
++        logDiagnostic('upload_start', { requestId: diagnosticId, session: sessionResult.sessionId.slice(0, 8), bytes: estimatedBytes })
+         try {
+             const result = await engine.uploadFile(
+                 sessionResult.sessionId,
+@@ -351,8 +356,10 @@
+                 parsed.data.content,
+                 parsed.data.mimeType
+             )
++            logDiagnostic('upload_finish', { requestId: diagnosticId, ok: result.success === true, elapsedMs: Math.round(performance.now() - started), ...diagnosticMemory() })
+             return c.json(result)
+         } catch (error) {
++            logDiagnostic('upload_finish', { requestId: diagnosticId, ok: false, outcome: 'exception', elapsedMs: Math.round(performance.now() - started), ...diagnosticMemory() })
+             return c.json({
+                 success: false,
+                 error: error instanceof Error ? error.message : 'Failed to upload file'
+diff --git a/hub/src/web/server.ts b/hub/src/web/server.ts
+--- a/hub/src/web/server.ts
++++ b/hub/src/web/server.ts
+@@ -1,7 +1,7 @@
+ import { Hono } from 'hono'
+ import { compress } from 'hono/compress'
+ import { cors } from 'hono/cors'
+-import { logger } from 'hono/logger'
++import { requestDiagnostics } from '../diagnostics'
+ import { join } from 'node:path'
+ import { existsSync } from 'node:fs'
+ import { serveStatic } from 'hono/bun'
+@@ -241,7 +241,7 @@
+ }): Hono<WebAppEnv> {
+     const app = new Hono<WebAppEnv>()
+ 
+-    app.use('*', logger())
++    app.use('*', requestDiagnostics)
+ 
+     const configuration = getConfiguration()
+     const corsOrigins = options.corsOrigins ?? configuration.corsOrigins

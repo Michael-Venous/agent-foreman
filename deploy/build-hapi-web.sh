@@ -14,6 +14,7 @@ PATCHES+=(hapi-graph-new-session.patch)
 PATCHES+=(hapi-frame-group-drop.patch)
 PATCHES+=(hapi-temporary-lifecycle-frame-drop.patch)
 PATCHES+=(hapi-sse-stalled-connections.patch hapi-sse-reconnect-storm.patch hapi-attachment-reconnect-previews.patch)
+PATCHES+=(hapi-diagnostics-privacy.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi
@@ -36,6 +37,7 @@ done
 (cd hub && "$BUN" run typecheck && "$BUN" test ../shared/src/nodeGraph.offline.test.ts ../shared/src/nodePlacement.test.ts ../shared/src/backgroundTaskReceipt.test.ts src/managerControl.test.ts src/web/routes/sessions.test.ts src/sync/serviceTier.test.ts src/sync/manualPause.test.ts src/sync/sessionManager.test.ts src/sync/nodeGraph.test.ts src/store/messages.test.ts src/sync/turnFailure.test.ts src/sync/turnFailure.backfill.test.ts src/sync/nodeTree.test.ts src/sync/messageService.test.ts src/coordinationOrigins.test.ts src/web/routes/messages.test.ts ../shared/src/apiTypes.test.ts src/web/routes/codexFolders.test.ts src/web/routes/providerHandoff.test.ts src/sessionGoals.test.ts src/web/routes/managedSessions.test.ts src/web/routes/codexContext.test.ts src/chatStatistics.test.ts src/web/routes/chatStatistics.test.ts src/sync/usageService.test.ts src/sync/backgroundTasks.test.ts src/sync/claudeTaskCompletion.test.ts src/sync/sessionCache.backgroundTasks.test.ts src/sync/localProcesses.test.ts src/sync/sessionCache.localProcesses.test.ts src/store/backgroundStatus.test.ts src/sync/sessionCache.applySessionPatch.test.ts ../shared/src/schemas.sessionPatch.test.ts ../shared/src/sessionSummary.test.ts src/sync/steerQueuedMessage.test.ts src/sync/temporarySession.test.ts src/socket/handlers/cli/sessionHandlers.test.ts src/web/routes/machines.test.ts src/sideChats.test.ts src/web/routes/sideChats.test.ts src/backgroundTaskOutput.test.ts src/web/routes/backgroundTasks.test.ts)
 # User requested selecting Desktop Midnight once per browser; later choices persist.
 (cd hub && "$BUN" test src/sync/archiveInactive.test.ts)
+(cd hub && "$BUN" test src/diagnostics.test.ts)
 export VITE_DESKTOP_THEME_SELECTION="${VITE_DESKTOP_THEME_SELECTION-desktop-midnight-v1}"
 export VITE_DEFAULT_NEW_SESSION_DIRECTORY="${VITE_DEFAULT_NEW_SESSION_DIRECTORY:-$HOME}"
 # Deployment identity stays in ignored local state, never in public source.
