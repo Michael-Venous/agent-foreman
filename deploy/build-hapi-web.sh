@@ -15,6 +15,7 @@ PATCHES+=(hapi-frame-group-drop.patch)
 PATCHES+=(hapi-temporary-lifecycle-frame-drop.patch)
 PATCHES+=(hapi-sse-stalled-connections.patch hapi-sse-reconnect-storm.patch hapi-attachment-reconnect-previews.patch)
 PATCHES+=(hapi-diagnostics-privacy.patch)
+PATCHES+=(hapi-subagent-window-activity.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi

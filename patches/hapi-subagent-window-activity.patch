@@ -1,0 +1,236 @@
+diff --git a/hub/src/sync/backgroundTasks.test.ts b/hub/src/sync/backgroundTasks.test.ts
+--- a/hub/src/sync/backgroundTasks.test.ts
++++ b/hub/src/sync/backgroundTasks.test.ts
+@@ -1,3 +1,3 @@
+ import { describe, expect, it } from 'bun:test'
+-import { BackgroundTaskTracker, extractBackgroundTaskDelta } from './backgroundTasks'
++import { BackgroundTaskTracker, extractBackgroundTaskDelta, isClaudeSubagentActivity } from './backgroundTasks'
+ 
+@@ -16,2 +16,8 @@
+ describe('native background tasks', () => {
++    it('recognizes only native child output as recent subagent activity', () => {
++        const child = { role: 'agent', content: { type: 'output', data: { type: 'assistant', isSidechain: true, parentToolUseId: 'tool-1' } } }
++        expect(isClaudeSubagentActivity(child)).toBe(true)
++        expect(isClaudeSubagentActivity({ ...child, role: 'user' })).toBe(false)
++        expect(isClaudeSubagentActivity({ role: 'agent', content: { type: 'output', data: { type: 'assistant', isSidechain: false, parentToolUseId: 'tool-1' } } })).toBe(false)
++    })
+     it('reads Claude tool results in native user messages', () => {
+diff --git a/hub/src/sync/backgroundTasks.ts b/hub/src/sync/backgroundTasks.ts
+--- a/hub/src/sync/backgroundTasks.ts
++++ b/hub/src/sync/backgroundTasks.ts
+@@ -10,2 +10,11 @@
+ 
++/** Recent native child output is activity evidence, not proof of an active process. */
++export function isClaudeSubagentActivity(messageContent: unknown): boolean {
++    const record = unwrapRoleWrappedRecordEnvelope(messageContent)
++    if (!record || record.role !== 'agent' || !isObject(record.content) || record.content.type !== 'output') return false
++    const data = record.content.data
++    return isObject(data) && data.isSidechain === true && typeof data.parentToolUseId === 'string'
++        && data.parentToolUseId.length > 0 && (data.type === 'assistant' || data.type === 'user')
++}
++
+ /** A successful native TaskStop receipt, not a request, prose claim or failed result. */
+diff --git a/hub/src/sync/sessionCache.backgroundTasks.test.ts b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+--- a/hub/src/sync/sessionCache.backgroundTasks.test.ts
++++ b/hub/src/sync/sessionCache.backgroundTasks.test.ts
+@@ -8,2 +8,15 @@
+ describe('SessionCache background task recovery', () => {
++    it('reports recent child output briefly without inventing a running process', () => {
++        const store = new Store(':memory:')
++        const cache = new SessionCache(store, { emit: () => {} } as unknown as EventPublisher)
++        const session = cache.getOrCreateSession('child-activity', { path: '/tmp', host: 'test', flavor: 'claude' }, null, 'default')
++        const now = Date.now()
++        cache.handleSessionAlive({ sid: session.id, time: now, thinking: false })
++        cache.recordRecentSubagentActivity(session.id, now)
++        expect(cache.getSession(session.id)).toMatchObject({ thinking: false, recentSubagentActivityAt: now, backgroundTaskCount: 0 })
++        cache.expireInactive(now + 21_000)
++        expect(cache.getSession(session.id)?.recentSubagentActivityAt).toBe(0)
++        cache.recordRecentSubagentActivity(session.id, now - 60_000)
++        expect(cache.getSession(session.id)?.recentSubagentActivityAt).toBe(0)
++    })
+     it('restores only unfinished tasks belonging to the active controller and keeps live accounting consistent', () => {
+diff --git a/hub/src/sync/sessionCache.ts b/hub/src/sync/sessionCache.ts
+--- a/hub/src/sync/sessionCache.ts
++++ b/hub/src/sync/sessionCache.ts
+@@ -200,2 +200,3 @@
+         const session: Session = {
++            recentSubagentActivityAt: existing?.recentSubagentActivityAt ?? 0,
+             lastFailure: this.store.getManualPause(sessionId) !== null ? null : outcome.failure,
+@@ -835,2 +836,6 @@
+         for (const session of this.sessions.values()) {
++            if (session.recentSubagentActivityAt && now - session.recentSubagentActivityAt > 20_000) {
++                session.recentSubagentActivityAt = 0
++                this.publisher.emit({ type: 'session-updated', sessionId: session.id, namespace: session.namespace, data: { recentSubagentActivityAt: 0 } satisfies SessionPatch })
++            }
+             if (!session.active) continue
+@@ -851,2 +856,13 @@
+     }
++
++    recordRecentSubagentActivity(sessionId: string, at: number): void {
++        const session = this.sessions.get(sessionId)
++        const now = Date.now()
++        if (!session?.active || session.metadata?.flavor !== 'claude' || at > now + 1000 || now - at > 20_000) return
++        if (at <= (session.recentSubagentActivityAt ?? 0)) return
++        // Coalesce noisy streams; the 20-second freshness window remains valid.
++        if (at - (session.recentSubagentActivityAt ?? 0) < 5000) return
++        session.recentSubagentActivityAt = at
++        this.publisher.emit({ type: 'session-updated', sessionId, namespace: session.namespace, data: { recentSubagentActivityAt: at } satisfies SessionPatch })
++    }
+ 
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -1,2 +1,2 @@
+-import { extractBackgroundTaskDelta } from './backgroundTasks'
++import { extractBackgroundTaskDelta, isClaudeSubagentActivity } from './backgroundTasks'
+ import { toSessionSummary } from '@hapi/protocol'
+@@ -247,2 +247,3 @@
+             if (event.type === 'message-received') {
++                if (event.message.createdAt >= membershipStartedAt && isClaudeSubagentActivity(event.message.content)) this.sessionCache.recordRecentSubagentActivity(event.sessionId, event.message.createdAt)
+                 const failed = this.sessionCache.observeTurnOutcome(event.sessionId, event.message.content, event.message.createdAt, event.message.seq ?? 0)
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -346,2 +346,3 @@
+ export const SessionSchema = z.object({
++    recentSubagentActivityAt: z.number().nonnegative().optional(),
+     backgroundProcesses: z.array(BackgroundProcessSchema).optional(),
+@@ -418,2 +419,3 @@
+ export const SessionPatchSchema = z.object({
++    recentSubagentActivityAt: z.number().nonnegative().optional(),
+     backgroundProcesses: z.array(BackgroundProcessSchema).optional(),
+diff --git a/shared/src/sessionSummary.ts b/shared/src/sessionSummary.ts
+--- a/shared/src/sessionSummary.ts
++++ b/shared/src/sessionSummary.ts
+@@ -49,2 +49,3 @@
+ export type SessionSummary = {
++    recentSubagentActivityAt?: number
+     backgroundProcesses?: Session['backgroundProcesses']
+@@ -213,2 +214,3 @@
+     return {
++        ...(session.recentSubagentActivityAt !== undefined ? { recentSubagentActivityAt: session.recentSubagentActivityAt } : {}),
+         ...(session.backgroundProcesses !== undefined ? { backgroundProcesses: session.backgroundProcesses } : {}),
+diff --git a/web/src/chat/reducer.test.ts b/web/src/chat/reducer.test.ts
+--- a/web/src/chat/reducer.test.ts
++++ b/web/src/chat/reducer.test.ts
+@@ -8,2 +8,16 @@
+ 
++describe('subagent activity across bounded history pages', () => {
++    it('shows labeled child output when the parent is outside the page and rejoins it when loaded', () => {
++        const child: NormalizedMessage = { id: 'child', localId: null, createdAt: 2, role: 'agent', isSidechain: true, parentToolUseId: 'agent-tool', content: [{ type: 'text', text: 'Child progress', uuid: 'child-uuid', parentUUID: 'missing' }] }
++        const partial = reduceChatBlocks([child], null).blocks
++        expect(partial.some(b => b.kind === 'agent-text' && b.text.includes('Earlier context is not loaded'))).toBe(true)
++        expect(partial.some(b => b.kind === 'agent-text' && b.text === 'Child progress')).toBe(true)
++        const parent: NormalizedMessage = { id: 'parent', localId: null, createdAt: 1, role: 'agent', isSidechain: false, content: [{ type: 'tool-call', id: 'agent-tool', name: 'Agent', input: { prompt: 'inspect' }, description: null, uuid: 'parent-uuid', parentUUID: null }] }
++        const joined = reduceChatBlocks([parent, child], null).blocks
++        expect(joined.some(b => b.kind === 'agent-text' && b.text.includes('Earlier context is not loaded'))).toBe(false)
++        const agent = joined.find(b => b.kind === 'tool-call')
++        expect(agent?.kind === 'tool-call' && agent.children.some(b => b.kind === 'agent-text' && b.text === 'Child progress')).toBe(true)
++    })
++})
++
+ function userMessage(id: string, text: string, createdAt: number): NormalizedMessage {
+diff --git a/web/src/chat/reducer.ts b/web/src/chat/reducer.ts
+--- a/web/src/chat/reducer.ts
++++ b/web/src/chat/reducer.ts
+@@ -3,3 +3,3 @@
+ import type { ThreadGoal } from '@/types/api'
+-import { traceMessages, type TracedMessage } from '@/chat/tracer'
++import { traceMessages, UNLOADED_PARENT_PREFIX, type TracedMessage } from '@/chat/tracer'
+ import { dedupeAgentEvents, foldApiErrorEvents } from '@/chat/reducerEvents'
+@@ -138,2 +138,21 @@
+ 
++    // A window can contain only child events while the originating Agent
++    // call is on an older page. Show the real child activity as a clearly
++    // labeled partial view rather than rendering an apparently empty chat.
++    // Once the parent arrives tracer attaches it normally, so no duplicate
++    // synthetic section remains. Do not infer whether the child is running.
++    const partialBlocks: ChatBlock[] = []
++    for (const [groupId, children] of groups) {
++        if (!groupId.startsWith(UNLOADED_PARENT_PREFIX) || consumedGroupIds.has(groupId)) continue
++        consumedGroupIds.add(groupId)
++        const child = reduceTimeline(children, reducerContext)
++        if (!child.blocks.length) continue
++        const createdAt = Math.min(...children.map(message => message.createdAt))
++        partialBlocks.push({ kind: 'agent-text', id: groupId, localId: null, createdAt, text: '**Subagent activity** · Earlier context is not loaded.' }, ...child.blocks)
++    }
++    if (partialBlocks.length) {
++        rootResult.blocks.push(...partialBlocks)
++        rootResult.blocks.sort((a, b) => a.createdAt - b.createdAt)
++    }
++
+     // Synthesize a tool card only for a *pending* permission that has no tool
+diff --git a/web/src/chat/tracer.ts b/web/src/chat/tracer.ts
+--- a/web/src/chat/tracer.ts
++++ b/web/src/chat/tracer.ts
+@@ -8,2 +8,5 @@
+ 
++/** A bounded page can contain child activity before its parent tool call. */
++export const UNLOADED_PARENT_PREFIX = 'unloaded-parent:'
++
+ type TracerState = {
+@@ -96,3 +99,3 @@
+         if (parentToolUseId) {
+-            sidechainId = state.toolUseIdToTaskId.get(parentToolUseId)
++            sidechainId = state.toolUseIdToTaskId.get(parentToolUseId) ?? `${UNLOADED_PARENT_PREFIX}${parentToolUseId}`
+         }
+diff --git a/web/src/components/NodeGraphView.test.tsx b/web/src/components/NodeGraphView.test.tsx
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -224,2 +224,4 @@
+     it('maps live summary state to node labels', () => {
++        expect(nodeStatus(session('x', 'x', { recentSubagentActivityAt: Date.now() }))).toBe('Recent activity')
++        expect(nodeStatus(session('x', 'x', { recentSubagentActivityAt: Date.now() - 21_000 }))).toBe('Idle')
+         expect(nodeStatus(session('x', 'x', { thinking: true }))).toBe('Running')
+diff --git a/web/src/components/NodeGraphView.tsx b/web/src/components/NodeGraphView.tsx
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -29,3 +29,3 @@
+ 
+-export type NodeStatus = 'Running' | 'Background' | 'Processes' | 'Unconfirmed' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
++export type NodeStatus = 'Running' | 'Background' | 'Recent activity' | 'Processes' | 'Unconfirmed' | 'Capacity' | 'Failed' | 'Idle' | 'Stopped' | 'Inactive' | 'Unavailable' | 'Loading'
+ type View = { x: number; y: number; k: number }
+@@ -71,2 +71,3 @@
+     if (!nodeIsIdle(session)) return session.thinking || session.pendingRequestsCount > 0 ? 'Running' : (sessionWorkEvidence(session).label as NodeStatus ?? 'Background')
++    if (session.active && session.recentSubagentActivityAt && Date.now() - session.recentSubagentActivityAt <= 20_000 && Date.now() >= session.recentSubagentActivityAt) return 'Recent activity'
+     return session.active ? 'Idle' : 'Inactive'
+@@ -74,3 +75,3 @@
+ const STATUS_DOT: Record<NodeStatus, string> = {
+-    Processes: 'bg-slate-500', Unconfirmed: 'bg-amber-500', Running: 'bg-emerald-500', Background: 'bg-sky-500', Capacity: 'bg-amber-500', Failed: 'bg-red-500', Idle: 'bg-[var(--app-hint)]', Stopped: 'bg-amber-500',
++    Processes: 'bg-slate-500', Unconfirmed: 'bg-amber-500', Running: 'bg-emerald-500', Background: 'bg-sky-500', 'Recent activity': 'bg-sky-500', Capacity: 'bg-amber-500', Failed: 'bg-red-500', Idle: 'bg-[var(--app-hint)]', Stopped: 'bg-amber-500',
+     Inactive: 'border border-[var(--app-hint)]', Unavailable: 'bg-[var(--app-badge-error-text)]', Loading: 'border border-dashed border-[var(--app-hint)]',
+@@ -1221,3 +1222,3 @@
+                                 {id === overseer && <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 font-medium text-violet-500">Overseer</span>}
+-                                <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
++                                <span className="truncate" title={status === 'Recent activity' ? 'Subagent output arrived in the last 20 seconds; its current process state is unconfirmed.' : undefined}>{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
+                             </span>
+diff --git a/web/src/hooks/useSSE.test.ts b/web/src/hooks/useSSE.test.ts
+--- a/web/src/hooks/useSSE.test.ts
++++ b/web/src/hooks/useSSE.test.ts
+@@ -107,2 +107,8 @@
+         expect(session()).toMatchObject({ backgroundProcesses: [], backgroundTaskCount: 0, backgroundTasksUpdatedAt: 2000, thinking: false })
++        emit({ recentSubagentActivityAt: 3000 })
++        expect(summaries()[0].recentSubagentActivityAt).toBe(3000)
++        expect(session().recentSubagentActivityAt).toBe(3000)
++        emit({ recentSubagentActivityAt: 0 })
++        expect(summaries()[0].recentSubagentActivityAt).toBe(0)
++        expect(session().recentSubagentActivityAt).toBe(0)
+         unmount(); client.clear()
+diff --git a/web/src/hooks/useSSE.ts b/web/src/hooks/useSSE.ts
+--- a/web/src/hooks/useSSE.ts
++++ b/web/src/hooks/useSSE.ts
+@@ -167,2 +167,3 @@
+         && current.thinking === next.thinking
++        && current.recentSubagentActivityAt === next.recentSubagentActivityAt
+         && sameSessionFailure(current.lastFailure, next.lastFailure)
+@@ -537,2 +538,3 @@
+                     thinking: patch.thinking ?? current.thinking,
++                    recentSubagentActivityAt: patch.recentSubagentActivityAt ?? current.recentSubagentActivityAt,
+                     ...(acceptsFailurePatch(current, patch) ? {
+diff --git a/web/src/lib/sessionPatch.ts b/web/src/lib/sessionPatch.ts
+--- a/web/src/lib/sessionPatch.ts
++++ b/web/src/lib/sessionPatch.ts
+@@ -92,2 +92,3 @@
+     if (patch.copilotAgentMode !== undefined) assign('copilotAgentMode', patch.copilotAgentMode)
++    if (patch.recentSubagentActivityAt !== undefined) assign('recentSubagentActivityAt', patch.recentSubagentActivityAt)
+     if (acceptsBackgroundTasksPatch(session, patch)) {
