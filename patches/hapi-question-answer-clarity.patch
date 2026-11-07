@@ -1,0 +1,24 @@
+--- a/web/src/lib/locales/en.ts
++++ b/web/src/lib/locales/en.ts
+@@ -616,3 +616,3 @@
+   'tool.other': 'Other',
+-  'tool.otherDescription': 'Type your own answer',
++  'tool.otherDescription': 'Type your answer here; queued chat messages are separate.',
+   'tool.question': 'Question',
+@@ -633,3 +633,3 @@
+   'tool.requestUserInput.otherLabel': 'None of the above',
+-  'tool.requestUserInput.otherDescription': 'Optionally, add details in notes.',
++  'tool.requestUserInput.otherDescription': 'Add details in notes; queued chat messages are separate.',
+   'tool.requestUserInput.popupBlocked': 'Could not open the sign-in page. Allow popups and try again.',
+--- a/web/src/lib/locales/zh-CN.ts
++++ b/web/src/lib/locales/zh-CN.ts
+@@ -606,3 +606,3 @@
+   'tool.other': '其他',
+-  'tool.otherDescription': '输入您自己的答案',
++  'tool.otherDescription': '请在此输入答案；排队中的聊天消息不会附在答案中。',
+   'tool.question': '问题',
+@@ -623,3 +623,3 @@
+   'tool.requestUserInput.otherLabel': '以上都不是',
+-  'tool.requestUserInput.otherDescription': '可在备注中补充说明（可选）。',
++  'tool.requestUserInput.otherDescription': '请在备注中补充说明；排队中的聊天消息不会附在答案中。',
+   'tool.requestUserInput.popupBlocked': '无法打开登录页面。请允许弹出窗口后重试。',
