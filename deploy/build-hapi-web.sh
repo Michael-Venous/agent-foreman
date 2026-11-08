@@ -17,6 +17,7 @@ PATCHES+=(hapi-sse-stalled-connections.patch hapi-sse-reconnect-storm.patch hapi
 PATCHES+=(hapi-diagnostics-privacy.patch)
 PATCHES+=(hapi-subagent-window-activity.patch)
 PATCHES+=(hapi-question-answer-clarity.patch)
+PATCHES+=(hapi-compact-message-previews.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi

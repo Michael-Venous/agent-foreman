@@ -1,0 +1,76 @@
+--- a/web/src/lib/attachmentAdapter.ts
++++ b/web/src/lib/attachmentAdapter.ts
+@@ -207,3 +207,3 @@
+                 path,
+-                previewUrl: pending.previewUrl
++                previewUrl: await compactMessagePreview(pending.previewUrl)
+             } : undefined
+@@ -246 +246,28 @@
+ }
++
++// Only the preview travels with message metadata. The original uploaded file
++// remains unchanged at `path`; never re-send a multi-megabyte data URL.
++export async function compactMessagePreview(dataUrl?: string): Promise<string | undefined> {
++    const limit = 180_000
++    if (!dataUrl) return undefined
++    if (dataUrl.length <= limit) return dataUrl
++    if (!dataUrl.startsWith('data:image/')) return undefined
++    try {
++        const image = new Image()
++        image.src = dataUrl
++        await image.decode()
++        if (!image.naturalWidth || !image.naturalHeight) return undefined
++        const canvas = document.createElement('canvas')
++        const context = canvas.getContext('2d')
++        if (!context) return undefined
++        for (const [bound, quality] of [[1280, 0.72], [768, 0.55], [480, 0.45]] as const) {
++            const scale = Math.min(1, bound / Math.max(image.naturalWidth, image.naturalHeight))
++            canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
++            canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
++            context.drawImage(image, 0, 0, canvas.width, canvas.height)
++            const result = canvas.toDataURL('image/webp', quality)
++            if ((/^data:image\/(?:webp|png);base64,/.test(result)) && result.length <= limit) return result
++        }
++    } catch { /* Unsupported or corrupt image: omit the preview, retain the original. */ }
++    return undefined
++}
+--- a/web/src/lib/attachmentAdapter.test.ts
++++ b/web/src/lib/attachmentAdapter.test.ts
+@@ -278 +278,37 @@
+ })
++
++
++describe('message preview payload', () => {
++    it('keeps small previews and never sends oversized or unsupported data', async () => {
++        const { compactMessagePreview } = await import('./attachmentAdapter')
++        expect(await compactMessagePreview('data:image/png;base64,small')).toBe('data:image/png;base64,small')
++        expect(await compactMessagePreview('data:text/plain;base64,' + 'x'.repeat(200_000))).toBeUndefined()
++        expect(await compactMessagePreview('data:image/png;base64,' + 'x'.repeat(200_000))).toBeUndefined()
++    })
++    it('reduces a large image to a bounded preview', async () => {
++        const { compactMessagePreview } = await import('./attachmentAdapter')
++        const draw = vi.fn()
++        vi.stubGlobal('Image', class { src = ''; naturalWidth = 4000; naturalHeight = 2000; async decode() {} })
++        const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ drawImage: draw } as never)
++        const toDataURL = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/webp;base64,small')
++        try {
++            expect(await compactMessagePreview('data:image/png;base64,' + 'x'.repeat(200_000))).toBe('data:image/webp;base64,small')
++            expect(draw).toHaveBeenCalledOnce()
++        } finally { getContext.mockRestore(); toDataURL.mockRestore(); vi.unstubAllGlobals() }
++    })
++})
++
++it('sends compact preview metadata while preserving the uploaded file path', async () => {
++    const { createAttachmentAdapter } = await import('./attachmentAdapter')
++    vi.stubGlobal('Image', class { src = ''; naturalWidth = 3200; naturalHeight = 1600; async decode() {} })
++    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ drawImage: vi.fn() } as never)
++    const encode = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/webp;base64,compact')
++    try {
++        const adapter = createAttachmentAdapter({} as never, 'session-1')
++        const sent = await adapter.send({ id: 'a', name: 'image.png', type: 'file', contentType: 'image/png', file: new File(['original'], 'image.png'), path: '/uploaded/original.png', previewUrl: 'data:image/png;base64,' + 'x'.repeat(200_000) } as never)
++        const item = sent.content[0] as { type: string; text: string }
++        const metadata = JSON.parse(item.text).__attachmentMetadata
++        expect(metadata.path).toBe('/uploaded/original.png')
++        expect(metadata.previewUrl).toBe('data:image/webp;base64,compact')
++    } finally { context.mockRestore(); encode.mockRestore(); vi.unstubAllGlobals() }
++})
