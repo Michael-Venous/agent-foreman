@@ -1,0 +1,154 @@
+--- a/cli/src/utils/MessageQueue2.ts
++++ b/cli/src/utils/MessageQueue2.ts
+@@ -6,6 +6,11 @@
+     modeHash: string;
+     localId?: string;
+     isolate?: boolean; // If true, this message must be processed alone
++    /**
++     * Delivered as its own turn without joining neighbours, but unlike
++     * `isolate` it does not ask the launcher to restart the agent process.
++     */
++    standalone?: boolean;
+     /** Stable FIFO key used when an async reservation is restored later. */
+     enqueueOrder?: number;
+ }
+@@ -171,6 +176,18 @@
+     }
+ 
+     /**
++     * Push a message that is never batched with neighbours but is otherwise an
++     * ordinary turn (no process restart, earlier messages kept in order).
++     */
++    pushStandalone(message: string, mode: T, localId?: string): void {
++        this.push(message, mode, localId);
++        const item = this.queue[this.queue.length - 1];
++        if (item && item.message === message && item.localId === localId) {
++            item.standalone = true;
++        }
++    }
++
++    /**
+      * Push a message that must be processed in complete isolation.
+      * Clears any pending messages and ensures this message is never batched with others.
+      * Used for special commands that require dedicated processing.
+@@ -593,7 +610,7 @@
+         const targetModeHash = firstItem.modeHash;
+ 
+         // If the first message requires isolation, only process it alone
+-        if (firstItem.isolate) {
++        if (firstItem.isolate || firstItem.standalone) {
+             const item = this.queue.shift()!;
+             sameModeMessages.push(item.message);
+             items.push({ message: item.message, localId: item.localId });
+@@ -603,7 +620,8 @@
+             // Collect all messages with the same mode until we hit an isolated message
+             while (this.queue.length > 0 &&
+                 this.queue[0].modeHash === targetModeHash &&
+-                !this.queue[0].isolate) {
++                !this.queue[0].isolate &&
++                !this.queue[0].standalone) {
+                 const item = this.queue.shift()!;
+                 sameModeMessages.push(item.message);
+                 items.push({ message: item.message, localId: item.localId });
+--- a/cli/src/utils/MessageQueue2.test.ts
++++ b/cli/src/utils/MessageQueue2.test.ts
+@@ -9,6 +9,22 @@
+         expect(queue.isClosed()).toBe(false);
+     });
+ 
++    it('delivers standalone messages alone without marking them isolated', async () => {
++        const queue = new MessageQueue2<string>(mode => mode);
++        queue.push('before', 'local', 'a');
++        queue.pushStandalone('/goal clear', 'local', 'b');
++        queue.push('after one', 'local', 'c');
++        queue.push('after two', 'local', 'd');
++
++        const first = await queue.waitForMessagesAndGetAsString();
++        expect(first?.message).toBe('before');
++        const goal = await queue.waitForMessagesAndGetAsString();
++        expect(goal?.message).toBe('/goal clear');
++        expect(goal?.isolate).toBe(false);
++        const rest = await queue.waitForMessagesAndGetAsString();
++        expect(rest?.message).toBe('after one\nafter two');
++    });
++
+     it('should push and retrieve messages with same mode', async () => {
+         const queue = new MessageQueue2<string>(mode => mode);
+         
+--- a/cli/src/claude/runClaude.ts
++++ b/cli/src/claude/runClaude.ts
+@@ -475,9 +475,10 @@
+                 allowedTools: messageAllowedTools,
+                 disallowedTools: messageDisallowedTools
+             };
+-            // Isolated so a queued neighbour can never be batched into the
+-            // goal argument; trailing lines follow as an ordinary message.
+-            messageQueue.pushIsolated(goalCommand.command, goalMode, localId);
++            // Standalone so a queued neighbour can never be batched into the
++            // goal argument (without the process restart `isolate` implies);
++            // trailing lines follow as an ordinary message.
++            messageQueue.pushStandalone(goalCommand.command, goalMode, localId);
+             if (goalCommand.followUp) {
+                 messageQueue.push(
+                     formatMessageWithAttachments(goalCommand.followUp, message.content.attachments),
+--- a/cli/src/claude/claudeRemote.ts
++++ b/cli/src/claude/claudeRemote.ts
+@@ -30,7 +30,7 @@
+     bootstrapMode?: EnhancedMode,
+ 
+     // Dynamic parameters
+-    nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
++    nextMessage: () => Promise<{ message: string, mode: EnhancedMode, uuid?: string } | null>,
+     onReady: (completionEvent?: string) => void | Promise<void>,
+     isAborted: (toolCallId: string) => boolean,
+ 
+@@ -265,7 +265,7 @@
+                 }
+                 mode = next.mode;
+                 updateThinking(true);
+-                messages.push({ type: 'user', priority: 'later', message: { role: 'user', content: next.message } });
++                messages.push({ type: 'user', priority: 'later', ...(next.uuid ? { uuid: next.uuid } : {}), message: { role: 'user', content: next.message } });
+                 logger.debug(
+                     `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
+                     `messageLength=${next.message.length} permissionMode=${next.mode.permissionMode}`
+--- a/cli/src/claude/claudeRemoteLauncher.ts
++++ b/cli/src/claude/claudeRemoteLauncher.ts
+@@ -55,6 +55,19 @@
+     private readyCancel: ((uuid: string) => Promise<boolean>) | null = null;
+     private readyMessages: ClaudeReadyMessages;
+     private readySendNow: ((uuid: string) => Promise<'stopped' | 'delivering' | 'nothing_waiting'>) | null = null;
++
++    /**
++     * A slash command handed to Claude while it is busy waits in Claude's own
++     * queue (a `/goal clear` can wait out a whole goal loop). With message
++     * lifecycle support, give it a uuid so it shows as waiting until Claude
++     * actually starts it, instead of looking applied at hand-off.
++     */
++    private trackSlashCommand(items: Array<{ localId?: string }>, text: string): { uuid?: string } {
++        if (!this.readySendNow || !text.trimStart().startsWith('/')) return {};
++        const localIds = items.flatMap((item) => item.localId ? [item.localId] : []);
++        if (localIds.length !== 1) return {};
++        return { uuid: this.readyMessages.prepare(localIds[0], text) };
++    }
+     private abortController: AbortController | null = null;
+     private abortFuture: Future<void> | null = null;
+     private permissionHandler: PermissionHandler | null = null;
+@@ -461,7 +474,7 @@
+                                     deliveredText,
+                                     p.items.flatMap((item) => item.localId ? [item.localId] : [])
+                                 )
+-                                return { ...p, message: deliveredText };
++                                return { ...p, message: deliveredText, ...this.trackSlashCommand(p.items, deliveredText) };
+                             }
+ 
+                             let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
+@@ -498,7 +511,8 @@
+                                 )
+                                 return {
+                                     message: deliveredText,
+-                                    mode: msg.mode
++                                    mode: msg.mode,
++                                    ...this.trackSlashCommand(msg.items, deliveredText)
+                                 };
+                             }
+ 

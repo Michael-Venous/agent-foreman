@@ -1,0 +1,214 @@
+--- a/cli/src/codex/utils/slashCommands.ts
++++ b/cli/src/codex/utils/slashCommands.ts
+@@ -58,6 +58,8 @@
+         action: 'show' | 'set' | 'pause' | 'resume' | 'clear';
+         objective?: string;
+         message?: string;
++        /** Lines after a control word; sent as an ordinary prompt, never a goal. */
++        followUp?: string;
+     };
+ 
+ export function resolveCodexSlashCommand(
+@@ -140,18 +142,16 @@
+     }
+ 
+     if (command === 'goal') {
+-        const lowerRest = rest.toLowerCase();
++        // Only the first line can be a control word. `/goal clear\nFinish up`
++        // used to become a new goal whose objective began with "clear".
++        const newline = rest.indexOf('\n');
++        const firstLine = (newline === -1 ? rest : rest.slice(0, newline)).trim().toLowerCase();
++        const followUp = newline === -1 ? '' : rest.slice(newline + 1).trim();
+         if (!rest) {
+             return { kind: 'goal', action: 'show' };
+         }
+-        if (lowerRest === 'clear') {
+-            return { kind: 'goal', action: 'clear' };
+-        }
+-        if (lowerRest === 'pause') {
+-            return { kind: 'goal', action: 'pause' };
+-        }
+-        if (lowerRest === 'resume') {
+-            return { kind: 'goal', action: 'resume' };
++        if (firstLine === 'clear' || firstLine === 'pause' || firstLine === 'resume') {
++            return { kind: 'goal', action: firstLine, ...(followUp ? { followUp } : {}) };
+         }
+         const objective = rest.trim();
+         if (!objective) {
+--- a/cli/src/codex/utils/slashCommands.test.ts
++++ b/cli/src/codex/utils/slashCommands.test.ts
+@@ -138,6 +138,29 @@
+         });
+     });
+ 
++    it('applies a goal control word and sends trailing lines as a normal prompt', () => {
++        expect(resolveCodexSlashCommand('/goal clear\nFinish up once you are done', state)).toEqual({
++            kind: 'goal',
++            action: 'clear',
++            followUp: 'Finish up once you are done'
++        });
++        expect(resolveCodexSlashCommand('/goal PAUSE \n\n wait for the GPU', state)).toEqual({
++            kind: 'goal',
++            action: 'pause',
++            followUp: 'wait for the GPU'
++        });
++        expect(resolveCodexSlashCommand('/goal clear\n   ', state)).toEqual({
++            kind: 'goal',
++            action: 'clear'
++        });
++        // A multi-line objective that does not start with a control word stays a goal.
++        expect(resolveCodexSlashCommand('/goal clear the backlog\nthen report', state)).toEqual({
++            kind: 'goal',
++            action: 'set',
++            objective: 'clear the backlog\nthen report'
++        });
++    });
++
+     it('resolves Codex goal commands for native handling', () => {
+         expect(resolveCodexSlashCommand('/goal', state)).toEqual({
+             kind: 'goal',
+--- a/cli/src/codex/shared/root.ts
++++ b/cli/src/codex/shared/root.ts
+@@ -617,7 +617,7 @@
+             this.notice(savedStateConfirmed
+                 ? `Saved goal ${label}${goalStatus ? ` (${goalStatus})` : ''}; current turn unchanged.`
+                 : 'Goal command handled; saved state unconfirmed; current turn unchanged.');
+-            return null;
++            return slash.followUp ?? null;
+         }
+         if (slash.updates?.proactiveMultiAgent !== undefined) throw new Error('This Codex version uses Ultra reasoning effort instead of a multi-agent toggle');
+         if (slash.updates?.model === null) throw new Error('Choose an explicit model in a shared thread');
+--- a/cli/src/parsers/specialCommands.ts
++++ b/cli/src/parsers/specialCommands.ts
+@@ -109,6 +109,36 @@
+     };
+ }
+ 
++export interface GoalCommandSplit {
++    /** The `/goal ...` command to deliver on its own. */
++    command: string;
++    /** Lines after a control word, delivered as an ordinary message. */
++    followUp: string | null;
++}
++
++const GOAL_CONTROL_WORDS = new Set(['clear', 'pause', 'resume']);
++
++/**
++ * Claude Code treats `/goal clear` as a clear only when the argument is exactly
++ * a control word; `/goal clear\nFinish up` sets an unsatisfiable new goal whose
++ * condition starts with "clear". Split the control word from trailing lines.
++ * Any other `/goal` message is returned whole so it can be sent unbatched.
++ */
++export function splitGoalCommand(message: string): GoalCommandSplit | null {
++    const text = message.trim();
++    if (!/^\/goal(?:\s|$)/i.test(text)) {
++        return null;
++    }
++    const newline = text.indexOf('\n');
++    const firstLine = (newline === -1 ? text : text.slice(0, newline)).trim();
++    const argument = firstLine.slice('/goal'.length).trim().toLowerCase();
++    if (newline !== -1 && GOAL_CONTROL_WORDS.has(argument)) {
++        const followUp = text.slice(newline + 1).trim();
++        return { command: firstLine, followUp: followUp || null };
++    }
++    return { command: text, followUp: null };
++}
++
+ /**
+  * Unified parser for special commands
+  * Returns the type of command and original message if applicable
+--- a/cli/src/parsers/specialCommands.test.ts
++++ b/cli/src/parsers/specialCommands.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, it, expect } from 'vitest';
+-import { parseCompact, parseClear, parsePlan, parseSpecialCommand } from './specialCommands';
++import { parseCompact, parseClear, parsePlan, parseSpecialCommand, splitGoalCommand } from './specialCommands';
+ 
+ describe('parseCompact', () => {
+     it('should parse /compact command with argument', () => {
+@@ -131,3 +131,31 @@
+         expect(parseSpecialCommand('/planner').type).toBeNull();
+     });
+ });
++
++describe('splitGoalCommand', () => {
++    it('ignores non-goal messages', () => {
++        expect(splitGoalCommand('please clear the goal')).toBeNull();
++        expect(splitGoalCommand('/goals')).toBeNull();
++    });
++
++    it('splits a control word from trailing lines', () => {
++        expect(splitGoalCommand('/goal clear\nFinish up once you are done')).toEqual({
++            command: '/goal clear',
++            followUp: 'Finish up once you are done'
++        });
++        expect(splitGoalCommand('  /goal resume\n\nkeep going  ')).toEqual({
++            command: '/goal resume',
++            followUp: 'keep going'
++        });
++        expect(splitGoalCommand('/goal pause\n  ')).toEqual({ command: '/goal pause', followUp: null });
++    });
++
++    it('keeps other goal messages whole', () => {
++        expect(splitGoalCommand('/goal clear')).toEqual({ command: '/goal clear', followUp: null });
++        expect(splitGoalCommand('/goal')).toEqual({ command: '/goal', followUp: null });
++        expect(splitGoalCommand('/goal ship the release\nwith notes')).toEqual({
++            command: '/goal ship the release\nwith notes',
++            followUp: null
++        });
++    });
++});
+--- a/cli/src/claude/runClaude.ts
++++ b/cli/src/claude/runClaude.ts
+@@ -5,7 +5,7 @@
+ import { MessageQueue2 } from '@/utils/MessageQueue2';
+ import { hashObject } from '@/utils/deterministicJson';
+ import { classifyClaudeSlashCatalog, extractSDKMetadata } from '@/claude/sdk/metadataExtractor';
+-import { parseSpecialCommand } from '@/parsers/specialCommands';
++import { parseSpecialCommand, splitGoalCommand } from '@/parsers/specialCommands';
+ import { getEnvironmentInfo } from '@/ui/doctor';
+ import { startHappyServer, toClaudeAllowedHapiMcpTools } from '@/claude/utils/startHappyServer';
+ import { startHookServer } from '@/claude/utils/startHookServer';
+@@ -463,6 +463,32 @@
+             return;
+         }
+ 
++        const goalCommand = splitGoalCommand(message.content.text);
++        if (goalCommand) {
++            const goalMode: EnhancedMode = {
++                permissionMode: messagePermissionMode ?? 'default',
++                model: messageModel,
++                effort: messageEffort,
++                fallbackModel: messageFallbackModel,
++                customSystemPrompt: messageCustomSystemPrompt,
++                appendSystemPrompt: messageAppendSystemPrompt,
++                allowedTools: messageAllowedTools,
++                disallowedTools: messageDisallowedTools
++            };
++            // Isolated so a queued neighbour can never be batched into the
++            // goal argument; trailing lines follow as an ordinary message.
++            messageQueue.pushIsolated(goalCommand.command, goalMode, localId);
++            if (goalCommand.followUp) {
++                messageQueue.push(
++                    formatMessageWithAttachments(goalCommand.followUp, message.content.attachments),
++                    goalMode,
++                    localId
++                );
++            }
++            logger.debug('[start] /goal command pushed to queue in isolation');
++            return;
++        }
++
+         // Push with resolved permission mode, model, system prompts, and tools
+         const enhancedMode: EnhancedMode = {
+             permissionMode: messagePermissionMode ?? 'default',
+--- a/cli/src/claude/utils/systemPrompt.ts
++++ b/cli/src/claude/utils/systemPrompt.ts
+@@ -9,6 +9,7 @@
+  */
+ const BASE_SYSTEM_PROMPT = (() => trimIdent(`
+     Use the title tool sparingly. For a new chat, call the tool "mcp__hapi__change_title" once after the user's initial request is clear, and set a concise task title. Do not rename the chat for routine progress, substeps, implementation details, or a slightly better wording. Rename only when the user's primary objective changes substantially and the existing title would be misleading.
++    While a /goal is active, do not end turns with status-only replies when you are blocked on something you cannot resolve yourself (another process, a resource held elsewhere, a human decision). Each such reply triggers another goal check and rereads the whole context. Instead ask the user once with AskUserQuestion, naming the blocker and what would unblock it.
+     ${DISPLAY_IMAGE_PROMPT_CLAUDE}
+     ${DISPLAY_VIDEO_PROMPT_CLAUDE}
+     ${DISPLAY_MEDIA_PROMPT_CLAUDE}

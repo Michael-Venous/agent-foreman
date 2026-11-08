@@ -1,0 +1,81 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -13,7 +13,7 @@
+ import { createPortal } from 'react-dom'
+ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent } from 'react'
+ import { nodeRouting, nodeRoutingError, createsCycle, type NodeJunction, type NodeRouting, edgeAsleep, nodeIsIdle, type NodeAnnotation, type NodeGraphResponse, type NodeLayoutPositions, type NodeSwitchResult, type NodeWorkspace } from '@hapi/protocol/nodeGraph'
+-import type { ApiClient } from '@/api/client'
++import type { ApiClient, ManagedSession } from '@/api/client'
+ import type { SessionSummary } from '@/types/api'
+ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+ import { activeWorkspaceName, useNodeGraph, useNodeGraphPreview } from '@/hooks/useNodeGraph'
+@@ -80,6 +80,16 @@
+ const DOUBLE_TAP_MS = 350, DOUBLE_TAP_SLOP = 24
+ const iconButton = 'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:opacity-40'
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
++
++/** Ownership determines icon visibility; the oversight snapshot can lag a graph edit. */
++function ChildrenOversight({ name, children, managed, api, title, previewing }: { name: string; children: string[]; managed: Record<string, ManagedSession>; api: ApiClient | null; title: (id: string) => string; previewing: boolean }) {
++    return <Popover.Root><Popover.Trigger asChild><button type="button" aria-label={`Managed children of ${name}`} title="Managed children" onClick={event => event.stopPropagation()} className="flex h-7 w-7 items-center justify-center rounded-md text-violet-500 hover:bg-[var(--app-subtle-bg)]">
++        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
++    </button></Popover.Trigger><Popover.Portal><Popover.Content data-graph-ui side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl">
++        <p className="mb-2 font-medium">Managed children</p>
++        {children.map(id => <div key={id} className="flex min-h-8 items-center gap-2"><span className="min-w-0 flex-1 truncate" title={title(id)}>{title(id)}</span>{previewing ? <span className="text-[var(--app-hint)]">Preview</span> : managed[id]?.worker ? <SessionOversightBadge managed={managed[id]} api={api} sessionId={id} /> : <span className="text-[var(--app-hint)]">Oversight unconfirmed</span>}</div>)}
++    </Popover.Content></Popover.Portal></Popover.Root>
++}
+ 
+ /** Pan/zoomable owner -> child graph of the active workspace, with node actions and workspace slots. */
+ export function NodeGraphView({ api, sessions, onOpenChat, visible = true, headerTargets, respectChatPin = true }: {
+@@ -192,6 +202,11 @@
+     const positions = useMemo(() => ({ ...layout?.positions, ...overrides }), [layout, overrides])
+     const ids = useMemo(() => Object.keys(layout?.positions ?? {}), [layout])
+     const edges = useMemo(() => Object.entries(layout?.parent ?? {}).map(([child, owner]) => ({ owner, child, via: graph?.graph.edges.find(e => e.child === child && e.owner === owner)?.via })), [layout, graph])
++    const childrenByOwner = useMemo(() => {
++        const result = new Map<string, string[]>()
++        for (const edge of edges) result.set(edge.owner, [...(result.get(edge.owner) ?? []), edge.child])
++        return result
++    }, [edges])
+     const positionsRef = useRef(positions); positionsRef.current = positions
+ 
+     const junctions = (graph?.graph.junctions ?? []).map(j => ({ ...j, ...junctionDrafts[j.id] }))
+@@ -1165,7 +1180,7 @@
+                                 <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
+                             </span>
+                         </button>
+-                        {managedSessions[id] && <span data-graph-ui className="absolute bottom-0 right-0"><SessionOversightBadge managed={managedSessions[id]} api={api} sessionId={id} /></span>}
++                        {childrenByOwner.has(id) && <span data-graph-ui className="absolute bottom-0 right-0 z-[8]"><ChildrenOversight name={name} children={childrenByOwner.get(id)!} managed={managedSessions} api={api} title={title} previewing={previewing} /></span>}
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+                             data-port-side={nodePorts[id]?.input} style={nodePortStyle(id, 'input')}
+                             title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -125,6 +125,29 @@
+     </I18nProvider></QueryClientProvider>)
+     return { api, client, onOpenChat, view }
+ }
++it('shows a clickable eye only on nodes with children and follows edge changes without waiting for oversight snapshots', async () => {
++    const now = Date.now() / 1000
++    const managed = { A: { role: 'worker', worker: 'wa', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, notifications: true, fallbackMinutes: 30 } }, C: { role: 'worker', worker: 'wc', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, notifications: true, fallbackMinutes: 30 } } }
++    const api = Object.assign(makeApi(), { getManagedSessions: vi.fn(async () => managed) })
++    const { client, onOpenChat } = setup(api)
++    const eye = await screen.findByRole('button', { name: 'Managed children of Overseer chat' })
++    expect(screen.getByRole('button', { name: 'Managed children of Alpha' })).toBeTruthy()
++    expect(screen.queryByRole('button', { name: 'Managed children of Bravo' })).toBeNull()
++    fireEvent.pointerDown(eye, { pointerId: 41, button: 0 }); fireEvent.pointerUp(eye, { pointerId: 41, button: 0 }); fireEvent.click(eye)
++    expect(await screen.findByText('Managed children')).toBeTruthy()
++    expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0)
++    fireEvent.click(await screen.findByRole('button', { name: 'Oversight: Watching' }))
++    expect(await screen.findByLabelText('Routine checks')).toBeTruthy()
++    expect(onOpenChat).not.toHaveBeenCalled()
++    const graph = await api.getNodeGraph()
++    const withoutInput = { ...graph, graph: { ...graph.graph, edges: graph.graph.edges.filter(edge => edge.child !== 'A') } }
++    act(() => client.setQueryData(['node-graph'], withoutInput))
++    expect(screen.getByRole('button', { name: 'Managed children of Alpha' })).toBeTruthy()
++    const withoutChild = { ...withoutInput, graph: { ...withoutInput.graph, edges: withoutInput.graph.edges.filter(edge => edge.child !== 'C') } }
++    act(() => client.setQueryData(['node-graph'], withoutChild))
++    await waitFor(() => expect(screen.queryByRole('button', { name: 'Managed children of Alpha' })).toBeNull())
++    expect(screen.getByRole('button', { name: 'Managed children of Overseer chat' })).toBeTruthy()
++})
+ const openNode = async (name: string) => {
+     fireEvent.contextMenu(await screen.findByRole('button', { name: `Node ${name}` }), { clientX: 200, clientY: 150 })
+     return screen.findByRole('dialog', { name: `Actions for ${name}` })

@@ -1,0 +1,73 @@
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -94,11 +94,10 @@
+     </button></Popover.Trigger><Popover.Portal><Popover.Content data-graph-ui side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl">
+         <p className="mb-2 font-medium">Managed children</p>
+         {!previewing && api && <form className="mb-2 space-y-2 border-b border-[var(--app-border)] pb-3" onSubmit={async event => { event.preventDefault(); if (mode === 'unset') return; setSaving(true); setError(''); setSaved(false); try { await api.setChildrenReporting(managerId, { mode, instructions, ...(mode === 'fixed' ? { minutes: Number(minutes) } : {}) }); setSaved(true) } catch (e) { setError(e instanceof Error ? e.message : 'Could not save') } finally { setSaving(false) } }}>
+-            <label className="block font-medium">Default for direct children<select aria-label="Default for direct children" value={mode} onChange={event => { setMode(event.target.value as typeof mode); setSaved(false) }} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="unset" disabled>Use existing default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
++            <label className="block font-medium">Check-in interval<select aria-label="Check-in interval for children" value={mode} onChange={event => { setMode(event.target.value as typeof mode); setSaved(false) }} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="unset" disabled>Use existing default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
+             {mode === 'fixed' && <label className="block">Minutes<input aria-label="Default minutes" type="number" min="5" required value={minutes} onChange={event => setMinutes(event.target.value)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
+             {mode === 'automatic' && <label className="block">Instructions (optional)<textarea aria-label="Default automatic polling instructions" maxLength={2000} value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="For example: check stable renders every few hours" rows={3} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
+-            <p className="text-[var(--app-hint)]">Applies to direct children using the manager default. Individual overrides are kept.</p>
+-            {error && <p role="alert" className="text-red-500">{error}</p>}<button type="submit" disabled={saving || mode === 'unset'} className="rounded border border-[var(--app-border)] px-2 py-1">{saving ? 'Saving…' : 'Save default'}</button>{saved && <span className="ml-2">Saved</span>}
++            {error && <p role="alert" className="text-red-500">{error}</p>}<button type="submit" disabled={saving || mode === 'unset'} className="rounded border border-[var(--app-border)] px-2 py-1">{saving ? 'Applying…' : 'Apply to children'}</button>{saved && <span className="ml-2">Applied</span>}
+         </form>}
+         {children.map(id => <div key={id} className="flex min-h-8 items-center gap-2"><span className="min-w-0 flex-1 truncate" title={title(id)}>{title(id)}</span>{previewing ? <span className="text-[var(--app-hint)]">Preview</span> : managed[id]?.worker ? <SessionOversightBadge managed={managed[id]} api={api} sessionId={id} /> : <span className="text-[var(--app-hint)]">Oversight unconfirmed</span>}</div>)}
+     </Popover.Content></Popover.Portal></Popover.Root>
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -137,7 +137,7 @@
+     expect(await screen.findByText('Managed children')).toBeTruthy()
+     expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0)
+     fireEvent.click(await screen.findByRole('button', { name: 'Oversight: Watching' }))
+-    expect(await screen.findByLabelText('Routine checks')).toBeTruthy()
++    expect(await screen.findByRole('combobox', { name: 'Check-in interval' })).toBeTruthy()
+     expect(onOpenChat).not.toHaveBeenCalled()
+     const graph = await api.getNodeGraph()
+     const withoutInput = { ...graph, graph: { ...graph.graph, edges: graph.graph.edges.filter(edge => edge.child !== 'A') } }
+@@ -153,11 +153,11 @@
+     const api = Object.assign(makeApi(), { getManagedSessions: vi.fn(async () => ({})), setChildrenReporting })
+     setup(api)
+     fireEvent.click(await screen.findByRole('button', { name: 'Managed children of Overseer chat' }))
+-    fireEvent.change(screen.getByLabelText('Default for direct children'), { target: { value: 'automatic' } })
++    fireEvent.change(screen.getByLabelText('Check-in interval for children'), { target: { value: 'automatic' } })
+     fireEvent.change(screen.getByLabelText('Default automatic polling instructions'), { target: { value: 'Stable renders every few hours' } })
+-    fireEvent.click(screen.getByRole('button', { name: 'Save default' }))
++    fireEvent.click(screen.getByRole('button', { name: 'Apply to children' }))
+     await waitFor(() => expect(setChildrenReporting).toHaveBeenCalledWith('O', { mode: 'automatic', instructions: 'Stable renders every few hours' }))
+-    expect(await screen.findByText('Saved')).toBeTruthy()
++    expect(await screen.findByText('Applied')).toBeTruthy()
+ })
+ const openNode = async (name: string) => {
+     fireEvent.contextMenu(await screen.findByRole('button', { name: `Node ${name}` }), { clientX: 200, clientY: 150 })
+--- a/web/src/components/SessionOversightBadge.tsx
++++ b/web/src/components/SessionOversightBadge.tsx
+@@ -17,7 +17,7 @@
+         <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{evidence.label !== 'Watching' && <path d="m3 3 18 18"/>}</svg>
+     </button></Popover.Trigger><Popover.Portal><Popover.Content side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl"><p className="mb-1 font-medium">{evidence.label}</p><p className="text-[var(--app-hint)]">{evidence.description}</p>
+         {api && sessionId && managed?.worker && <form className="mt-3 space-y-2" onSubmit={async event => { event.preventDefault(); setSaving(true); setError(''); try { await api.setManagedReporting(sessionId, { mode, ...(mode === 'fixed' ? { minutes: Number(minutes) } : {}), instructions }); setOpen(false) } catch (e) { setError(e instanceof Error ? e.message : 'Could not save') } finally { setSaving(false) } }}>
+-            <label className="block font-medium">Routine checks<select aria-label="Routine checks" value={mode} onChange={event => setMode(event.target.value as typeof mode)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="inherit">Use manager default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
++            <label className="block font-medium">Check-in interval<select aria-label="Check-in interval" value={mode} onChange={event => setMode(event.target.value as typeof mode)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="inherit">Use manager default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
+             {mode === 'fixed' && <label className="block">Minutes<input aria-label="Minutes" type="number" min="5" required value={minutes} onChange={event => setMinutes(event.target.value)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
+             {mode === 'automatic' && <label className="block">Instructions (optional)<textarea aria-label="Automatic polling instructions" maxLength={2000} value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="For example: check stable renders every few hours; volatile work every 10 minutes" className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" rows={3} /></label>}
+             {error && <p role="alert" className="text-red-500">{error}</p>}<button type="submit" disabled={saving} className="rounded border border-[var(--app-border)] px-2 py-1">{saving ? 'Saving…' : 'Save'}</button>
+--- a/web/src/components/SessionOversightBadge.test.tsx
++++ b/web/src/components/SessionOversightBadge.test.tsx
+@@ -15,7 +15,7 @@
+     const now = Date.now() / 1000
+     render(<SessionOversightBadge api={{ setManagedReporting: save } as unknown as ApiClient} sessionId="child" managed={{ role: 'worker', worker: 'w', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, notifications: true, fallbackMinutes: 30 } }} />)
+     fireEvent.click(screen.getByRole('button', { name: 'Oversight: Watching' }))
+-    fireEvent.change(screen.getByLabelText('Routine checks'), { target: { value: 'automatic' } })
++    fireEvent.change(screen.getByLabelText('Check-in interval'), { target: { value: 'automatic' } })
+     fireEvent.change(screen.getByLabelText('Automatic polling instructions'), { target: { value: 'Check stable renders every few hours' } })
+     fireEvent.click(screen.getByText('Save'))
+     await waitFor(() => expect(save).toHaveBeenCalledWith('child', { mode: 'automatic', instructions: 'Check stable renders every few hours' }))
+@@ -24,7 +24,7 @@
+     const save = vi.fn().mockResolvedValue(undefined), now = Date.now() / 1000
+     render(<SessionOversightBadge api={{ setManagedReporting: save } as unknown as ApiClient} sessionId="child" managed={{ role: 'worker', worker: 'w', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, notifications: true, fallbackMinutes: 10, cadenceMode: 'fixed', cadenceSource: 'child' } }} />)
+     fireEvent.click(screen.getByRole('button', { name: 'Oversight: Watching' }))
+-    fireEvent.change(screen.getByLabelText('Routine checks'), { target: { value: 'inherit' } })
++    fireEvent.change(screen.getByLabelText('Check-in interval'), { target: { value: 'inherit' } })
+     fireEvent.click(screen.getByText('Save'))
+     await waitFor(() => expect(save).toHaveBeenCalledWith('child', { mode: 'inherit', instructions: '' }))
+ })

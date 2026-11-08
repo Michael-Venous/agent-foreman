@@ -1,0 +1,184 @@
+--- a/hub/src/managerControl.ts
++++ b/hub/src/managerControl.ts
+@@ -3,7 +3,7 @@
+ import { randomUUID } from 'node:crypto'
+ 
+ /** The same durable request protocol as managerctl; never spawn a model/shell. */
+-export async function requestManagerControl(command: { op: 'unmanage'; worker: string; session: string } | { op: 'node_sync' } | { op: 'reporting'; worker: string; session: string; cadence_mode: 'automatic' | 'fixed' | 'off'; cadence_instructions: string; fallback_minutes?: number }, options?: { directory?: string; timeoutMs?: number }): Promise<unknown> {
++export async function requestManagerControl(command: { op: 'unmanage'; worker: string; session: string } | { op: 'node_sync' } | { op: 'reporting'; worker: string; session: string; cadence_mode: 'automatic' | 'fixed' | 'off' | 'inherit'; cadence_instructions: string; fallback_minutes?: number } | { op: 'manager_reporting'; manager: string; cadence_mode: 'automatic' | 'fixed' | 'off'; cadence_instructions: string; fallback_minutes?: number }, options?: { directory?: string; timeoutMs?: number }): Promise<unknown> {
+     const directory = options?.directory ?? process.env.HAPI_MANAGER_CONTROL_DIR
+         ?? (process.env.HAPI_MANAGED_SESSIONS_FILE ? resolve(dirname(process.env.HAPI_MANAGED_SESSIONS_FILE), '../manager/control') : undefined)
+     if (!directory) throw new Error('Manager control is unavailable')
+--- a/hub/src/web/routes/managedSessions.ts
++++ b/hub/src/web/routes/managedSessions.ts
+@@ -3,7 +3,7 @@
+ import { Hono } from 'hono'
+ import type { WebAppEnv } from '../middleware/auth'
+ 
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean; cadenceMode?: 'automatic' | 'fixed' | 'off'; cadenceInstructions?: string } }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; childrenReporting?: { cadence_mode: 'automatic' | 'fixed' | 'off'; cadence_instructions: string; fallback_minutes: number }; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean; cadenceMode?: 'automatic' | 'fixed' | 'off'; cadenceInstructions?: string; cadenceSource?: 'child' | 'manager' | 'default' } }
+ 
+ /** Chats an external manager supervises, published as JSON (HAPI_MANAGED_SESSIONS_FILE). */
+ export function readManagedSessions(path = process.env.HAPI_MANAGED_SESSIONS_FILE): Record<string, ManagedSession> {
+@@ -28,9 +28,18 @@
+         const session = c.req.param('id'), managed = read()[session]
+         if (managed?.role !== 'worker' || !managed.worker) return c.json({ error: 'Session is not managed' }, 409)
+         const body = await c.req.json().catch(() => null) as { mode?: unknown; minutes?: unknown; instructions?: unknown } | null
++        if (!body || !['automatic', 'fixed', 'off', 'inherit'].includes(String(body.mode)) || typeof body.instructions !== 'string' || body.instructions.length > 2000 || (body.mode === 'fixed' && (typeof body.minutes !== 'number' || !Number.isFinite(body.minutes) || body.minutes < 5))) return c.json({ error: 'Invalid reporting settings' }, 400)
++        try {
++            await control({ op: 'reporting', worker: managed.worker, session, cadence_mode: body.mode as 'automatic' | 'fixed' | 'off' | 'inherit', cadence_instructions: body.instructions, ...(body.mode === 'fixed' ? { fallback_minutes: body.minutes as number } : {}) })
++            return c.json({ ok: true })
++        } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Reporting update failed' }, 503) }
++    })
++    app.post('/managed-sessions/:id/children-reporting', async (c) => {
++        if (c.get('namespace') !== 'default') return c.json({ error: 'Access denied' }, 403)
++        const body = await c.req.json().catch(() => null) as { mode?: unknown; minutes?: unknown; instructions?: unknown } | null
+         if (!body || !['automatic', 'fixed', 'off'].includes(String(body.mode)) || typeof body.instructions !== 'string' || body.instructions.length > 2000 || (body.mode === 'fixed' && (typeof body.minutes !== 'number' || !Number.isFinite(body.minutes) || body.minutes < 5))) return c.json({ error: 'Invalid reporting settings' }, 400)
+         try {
+-            await control({ op: 'reporting', worker: managed.worker, session, cadence_mode: body.mode as 'automatic' | 'fixed' | 'off', cadence_instructions: body.instructions, ...(body.mode === 'fixed' ? { fallback_minutes: body.minutes as number } : {}) })
++            await control({ op: 'manager_reporting', manager: c.req.param('id'), cadence_mode: body.mode as 'automatic' | 'fixed' | 'off', cadence_instructions: body.instructions, ...(body.mode === 'fixed' ? { fallback_minutes: body.minutes as number } : {}) })
+             return c.json({ ok: true })
+         } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Reporting update failed' }, 503) }
+     })
+--- a/hub/src/web/routes/managedSessions.test.ts
++++ b/hub/src/web/routes/managedSessions.test.ts
+@@ -71,3 +71,16 @@
+     expect((await send('default', { mode: 'automatic', instructions: 'Be efficient' })).status).toBe(200)
+     expect(commands).toEqual([{ op: 'reporting', worker: 'w', session: 's', cadence_mode: 'automatic', cadence_instructions: 'Be efficient' }])
+ })
++it('limits manager-wide cadence requests to the owner namespace and validates the interval', async () => {
++    const commands: unknown[] = []
++    const app = (namespace: string) => {
++        const root = new Hono<WebAppEnv>(); root.use('*', async (c, next) => { c.set('namespace', namespace); await next() })
++        root.route('/', createManagedSessionsRoutes(() => ({}), async command => { commands.push(command); return {} }))
++        return root
++    }
++    const send = (namespace: string, body: unknown) => app(namespace).request('/managed-sessions/m/children-reporting', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
++    expect((await send('other', { mode: 'automatic', instructions: '' })).status).toBe(403)
++    expect((await send('default', { mode: 'fixed', minutes: 0, instructions: '' })).status).toBe(400)
++    expect((await send('default', { mode: 'automatic', instructions: 'Be efficient' })).status).toBe(200)
++    expect(commands).toEqual([{ op: 'manager_reporting', manager: 'm', cadence_mode: 'automatic', cadence_instructions: 'Be efficient' }])
++})
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -79,7 +79,7 @@
+     const inner = raw && typeof raw === 'object' ? (raw as { graph?: unknown }).graph : undefined
+     return isGraph(inner) ? nodeGraphOf(inner) : null
+ }
+-export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean; cadenceMode?: 'automatic' | 'fixed' | 'off'; cadenceInstructions?: string } }
++export type ManagedSession = { role: 'manager' | 'worker'; worker?: string; project?: string; watch?: string; projectStatus?: string; manualHold?: boolean; childrenReporting?: { cadence_mode: 'automatic' | 'fixed' | 'off'; cadence_instructions: string; fallback_minutes: number }; oversight?: { pendingUpdates?: number; state: 'watching' | 'idle' | 'held' | 'quiet' | 'attention' | 'unknown'; observedAt?: number | null; publishedAt: number; owner?: string | null; ownerState: 'available' | 'paused' | 'offline' | 'unknown'; notifications: boolean; fallbackMinutes: number; routineEnabled?: boolean; cadenceMode?: 'automatic' | 'fixed' | 'off'; cadenceInstructions?: string; cadenceSource?: 'child' | 'manager' | 'default' } }
+ 
+ /** Native /goal of a chat (Codex goals DB or Claude transcript), read-only. */
+ export type SessionGoal = {
+@@ -884,8 +884,11 @@
+     async getManagedSessions(): Promise<Record<string, ManagedSession>> {
+         return (await this.request<{ sessions: Record<string, ManagedSession> }>('/api/managed-sessions')).sessions
+     }
+-    async setManagedReporting(sessionId: string, settings: { mode: 'automatic' | 'fixed' | 'off'; minutes?: number; instructions: string }): Promise<void> {
++    async setManagedReporting(sessionId: string, settings: { mode: 'automatic' | 'fixed' | 'off' | 'inherit'; minutes?: number; instructions: string }): Promise<void> {
+         await this.request(`/api/managed-sessions/${encodeURIComponent(sessionId)}/reporting`, { method: 'POST', body: JSON.stringify(settings) })
++    }
++    async setChildrenReporting(sessionId: string, settings: { mode: 'automatic' | 'fixed' | 'off'; minutes?: number; instructions: string }): Promise<void> {
++        await this.request(`/api/managed-sessions/${encodeURIComponent(sessionId)}/children-reporting`, { method: 'POST', body: JSON.stringify(settings) })
+     }
+ 
+     async getNodeGraph(workspaceId?: string): Promise<NodeGraphResponse> {
+--- a/web/src/components/SessionOversightBadge.tsx
++++ b/web/src/components/SessionOversightBadge.tsx
+@@ -6,18 +6,18 @@
+ export function SessionOversightBadge({ managed, interactive = true, api, sessionId }: { managed?: ManagedSession; interactive?: boolean; api?: ApiClient | null; sessionId?: string }) {
+     const evidence = oversightEvidence(managed)
+     const [open, setOpen] = useState(false)
+-    const [mode, setMode] = useState<'automatic' | 'fixed' | 'off'>('off')
++    const [mode, setMode] = useState<'automatic' | 'fixed' | 'off' | 'inherit'>('inherit')
+     const [minutes, setMinutes] = useState('30')
+     const [instructions, setInstructions] = useState('')
+     const [error, setError] = useState('')
+     const [saving, setSaving] = useState(false)
+     if (!interactive) return <span aria-label={`Oversight: ${evidence.label}`} title={`${evidence.label}. ${evidence.description}`} className={`shrink-0 text-[11px] ${evidence.label === 'Watching' ? 'text-violet-500' : 'text-[var(--app-hint)]'}`}>{evidence.label === 'Watching' ? '◉' : '◌'}</span>
+-    return <Popover.Root open={open} onOpenChange={next => { setOpen(next); if (next) { setMode(managed?.oversight?.cadenceMode ?? (managed?.oversight?.routineEnabled ? 'fixed' : 'off')); setMinutes(String(managed?.oversight?.fallbackMinutes ?? 30)); setInstructions(managed?.oversight?.cadenceInstructions ?? ''); setError('') } }}><Popover.Trigger asChild><button type="button" aria-label={`Oversight: ${evidence.label}`} title={`${evidence.label}. ${evidence.description}`} onClick={event => event.stopPropagation()}
++    return <Popover.Root open={open} onOpenChange={next => { setOpen(next); if (next) { setMode(managed?.oversight?.cadenceSource && managed.oversight.cadenceSource !== 'child' ? 'inherit' : managed?.oversight?.cadenceMode ?? (managed?.oversight?.routineEnabled ? 'fixed' : 'off')); setMinutes(String(managed?.oversight?.fallbackMinutes ?? 30)); setInstructions(managed?.oversight?.cadenceInstructions ?? ''); setError('') } }}><Popover.Trigger asChild><button type="button" aria-label={`Oversight: ${evidence.label}`} title={`${evidence.label}. ${evidence.description}`} onClick={event => event.stopPropagation()}
+         className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] ${evidence.label === 'Watching' ? 'text-violet-500' : 'text-[var(--app-hint)]'}`}>
+         <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{evidence.label !== 'Watching' && <path d="m3 3 18 18"/>}</svg>
+     </button></Popover.Trigger><Popover.Portal><Popover.Content side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl"><p className="mb-1 font-medium">{evidence.label}</p><p className="text-[var(--app-hint)]">{evidence.description}</p>
+         {api && sessionId && managed?.worker && <form className="mt-3 space-y-2" onSubmit={async event => { event.preventDefault(); setSaving(true); setError(''); try { await api.setManagedReporting(sessionId, { mode, ...(mode === 'fixed' ? { minutes: Number(minutes) } : {}), instructions }); setOpen(false) } catch (e) { setError(e instanceof Error ? e.message : 'Could not save') } finally { setSaving(false) } }}>
+-            <label className="block font-medium">Routine checks<select aria-label="Routine checks" value={mode} onChange={event => setMode(event.target.value as typeof mode)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
++            <label className="block font-medium">Routine checks<select aria-label="Routine checks" value={mode} onChange={event => setMode(event.target.value as typeof mode)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="inherit">Use manager default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
+             {mode === 'fixed' && <label className="block">Minutes<input aria-label="Minutes" type="number" min="5" required value={minutes} onChange={event => setMinutes(event.target.value)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
+             {mode === 'automatic' && <label className="block">Instructions (optional)<textarea aria-label="Automatic polling instructions" maxLength={2000} value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="For example: check stable renders every few hours; volatile work every 10 minutes" className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" rows={3} /></label>}
+             {error && <p role="alert" className="text-red-500">{error}</p>}<button type="submit" disabled={saving} className="rounded border border-[var(--app-border)] px-2 py-1">{saving ? 'Saving…' : 'Save'}</button>
+--- a/web/src/components/SessionOversightBadge.test.tsx
++++ b/web/src/components/SessionOversightBadge.test.tsx
+@@ -20,6 +20,14 @@
+     fireEvent.click(screen.getByText('Save'))
+     await waitFor(() => expect(save).toHaveBeenCalledWith('child', { mode: 'automatic', instructions: 'Check stable renders every few hours' }))
+ })
++it('lets a child return to its manager default', async () => {
++    const save = vi.fn().mockResolvedValue(undefined), now = Date.now() / 1000
++    render(<SessionOversightBadge api={{ setManagedReporting: save } as unknown as ApiClient} sessionId="child" managed={{ role: 'worker', worker: 'w', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, notifications: true, fallbackMinutes: 10, cadenceMode: 'fixed', cadenceSource: 'child' } }} />)
++    fireEvent.click(screen.getByRole('button', { name: 'Oversight: Watching' }))
++    fireEvent.change(screen.getByLabelText('Routine checks'), { target: { value: 'inherit' } })
++    fireEvent.click(screen.getByText('Save'))
++    await waitFor(() => expect(save).toHaveBeenCalledWith('child', { mode: 'inherit', instructions: '' }))
++})
+ it('distinguishes watching from process liveness and shows pending manager handling', () => {
+     const now = Date.now() / 1000
+     render(<SessionOversightBadge managed={{ role: 'worker', oversight: { state: 'watching', ownerState: 'available', publishedAt: now, observedAt: now, pendingUpdates: 2, notifications: true, fallbackMinutes: 30 } }} />)
+--- a/web/src/components/NodeGraphView.tsx
++++ b/web/src/components/NodeGraphView.tsx
+@@ -82,11 +82,24 @@
+ const menuItem = 'flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-left text-sm hover:bg-[var(--app-subtle-bg)] disabled:opacity-40'
+ 
+ /** Ownership determines icon visibility; the oversight snapshot can lag a graph edit. */
+-function ChildrenOversight({ name, children, managed, api, title, previewing }: { name: string; children: string[]; managed: Record<string, ManagedSession>; api: ApiClient | null; title: (id: string) => string; previewing: boolean }) {
+-    return <Popover.Root><Popover.Trigger asChild><button type="button" aria-label={`Managed children of ${name}`} title="Managed children" onClick={event => event.stopPropagation()} className="flex h-7 w-7 items-center justify-center rounded-md text-violet-500 hover:bg-[var(--app-subtle-bg)]">
++function ChildrenOversight({ id: managerId, name, children, managed, api, title, previewing }: { id: string; name: string; children: string[]; managed: Record<string, ManagedSession>; api: ApiClient | null; title: (id: string) => string; previewing: boolean }) {
++    const [mode, setMode] = useState<'automatic' | 'fixed' | 'off' | 'unset'>('unset')
++    const [minutes, setMinutes] = useState('30')
++    const [instructions, setInstructions] = useState('')
++    const [saving, setSaving] = useState(false)
++    const [error, setError] = useState('')
++    const [saved, setSaved] = useState(false)
++    return <Popover.Root onOpenChange={open => { if (open) { const policy = managed[managerId]?.childrenReporting; setMode(policy?.cadence_mode ?? 'unset'); setMinutes(String(policy?.fallback_minutes ?? 30)); setInstructions(policy?.cadence_instructions ?? ''); setError(''); setSaved(false) } }}><Popover.Trigger asChild><button type="button" aria-label={`Managed children of ${name}`} title="Managed children" onClick={event => event.stopPropagation()} className="flex h-7 w-7 items-center justify-center rounded-md text-violet-500 hover:bg-[var(--app-subtle-bg)]">
+         <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+     </button></Popover.Trigger><Popover.Portal><Popover.Content data-graph-ui side="bottom" collisionPadding={8} onClick={event => event.stopPropagation()} className="z-[120] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-3 text-xs shadow-xl">
+         <p className="mb-2 font-medium">Managed children</p>
++        {!previewing && api && <form className="mb-2 space-y-2 border-b border-[var(--app-border)] pb-3" onSubmit={async event => { event.preventDefault(); if (mode === 'unset') return; setSaving(true); setError(''); setSaved(false); try { await api.setChildrenReporting(managerId, { mode, instructions, ...(mode === 'fixed' ? { minutes: Number(minutes) } : {}) }); setSaved(true) } catch (e) { setError(e instanceof Error ? e.message : 'Could not save') } finally { setSaving(false) } }}>
++            <label className="block font-medium">Default for direct children<select aria-label="Default for direct children" value={mode} onChange={event => { setMode(event.target.value as typeof mode); setSaved(false) }} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5"><option value="unset" disabled>Use existing default</option><option value="off">Off</option><option value="fixed">Fixed interval</option><option value="automatic">Automatic (manager decides)</option></select></label>
++            {mode === 'fixed' && <label className="block">Minutes<input aria-label="Default minutes" type="number" min="5" required value={minutes} onChange={event => setMinutes(event.target.value)} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
++            {mode === 'automatic' && <label className="block">Instructions (optional)<textarea aria-label="Default automatic polling instructions" maxLength={2000} value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="For example: check stable renders every few hours" rows={3} className="mt-1 w-full rounded border border-[var(--app-border)] bg-[var(--app-dialog-bg)] p-1.5" /></label>}
++            <p className="text-[var(--app-hint)]">Applies to direct children using the manager default. Individual overrides are kept.</p>
++            {error && <p role="alert" className="text-red-500">{error}</p>}<button type="submit" disabled={saving || mode === 'unset'} className="rounded border border-[var(--app-border)] px-2 py-1">{saving ? 'Saving…' : 'Save default'}</button>{saved && <span className="ml-2">Saved</span>}
++        </form>}
+         {children.map(id => <div key={id} className="flex min-h-8 items-center gap-2"><span className="min-w-0 flex-1 truncate" title={title(id)}>{title(id)}</span>{previewing ? <span className="text-[var(--app-hint)]">Preview</span> : managed[id]?.worker ? <SessionOversightBadge managed={managed[id]} api={api} sessionId={id} /> : <span className="text-[var(--app-hint)]">Oversight unconfirmed</span>}</div>)}
+     </Popover.Content></Popover.Portal></Popover.Root>
+ }
+@@ -1180,7 +1193,7 @@
+                                 <span className="truncate">{session?.metadata?.flavor ?? (session ? 'claude' : '—')} · {status}{session?.backgroundProcesses?.length && status !== 'Background' && status !== 'Running' ? ` · ${session.backgroundProcesses.length} background verified` : ''}</span>
+                             </span>
+                         </button>
+-                        {childrenByOwner.has(id) && <span data-graph-ui className="absolute bottom-0 right-0 z-[8]"><ChildrenOversight name={name} children={childrenByOwner.get(id)!} managed={managedSessions} api={api} title={title} previewing={previewing} /></span>}
++                        {childrenByOwner.has(id) && <span data-graph-ui className="absolute bottom-0 right-0 z-[8]"><ChildrenOversight id={id} name={name} children={childrenByOwner.get(id)!} managed={managedSessions} api={api} title={title} previewing={previewing} /></span>}
+                         {id !== overseer && <button type="button" data-input-handle={id} aria-label={`Input for ${name}`}
+                             data-port-side={nodePorts[id]?.input} style={nodePortStyle(id, 'input')}
+                             title="Input: drag its connected wire to another chat input, or to empty space to disconnect. An empty input can connect to an output."
+--- a/web/src/components/NodeGraphView.test.tsx
++++ b/web/src/components/NodeGraphView.test.tsx
+@@ -148,6 +148,17 @@
+     await waitFor(() => expect(screen.queryByRole('button', { name: 'Managed children of Alpha' })).toBeNull())
+     expect(screen.getByRole('button', { name: 'Managed children of Overseer chat' })).toBeTruthy()
+ })
++it('saves a manager default for direct children separately from individual overrides', async () => {
++    const setChildrenReporting = vi.fn().mockResolvedValue(undefined)
++    const api = Object.assign(makeApi(), { getManagedSessions: vi.fn(async () => ({})), setChildrenReporting })
++    setup(api)
++    fireEvent.click(await screen.findByRole('button', { name: 'Managed children of Overseer chat' }))
++    fireEvent.change(screen.getByLabelText('Default for direct children'), { target: { value: 'automatic' } })
++    fireEvent.change(screen.getByLabelText('Default automatic polling instructions'), { target: { value: 'Stable renders every few hours' } })
++    fireEvent.click(screen.getByRole('button', { name: 'Save default' }))
++    await waitFor(() => expect(setChildrenReporting).toHaveBeenCalledWith('O', { mode: 'automatic', instructions: 'Stable renders every few hours' }))
++    expect(await screen.findByText('Saved')).toBeTruthy()
++})
+ const openNode = async (name: string) => {
+     fireEvent.contextMenu(await screen.findByRole('button', { name: `Node ${name}` }), { clientX: 200, clientY: 150 })
+     return screen.findByRole('dialog', { name: `Actions for ${name}` })
