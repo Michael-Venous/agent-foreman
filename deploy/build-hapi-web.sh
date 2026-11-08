@@ -22,6 +22,7 @@ PATCHES+=(hapi-question-answer-clarity.patch)
 PATCHES+=(hapi-compact-message-previews.patch)
 PATCHES+=(hapi-goal-control-isolation.patch)
 PATCHES+=(hapi-claude-slash-receipts.patch)
+PATCHES+=(hapi-question-timeout.patch)
 if [[ ! -d "$SOURCE/.git" ]]; then
     git clone --branch v0.30.7 --depth 1 https://github.com/tiann/hapi.git "$SOURCE"
 fi
@@ -45,6 +46,8 @@ done
 # User requested selecting Desktop Midnight once per browser; later choices persist.
 (cd hub && "$BUN" test src/sync/archiveInactive.test.ts)
 (cd hub && "$BUN" test src/diagnostics.test.ts)
+# Unanswered agent questions auto-answer after 60s so chats continue.
+(cd hub && "$BUN" test src/sync/questionTimeout.test.ts)
 export VITE_DESKTOP_THEME_SELECTION="${VITE_DESKTOP_THEME_SELECTION-desktop-midnight-v1}"
 export VITE_DEFAULT_NEW_SESSION_DIRECTORY="${VITE_DEFAULT_NEW_SESSION_DIRECTORY:-$HOME}"
 # Deployment identity stays in ignored local state, never in public source.

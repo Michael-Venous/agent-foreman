@@ -1,0 +1,265 @@
+diff --git a/hub/src/sync/syncEngine.ts b/hub/src/sync/syncEngine.ts
+index e5db1ed..f683715 100644
+--- a/hub/src/sync/syncEngine.ts
++++ b/hub/src/sync/syncEngine.ts
+@@ -67,6 +67,7 @@ import {
+     type RpcUploadFileResponse
+ } from './rpcGateway'
+ import { SessionCache } from './sessionCache'
++import { createQuestionTimeoutState, dueQuestions, QUESTION_TIMEOUT_MS } from './questionTimeout'
+ import { ingestNotifySummaryFromMessage } from './workGraphNotifyIngest'
+ 
+ type PiResumeAttempt = NonNullable<NonNullable<Session['metadata']>['piResumeAttempt']>
+@@ -281,6 +282,7 @@ export class SyncEngine {
+         for (const session of this.getSessions()) if (session.metadata?.temporary) this.expiredTemporaryIds.add(session.id)
+         this.inactivityTimer = setInterval(() => this.expireInactive(), 5_000)
+         this.temporaryExpiryTimer = setInterval(() => void this.expireTemporarySessions(), 5_000)
++        this.questionTimeoutTimer = setInterval(() => void this.answerUnansweredQuestions(), 5_000)
+     }
+ 
+     setHubOwnerUserId(ownerUserId: string | number): void {
+@@ -289,6 +291,7 @@ export class SyncEngine {
+ 
+     stop(): void {
+         if (this.temporaryExpiryTimer) { clearInterval(this.temporaryExpiryTimer); this.temporaryExpiryTimer = null }
++        if (this.questionTimeoutTimer) { clearInterval(this.questionTimeoutTimer); this.questionTimeoutTimer = null }
+         if (this.inactivityTimer) {
+             clearInterval(this.inactivityTimer)
+             this.inactivityTimer = null
+@@ -296,6 +299,21 @@ export class SyncEngine {
+     }
+ 
+     private temporaryExpiryTimer: ReturnType<typeof setInterval> | null = null
++    private questionTimeoutTimer: ReturnType<typeof setInterval> | null = null
++    private readonly questionTimeouts = createQuestionTimeoutState()
++
++    /** Answer agent questions left unanswered past QUESTION_TIMEOUT_MS so the chat continues. */
++    async answerUnansweredQuestions(now = Date.now()): Promise<void> {
++        for (const due of dueQuestions(this.getSessions(), now, QUESTION_TIMEOUT_MS, this.questionTimeouts)) {
++            this.questionTimeouts.attempts.set(`${due.sessionId}:${due.requestId}`, now)
++            // A manually paused chat stays paused; approvePermission refuses it.
++            try {
++                await this.approvePermission(due.sessionId, due.requestId, undefined, undefined, undefined, due.answers)
++            } catch {
++                // Agent disconnected or paused; retried after QUESTION_TIMEOUT_RETRY_MS while still pending.
++            }
++        }
++    }
+ 
+     private async expireTemporarySessions(): Promise<void> {
+         if (this.temporaryExpiryInFlight) return
+diff --git a/hub/src/sync/questionTimeout.ts b/hub/src/sync/questionTimeout.ts
+new file mode 100644
+index 0000000..fa44dca
+--- /dev/null
++++ b/hub/src/sync/questionTimeout.ts
+@@ -0,0 +1,124 @@
++import { isObject } from '@hapi/protocol'
++import type { Session } from '@hapi/protocol/types'
++
++/**
++ * Agent questions (AskUserQuestion, request_user_input, Cursor questions) block
++ * the turn until someone answers. An unanswered question is answered for the
++ * user after this long so the chat keeps working. HAPI_QUESTION_TIMEOUT_MS=0
++ * disables the timeout.
++ */
++export const QUESTION_TIMEOUT_MS = (() => {
++    const parsed = process.env.HAPI_QUESTION_TIMEOUT_MS ? Number(process.env.HAPI_QUESTION_TIMEOUT_MS) : NaN
++    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000
++})()
++
++/** Failed RPC answers (agent briefly disconnected) are retried after this delay. */
++export const QUESTION_TIMEOUT_RETRY_MS = 30_000
++
++const FLAT_ANSWER_TOOLS = new Set(['AskUserQuestion', 'ask_user_question', 'CursorAskQuestion'])
++const NESTED_ANSWER_TOOLS = new Set(['request_user_input'])
++
++export function questionTimeoutText(timeoutMs: number): string {
++    const seconds = Math.round(timeoutMs / 1000)
++    return `No answer within ${seconds} seconds; the user may be away. Continue with your best judgment `
++        + '(prefer the option you would recommend), state the assumption you made, and keep working. '
++        + 'The user can redirect you later.'
++}
++
++function toolName(tool: string): string {
++    return tool.startsWith('functions.') ? tool.slice('functions.'.length) : tool
++}
++
++export function isTimedQuestionTool(tool: string): boolean {
++    const name = toolName(tool)
++    return FLAT_ANSWER_TOOLS.has(name) || NESTED_ANSWER_TOOLS.has(name)
++}
++
++function questionList(input: unknown): unknown[] {
++    return isObject(input) && Array.isArray(input.questions) ? input.questions : []
++}
++
++/** Answers in the same shape the web question cards submit. */
++export function questionTimeoutAnswers(
++    tool: string,
++    input: unknown,
++    text: string
++): Record<string, string[]> | Record<string, { answers: string[] }> {
++    const name = toolName(tool)
++    const questions = questionList(input)
++    if (NESTED_ANSWER_TOOLS.has(name)) {
++        const answers: Record<string, { answers: string[] }> = {}
++        questions.forEach((question, index) => {
++            const id = isObject(question) && typeof question.id === 'string' && question.id.trim()
++                ? question.id.trim()
++                : String(index)
++            answers[id] = { answers: [`user_note: ${text}`] }
++        })
++        if (Object.keys(answers).length === 0) answers['0'] = { answers: [`user_note: ${text}`] }
++        return answers
++    }
++    const stableIds = name === 'CursorAskQuestion'
++    const answers: Record<string, string[]> = {}
++    questions.forEach((question, index) => {
++        const id = stableIds && isObject(question) && typeof question.id === 'string' && question.id.trim()
++            ? question.id.trim()
++            : String(index)
++        answers[id] = [text]
++    })
++    if (Object.keys(answers).length === 0) answers['0'] = [text]
++    return answers
++}
++
++export type DueQuestion = {
++    sessionId: string
++    requestId: string
++    tool: string
++    answers: Record<string, string[]> | Record<string, { answers: string[] }>
++}
++
++/**
++ * Pending questions on active sessions that have waited at least `timeoutMs`.
++ * `state.attempts` holds each `${sessionId}:${requestId}` last answer attempt so
++ * a failed delivery is retried only after QUESTION_TIMEOUT_RETRY_MS;
++ * `state.seen` times requests stored without `createdAt` from first sight.
++ */
++export type QuestionTimeoutState = { attempts: Map<string, number>; seen: Map<string, number> }
++
++export function createQuestionTimeoutState(): QuestionTimeoutState {
++    return { attempts: new Map(), seen: new Map() }
++}
++
++export function dueQuestions(
++    sessions: Session[],
++    now: number,
++    timeoutMs: number,
++    state: QuestionTimeoutState
++): DueQuestion[] {
++    if (timeoutMs <= 0) return []
++    const due: DueQuestion[] = []
++    const live = new Set<string>()
++    const text = questionTimeoutText(timeoutMs)
++    for (const session of sessions) {
++        if (!session.active) continue
++        for (const [requestId, request] of Object.entries(session.agentState?.requests ?? {})) {
++            if (!isTimedQuestionTool(request.tool)) continue
++            const key = `${session.id}:${requestId}`
++            live.add(key)
++            if (!state.seen.has(key)) state.seen.set(key, now)
++            const createdAt = typeof request.createdAt === 'number' ? request.createdAt : state.seen.get(key)!
++            if (now - createdAt < timeoutMs) continue
++            const attempted = state.attempts.get(key)
++            if (attempted !== undefined && now - attempted < QUESTION_TIMEOUT_RETRY_MS) continue
++            due.push({
++                sessionId: session.id,
++                requestId,
++                tool: request.tool,
++                answers: questionTimeoutAnswers(request.tool, request.arguments, text)
++            })
++        }
++    }
++    for (const map of [state.attempts, state.seen]) {
++        for (const key of map.keys()) if (!live.has(key)) map.delete(key)
++    }
++    return due
++}
+diff --git a/hub/src/sync/questionTimeout.test.ts b/hub/src/sync/questionTimeout.test.ts
+new file mode 100644
+index 0000000..19dbcd4
+--- /dev/null
++++ b/hub/src/sync/questionTimeout.test.ts
+@@ -0,0 +1,79 @@
++import { describe, expect, it } from 'bun:test'
++import type { Session } from '@hapi/protocol/types'
++import { createQuestionTimeoutState, dueQuestions, QUESTION_TIMEOUT_RETRY_MS, questionTimeoutText } from './questionTimeout'
++
++function session(requests: Record<string, { tool: string; arguments: unknown; createdAt?: number }>, active = true): Session {
++    return { id: 's1', active, agentState: { requests } } as unknown as Session
++}
++
++describe('question timeout', () => {
++    const text = questionTimeoutText(60_000)
++
++    it('answers an AskUserQuestion left unanswered for 60 seconds by question index', () => {
++        const sessions = [session({ r1: { tool: 'AskUserQuestion', arguments: { questions: [{ question: 'A?' }, { question: 'B?' }] }, createdAt: 1_000 } })]
++        const state = createQuestionTimeoutState()
++        expect(dueQuestions(sessions, 60_999, 60_000, state)).toEqual([])
++        expect(dueQuestions(sessions, 61_000, 60_000, state)).toEqual([
++            { sessionId: 's1', requestId: 'r1', tool: 'AskUserQuestion', answers: { '0': [text], '1': [text] } }
++        ])
++    })
++
++    it('answers Codex request_user_input by question id with a note', () => {
++        const sessions = [session({ r2: { tool: 'request_user_input', arguments: { questions: [{ id: 'scope', question: 'Which?' }] }, createdAt: 0 } })]
++        expect(dueQuestions(sessions, 60_000, 60_000, createQuestionTimeoutState())[0]?.answers)
++            .toEqual({ scope: { answers: [`user_note: ${text}`] } })
++    })
++
++    it('uses stable ids for Cursor questions', () => {
++        const sessions = [session({ r3: { tool: 'CursorAskQuestion', arguments: { questions: [{ id: 'q-a', prompt: 'A?' }] }, createdAt: 0 } })]
++        expect(dueQuestions(sessions, 60_000, 60_000, createQuestionTimeoutState())[0]?.answers).toEqual({ 'q-a': [text] })
++    })
++
++    it('leaves permission prompts, inactive chats and disabled timeouts alone', () => {
++        const state = createQuestionTimeoutState()
++        expect(dueQuestions([session({ p: { tool: 'Bash', arguments: {}, createdAt: 0 } })], 120_000, 60_000, state)).toEqual([])
++        expect(dueQuestions([session({ q: { tool: 'AskUserQuestion', arguments: {}, createdAt: 0 } }, false)], 120_000, 60_000, state)).toEqual([])
++        expect(dueQuestions([session({ q: { tool: 'AskUserQuestion', arguments: {}, createdAt: 0 } })], 120_000, 0, state)).toEqual([])
++    })
++
++    it('retries a failed answer only after the retry delay, and times undated requests from first sight', () => {
++        const state = createQuestionTimeoutState()
++        const dated = [session({ q: { tool: 'AskUserQuestion', arguments: {}, createdAt: 0 } })]
++        expect(dueQuestions(dated, 60_000, 60_000, state)).toHaveLength(1)
++        state.attempts.set('s1:q', 60_000)
++        expect(dueQuestions(dated, 60_000 + QUESTION_TIMEOUT_RETRY_MS - 1, 60_000, state)).toEqual([])
++        expect(dueQuestions(dated, 60_000 + QUESTION_TIMEOUT_RETRY_MS, 60_000, state)).toHaveLength(1)
++
++        const undated = [session({ u: { tool: 'ask_user_question', arguments: {} } })]
++        expect(dueQuestions(undated, 500_000, 60_000, state)).toEqual([])
++        expect(dueQuestions(undated, 560_000, 60_000, state)).toHaveLength(1)
++        expect(state.attempts.has('s1:q')).toBe(false)
++    })
++})
++
++describe('SyncEngine question timeout', () => {
++    it('answers a stale question through the permission RPC and leaves paused chats waiting', async () => {
++        const { Store } = await import('../store')
++        const { RpcRegistry } = await import('../socket/rpcRegistry')
++        const { SyncEngine } = await import('./syncEngine')
++        const store = new Store(':memory:')
++        const engine = new SyncEngine(store, { of: () => ({ to: () => ({ emit() {} }) }) } as never, new RpcRegistry(), { broadcast() {} } as never)
++        try {
++            const created = engine.getOrCreateSession('test', { path: '/tmp/test', host: 'pc', flavor: 'claude' }, {}, 'default')
++            const cached = engine.getSession(created.id)! as Session
++            cached.active = true
++            cached.agentState = { requests: { ask: { tool: 'AskUserQuestion', arguments: { questions: [{ question: 'Pick?' }] }, createdAt: 0 } } }
++            const calls: unknown[][] = []
++            ;(engine as any).rpcGateway.approvePermission = async (...args: unknown[]) => { calls.push(args) }
++
++            await engine.answerUnansweredQuestions(59_999)
++            expect(calls).toEqual([])
++            await engine.answerUnansweredQuestions(60_000)
++            expect(calls).toEqual([[created.id, 'ask', undefined, undefined, undefined, { '0': [questionTimeoutText(60_000)] }]])
++
++            engine.pauseSession(created.id)
++            await engine.answerUnansweredQuestions(60_000 + QUESTION_TIMEOUT_RETRY_MS)
++            expect(calls).toHaveLength(1)
++        } finally { engine.stop(); store.close() }
++    })
++})
