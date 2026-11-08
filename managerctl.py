@@ -23,7 +23,7 @@ def read_command(args, stdin=None):
 
 def stamp_command(command, environ=None):
     command = dict(command)
-    if command.get('op') in ('resume_chat', 'steer_assignment', 'steer_queued', 'supersede_assignment', 'resource_handoff', 'resource_reservation', 'gpu_unclaim', 'cancel_queued'):
+    if command.get('op') in ('resume_chat', 'steer_assignment', 'steer_queued', 'supersede_assignment', 'resource_handoff', 'resource_reservation', 'gpu_unclaim', 'cancel_queued', 'recovery_process_authorize'):
         command['requested_at'] = time.time()
     # Actor is always the calling HAPI chat, never supplied by JSON, a file or stdin.
     command.pop('actor', None)

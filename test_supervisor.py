@@ -59,7 +59,8 @@ class Tests(IsolatedSupervisorTest):
 
  def test_observation_failure_queues_one_warning_per_episode_without_replaying_work(self):
   with unittest.mock.patch.object(self.s,'scan',side_effect=RuntimeError('probe unavailable')):
-   self.s.reconcile();self.s.reconcile()
+   self.s.reconcile();self.s.reconcile();self.assertEqual(self.s.rows("SELECT * FROM events WHERE kind='observer-error'"),[])  # a short outage is silent
+   self.s.reconcile()
   events=self.s.rows("SELECT * FROM events WHERE kind='observer-error'")
   self.assertEqual(len(events),1);self.assertIsNotNone(self.s.get('scan-error:w'));self.assertEqual(self.api.sent,[])
   self.s.reconcile();self.assertIsNone(self.s.get('scan-error:w'));self.assertEqual(self.api.sent,[])
@@ -263,6 +264,31 @@ class Tests(IsolatedSupervisorTest):
   self.assertEqual(len(self.api.sent),2)
   self.api.invoked.append(self.api.sent[-1]['localId']);self.s.recover_usage()
   self.assertEqual(self.s.one('SELECT * FROM usage_recovery')['state'],'done')
+ def test_weekly_reset_days_away_still_gets_an_early_probe(self):
+  m=self.limit();m['content']['content']['data']['message']['content'][0]['text']='Claude AI usage limit reached|'+str(int(time.time()+5*86400))+'|seven_day'
+  self.s.observe_usage_limit(self.s.worker('w'),m)
+  due=self.s.one('SELECT * FROM usage_recovery')['due'];self.assertLess(due,time.time()+1300)
+  self.assertIn('tentative',self.s.one("SELECT detail FROM events WHERE kind='usage-wait'")['detail'])
+ def test_real_output_after_limit_clears_usage_block(self):
+  self.s.observe_usage_limit(self.s.worker('w'),self.limit())
+  out={'id':'later','createdAt':(time.time()+5)*1000,'content':{'role':'agent','content':{'type':'output','data':{'type':'assistant','message':{'content':[{'type':'text','text':'Continuing with the GM Financial application.'}]}}}}}
+  self.s.observe_usage_progress(self.s.worker('w'),out)
+  row=self.s.one('SELECT * FROM usage_recovery');self.assertEqual((row['state'],row['attempts']),('done',0))
+  self.assertEqual(self.s.one("SELECT acked FROM events WHERE kind='usage-wait'")['acked'],1)
+  self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE kind='usage-cleared'")),1)
+ def test_limit_text_and_older_output_do_not_clear_usage_block(self):
+  self.s.observe_usage_limit(self.s.worker('w'),self.limit())
+  echo={'id':'echo','createdAt':(time.time()+5)*1000,'content':{'role':'agent','content':{'type':'output','data':{'type':'assistant','message':{'content':[{'type':'text','text':"You've hit your session limit. Try again at 7:59 PM."}]}}}}}
+  older={'id':'older','createdAt':(time.time()-60)*1000,'content':{'role':'agent','content':{'type':'output','data':{'type':'assistant','message':{'content':[{'type':'text','text':'Earlier progress.'}]}}}}}
+  for m in (echo,older):self.s.observe_usage_progress(self.s.worker('w'),m)
+  self.assertEqual(self.s.one('SELECT * FROM usage_recovery')['state'],'waiting')
+ def test_rejected_probe_reschedules_quietly_with_backoff(self):
+  self.s.observe_usage_limit(self.s.worker('w'),self.limit('first'))
+  self.s.db.execute("UPDATE usage_recovery SET state='done',attempts=1")
+  second=self.limit('second');second['content']['content']['data']['message']['content'][0]['text']='Claude AI usage limit reached|'+str(int(time.time()+86400))+'|seven_day'
+  self.s.observe_usage_limit(self.s.worker('w'),second)
+  self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE kind='usage-wait'")),1)
+  self.assertGreater(self.s.one('SELECT * FROM usage_recovery')['due'],time.time()+2300)
  def test_usage_recovery_respects_pause_busy_and_release(self):
   self.s.observe_usage_limit(self.s.worker('w'),self.limit());self.s.db.execute('UPDATE usage_recovery SET due=0')
   self.api.session['thinking']=True;self.s.recover_usage();self.assertEqual(self.api.sent,[])
@@ -294,7 +320,9 @@ class Tests(IsolatedSupervisorTest):
   for i,data in enumerate([{'type':'thread_goal_updated','goal':{'status':'usageLimited'}},{'type':'task_failed','codex_error_info':'usageLimitExceeded','error':'quota'}]):
    m={'id':str(i),'content':{'role':'agent','content':{'type':'codex','data':data}}}
    self.s.observe_usage_limit(self.s.worker('w'),m)
-   self.assertGreater(self.s.one('SELECT * FROM usage_recovery')['due'],time.time()+3500)
+   # No stated reset: probe soon instead of waiting hours.
+   due=self.s.one('SELECT * FROM usage_recovery')['due']
+   self.assertGreater(due,time.time()+1100);self.assertLess(due,time.time()+1300)
  def test_recovery_does_not_race_another_checkout_worker(self):
   self.s.observe_usage_limit(self.s.worker('w'),self.limit());self.s.db.execute('UPDATE usage_recovery SET due=0')
   self.s.db.execute('INSERT INTO workers VALUES(?,?,?,?,?,?,?,?)',('other',self.p,'codex','other','other',self.tmp.name,'managed',time.time()))
@@ -803,6 +831,19 @@ class Tests(IsolatedSupervisorTest):
   self.s.dispatch({'op':'reporting','fallback_minutes':60})
   self.s.db.close();self.s=Supervisor(self.tmp.name+'/db',self.api)
   self.assertEqual(self.s.reporting('w')['fallback_minutes'],45);self.assertFalse(self.s.reporting('w')['important']);self.assertEqual(self.s.reporting()['fallback_minutes'],60)
+ def test_adaptive_cadence_recalculates_unsent_routine_and_keeps_meaningful_events(self):
+  self.api.session.update(thinking=False,backgroundTaskCount=1);self.set_public('Rendering',1)
+  self.s.dispatch({'op':'reporting','worker':'w','fallback_minutes':10})
+  self.observe(1000);self.observe(1600);self.assertEqual(len(self.observations()),1)
+  self.s.dispatch({'op':'reporting','worker':'w','fallback_minutes':180})
+  self.assertEqual(self.observations(),[])
+  self.observe(11799);self.assertEqual(self.observations(),[])
+  self.observe(11800);self.assertEqual(len(self.observations()),1)
+  self.s.queue_observation(self.s.worker('w'),{'status':'background'},[{'reason':'Important render change'}],11801)
+  self.s.dispatch({'op':'reporting','worker':'w','fallback_minutes':10})
+  self.assertEqual(len(self.observations()),1)
+  self.assertEqual(json.loads(self.observations()[0]['detail'])['changes'][0]['reason'],'Important render change')
+  self.assertEqual(self.api.sent,[])
  def background_jobs(self,ids):
   self.api.session.update(thinking=False,backgroundTaskCount=len(ids),backgroundProcesses=[{'id':i,'pid':123,'checkedAt':1000000} for i in ids])
  def test_background_review_exit_notifies_once_after_conversational_turn_finished(self):

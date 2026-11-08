@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SEED_NOTE = 'Managed before the node graph; seeded as an overseer child'
-MID_LEVEL_OPS = {'check_status', 'assignment_delivery', 'steer_assignment', 'assign', 'answer', 'interrupt', 'remind', 'cancel_queued', 'cancel_reminder', 'read', 'read_native',
+MID_LEVEL_OPS = {'check_status', 'reporting', 'assignment_delivery', 'steer_assignment', 'assign', 'answer', 'interrupt', 'remind', 'cancel_queued', 'cancel_reminder', 'read', 'read_native',
                  'events', 'ack', 'status', 'requests', 'digest', 'sessions', 'reminders', 'node_graph', 'node_spawn',
                  'node_detach', 'gpu', 'node_sync', 'node_tree', 'node_edit'}
 # A node controls the graph below itself: only these node_edit actions, only on chats beneath it.
@@ -172,7 +172,10 @@ def reconcile(s):
             if not w:w = adopt_session(s, child, owner_id)
             elif w['state'] == 'released' or s.get('unmanaged:' + w['id']) or s.watch(w['id'])['mode'] == 'off':remanage(s, w)
             s.set('node-edge-seen:' + w['id'], '1')
-            if owner(s, w['id']) != owner_id:s.set('owner:' + w['id'], owner_id)
+            if owner(s, w['id']) != owner_id:
+                s.db.execute('DELETE FROM settings WHERE key=?', ('reporting-auto:' + w['id'],))
+                s.set('owner:' + w['id'], owner_id)
+            s.sync_manager_cadence(w)
             s.db.execute('DELETE FROM settings WHERE key=?', ('node-registration-error:' + child,))
             s.db.execute('RELEASE node_child')
         except Exception:
@@ -264,6 +267,8 @@ def actor_check(s, o):
     op = o['op']
     if op not in MID_LEVEL_OPS:
         raise ValueError('Only the overseer may use ' + op + ' in the node graph')
+    if op == 'reporting' and not o.get('worker'):
+        raise ValueError('Specify your direct child worker for reporting; only the overseer may change defaults')
     if op == 'node_detach':
         # Any level below you may be detached (with the same explicit-user-request rule as direct children).
         _, below, _ = subtree_of(s, actor)
@@ -289,7 +294,7 @@ def actor_check(s, o):
                 raise ValueError('You can only detach your own children')
             return
     live_edges = None
-    if op in {'assign','steer_assignment','answer','interrupt','remind','cancel_queued','cancel_reminder','ack','node_detach'} and (target or op in {'ack','node_detach'}):
+    if op in {'reporting','assign','steer_assignment','answer','interrupt','remind','cancel_queued','cancel_reminder','ack','node_detach'} and (target or op in {'ack','node_detach'}):
         current = fetch(s)
         live_edges = {edge['child']: edge['owner'] for edge in current['graph']['edges']}
     if target and live_edges is not None and live_edges.get(target['session']) != actor:
@@ -340,6 +345,21 @@ def gpu(s, o):
     raise ValueError('gpu action must be list, reserve, release or request')
 
 
+def spawn_model_options(o):
+    """Translate explicit model selection to the provider's launch fields."""
+    runtime = o.get('runtime', 'claude')
+    if runtime not in ('codex', 'claude'):
+        raise ValueError('Unsupported runtime')
+    result = {}
+    for key in ('model', 'reasoning_effort'):
+        if key in o:
+            value = o[key]
+            if not isinstance(value, str) or not value.strip() or len(value) > 200:
+                raise ValueError(key + ' must be a nonempty string of at most 200 characters')
+            result[key] = value.strip()
+    return result
+
+
 def spawn(s, o):
     """New child chat for the acting owner (or a given owner when the overseer acts)."""
     actor = o.get('actor')
@@ -354,13 +374,14 @@ def spawn(s, o):
     name = str(o.get('name', '')).strip()
     if not name:
         raise ValueError('Child name required')
+    options = spawn_model_options(o)  # Validate before creating any project or worker.
     project = s.dispatch({'op': 'register', 'name': name, 'repo': o['directory'], 'objective': str(o.get('objective', ''))[:2000]})
     s.dispatch({'op': 'resume', 'project': project['id']})
     if o.get('worktree'):
         # A checkout already used by another worker needs its own worktree; the owner integrates it.
         s.dispatch({'op': 'update', 'project': project['id'], 'integration_owner': parent})
     w = s.dispatch({'op': 'launch', 'project': project['id'], 'runtime': o.get('runtime', 'claude'),
-                    'permission': o.get('permission', 'full'), 'worktree': bool(o.get('worktree'))})
+                    'permission': o.get('permission', 'full'), 'worktree': bool(o.get('worktree')), **options})
     set_edge(s, parent, w['session'], actor or 'overseer')
     s.set('node-edge-seen:' + w['id'], '1'); s.set('owner:' + w['id'], parent)
     result = {'worker': w, 'owner': parent}

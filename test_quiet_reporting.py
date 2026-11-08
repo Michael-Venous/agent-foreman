@@ -22,13 +22,22 @@ class QuietReporting(fixtures.IsolatedSupervisorTest):
   self.assertEqual(json.loads(self.observations()[0]['detail'])['changes'][0]['category'],'status-changed')
   self.s.db.execute('UPDATE events SET acked=1');self.observe(20000)
   self.assertEqual(self.observations(),[]);self.assertEqual(self.api.sent,[])
+ def test_short_background_transition_is_not_a_manager_wake(self):
+  self.quiet_default();self.api.session['thinking']=True;self.set_public('Working.',1);self.observe(1000)
+  self.api.session.update(thinking=False,backgroundTaskCount=1);self.observe(1001)
+  self.assertEqual(self.observations(),[])
+  self.api.session['thinking']=True;self.observe(1005);self.assertEqual(self.observations(),[])
+  self.api.session['thinking']=False;self.observe(1010);self.observe(1024);self.assertEqual(self.observations(),[])
+  self.observe(1025);self.assertEqual(json.loads(self.observations()[0]['detail'])['changes'][0]['category'],'status-changed')
+  queued=self.observations()[0];self.api.session['thinking']=True
+  self.assertFalse(self.s.progress_deliverable(queued));self.assertEqual(self.observations(),[])
  def test_interval_turns_on_routine_and_can_be_disabled_without_hiding_failures(self):
   self.quiet_default();self.s.dispatch({'op':'reporting','worker':'w','fallback_minutes':10})
   self.assertTrue(self.s.reporting('w')['routine_enabled'])
   self.api.session['thinking']=True;self.set_public('Running.',1);self.observe(1000);self.observe(1600)
   self.assertEqual(len(self.observations()),1)
   self.s.dispatch({'op':'reporting','worker':'w','routine_enabled':False})
-  self.assertFalse(self.s.progress_deliverable(self.observations()[0]));self.assertEqual(self.observations(),[])
+  self.assertEqual(self.observations(),[])  # Disabling retires unsent routine observations immediately.
   self.api.session.update(thinking=False,lastFailure={'kind':'failed','message':'error','at':1601});self.observe(1601)
   changes=json.loads(self.observations()[0]['detail'])['changes']
   self.assertTrue(any(x['category']=='runtime-failure' for x in changes))

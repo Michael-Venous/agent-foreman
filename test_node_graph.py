@@ -10,7 +10,7 @@ class FakeNodeHub:
     """Enough of HAPI for node reconciliation: sessions, messages, graph edges and wakes."""
     def __init__(self):
         self.sessions = {}; self.messages = {}; self.sent = []; self.edges = {}; self.nodes = set(); self.calls = []
-        self.workspace = 'default-ws'; self.spawned = 0
+        self.workspace = 'default-ws'; self.spawned = 0; self.spawn_requests = []
         self.add(OVERSEER, flavor='claude')
 
     def add(self, sid, flavor='codex', **state):
@@ -33,6 +33,7 @@ class FakeNodeHub:
         if path == '/sessions': return {'sessions': [{k: v for k, v in s.items() if k != 'agentState'} for s in self.sessions.values()]}
         if path == '/machines': return {'machines': [{'id': 'm'}]}
         if path == '/machines/m/spawn':
+            self.spawn_requests.append(data.copy())
             self.spawned += 1; sid = 'spawned%d' % self.spawned; self.add(sid); return {'type': 'success', 'sessionId': sid}
         parts = path.split('?')[0].split('/')
         sid = parts[2] if len(parts) > 2 else None
@@ -141,8 +142,8 @@ class NodeGraphTests(IsolatedSupervisorTest):
         self.s.reconcile();self.assertIsNotNone(self.s.get('asleep:w1'))
         events=self.s.rows("SELECT * FROM events WHERE worker='w1' AND kind='observation'")
         self.assertEqual(len(events),1);self.assertIn('background-ended',events[0]['detail'])
-        self.assertEqual(self.hub.edges,{'c1':OVERSEER});self.assertEqual(len(self.wakes(OVERSEER)),2)
-        self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE worker='w1' AND kind='observer-error'")),1)
+        self.assertEqual(self.hub.edges,{'c1':OVERSEER});self.assertEqual(len(self.wakes(OVERSEER)),1)  # one transient scan failure is retried silently
+        self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE worker='w1' AND kind='observer-error'")),0)
         self.assertEqual(self.wakes('c1'),[])
         count=len(self.hub.calls);self.s.reconcile()
         self.assertFalse(any(p.startswith('/sessions/c1/messages') for p in self.hub.calls[count:]))
@@ -207,6 +208,75 @@ class NodeGraphTests(IsolatedSupervisorTest):
         self.s.dispatch({'op': 'node_edge', 'owner': 'midchat', 'child': 'otherchat', 'actor': OVERSEER})
         self.assertEqual(self.hub.edges['otherchat'], 'midchat'); self.assertEqual(self.s.get('owner:other'), 'midchat')
 
+    def test_mid_level_reporting_is_scoped_to_live_direct_child(self):
+        self.worker('mid', 'midchat'); self.worker('leaf', 'leafchat'); self.worker('other', 'otherchat'); self.s.set('node-graph-seeded', '1')
+        self.hub.edges.update({'midchat': OVERSEER, 'leafchat': 'midchat', 'otherchat': OVERSEER}); self.s.reconcile()
+        self.s.dispatch({'op': 'reporting', 'actor': 'midchat', 'worker': 'leaf', 'fallback_minutes': 10})
+        self.assertTrue(self.s.reporting('leaf')['routine_enabled']); self.assertEqual(self.s.reporting('leaf')['fallback_minutes'], 10)
+        with self.assertRaisesRegex(ValueError, 'direct child'):
+            self.s.dispatch({'op': 'reporting', 'actor': 'midchat', 'fallback_minutes': 10})
+        with self.assertRaisesRegex(ValueError, 'own children'):
+            self.s.dispatch({'op': 'reporting', 'actor': 'midchat', 'worker': 'other', 'fallback_minutes': 10})
+        self.hub.edges['leafchat'] = OVERSEER
+        with self.assertRaisesRegex(ValueError, 'current graph'):
+            self.s.dispatch({'op': 'reporting', 'actor': 'midchat', 'worker': 'leaf', 'fallback_minutes': 10})
+
+    def test_automatic_policy_notifies_owner_and_fixed_policy_blocks_manager_changes(self):
+        self.worker('mid', 'midchat'); self.worker('leaf', 'leafchat'); self.s.set('node-graph-seeded', '1')
+        self.hub.edges.update({'midchat': OVERSEER, 'leafchat': 'midchat'}); self.s.reconcile()
+        self.s.dispatch({'op': 'reporting', 'worker': 'leaf', 'session': 'leafchat', 'cadence_mode': 'automatic', 'cadence_instructions': 'Prefer hours for stable renders'})
+        self.assertEqual(self.s.reporting('leaf')['cadence_instructions'], 'Prefer hours for stable renders')
+        self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE worker='leaf' AND kind='cadence-policy'")), 1)
+        self.s.notify_manager()
+        self.assertTrue(any('cadence-policy' in wake['text'] for wake in self.wakes('midchat')))
+        self.assertFalse(any('cadence-policy' in wake['text'] for wake in self.wakes(OVERSEER)))
+        self.s.dispatch({'op':'reporting','actor':'midchat','worker':'leaf','fallback_minutes':180})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],180)
+        for change in ({'reset':True},{'routine_enabled':False},{'enabled':False}):
+            with self.assertRaisesRegex(ValueError,'automatic cadence'):
+                self.s.dispatch({'op':'reporting','actor':'midchat','worker':'leaf',**change})
+        self.assertEqual(self.s.reporting('leaf')['cadence_instructions'],'Prefer hours for stable renders')
+        with self.assertRaisesRegex(ValueError,'pass worker too'):
+            self.s.dispatch({'op':'reporting','session':'leafchat','fallback_minutes':10})
+        self.s.dispatch({'op':'reporting','worker':'leaf','cadence_mode':'fixed','fallback_minutes':20})
+        with self.assertRaisesRegex(ValueError,'fixed or disabled'):
+            self.s.dispatch({'op':'reporting','actor':'midchat','worker':'leaf','fallback_minutes':180})
+        with self.assertRaisesRegex(ValueError,'no longer managed'):
+            self.s.dispatch({'op':'reporting','worker':'leaf','session':'wrong','cadence_mode':'automatic'})
+        self.assertEqual(self.wakes('leafchat'),[])
+
+    def test_manager_cadence_inherits_for_current_and_new_direct_children_only(self):
+        self.worker('mid', 'midchat'); self.worker('leaf', 'leafchat'); self.worker('other', 'otherchat')
+        self.s.set('node-graph-seeded', '1'); self.hub.nodes.update({'midchat','leafchat','otherchat'})
+        self.hub.edges.update({'midchat': OVERSEER, 'leafchat': 'midchat', 'otherchat': OVERSEER}); self.s.reconcile()
+        self.s.dispatch({'op':'manager_reporting','manager':'midchat','cadence_mode':'automatic','cadence_instructions':'Hours for stable renders'})
+        self.assertEqual(self.s.reporting('leaf')['cadence_instructions'],'Hours for stable renders')
+        self.assertNotEqual(self.s.reporting('other').get('cadence_mode'),'automatic')
+        self.s.dispatch({'op':'reporting','actor':'midchat','worker':'leaf','fallback_minutes':180})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],180)
+        self.s.dispatch({'op':'manager_reporting','manager':'midchat','cadence_mode':'automatic','cadence_instructions':'Check often'})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],30)
+        self.s.dispatch({'op':'manager_reporting','manager':'midchat','cadence_mode':'fixed','fallback_minutes':20})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],20)
+        self.s.dispatch({'op':'reporting','worker':'leaf','cadence_mode':'fixed','fallback_minutes':45})
+        self.s.dispatch({'op':'manager_reporting','manager':'midchat','cadence_mode':'fixed','fallback_minutes':25})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],45)
+        self.s.dispatch({'op':'reporting','worker':'leaf','cadence_mode':'inherit'})
+        self.assertEqual(self.s.reporting('leaf')['fallback_minutes'],25)
+        self.worker('new', 'newchat'); self.hub.nodes.add('newchat'); self.hub.edges['newchat']='midchat'; self.s.reconcile()
+        self.assertEqual(self.s.reporting('new')['fallback_minutes'],25)
+        self.assertEqual(self.wakes('leafchat'),[]); self.assertEqual(self.wakes('newchat'),[])
+        with self.assertRaisesRegex(ValueError,'Only the user'):
+            self.s.dispatch({'op':'manager_reporting','actor':OVERSEER,'manager':'midchat','cadence_mode':'off'})
+
+    def test_new_child_automatic_cadence_notifies_once_and_preserves_manual_pause(self):
+        self.worker('mid','midchat'); self.s.set('node-graph-seeded','1'); self.hub.nodes.add('midchat'); self.hub.edges['midchat']=OVERSEER; self.s.reconcile()
+        self.s.dispatch({'op':'manager_reporting','manager':'midchat','cadence_mode':'automatic','cadence_instructions':'Be efficient'})
+        self.worker('leaf','leafchat'); self.hub.nodes.add('leafchat'); self.hub.edges['leafchat']='midchat'; self.hub.sessions['leafchat']['manualPausedAt']=1
+        self.s.reconcile(); self.s.reconcile()
+        self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE worker='leaf' AND kind='cadence-policy' AND acked=0")),1)
+        self.assertEqual(self.hub.sessions['leafchat']['manualPausedAt'],1); self.assertEqual(self.wakes('leafchat'),[])
+
     def test_mid_level_spawn_creates_its_own_child(self):
         self.worker('mid', 'midchat'); self.s.set('node-graph-seeded', '1'); self.hub.edges['midchat'] = OVERSEER; self.s.reconcile()
         with self.assertRaisesRegex(ValueError, 'use a worktree'):
@@ -216,6 +286,25 @@ class NodeGraphTests(IsolatedSupervisorTest):
         self.assertEqual(self.wakes(result['worker']['session'])[0]['text'], 'Start the sub task')
         self.assertEqual(result['owner'], 'midchat'); self.assertEqual(self.hub.edges[result['worker']['session']], 'midchat')
         self.s.reconcile(); self.assertEqual(self.s.get('owner:' + result['worker']['id']), 'midchat')
+
+    def test_spawn_passes_explicit_provider_model_and_effort_before_assignment(self):
+        import os
+        self.worker('mid', 'midchat'); self.s.set('node-graph-seeded', '1'); self.hub.edges['midchat'] = OVERSEER; self.s.reconcile()
+        for runtime, field in [('codex', 'modelReasoningEffort'), ('claude', 'effort')]:
+            path = self.tmp.name + '/' + runtime; os.mkdir(path)
+            result = self.s.dispatch({'op': 'node_spawn', 'actor': 'midchat', 'name': runtime, 'directory': path,
+                                      'runtime': runtime, 'model': 'explicit-model', 'reasoning_effort': 'high', 'text': 'Start'})
+            request = self.hub.spawn_requests[-1]
+            self.assertEqual((request['agent'], request['model'], request[field]), (runtime, 'explicit-model', 'high'))
+            self.assertNotIn('effort' if runtime == 'codex' else 'modelReasoningEffort', request)
+            self.assertEqual(self.wakes(result['worker']['session'])[0]['text'], 'Start')
+
+    def test_spawn_rejects_invalid_model_before_creating_project(self):
+        before = len(self.s.rows('SELECT * FROM projects'))
+        with self.assertRaisesRegex(ValueError, 'reasoning_effort'):
+            self.s.dispatch({'op': 'node_spawn', 'name': 'bad', 'directory': self.tmp.name, 'runtime': 'codex', 'reasoning_effort': ''})
+        self.assertEqual(len(self.s.rows('SELECT * FROM projects')), before)
+        self.assertEqual(self.hub.spawn_requests, [])
 
     def test_gpu_reservations_are_advisory_and_mid_level_requests_reach_the_overseer(self):
         self.worker('mid', 'midchat'); self.s.set('node-graph-seeded', '1'); self.hub.edges['midchat'] = OVERSEER; self.s.reconcile()

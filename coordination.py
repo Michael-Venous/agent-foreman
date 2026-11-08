@@ -12,7 +12,13 @@ def signals(text):
                    or re.search(r'\ball\s+(?:my\s+)?gpu\s+jobs\s+(?:are\s+|have\s+)?stopped\b', text))
     hypothetical = re.search(r'\b(?:if|once|when|until)\b[^.!?\n]{0,60}\b' + gpu + r'\b[^.!?\n]{0,20}\bfree\b', text)
     release = release and not hypothetical
-    waiting = bool(re.search(r"\b(?:stays?|still|remains?|keeping)\s+(?:\w+\s+){0,2}(?:paused|on hold)\b|\b(?:paused|on hold)\b[^.!?\n]{0,100}\buntil\b|\b(?:waiting|wait)\b[^.!?\n]{0,100}\b(?:handoff|go-ahead|gpu (?:availability|reservation)|gpu (?:to be |is )?(?:free|available))\b|\b(?:resume|continue)\b[^.!?\n]{0,50}\b(?:when|once)\s+(?:you|drift|terrain)\b", text))
+    held = False
+    for match in re.finditer(r"\b(?:stays?|still|remains?|keeping)\s+(?:\w+\s+){0,2}(?:paused|on hold)\b|\b(?:paused|on hold)\b[^.!?\n]{0,100}\buntil\b", text):
+        prefix = text[max(0, match.start()-70):match.start()].split('.')[-1].split('\n')[-1]
+        # A release, feature or publication can be held while work continues.
+        if re.search(r'\b(?:release|publication|launch|feature|sales|deployment)\s+(?:(?:is|will|remains?|stays?|still)\s+){0,3}$', prefix):continue
+        held = True; break
+    waiting = held or bool(re.search(r"\b(?:waiting|wait)\b[^.!?\n]{0,100}\b(?:handoff|go-ahead|gpu (?:availability|reservation)|gpu (?:to be |is )?(?:free|available))\b|\b(?:resume|continue)\b[^.!?\n]{0,50}\b(?:when|once)\s+(?:you|drift|terrain)\b", text))
     return {'resource-release': release, 'dependency-wait': waiting}
 
 
@@ -51,10 +57,19 @@ def observe(supervisor, worker, messages, previous):
             continue
         if seq <= state.get('user_seq', -1):
             continue
+        record = content(m); inner = record.get('content') if isinstance(record.get('content'),dict) else {}
+        data = inner.get('data') if isinstance(inner.get('data'),dict) else {}
+        native_message = data.get('message') if isinstance(data.get('message'),dict) else {}
+        parts = native_message.get('content') if isinstance(native_message.get('content'),list) else []
+        actual_tool = data.get('type') in ('tool-call','tool_call') or any(isinstance(p,dict) and p.get('type')=='tool_use' for p in parts)
+        if actual_tool and seq > state.get('wait_latest_seq', -1):
+            state['wait_messages'] = []; state['wait_reset_seq'] = max(seq,state.get('wait_reset_seq',-1))
         text = public_reply(m)
         if not text:
             continue
         found = signals(text)
+        if not found['dependency-wait'] and seq > state.get('wait_latest_seq', -1):
+            state['wait_messages'] = []; state['wait_reset_seq'] = max(seq,state.get('wait_reset_seq',-1))
         # Initial attachment seeds state silently; subsequent evidence is actionable.
         for kind, present in found.items():
             if not present or kind in state.get('seen', []):
@@ -63,10 +78,11 @@ def observe(supervisor, worker, messages, previous):
             if previous is not None:
                 candidates.append({'category': kind, 'message': m['id'], 'text': text[:1200],
                                    'reason': 'Worker reports resource released; inspect waiting handoff and verify current GPU ownership/availability' if kind == 'resource-release' else 'Worker reports waiting for a dependency; preserve goal and review handoff, do not replay work'})
-        if found['dependency-wait']:
+        if found['dependency-wait'] and seq > state.get('wait_reset_seq',-1):
             wait_messages = state.setdefault('wait_messages', [])
             if m['id'] not in wait_messages:
                 wait_messages.append(m['id']); state['wait_messages'] = wait_messages[-3:]
+                state['wait_latest_seq'] = max(seq,state.get('wait_latest_seq',-1))
             if len(state['wait_messages']) >= 3 and 'native-wait-loop' not in state.get('seen', []):
                 state.setdefault('seen', []).append('native-wait-loop')
                 if previous is not None:

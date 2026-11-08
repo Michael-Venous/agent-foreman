@@ -33,14 +33,25 @@ class BackoffTests(IsolatedSupervisorTest):
    self.s.db.execute("UPDATE transient_recovery SET state='cancelled' WHERE session='s'") # next failure is a new episode in the same outage
   self.assertEqual(loud,[1,4,8]);self.assertEqual(json.loads(self.events()[3]['detail'])['consecutiveFailures'],4)
 
+ def test_long_quota_outage_probes_stay_one_quiet_streak(self):
+  self.s.set('manager','s');loud=[]
+  for n in range(1,6):
+   self.now+=tr.USAGE_PROBE_MAX+60;self.observe([self.failure('turn%d'%n,'e%d'%n,at=self.now,text='429 usage limit exceeded, weekly quota resets in 3 days')])
+   if not self.s.rows("SELECT * FROM events WHERE event_key=?",('transient:s:turn%d'%n,))[0]['acked']:loud.append(n)
+   self.s.db.execute("UPDATE transient_recovery SET state='cancelled' WHERE session='s'")
+  self.assertEqual(loud,[1,4])
+
  def test_quota_waits_that_need_a_human_are_never_quiet(self):
   self.s.set('manager','s') # quota waits are tracked for the manager chat; workers use usage recovery
   self.observe([self.failure(text='429 usage limit exceeded, weekly quota resets tomorrow')])
-  self.assertEqual([e['acked'] for e in self.events()],[0]);self.assertTrue(json.loads(self.events()[0]['detail'])['needsHumanInput'])
+  # Reported (not quiet), but probed automatically rather than waiting on a human.
+  self.assertEqual([e['acked'] for e in self.events()],[0]);self.assertFalse(json.loads(self.events()[0]['detail'])['needsHumanInput'])
 
  def test_provider_outage_window_holds_retries_even_if_a_row_is_due(self):
   self.observe([self.failure()]);until=tr.provider_until(self.s,'codex');self.assertGreater(until,self.now)
   self.s.db.execute("UPDATE transient_recovery SET due=? WHERE session='s'",(self.now,)) # row says due, provider says wait
+  self.s.db.close();self.s=__import__('supervisor').Supervisor(self.tmp.name+'/db',self.api)
+  self.assertEqual(tr.provider_until(self.s,'codex'),until)
   tr.recover(self.s);self.assertEqual(self.api.sent,[])
   self.now=until+1;tr.recover(self.s);self.assertEqual(len(self.api.sent),1)
 

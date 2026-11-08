@@ -218,7 +218,9 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
    # import stamps replayed prompts with import time; pre-adoption client IDs prove history.
    recent=m.get('createdAt',0)/1000 >= w['created'] and local not in history
    recovery_own=bool(local and (self.db.execute('SELECT 1 FROM usage_recovery WHERE local_id=?',(local,)).fetchone() or self.db.execute('SELECT 1 FROM transient_recovery WHERE local_id=?',(local,)).fetchone()))
-   if recent and role=='agent':self.observe_usage_limit(w,m)
+   if recent and role=='agent':
+    self.observe_usage_limit(w,m)
+    self.observe_usage_progress(w,m)
    if is_instruction_message(m) and not own and not recovery_own and recent:
     self.db.execute("UPDATE usage_recovery SET state='cancelled' WHERE worker=?",(w['id'],))
     # The user may steer or set goals in manager chats; monitoring continues.
@@ -350,11 +352,26 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   old=old[0] if old else None
   if old and old['source']==m['id']:return
   attempts=old['attempts'] if old and old['state']!='cancelled' else 0
-  delay=min(6*3600,3600*2**min(attempts,3))
-  due=max(time.time()+60,float(reset)+60) if isinstance(reset,(float,int)) else time.time()+delay
+  due=transient_recovery.usage_probe_due(attempts,reset if isinstance(reset,(float,int)) else None)
   self.db.execute("INSERT OR REPLACE INTO usage_recovery VALUES(?,?,?,?,?,?,?)",(w['id'],m['id'],due,attempts,'waiting',None,w['session']))
+  self.set('usage-at:'+w['id'],str(m.get('createdAt',0)/1000))
   # A limit is not assignment completion. Retain ownership until recovery concludes.
-  self.event('usage:'+m['id'],w['project'],w['id'],'usage-wait','Usage exhausted; supervisor will continue the same chat after '+time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime(due))+'. Do not send a competing retry.')
+  # Repeated rejections of our own probes stay quiet; only a new limit streak wakes the owner.
+  if old and old['state']!='cancelled' and attempts>0:return
+  stated=' (provider says it resets '+time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime(float(reset)))+')' if isinstance(reset,(float,int)) else ''
+  self.event('usage:'+m['id'],w['project'],w['id'],'usage-wait','Usage limit reported'+stated+'. Treated as tentative: the supervisor probes the same chat at '+time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime(due))+' and backs off to every 2h until it runs; any later real output clears this. Do not send a competing retry; to test sooner, ask the user or use assign with user_requested.')
+ def observe_usage_progress(self,w,m):
+  """Output after a recorded limit proves the provider accepts turns again; drop the block."""
+  import transient_recovery
+  if not transient_recovery.progress(m):return
+  if m.get('createdAt',0)/1000<=float(self.get('usage-at:'+w['id']) or 0):return
+  rows=self.rows("SELECT * FROM usage_recovery WHERE worker=? AND (state IN ('waiting','sent') OR (state='done' AND attempts>0))",(w['id'],))
+  if not rows:return
+  # Keep the row (its local_id identifies our own probe) but end the streak.
+  self.db.execute("UPDATE usage_recovery SET state='done',attempts=0 WHERE worker=?",(w['id'],))
+  self.db.execute("UPDATE events SET acked=1 WHERE worker=? AND kind='usage-wait' AND wake_id IS NULL",(w['id'],))
+  if rows[0]['state']=='waiting':
+   self.event('usage-cleared:'+m['id'],w['project'],w['id'],'usage-cleared','Worker produced output again before the scheduled usage probe; usage block cleared.')
  def recover_usage(self):
   for r in self.rows("SELECT * FROM usage_recovery WHERE state IN ('waiting','sending','uncertain','sent','resume-check')"):
    if self.manager_paused():return
@@ -512,9 +529,14 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
     policy=self.reporting(w['id'])
     state='held' if w['status']=='paused' or w['manual'] else 'quiet' if mode!='events' or not policy['enabled'] else 'idle' if asleep else 'attention' if self.get('scan-error:'+w['id']) else 'watching' if observed and time.time()-observed<=120 else 'unknown'
     pending=self.one('SELECT COUNT(*) AS n FROM events WHERE worker=? AND acked=0',(w['id'],))['n']
-    out[w['session']]['oversight']={'pendingUpdates':pending,'state':state,'observedAt':observed,'publishedAt':time.time(),'owner':owner,'ownerState':owner_state,'notifications':bool(mode=='events' and policy['enabled']),'fallbackMinutes':policy['fallback_minutes'],'routineEnabled':policy['routine_enabled']}
+    override=json.loads(self.get('reporting:'+w['id']) or '{}')
+    source='child' if any(k in override for k in ('cadence_mode','fallback_minutes','routine_enabled')) else 'manager' if self.get('manager-reporting:'+str(owner)) else 'default'
+    out[w['session']]['oversight']={'pendingUpdates':pending,'state':state,'observedAt':observed,'publishedAt':time.time(),'owner':owner,'ownerState':owner_state,'notifications':bool(mode=='events' and policy['enabled']),'fallbackMinutes':policy['fallback_minutes'],'routineEnabled':policy['routine_enabled'],'cadenceMode':policy.get('cadence_mode','fixed' if policy['routine_enabled'] else 'off'),'cadenceInstructions':policy.get('cadence_instructions',''),'cadenceSource':source}
 
   if self.get('manager'):out[self.get('manager')]={'role':'manager'}
+  for entry in out.values():
+   owner=(entry.get('oversight') or {}).get('owner')
+   if owner and owner in out and self.get('manager-reporting:'+owner):out[owner]['childrenReporting']=json.loads(self.get('manager-reporting:'+owner))
   path=Path(path or STATE/'managed-sessions.json');tmp=path.with_suffix('.tmp')
   tmp.write_text(json.dumps({'updatedAt':time.time(),'sessions':out}));tmp.chmod(0o600);tmp.replace(path)
   return out
@@ -525,13 +547,30 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   # Existing installations retain their stored interval, while the user's new
   # default disables routine wakes. An explicit per-chat interval remains an override.
   base.setdefault('routine_enabled',False);base.setdefault('semantic_updates',False);base.setdefault('status_changes',True)
+  owner=self.get('owner:'+wid) if wid else None
+  shared=json.loads(self.get('manager-reporting:'+owner) or '{}') if owner else {}
   override=json.loads(self.get('reporting:'+wid) or '{}') if wid else {}
   if 'fallback_minutes' in override and 'routine_enabled' not in override:override['routine_enabled']=True
   if override.get('important') is True and 'semantic_updates' not in override:override['semantic_updates']=True
-  return {**base,**override}
+  result={**base,**shared,**override}
+  if wid and result.get('cadence_mode')=='automatic':
+   chosen=json.loads(self.get('reporting-auto:'+wid) or '{}')
+   signature=json.dumps([owner,result.get('cadence_mode'),result.get('cadence_instructions','')],sort_keys=True)
+   if chosen.get('signature')==signature:result['fallback_minutes']=chosen['minutes']
+  return result
  def reporting_allowed(self,w):
   p=self.project(w['project'])
   return w['state']=='managed' and p['status']!='paused' and not p['manual'] and self.watch(w['id'])['mode']=='events' and self.reporting(w['id'])['enabled']
+ def sync_manager_cadence(self,w):
+  owner=self.get('owner:'+w['id']);shared=json.loads(self.get('manager-reporting:'+str(owner)) or '{}')
+  override=json.loads(self.get('reporting:'+w['id']) or '{}')
+  inherited=not any(k in override for k in ('cadence_mode','fallback_minutes','routine_enabled'))
+  signature=json.dumps([owner,shared.get('cadence_mode'),shared.get('cadence_instructions','')],sort_keys=True) if inherited and shared.get('cadence_mode')=='automatic' else ''
+  key='manager-cadence-notice:'+w['id']
+  if self.get(key)==signature:return
+  self.db.execute("UPDATE events SET acked=1 WHERE worker=? AND kind='cadence-policy' AND acked=0 AND wake_id IS NULL",(w['id'],))
+  self.set(key,signature)
+  if signature:self.event('cadence-policy:'+w['id']+':'+uid(),w['project'],w['id'],'cadence-policy',"User enabled automatic polling for this manager's children. Read reporting for this worker for instructions; choose and adjust fallback_minutes. Do not prompt the child for status.")
  def important_change(self,text,context):
   """Conservative evidence candidates, not a semantic claim of a breakthrough."""
   if not text:return None
@@ -723,7 +762,15 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   due=now-max(last,state['routineSince'])>=policy['fallback_minutes']*60
   if not working:self.discard_routine_updates(w['id'])
   previous_status=old.get('snapshot',{}).get('status')
-  if policy['status_changes'] and previous_status and previous_status!=snap['status'] and snap['status']!='running' and not candidates:
+  pending_background=old.get('pendingBackgroundStatus')
+  if snap['status']!='background' or not policy['status_changes']:
+   state.pop('pendingBackgroundStatus',None)
+  elif previous_status=='running':
+   state['pendingBackgroundStatus']={'at':now}
+  elif pending_background and now-pending_background['at']>=15:
+   if not candidates:candidates.append({'category':'status-changed','reason':'Observed status changed from running to background; inspect the current task and evidence before deciding whether follow-up is needed.'})
+   state.pop('pendingBackgroundStatus',None)
+  if policy['status_changes'] and previous_status and previous_status!=snap['status'] and snap['status'] not in ('running','background') and not candidates:
    candidates.append({'category':'status-changed','reason':'Observed status changed from '+previous_status+' to '+snap['status']+'; inspect the current task and evidence before deciding whether follow-up is needed.'})
   if candidates or (policy['routine_enabled'] and due and working and not scheduled):
    self.queue_observation(w,snap,candidates,now)
@@ -825,6 +872,10 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries(reminder_id TEXT NOT NULL,due REA
   w=self.worker(e['worker']);p=self.project(w['project'])
   if w['state']!='managed' or p['status']=='paused' or p['manual'] or self.watch(w['id'])['mode']=='off':return False
   if e['kind']=='observation' and not self.reporting_allowed(w):return False
+  if e['kind']=='observation':
+   detail=json.loads(e['detail']);changes=detail.get('changes') or []
+   if detail.get('status')=='background' and changes and all(c.get('category')=='status-changed' for c in changes) and self.progress_snapshot(w)['status']!='background':
+    self.db.execute('UPDATE events SET acked=1 WHERE id=? AND wake_id IS NULL',(e['id'],));return False
   if e['kind']=='observation' and self.routine_update(e) and not self.reporting(w['id'])['routine_enabled']:
    self.db.execute('UPDATE events SET acked=1 WHERE id=? AND wake_id IS NULL',(e['id'],));return False
   # Recheck at delivery: a queued routine report can outlive the work it describes.
@@ -949,6 +1000,10 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   node_graph.actor_check(self,o)
   result=node_graph.dispatch(self,o)
   if result is not None:return result
+  if op in ('recovery_process_review','recovery_process_authorize'):
+   if o.get('actor') and o['actor']!=self.get('manager'):raise ValueError('Only the overseer may review recovery processes')
+   import recovery_process_review
+   return recovery_process_review.review(self,o) if op=='recovery_process_review' else recovery_process_review.authorize(self,o)
   if op=='handoff_watches':return [json.loads(r['value']) for r in self.rows("SELECT value FROM settings WHERE key LIKE 'handoff-watch:%'")]
   if op=='handoff_watch':
    from coordination import watch
@@ -1115,6 +1170,8 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
   if op in ('launch','attach'):
    p=self.project(o['project']);rt=o['runtime']
    if rt not in ('codex','claude'):raise ValueError('Unsupported runtime')
+   from node_graph import spawn_model_options
+   launch_options=spawn_model_options(o) if op=='launch' else {}
    w=uid();path=p['repo'];nid=o.get('native_id')
    profile=o.get('permission','full');permission_mode=self.permission_mode(rt,profile)
    self.set('worker_permission:'+w,profile)
@@ -1158,19 +1215,65 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    machines=self.api.call('/machines')['machines']
    if len(machines)!=1:raise ValueError('Expected exactly one local runner')
    self.db.execute('INSERT INTO workers VALUES(?,?,?,?,?,?,?,?)',(w,p['id'],rt,None,None,path,'launching',time.time()))
-   result=self.api.call('/machines/'+machines[0]['id']+'/spawn',{'directory':path,'agent':rt,'startingMode':'remote','permissionMode':permission_mode})
+   spawn_request={'directory':path,'agent':rt,'startingMode':'remote','permissionMode':permission_mode}
+   if 'model' in launch_options:spawn_request['model']=launch_options['model']
+   if 'reasoning_effort' in launch_options:spawn_request['modelReasoningEffort' if rt=='codex' else 'effort']=launch_options['reasoning_effort']
+   result=self.api.call('/machines/'+machines[0]['id']+'/spawn',spawn_request)
    if result.get('type')!='success':
     self.db.execute("UPDATE workers SET state='launch-failed' WHERE id=?",(w,));raise ValueError(str(result))
    sid=result['sessionId'];self.db.execute("UPDATE workers SET session=?,state='managed' WHERE id=?",(sid,w))
    self.api.call('/sessions/'+sid,{'name':p['name']+' · '+rt},'PATCH');return self.worker(w)
   if op=='reconcile_inactive':return self.reconcile_inactive(o['worker'],o.get('reason',''))
   if op=='adopt':return self.adopt(o['worker'])
+  if op=='manager_reporting':
+   if o.get('actor'):raise ValueError('Only the user may set a manager-wide cadence')
+   owner=o.get('manager');graph=node_graph.fetch(self)
+   ids={n['sessionId'] for n in graph['graph']['nodes']}|{graph.get('overseer')}
+   if not isinstance(owner,str) or owner not in ids:raise ValueError('Manager is not in the active graph')
+   mode=o.get('cadence_mode');instructions=o.get('cadence_instructions','')
+   if mode not in ('automatic','fixed','off') or not isinstance(instructions,str) or len(instructions)>2000:raise ValueError('Invalid cadence policy')
+   minutes=o.get('fallback_minutes',30)
+   if not isinstance(minutes,(int,float)) or isinstance(minutes,bool) or not math.isfinite(minutes) or minutes<5:raise ValueError('fallback_minutes must be finite and at least 5')
+   value={'cadence_mode':mode,'cadence_instructions':instructions.strip(),'routine_enabled':mode!='off','fallback_minutes':float(minutes),'enabled':True}
+   prior=json.loads(self.get('manager-reporting:'+owner) or '{}')
+   self.set('manager-reporting:'+owner,json.dumps(value))
+   for edge in graph['graph']['edges']:
+    if edge['owner']!=owner:continue
+    worker=node_graph.worker_for(self,edge['child'])
+    if not worker or worker['state']!='managed' or self.get('owner:'+worker['id'])!=owner:continue
+    override=json.loads(self.get('reporting:'+worker['id']) or '{}')
+    if any(k in override for k in ('cadence_mode','fallback_minutes','routine_enabled')):continue
+    if (prior.get('cadence_mode'),prior.get('cadence_instructions',''))!=(mode,value['cadence_instructions']):self.db.execute('DELETE FROM settings WHERE key=?',('reporting-auto:'+worker['id'],))
+    for event in self.rows("SELECT * FROM events WHERE worker=? AND kind='observation' AND acked=0 AND wake_id IS NULL",(worker['id'],)):
+     if self.routine_update(event):self.db.execute('UPDATE events SET acked=1 WHERE id=?',(event['id'],))
+    self.sync_manager_cadence(worker)
+   return {'manager':owner,'policy':value}
   if op=='reporting':
    wid=o.get('worker')
-   if wid:self.worker(wid)
+   if o.get('session') and not wid:raise ValueError('session only guards a worker; pass worker too (session alone would change the default for every chat)')
+   if wid:
+    target=self.worker(wid)
+    if o.get('session') and (target['session']!=o['session'] or target['state']!='managed'):raise ValueError('Session is no longer managed by this worker')
+   previous_policy=self.reporting(wid) if wid else None
+   if o.get('actor') and any(k in o for k in ('cadence_mode','cadence_instructions')):raise ValueError('Only the user may set cadence mode or instructions')
+   if o.get('actor') and wid and previous_policy.get('cadence_mode') in ('fixed','off') and any(k in o for k in ('fallback_minutes','routine_enabled','enabled','reset')):raise ValueError('User selected a fixed or disabled cadence')
+   # Under a user-chosen automatic cadence a manager tunes only the interval, never resets or overrides the policy.
+   if o.get('actor') and wid and previous_policy.get('cadence_mode')=='automatic' and any(k in o for k in ('routine_enabled','enabled','reset')):raise ValueError('User selected an automatic cadence; adjust only fallback_minutes')
    key='reporting:'+wid if wid else 'reporting-default'
    value=json.loads(self.get(key) or '{}')
    if o.get('reset') and wid:value={}
+   if 'cadence_mode' in o:
+    if not wid or o['cadence_mode'] not in ('automatic','fixed','off','inherit'):raise ValueError('Expected a worker and cadence_mode automatic, fixed, off, or inherit')
+    if o['cadence_mode']=='inherit':
+     for field in ('cadence_mode','cadence_instructions','fallback_minutes','routine_enabled','enabled'):value.pop(field,None)
+     self.db.execute('DELETE FROM settings WHERE key=?',('reporting-auto:'+wid,))
+    else:
+     value['cadence_mode']=o['cadence_mode'];value['routine_enabled']=o['cadence_mode']!='off'
+     if o['cadence_mode']!='off':value['enabled']=True
+   if 'cadence_instructions' in o and o.get('cadence_mode')!='inherit':
+    instructions=o['cadence_instructions']
+    if not wid or not isinstance(instructions,str) or len(instructions)>2000:raise ValueError('cadence_instructions must be a string of at most 2000 characters')
+    value['cadence_instructions']=instructions.strip()
    for field in ('enabled','important','routine_enabled','semantic_updates','status_changes'):
     if field in o:
      if not isinstance(o[field],bool):raise ValueError(field+' must be boolean')
@@ -1178,8 +1281,12 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    if 'fallback_minutes' in o:
     minutes=float(o['fallback_minutes'])
     if not math.isfinite(minutes) or minutes<5:raise ValueError('fallback_minutes must be finite and at least 5')
-    value['fallback_minutes']=minutes
-    if 'routine_enabled' not in o:value['routine_enabled']=True
+    if o.get('actor') and wid and previous_policy.get('cadence_mode')=='automatic':
+     signature=json.dumps([self.get('owner:'+wid),previous_policy.get('cadence_mode'),previous_policy.get('cadence_instructions','')],sort_keys=True)
+     self.set('reporting-auto:'+wid,json.dumps({'signature':signature,'minutes':minutes}))
+    else:
+     value['fallback_minutes']=minutes
+     if 'routine_enabled' not in o:value['routine_enabled']=True
    if o.get('replace_reminder'):
     if not wid:raise ValueError('replace_reminder requires worker')
     r=self.one('SELECT * FROM reminders WHERE id=?',(o['replace_reminder'],))
@@ -1193,6 +1300,18 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
      self.set(key,json.dumps(value));self.db.execute('COMMIT')
     except Exception:self.db.execute('ROLLBACK');raise
    else:self.set(key,json.dumps(value))
+   if wid and (self.reporting(wid)['fallback_minutes']!=previous_policy['fallback_minutes'] or self.reporting(wid)['routine_enabled']!=previous_policy['routine_enabled']):
+    # Recalculate against the new cadence. Retire only unsent routine fallback
+    # observations, keeping meaningful changes and explicit progress reminders.
+    for event in self.rows("SELECT * FROM events WHERE worker=? AND kind='observation' AND acked=0 AND wake_id IS NULL",(wid,)):
+     if self.routine_update(event):self.db.execute('UPDATE events SET acked=1 WHERE id=?',(event['id'],))
+   if wid and ('cadence_mode' in o or 'cadence_instructions' in o) and (previous_policy.get('cadence_mode')!=value.get('cadence_mode') or previous_policy.get('cadence_instructions','')!=value.get('cadence_instructions','')):
+    self.db.execute('DELETE FROM settings WHERE key=?',('reporting-auto:'+wid,))
+    self.db.execute("UPDATE events SET acked=1 WHERE worker=? AND kind='cadence-policy' AND acked=0 AND wake_id IS NULL",(wid,))
+    if self.reporting(wid).get('cadence_mode')=='automatic':
+     w=self.worker(wid)
+     self.event('cadence-policy:'+wid+':'+uid(),w['project'],wid,'cadence-policy','User enabled automatic polling cadence. Read reporting for this worker to see the full instructions; choose and adjust fallback_minutes for its work. Do not prompt the child just to check status.')
+    self.set('manager-cadence-notice:'+wid,json.dumps([self.get('owner:'+wid),'automatic',self.reporting(wid).get('cadence_instructions','')],sort_keys=True) if o.get('cadence_mode')=='inherit' and self.reporting(wid).get('cadence_mode')=='automatic' else '')
    return {'worker':wid,'effective':self.reporting(wid),'override':value if wid else None,'replacedReminder':o.get('replace_reminder')}
 
   if op=='watch':
@@ -1333,7 +1452,7 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    p=self.project(w['project']) if ur else self.running(w['project'])
    import transient_recovery
    if not ur and transient_recovery.blocked(self,w['session']):raise ValueError('Transient provider recovery pending; do not send a competing retry')
-   if not ur and self.rows("SELECT worker FROM usage_recovery WHERE worker=? AND state NOT IN ('done','cancelled')",(w['id'],)):raise ValueError('Usage recovery pending; supervisor will continue after reset')
+   if not ur and self.rows("SELECT worker FROM usage_recovery WHERE worker=? AND state NOT IN ('done','cancelled')",(w['id'],)):raise ValueError('Usage recovery pending; the supervisor probes the chat automatically on a backoff (see status). Pass user_requested only with a current user instruction.')
    manager=self.get('manager')
    if manager and not ur:
     for m in self.api.call('/sessions/'+manager+'/messages?limit=100')['messages']:
@@ -1686,10 +1805,14 @@ ON CONFLICT(reminder_id,due) DO UPDATE SET status=excluded.status,event_key=COAL
    # Node children stay managed until removed; classic mode retires finished idle chats.
    try:
     scanned=self.scan(w,retire=not nodes)
-    if scanned is not None:self.db.execute('DELETE FROM settings WHERE key=?',('scan-error:'+w['id'],))
+    if scanned is not None:
+     self.db.execute('DELETE FROM settings WHERE key=?',('scan-error:'+w['id'],));self.db.execute('DELETE FROM settings WHERE key=?',('scan-fails:'+w['id'],))
     if nodes and scanned is not None:node_graph.scan_completed(self,w,scanned)
    except Exception as e:
-    if not self.get('scan-error:'+w['id']):
+    # A hub restart or network blip fails every scan for a few seconds. Report only a persistent failure
+    # (3 consecutive scans), so a short outage does not wake every owner with one event per chat.
+    fails=int(self.get('scan-fails:'+w['id']) or 0)+1;self.set('scan-fails:'+w['id'],fails)
+    if fails>=3 and not self.get('scan-error:'+w['id']):
      failed=time.time();self.set('scan-error:'+w['id'],failed)
      self.event('watch-error:'+w['id']+':'+str(failed),w['project'],w['id'],'observer-error','Unable to observe this chat. Inspect monitoring before relying on background completion/failure follow-up. No worker was restarted or messaged.')
     log.warning('scan %s: %s',w['id'],e)

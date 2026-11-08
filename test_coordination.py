@@ -126,6 +126,22 @@ class CoordinationTests(IsolatedSupervisorTest):
         self.api.messages += [reply('Waiting for GPU handoff.', 3), {'id': 'tool', 'seq': 4, 'content': {'role': 'agent', 'content': {'type': 'codex', 'data': {'type': 'tool-call', 'name': 'Bash'}}}}]
         self.assertEqual(self.s.progress_snapshot(self.s.worker('w'))['status'], 'running')
 
+    def test_release_hold_does_not_mean_worker_waiting(self):
+        self.assertFalse(signals('The tests are continuing. The showcases and release remain on hold.')['dependency-wait'])
+        self.assertFalse(signals('The release remains on hold until the tests pass.')['dependency-wait'])
+        self.assertTrue(signals('Terrain remains on hold until Drift finishes.')['dependency-wait'])
+
+    def test_productive_work_breaks_repeated_wait_streak(self):
+        self.scan(1000)
+        self.api.messages.extend([reply('Waiting for GPU handoff.',3), reply('Still waiting for GPU handoff.',4),
+            {'id':'tool','seq':5,'content':{'role':'agent','content':{'type':'codex','data':{'type':'tool-call','name':'Bash'}}}},
+            reply('Waiting for GPU handoff.',6)])
+        self.scan(1001);self.scan(1002)
+        self.assertNotIn('native-wait-loop',[c.get('category') for c in self.candidates()])
+        self.api.messages.extend([reply('Still waiting for GPU handoff.',7),reply('Waiting for GPU handoff.',8)])
+        self.scan(1003)
+        self.assertIn('native-wait-loop',[c.get('category') for c in self.candidates()])
+
     def test_waiting_for_own_background_render_is_real_work(self):
         self.api.session.update(thinking=False, backgroundTaskCount=1)
         self.api.messages.append(reply('Waiting for the GPU render to finish.', 3))

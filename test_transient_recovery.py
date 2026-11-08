@@ -55,6 +55,20 @@ class RecoveryTests(IsolatedSupervisorTest):
   tr.recover(self.s)
   self.assertEqual(self.row()['state'],'uncertain');self.now+=9999
   tr.recover(self.s);self.assertEqual(len(self.api.sent),1)
+  self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE kind='transient-uncertain' AND acked=0")),1)
+  tr.recover(self.s);self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE kind='transient-uncertain' AND acked=0")),1)
+  tr.settle(self.s,'s','cancelled');self.assertEqual(self.s.rows("SELECT * FROM events WHERE kind='transient-uncertain' AND acked=0"),[])
+ def test_background_guard_is_rechecked_after_restart_and_notifies_once_if_overdue(self):
+  self.observe([self.failure(text='Selected model is at capacity')]);self.due()
+  self.api.session['backgroundTaskCount']=1
+  self.s.db.close();self.s=Supervisor(self.tmp.name+'/db',self.api)
+  tr.recover(self.s);self.assertEqual(self.api.sent,[])
+  self.now+=601;tr.recover(self.s);tr.recover(self.s)
+  self.assertEqual(len(self.s.rows("SELECT * FROM events WHERE kind='transient-held' AND acked=0")),1)
+  self.assertEqual(self.api.sent,[])
+  self.api.session['backgroundTaskCount']=0;tr.recover(self.s);tr.recover(self.s)
+  self.assertEqual(len(self.api.sent),1);self.assertEqual(self.row()['state'],'sent')
+  self.assertEqual(self.api.sent[0]['target'] if 'target' in self.api.sent[0] else 's','s')
  def test_stops_holds_busy_offline_identity_and_background_jobs_block_without_restart(self):
   for state in [{'manualPausedAt':1},{'active':False},{'thinking':True},{'backgroundTaskCount':1},{'agentState':{'requests':{'a':{}}}},{'metadata':{'codexSessionId':'other'}}]:
    with self.subTest(state=state):
@@ -80,7 +94,7 @@ class RecoveryTests(IsolatedSupervisorTest):
  def test_quota_stays_on_separate_existing_reset_policy(self):
   m=self.failure(text='Usage limit exceeded, quota resets tomorrow');self.observe([m]);self.assertIsNone(self.row())
   self.s.observe_usage_limit(self.s.worker('w'),m);self.assertEqual(self.s.one('SELECT * FROM usage_recovery')['state'],'waiting')
-  self.assertGreaterEqual(self.s.one('SELECT * FROM usage_recovery')['due'],self.now+3600)
+  self.assertEqual(self.s.one('SELECT * FROM usage_recovery')['due'],self.now+tr.USAGE_PROBE_FIRST)
  def test_manager_failed_wake_is_gated_and_one_recovery_preserves_pending_events(self):
   self.s.set('manager','s');error=self.failure();self.api.messages=[error]
   ev=self.s.event('pending',self.p,'w','check-in','important task')
@@ -92,7 +106,13 @@ class RecoveryTests(IsolatedSupervisorTest):
   self.s.set('manager','s');self.api.messages=[self.failure()];self.s.notify_manager();self.due()
   self.api.session['manualPausedAt']=2;tr.recover(self.s);self.s.notify_manager();self.assertEqual(self.api.sent,[])
   self.api.session['manualPausedAt']=None;self.now+=1;self.api.messages=[self.failure('quota','quota',text='Weekly usage limit exceeded')]
-  self.s.notify_manager();self.assertEqual(self.row()['state'],'quota-wait');self.now+=99999;tr.recover(self.s);self.assertEqual(self.api.sent,[])
+  # Quota without a reset is a tentative wait with a scheduled probe, never an indefinite human-only hold.
+  self.s.notify_manager();self.assertEqual(self.row()['state'],'waiting');self.assertLessEqual(self.row()['due'],self.now+tr.USAGE_PROBE_MAX)
+ def test_claude_manager_output_clears_quota_block(self):
+  self.s.set('manager','s')
+  fail=self.failure(text='Usage limit exceeded');self.api.messages=[fail];self.s.notify_manager();self.assertTrue(tr.blocked(self.s,'s'))
+  self.now+=31;out={'id':'out','createdAt':self.now*1000,'content':{'role':'agent','content':{'type':'output','data':{'type':'assistant','message':{'content':[{'type':'text','text':'Back to work.'}]}}}}}
+  self.api.messages=[fail,out];self.s.notify_manager();self.assertFalse(tr.blocked(self.s,'s'))
  def test_global_dispatch_spacing(self):
   self.observe([self.failure()]);self.due();tr.recover(self.s)
   self.assertGreater(float(self.s.get('transient-next-dispatch')),self.now)
@@ -100,7 +120,8 @@ class RecoveryTests(IsolatedSupervisorTest):
  def test_known_manager_quota_reset_and_retry_after_are_respected(self):
   self.s.set('manager','s');m=self.failure(text='Quota usage limit exceeded')
   m['content']['content']['data']['resetsAt']=5000
-  self.api.messages=[m];self.s.notify_manager();self.assertEqual(self.row()['due'],5060)
+  # A distant stated reset is only a hint: probe after 20 minutes instead.
+  self.api.messages=[m];self.s.notify_manager();self.assertEqual(self.row()['due'],self.now+tr.USAGE_PROBE_FIRST)
   tr.recover(self.s);self.assertEqual(self.api.sent,[])
   self.s.db.execute('DELETE FROM transient_recovery');self.s.set('manager','')
   m=self.failure();m['content']['content']['data']['retryAfterSeconds']=300

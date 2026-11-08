@@ -43,7 +43,35 @@ def classify(message,native=None):
  return {'kind':kind,'text':text[:500],'episode':episode,**timing(d)}
 
 
-STREAK_WINDOW=7200   # failures this close together are one outage; manual messages do not reset the backoff
+# Provider limit messages are hints, not proof: resets move, limits get extended, and
+# some messages carry no reset at all. Probe the same chat on this schedule (capped
+# well below multi-day "weekly" resets) and let any real output clear the block.
+USAGE_PROBE_FIRST=1200
+USAGE_PROBE_MAX=7200
+
+def usage_probe_due(attempts,reset=None,now=None):
+ now=time.time() if now is None else now
+ due=now+min(USAGE_PROBE_MAX,USAGE_PROBE_FIRST*2**min(max(attempts,0),3))
+ if reset is not None:due=min(due,max(now+60,float(reset)+60))
+ return due
+
+def progress(m):
+ """Real model output or tool activity: evidence the provider accepts turns again."""
+ from supervisor import content
+ from resource_handoff import public_reply
+ c=content(m);inner=c.get('content') or {}
+ d=inner.get('data') if isinstance(inner,dict) and isinstance(inner.get('data'),dict) else {}
+ if c.get('role')!='agent' or d.get('isApiErrorMessage') or d.get('isSidechain') or d.get('parent_tool_use_id') or d.get('scope_role')=='child':return False
+ if d.get('type') in ('error','task_failed','rate_limit_event'):return False
+ msg=d.get('message') if isinstance(d.get('message'),dict) else {}
+ parts=msg.get('content') if isinstance(msg.get('content'),list) else []
+ if d.get('type') in ('tool-call','tool_call') or any(isinstance(p,dict) and p.get('type')=='tool_use' for p in parts):return True
+ text=public_reply(m)
+ return bool(text.strip()) and not re.search(r'usage.?limit|hit your .*limit|rate.?limit|limit reached|try again (?:at|in)',text,re.I)
+
+# Failures this close together are one outage; manual messages do not reset the backoff. It must exceed the
+# longest quota probe gap, or each 2-hour probe of a long limit would start a new, owner-waking streak.
+STREAK_WINDOW=USAGE_PROBE_MAX+3600
 ESCALATE_EVERY=4     # quiet retries: report the first failure, then every 4th, never each one
 
 
@@ -84,8 +112,26 @@ def install(s):
 
 def settle(s,sid,state):
  s.db.execute('UPDATE transient_recovery SET state=? WHERE session=?',(state,sid))
+ s.db.execute('DELETE FROM settings WHERE key=?',('transient-process-review:'+sid,))
  # Retire only undelivered retry bookkeeping, never a worker completion/input event.
- s.db.execute("UPDATE events SET acked=1 WHERE event_key LIKE ? AND kind='transient-wait' AND wake_id IS NULL",('transient:'+sid+':%',))
+ s.db.execute("UPDATE events SET acked=1 WHERE event_key LIKE ? AND kind IN ('transient-wait','transient-uncertain','transient-held') AND wake_id IS NULL",('transient:'+sid+':%',))
+
+def report_held(s,r,reason):
+ """One durable review request, without prompting or relaxing the retry guard."""
+ if r.get('due') is None or time.time()-r['due']<600:return
+ w=s.worker(r['worker']) if r.get('worker') else None
+ s.event('transient:'+r['session']+':held:'+str(r['episode']),w and w['project'],r.get('worker'),'transient-held',
+         'Capacity/rate recovery is overdue but a safety guard remains: '+reason+'. Inspect current work and receipts; no automatic override or worker prompt was sent.')
+
+def report_uncertain(s,r,session):
+ """Old unresolved dispatches need review; never allocate a new delivery ID."""
+ if r.get('state') not in ('sending','sent','uncertain','awaiting-outcome') or not r.get('local_id') or session.get('thinking'):return
+ rows=s.rows('SELECT created FROM outbox WHERE id=?',(r['local_id'],))
+ started=rows[0]['created'] if rows else r['failed_at']
+ if time.time()-started<600:return
+ w=s.worker(r['worker']) if r.get('worker') else None
+ s.event('transient:'+r['session']+':uncertain:'+r['local_id'],w and w['project'],r.get('worker'),'transient-uncertain',
+         'Recovery delivery or its outcome remains unconfirmed. Inspect exact intake and current work; no retry or new delivery ID was created.')
 
 
 def input_is_new(s,m,after,own=None):
@@ -119,7 +165,7 @@ def observe(s,sid,session,messages,worker=None):
     # A chat or manager message cancels a retry but does not end the outage: keep the backoff growing.
     failures=bump_streak(s,sid);attempts=max(attempts,failures-1)
     base=min(1800,60*2**min(attempts,5));jitter=int(hashlib.sha256((sid+f['episode']).encode()).hexdigest()[:8],16)%max(1,base//5)
-    due=max(time.time()+60,f['reset']+60) if f.get('reset') is not None else None if f['kind']=='quota' else time.time()+max(base,float(f.get('retryAfter') or 0))+jitter
+    due=usage_probe_due(attempts,f.get('reset')) if f['kind']=='quota' else time.time()+max(base,float(f.get('retryAfter') or 0))+jitter
     if due is not None and f['kind']!='quota':due=max(due,bump_provider(s,provider(session)))
     s.db.execute('INSERT OR REPLACE INTO transient_recovery VALUES(?,?,?,?,?,?,?,?,?,?,?)',(sid,nid,worker and worker['id'],f['episode'],m['id'],at,due,attempts,'quota-wait' if due is None else 'waiting',None,f['kind']))
     key='transient:'+sid+':'+f['episode']
@@ -138,7 +184,7 @@ def observe(s,sid,session,messages,worker=None):
   c=content(m);d=(c.get('content') or {}).get('data') or {}
   if c.get('role')!='agent' or not isinstance(d,dict) or d.get('scope_role')=='child' or d.get('isSidechain'):continue
   ident=str(d.get('id') or '')
-  if (ident.startswith('codex:'+nid+':') and ident.endswith((':agent_message',':exec_command_begin',':mcp_tool_call_begin'))) and (d.get('message') or d.get('type')=='tool-call'):
+  if ((ident.startswith('codex:'+nid+':') and ident.endswith((':agent_message',':exec_command_begin',':mcp_tool_call_begin'))) and (d.get('message') or d.get('type')=='tool-call')) or (not ident.startswith('codex:') and progress(m)):
    settle(s,sid,'done');s.db.execute('UPDATE transient_recovery SET attempts=0 WHERE session=?',(sid,));recovered(s,sid,session);return
 
 
@@ -175,6 +221,7 @@ def recover_one(s,r,manager):
  if session.get('manualPausedAt') is not None:
   settle(s,sid,'cancelled');return False
  if native(session)!=r['native']:return False
+ report_uncertain(s,r,session)
  if not session.get('active'):return False # never launch/restart a controller
  if r['worker']:
   w=s.worker(r['worker']);p=s.project(w['project'])
@@ -192,7 +239,10 @@ def recover_one(s,r,manager):
   return False # including uncertain or absent: never allocate another localId
  if time.time()<r['due'] or time.time()<float(s.get('transient-next-dispatch') or 0):return False
  agent=session.get('agentState') or {}
- if session.get('thinking') or session.get('backgroundTaskCount') or agent.get('requests') or agent.get('controlledByUser') or agent.get('claudeReadyMessages'):return False
+ if session.get('thinking') or agent.get('requests') or agent.get('controlledByUser') or agent.get('claudeReadyMessages'):return False
+ has_background=bool(session.get('backgroundTaskCount'))
+ if has_background and not s.get('transient-process-review:'+sid):
+  report_held(s,r,'background work is still reported');return False
  messages=s.api.call('/sessions/'+sid+'/messages?limit=100')['messages']
  if any(input_is_new(s,m,r['failed_at'],r['local_id']) for m in messages):
   settle(s,sid,'cancelled');return False
@@ -203,12 +253,24 @@ def recover_one(s,r,manager):
   consumed={i['localId'] for i in q.get('invokedLocalMessages',[])}
   if any(i not in consumed for i in pending):return False
  fresh=s.session(sid)
- if not fresh.get('active') or fresh.get('manualPausedAt') is not None or fresh.get('thinking') or native(fresh)!=r['native'] or (fresh.get('metadata') or {}).get('hostPid')!=(session.get('metadata') or {}).get('hostPid'):return False
+ fresh_agent=fresh.get('agentState') or {}
+ if not fresh.get('active') or fresh.get('manualPausedAt') is not None or fresh.get('thinking') or fresh_agent.get('requests') or fresh_agent.get('controlledByUser') or fresh_agent.get('claudeReadyMessages') or native(fresh)!=r['native'] or (fresh.get('metadata') or {}).get('hostPid')!=(session.get('metadata') or {}).get('hostPid'):return False
+ if fresh.get('backgroundTaskCount'):
+  import recovery_process_review
+  if not has_background or not recovery_process_review.approved(s,r):
+   report_held(s,r,'background work is still reported');return False
+  w2=s.worker(r['worker']);p2=s.project(w2['project']);owner2=s.get('owner:'+w2['id']) or manager
+  if w2['session']!=sid or w2['native_id']!=r['native'] or w2['state']!='managed' or p2['status']!='running' or p2['manual'] or s.watch(w2['id'])['mode']=='off' or s.get('unmanaged:'+w2['id']) or s.get('resume-pending:'+w2['id']) or (sid!=manager and s.checkout_busy(w2)) or s.rows("SELECT worker FROM usage_recovery WHERE worker=? AND state NOT IN ('done','cancelled')",(w2['id'],)) or (owner2 and owner2!=sid and s.session(owner2).get('manualPausedAt') is not None):return False
+  final=s.session(sid); final_agent=final.get('agentState') or {}
+  if s.manager_paused() or not final.get('active') or final.get('manualPausedAt') is not None or final.get('thinking') or final_agent.get('requests') or final_agent.get('controlledByUser') or final_agent.get('claudeReadyMessages') or native(final)!=r['native'] or (final.get('metadata') or {}).get('hostPid')!=(session.get('metadata') or {}).get('hostPid') or final.get('backgroundTaskCount')!=1 or [p.get('id') for p in (final.get('backgroundProcesses') or [])]!=[p.get('id') for p in (fresh.get('backgroundProcesses') or [])]:return False
+ elif has_background:return False # re-evaluate on the next pass
  local=str(uuid.uuid4())
  text='Provider recovery: continue the interrupted request from its latest checkpoint in this conversation. Check completed work and the latest user scope first; do not replay completed actions. Preserve all pauses, goals and resource allocations. If completed, cancelled or awaiting human input, stop and report that. '+('Handle any unacknowledged supervisor events already in context; do not resend worker assignments merely because a wake failed.' if sid==manager else '')
  s.db.execute('BEGIN IMMEDIATE')
  try:
-  s.db.execute("UPDATE transient_recovery SET state='sending',local_id=?,attempts=attempts+1 WHERE session=?",(local,sid))
+  if has_background:s.db.execute('DELETE FROM settings WHERE key=?',('transient-process-review:'+sid,))
+  s.db.execute("UPDATE transient_recovery SET state='sending',local_id=?,attempts=attempts+1 WHERE session=? AND state='waiting' AND episode=?",(local,sid,r['episode']))
+  if s.db.execute('SELECT changes()').fetchone()[0]!=1:raise ValueError('Recovery episode changed')
   s.db.execute('INSERT INTO outbox VALUES(?,?,?,?,?)',(local,sid,text,'sending',time.time()))
   s.set('transient-next-dispatch',time.time()+30)
   s.db.execute('COMMIT')
